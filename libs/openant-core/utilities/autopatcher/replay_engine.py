@@ -328,6 +328,51 @@ def _load_json_artifact(resolution: "lineage.Resolution") -> dict:
     return json.loads(Path(resolution.artifact_path).read_text(encoding="utf-8"))
 
 
+def _require_fix_a_planning_contract(s1: dict, replaying_stage: str) -> None:
+    """Refuse to let an isolated downstream replay (remediation_strategy or
+    guided_context_acquisition) reinterpret a PRE-Fix-A S1 artifact under
+    the new Planning evidence-sufficiency contract.
+
+    `"planning_forced_skip"` is written, unconditionally, into every S1
+    artifact this contract's own version of
+    `_run_repository_analysis_and_remediation_planning` produces (see
+    pipeline.py's S1 `finish()` call and this module's own S1 run_fn) --
+    its mere PRESENCE (regardless of value) is the version marker. An
+    artifact predating Fix A never wrote this key at all, so `"planning_
+    forced_skip" not in s1` is an exact, unambiguous test for "this
+    artifact was produced before the new contract existed" -- never a
+    heuristic on `plan_result` content, which the old contract already
+    populated with plausible-looking (but contract-irrelevant) data.
+
+    This is NOT the same situation as a live, current-contract Planning
+    response that merely omits `additional_evidence_required` (that is
+    ordinary model non-compliance, and correctly fails closed as
+    "missing_gate" -- see `_planning_gate_outcome`). An old ARTIFACT was
+    produced by a DIFFERENT, no-longer-existing contract entirely; neither
+    "grounded" nor "planning_ungrounded" is a truthful description of it
+    under the current contract, so neither is used. Silently choosing
+    either would rewrite the meaning of a historical run -- this raises
+    instead, exactly like every other "cannot proceed" precondition this
+    module already enforces before doing any LLM/external work (see
+    ReplayEngineError's own docstring).
+
+    Scoped narrowly to isolated downstream replay of S2/S3 consuming a
+    PERSISTED S1 artifact -- replaying S1 itself is never affected (it
+    always re-runs the current-contract executor for real, producing a
+    fresh, current-contract artifact regardless of what existed before;
+    see `_run_replay_repository_analysis_and_remediation_planning`)."""
+    if "planning_forced_skip" in s1:
+        return
+    raise ReplayEngineError(
+        f"Cannot replay {replaying_stage} in isolation: the "
+        f"repository_analysis_and_remediation_planning artifact it depends "
+        f"on predates the Planning evidence-sufficiency contract (Fix A) "
+        f"and cannot be safely reinterpreted under it -- replay "
+        f"repository_analysis_and_remediation_planning first to produce a "
+        f"current-contract artifact."
+    )
+
+
 def _resolve_authoritative_candidate(chain, s6_artifact: dict) -> "tuple[str, dict]":
     """THE one shared, deterministic rule for which candidate patch a
     downstream replay stage (patch_review, confidence_scoring,
@@ -474,7 +519,14 @@ def _run_replay_repository_analysis_and_remediation_planning(
 
     plan_result = s1_locals["_plan_result"]
     plan_text = s1_locals["_plan_text"]
-    if plan_result is not None:
+    planning_forced_skip = bool(s1_locals["_planning_forced_skip"])
+    if planning_forced_skip:
+        # See pipeline.py's own S1 outcome computation -- checked FIRST
+        # for the same reason: the loop always returns SOME
+        # RemediationPlanResult, grounded or not, so `plan_result is not
+        # None` alone can never distinguish the two.
+        outcome = "planning_ungrounded"
+    elif plan_result is not None:
         outcome = "generated"
     elif plan_text:
         outcome = "skipped_hand_authored_plan"
@@ -483,6 +535,54 @@ def _run_replay_repository_analysis_and_remediation_planning(
 
     artifact = {
         "plan_result": to_jsonable(plan_result),
+        # Same top-level mirror pipeline.py's own S1 artifact carries --
+        # see that dict's own comment for why S2/S3 replay must consume
+        # this, never re-derive it.
+        "planning_forced_skip": planning_forced_skip,
+        "planning_skip_reason": s1_locals["_planning_skip_reason"],
+        "evidence_acquisition": {
+            "terminal_state": s1_locals["_planning_terminal_state"],
+            "attempts_used": len(s1_locals["_planning_attempts"]),
+            "attempts": [
+                {
+                    "attempt": a.attempt,
+                    "llm_tag": a.llm_tag,
+                    "gate_state": a.gate_state,
+                    "evidence_requests": [
+                        {
+                            "request_type": r.request_type,
+                            "file_hint": r.file_hint,
+                            "symbol": r.symbol,
+                            "reason": r.reason,
+                        }
+                        for r in a.evidence_requests
+                    ],
+                    "invalid_requests": [
+                        {
+                            "request_type": r.request_type,
+                            "file_hint": r.file_hint,
+                            "symbol": r.symbol,
+                            "schema_failure_reason": reason,
+                        }
+                        for r, reason in a.invalid_requests
+                    ],
+                    "resolutions": [
+                        {
+                            "request_type": res.request.request_type,
+                            "file_hint": res.request.file_hint,
+                            "symbol": res.request.symbol,
+                            "resolved": res.resolved,
+                            "failure_reason": res.failure_reason,
+                            "resolved_file": res.resolved_file,
+                            "resolved_symbol": res.resolved_symbol,
+                        }
+                        for res in a.resolutions
+                    ],
+                    "outcome": a.outcome,
+                }
+                for a in s1_locals["_planning_attempts"]
+            ],
+        },
         "repository_understanding": to_jsonable(s1_locals["_repository_understanding"]),
         "pre_patch_anchors": to_jsonable(s1_locals["_pre_patch_anchors"]),
         "vulnerability_text": vulnerability_text,
@@ -542,11 +642,21 @@ def _run_replay_remediation_strategy(
     chain=None,
 ) -> RunFnResult:
     s1 = _load_json_artifact(resolved_dependencies[REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING])
+    _require_fix_a_planning_contract(s1, REMEDIATION_STRATEGY)
     vulnerability_text = s1["vulnerability_text"]
     repository_understanding_ctx = s1.get("repository_understanding_ctx") or ""
     planner_evidence_ctx = s1.get("planner_evidence_ctx") or ""
     plan_ctx = s1.get("plan_ctx") or ""
     repo_code = s1.get("repo_code") or ""
+    # Planning evidence-sufficiency gate ("Fix A"): S1 already made the
+    # authoritative ungrounded decision -- consumed exactly as recorded,
+    # never re-derived from `planner_evidence_ctx` being empty (which is
+    # ALSO empty for an ordinary Planner-call failure -- see S1's own
+    # comment on `_planning_forced_skip`). generate_remediation_strategy
+    # itself already no-ops on an empty planner_evidence_ctx (see its own
+    # docstring), so this check does not change WHETHER Strategy runs --
+    # only the recorded `outcome` string's provenance.
+    planning_forced_skip = bool(s1.get("planning_forced_skip"))
 
     with LLMCallCapture() as capture:
         strategy_result = generate_remediation_strategy(
@@ -560,9 +670,14 @@ def _run_replay_remediation_strategy(
     llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
     _assert_llm_ownership(capture.calls, REMEDIATION_STRATEGY)
 
-    outcome = "generated" if strategy_result is not None and strategy_result.rendered else (
-        "skipped_no_planner_evidence" if not planner_evidence_ctx else "unavailable"
-    )
+    if planning_forced_skip:
+        outcome = "skipped_planning_ungrounded"
+    elif strategy_result is not None and strategy_result.rendered:
+        outcome = "generated"
+    elif not planner_evidence_ctx:
+        outcome = "skipped_no_planner_evidence"
+    else:
+        outcome = "unavailable"
     artifact = {"strategy_result": to_jsonable(strategy_result)}
     artifact_path = output_dir / "remediation_strategy.json"
     artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
@@ -598,6 +713,7 @@ def _run_replay_guided_context_acquisition(
     chain=None,
 ) -> RunFnResult:
     s1 = _load_json_artifact(resolved_dependencies[REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING])
+    _require_fix_a_planning_contract(s1, GUIDED_CONTEXT_ACQUISITION)
     s2 = _load_json_artifact(resolved_dependencies[REMEDIATION_STRATEGY])
 
     vulnerability_text = s1["vulnerability_text"]
@@ -616,12 +732,18 @@ def _run_replay_guided_context_acquisition(
     _planner_claim_verification = s1.get("planner_claim_verification") or {}
     verifier_forced_skip = bool(_planner_claim_verification.get("forced_skip"))
     verifier_skip_reason = _planner_claim_verification.get("skip_reason")
+    # Planning evidence-sufficiency gate ("Fix A") -- same "must consume
+    # S1's own recorded decision, never re-derive it" discipline as the
+    # verifier fields immediately above; see S1 run_fn's own comment.
+    planning_forced_skip = bool(s1.get("planning_forced_skip"))
+    planning_skip_reason = s1.get("planning_skip_reason")
 
     with LLMCallCapture() as capture:
         s3_locals = _run_guided_context_acquisition(
             vulnerability_text=vulnerability_text, llm=llm, repo_root=repo_root, budget_controller=None,
             _strategy_result=strategy_result, _plan_result=plan_result, _investigation_context=None,
             _verifier_forced_skip=verifier_forced_skip, _verifier_skip_reason=verifier_skip_reason,
+            _planning_forced_skip=planning_forced_skip, _planning_skip_reason=planning_skip_reason,
         )
 
     llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
@@ -632,7 +754,14 @@ def _run_replay_guided_context_acquisition(
     skip_patch_generation = s3_locals["_skip_patch_generation"]
     skip_patch_generation_reason = s3_locals["_skip_patch_generation_reason"]
     has_targets = strategy_result is not None and (strategy_result.target_files or strategy_result.target_symbols)
-    outcome = "ready" if slice_result is not None else ("skipped_no_strategy_targets" if not has_targets else "unavailable")
+    if planning_forced_skip:
+        outcome = "skipped_planning_ungrounded"
+    elif slice_result is not None:
+        outcome = "ready"
+    elif not has_targets:
+        outcome = "skipped_no_strategy_targets"
+    else:
+        outcome = "unavailable"
 
     artifact = {
         "slice_result": to_jsonable(slice_result),

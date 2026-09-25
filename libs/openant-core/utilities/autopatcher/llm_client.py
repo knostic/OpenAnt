@@ -44,6 +44,7 @@ points at ``openant setup llm``. See ``ModelUnavailableError`` and
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -199,6 +200,47 @@ _MOCK_PATCH = """\
 ```
 """
 
+_MOCK_REMEDIATION_PLAN = json.dumps({
+    "remediation_mechanism": None,
+    "target_files": [],
+    "target_symbols": [],
+    "security_invariant": None,
+    "narrower_alternative_decision": "NONE_IDENTIFIED",
+    "narrower_alternative_considered": None,
+    "required_edits": [],
+    "approaches_to_avoid": [],
+    "explicit_unknowns": ["(mock response) no repository evidence was supplied to this mock call."],
+    "additional_evidence_required": False,
+    "evidence_requests": [],
+})
+"""A schema-valid, GROUNDED (`additional_evidence_required: false`) empty
+Planner response -- the prompt's own documented "evidence given is too
+weak to propose anything concrete" answer (see prompts/remediation_
+planner.md's own Rules section), not a placeholder specific to any one
+vulnerability. Grounded-but-empty is deliberate: mock mode must exercise
+the SAME downstream flow (Strategy/Patch Generation still attempted, using
+whatever other context exists) pre-Fix-A callers already relied on --
+never silently exercising the new fail-closed ungrounded path just
+because mock mode has no real model to ask."""
+
+_MOCK_REMEDIATION_STRATEGY = json.dumps({
+    "extended_mechanism": None,
+    "target_files": [],
+    "target_symbols": [],
+    "required_edits": [],
+    "rejected_targets": [],
+    "security_invariant": None,
+    "insufficient_evidence": [],
+    "target_authority_unresolved": False,
+})
+"""Companion to _MOCK_REMEDIATION_PLAN for the Final Strategy prompt --
+same rationale: a schema-valid empty response, never a CVE-specific
+placeholder. `insufficient_evidence` MUST stay empty: a non-empty value
+here combined with zero targets is exactly `_evidence_gap_fallback_
+trigger`'s own trigger condition (see pipeline.py) -- this mock response
+must not spuriously activate that pre-existing, unrelated fallback
+mechanism in tests that never intended to exercise it."""
+
 _MOCK_REVIEW = """\
 **Explanation:**
 The original code constructs a SQL query using f-string interpolation, which
@@ -304,6 +346,10 @@ def _mock_response(prompt_hint: str) -> str:
         return _MOCK_REVIEW
     if "challeng" in first_line or "adversarial" in first_line or "challenger" in first_line:
         return _MOCK_CHALLENGE
+    if "remediation planner" in first_line:
+        return _MOCK_REMEDIATION_PLAN
+    if "remediation strategy" in first_line:
+        return _MOCK_REMEDIATION_STRATEGY
     if "generator" in first_line or "patch" in first_line:
         return _MOCK_PATCH
     return "(mock response)"

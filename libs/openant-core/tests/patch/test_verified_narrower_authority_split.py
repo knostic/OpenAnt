@@ -89,6 +89,10 @@ def _plan(
         required_edits=list(required_edits),
         approaches_to_avoid=list(approaches_to_avoid),
         explicit_unknowns=[],
+        # Fix A: this file is about the verified-narrower authority split
+        # (a downstream concern), not Planning's own evidence-sufficiency
+        # gate -- every plan built here must already read as grounded.
+        additional_evidence_required="explicit_false",
     )
 
 
@@ -277,10 +281,20 @@ class TestImplementationEvidenceGap:
 # ---------------------------------------------------------------------------
 
 class TestV2AuthoritativePlanner:
-    def test_v2_semantics_used_not_v1(self, tmp_path):
-        """v1 is contradicted; the bounded one-shot revision produces v2;
-        verifier_v2 SUPPORTS v2 with match=True. Semantic authority MUST
-        come from v2's fields, never v1's."""
+    def test_v2_alone_is_never_sufficient_for_verified_authority(self, tmp_path):
+        """UPDATED by the post-CONTRADICTED authority-laundering fix (see
+        TestPostContradictedRevisionAuthorityNotLaundered below): this test
+        previously asserted that v2's mechanism became VERIFIED authority
+        merely because verifier_v2 (Mode B, decision-coherence-only)
+        returned SUPPORTED after v1 was CONTRADICTED. That was the
+        confirmed bug -- a v2 plan only exists because v1 was already
+        found CONTRADICTED, and Mode B's own contract never establishes
+        that the original contradiction was resolved by anything
+        repository-grounded (see prompts/remediation_verifier.md). Neither
+        v1's nor v2's Planner mechanism may reach Patch Generation as
+        VERIFIED authority in this shape; Strategy's own mechanism prose
+        is used instead, exactly like any other case where the split never
+        activates."""
         v1_mechanism = "v1's own narrow mechanism, later contradicted"
         v2_mechanism = "v2's own, revised narrow mechanism"
         plan_v1 = _plan(tmp_path, mechanism=v1_mechanism, narrower="v1 narrower alternative")
@@ -308,8 +322,88 @@ class TestV2AuthoritativePlanner:
         assert spy_verify.call_count == 2
         mock_gen.assert_called_once()
         code_context = mock_gen.call_args.kwargs["code_context"]
-        assert v2_mechanism in code_context
         assert v1_mechanism not in code_context
+        assert v2_mechanism not in code_context
+        assert _BROAD_MECHANISM in code_context
+
+
+# ---------------------------------------------------------------------------
+# E2. Post-CONTRADICTED revision authority laundering (FIX)
+#
+# Mode B (SELECTED / decision coherence -- see prompts/remediation_
+# verifier.md) is explicitly, by its own documented contract, "strictly a
+# coherence check between two descriptions the planner itself produced, not
+# an evaluation of the remediation on its own merits" and "never asks...
+# whether the remediation is globally correct or actually closes the
+# vulnerability." A v2 plan produced by the bounded one-shot revision only
+# ever exists because v1 was CONTRADICTED (see pipeline.py's revision
+# trigger) -- so every v2 that reaches the SELECTED/Mode-B authority gate is,
+# by construction, a plan that already failed verification once and was
+# never re-examined against any new repository evidence, only reworded.
+# Before this fix, `_verified_narrower_authoritative` could not distinguish
+# this from an uncontested first-pass SUPPORTED (TestCoreOrchestrationRegression),
+# and granted identical binding authority to both.
+# ---------------------------------------------------------------------------
+
+class TestPostContradictedRevisionAuthorityNotLaundered:
+    def test_post_contradicted_v2_mode_b_supported_does_not_gain_authority(self, tmp_path):
+        """RED (pre-fix): v1 CONTRADICTED -> bounded revision -> v2 SUPPORTED
+        via Mode B coherence only, target/mechanism substantively unchanged,
+        no new repository evidence. Neither v1's nor v2's Planner mechanism
+        may reach Patch Generation as VERIFIED authority -- Strategy's own
+        (fail-closed default) mechanism prose must be used instead, exactly
+        like any other case where authority never activates (see
+        TestNegativeCompatibility)."""
+        v1_mechanism = "v1's own narrow mechanism, later contradicted"
+        v2_mechanism = "v2's own, revised narrow mechanism (reworded only)"
+        plan_v1 = _plan(tmp_path, mechanism=v1_mechanism, narrower="v1 narrower alternative")
+        plan_v2 = _plan(tmp_path, mechanism=v2_mechanism, narrower="v2 narrower alternative (revised)")
+        strategy_result = _strategy()
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_plan",
+                side_effect=[plan_v1, plan_v2],
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_verifier.verify_planner_claim",
+                side_effect=[
+                    _verdict("CONTRADICTED", contradiction="v1 was wrong"),
+                    _verdict("SUPPORTED", matches_selected=True),  # Mode B coherence-only
+                ],
+            ) as spy_verify,
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
+                return_value=strategy_result,
+            ),
+            mock.patch(
+                "utilities.autopatcher.pipeline.generate_patch_raw",
+                return_value=_CLEAN_DIFF,
+            ) as mock_gen,
+        ):
+            pipeline_mod.run(vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path))
+        assert spy_verify.call_count == 2
+        mock_gen.assert_called_once()
+        code_context = mock_gen.call_args.kwargs["code_context"]
+        assert v1_mechanism not in code_context
+        assert v2_mechanism not in code_context
+        assert _BROAD_MECHANISM in code_context  # Strategy's own prose, the fail-closed fallback
+
+    def test_first_pass_selected_mode_b_supported_still_grants_authority(self, tmp_path):
+        """Control: a first-pass (never-contradicted) SELECTED/Mode-B
+        SUPPORTED result -- no revision ever attempted -- must retain its
+        EXISTING authority-granting behavior unchanged. Same scenario as
+        TestCoreOrchestrationRegression, asserted here again as the direct
+        control paired with the RED case above."""
+        plan_result = _plan(tmp_path)
+        strategy_result = _strategy()
+        _report, spy_verify, spy_strategy, mock_gen = _run_pipeline(
+            tmp_path, plan_result=plan_result, verify_side_effect=[_verdict("SUPPORTED", matches_selected=True)],
+            strategy_result=strategy_result,
+        )
+        spy_verify.assert_called_once()  # first pass only -- no revision ever attempted
+        code_context = mock_gen.call_args.kwargs["code_context"]
+        assert _NARROW_MECHANISM in code_context
+        assert _BROAD_MECHANISM not in code_context
 
 
 # ---------------------------------------------------------------------------

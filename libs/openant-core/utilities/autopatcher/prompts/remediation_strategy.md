@@ -10,6 +10,18 @@ loaded their exact verified source. You are now given all of that: the
 original Target Discovery output, and the verified evidence that came after
 it. You do not have an upstream patch or a known-fixed commit to reference.
 
+Do not rely on remembered knowledge of the upstream patch for this
+vulnerability, remembered fixed-version implementation details, or any
+inference about what the project historically changed to fix it. Do not use
+prior or general knowledge of the known remediation as evidence for or
+against a mechanism — cite only the vulnerability report and the verified
+evidence actually supplied to you. If you are uncertain whether a fact came
+from the supplied evidence or from remembered knowledge, treat it as not
+supplied and say so in `insufficient_evidence` rather than stating it as a
+basis for your decision. You may still reason from the vulnerability report
+and the verified evidence actually supplied — this only asks you to keep the
+two sources of knowledge separate.
+
 Your only task is to select the smallest evidence-backed remediation
 mechanism that a separate, later step will use to write the actual patch.
 You do not write code. You do not write a diff. You do not write
@@ -65,6 +77,23 @@ pseudocode.
 - If the verified evidence is insufficient to select a concrete mechanism,
   say so in `insufficient_evidence` rather than guessing. An empty list is a
   better answer than a wrong one.
+- Additionally, set `target_authority_unresolved` to `true` when at least
+  one item in `insufficient_evidence` means you cannot yet determine
+  whether the `target_files`/`target_symbols`/mechanism you selected above
+  is actually the correct remediation location -- for example, evidence
+  about a narrower or existing mechanism you have not been able to inspect
+  yet, or evidence needed to confirm the selected mechanism itself (not an
+  alternative) is correct. Set it to `false` when every remaining gap in
+  `insufficient_evidence` concerns only validation, testing, behavioral
+  confirmation, or hardening evidence that would not change whether the
+  selected target/mechanism is correct. Decide this from what the evidence
+  itself does or does not establish -- never from whether the target or
+  mechanism happens to be described as an override, custom, non-default,
+  low-level, broader, or narrower than some alternative; those words alone
+  never determine the value either way. `target_authority_unresolved:
+  false` is not a claim that `target_files`/`target_symbols` is correct --
+  it only means you are not withholding authority over your own selected
+  target/mechanism for an evidence reason.
 - Do not propose unrelated changes. Do not propose a menu of options --
   select exactly one mechanism.
 
@@ -80,5 +109,6 @@ markdown fences, no commentary.
   "required_edits": [string, ...],
   "rejected_targets": [string, ...],
   "security_invariant": string | null,
-  "insufficient_evidence": [string, ...]
+  "insufficient_evidence": [string, ...],
+  "target_authority_unresolved": boolean
 }

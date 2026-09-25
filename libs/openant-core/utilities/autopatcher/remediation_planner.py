@@ -43,6 +43,7 @@ whatever evidence already existed -- never raises, never a third LLM call.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -122,7 +123,38 @@ class RemediationPlanResult(NamedTuple):
     decide whether verification is even triggered at all, and in which
     mode, and (when triggered) to give the verifier the exact claim to
     check -- never by Strategy or Patch Generation, which continue to read
-    only the rendered Markdown."""
+    only the rendered Markdown.
+
+    `additional_evidence_required` is the Planner's own structured,
+    load-bearing evidence-sufficiency gate -- see
+    `run_planning_evidence_acquisition`'s own docstring for how it drives
+    the bounded acquisition loop. Unlike `target_authority_unresolved`
+    (Strategy's own asymmetric bool, where an absent/malformed key
+    defaults PERMISSIVELY to `False`), this field cannot be a plain bool:
+    the governing invariant (see `_planning_gate_outcome`) requires telling
+    "the model explicitly certified sufficiency" apart from "the model
+    said nothing trustworthy at all" -- a two-valued bool cannot represent
+    that distinction, so this is a small closed string enum instead, one
+    of `"explicit_false"` (the model wrote a real JSON `false` -- the ONLY
+    state that can ever certify a plan grounded), `"explicit_true"` (a
+    real JSON `true` -- more evidence is being requested),
+    `"missing"` (the key was absent from the response), or `"malformed"`
+    (the key was present but not a real JSON boolean -- `null` or a wrong
+    type). `"missing"` and `"malformed"` both fail closed identically for
+    gating purposes (see `_planning_gate_outcome`) but are kept distinct
+    here so the trace can record which one actually happened. Parsed by
+    `_parse_additional_evidence_required`, below.
+
+    `evidence_requests` is the Planner's own structured request for
+    additional repository evidence -- every already-parsed
+    `PlanningEvidenceRequest` from the response's `evidence_requests`
+    list, valid or not (schema validity is decided later, by
+    `_validate_planning_request_schema`, only for whichever requests the
+    gate actually needs to act on -- this field itself never drops or
+    filters anything at parse time, mirroring `GuidedContextRequest`'s own
+    parse-then-validate-later split). Never itself authoritative: only
+    `run_planning_evidence_acquisition`'s own gate/resolution logic reads
+    it as anything other than an observability record."""
 
     rendered: str
     target_files: "list[str]"
@@ -134,6 +166,8 @@ class RemediationPlanResult(NamedTuple):
     required_edits: "list[str]" = []
     approaches_to_avoid: "list[str]" = []
     explicit_unknowns: "list[str]" = []
+    additional_evidence_required: str = "missing"
+    evidence_requests: "list[PlanningEvidenceRequest]" = []
 
 
 _EMPTY_PLAN_RESULT = RemediationPlanResult(rendered="", target_files=[], target_symbols=[])
@@ -317,6 +351,64 @@ def _string_list(value) -> "list[str]":
     return [item for item in value if isinstance(item, str)]
 
 
+def _parse_additional_evidence_required(plan: dict) -> str:
+    """Parse the Planner's `additional_evidence_required` field into one of
+    the four states `RemediationPlanResult.additional_evidence_required`'s
+    own docstring documents. Unlike `_parse_target_authority_unresolved`,
+    there is no permissive default: a genuinely absent key is `"missing"`,
+    never silently `"explicit_false"` -- see `_planning_gate_outcome` for
+    why absence can never certify a plan grounded. A present-but-not-a-
+    real-JSON-boolean value (an explicit `null`, a string, a number) is
+    `"malformed"`, kept distinct from `"missing"` purely for trace
+    forensics (see PlanningAttemptRecord.gate_state) -- both states are
+    treated identically by the gate itself."""
+    if "additional_evidence_required" not in plan:
+        return "missing"
+    value = plan.get("additional_evidence_required")
+    if isinstance(value, bool):
+        return "explicit_true" if value else "explicit_false"
+    return "malformed"
+
+
+def _parse_one_planning_request(item) -> "PlanningEvidenceRequest | None":
+    """Extract only the four allowed fields from one raw JSON
+    `evidence_requests` item -- anything else present is never read.
+    Returns None only when `item` isn't even a dict (mirrors
+    `_parse_one_guided_request`'s own convention)."""
+    if not isinstance(item, dict):
+        return None
+
+    def _s(key: str) -> "str | None":
+        v = item.get(key)
+        return v.strip() if isinstance(v, str) and v.strip() else None
+
+    return PlanningEvidenceRequest(
+        request_type=_s("request_type"),
+        file_hint=_s("file_hint"),
+        symbol=_s("symbol"),
+        reason=_s("reason"),
+    )
+
+
+def _parse_planning_evidence_requests(plan: dict) -> "list[PlanningEvidenceRequest]":
+    """Parse the Planner's `evidence_requests` list -- a non-list value
+    (missing key, wrong type) coerces to `[]` (the "malformed request-list
+    container" case), and individual non-dict entries are silently
+    dropped, mirroring `_string_list`'s own defensive-coercion convention.
+    Schema validity of each SURVIVING entry (does it have the fields its
+    own `request_type` requires) is decided later, only when the gate
+    actually needs it -- see `_validate_planning_request_schema`."""
+    raw = plan.get("evidence_requests")
+    if not isinstance(raw, list):
+        return []
+    requests: "list[PlanningEvidenceRequest]" = []
+    for item in raw:
+        parsed = _parse_one_planning_request(item)
+        if parsed is not None:
+            requests.append(parsed)
+    return requests
+
+
 def generate_remediation_plan(
     vulnerability_text: str, llm, code_context: str = "", retry_hint: str = "",
     stage: str = "remediation_planning",
@@ -404,6 +496,8 @@ def generate_remediation_plan(
         required_edits=_string_list(plan.get("required_edits")),
         approaches_to_avoid=_string_list(plan.get("approaches_to_avoid")),
         explicit_unknowns=_string_list(plan.get("explicit_unknowns")),
+        additional_evidence_required=_parse_additional_evidence_required(plan),
+        evidence_requests=_parse_planning_evidence_requests(plan),
     )
 
 
@@ -1083,26 +1177,53 @@ def _compute_source_excerpt_plan(
     max_chars: "int | None" = None,
 ) -> _SourceExcerptPlan:
     """
-    Two deterministic passes over the already-verified Planner candidates
-    (same order build_planner_candidates produced) -- no scoring, no
-    ranking weights, just a strict priority split:
+    Deterministic passes over the already-verified Planner candidates (same
+    order build_planner_candidates produced) -- no scoring, no ranking
+    weights, no source truncation; every admission decision is still
+    whole-block-or-omit, exactly as before this function's Pass 1 gained a
+    fairness sub-split (1a/1b, below).
 
-    Pass 1: every candidate with a verified Planner symbol gets its exact
-    symbol source considered for the budget FIRST, in candidate order.
-    Never the enrichment pipeline's own containing-function guess (for a
-    file-only candidate that is the whole-module catch-all, not a real
-    symbol) -- only `symbol_locations.get(path)`, which holds nothing
-    unless a Planner symbol was independently verified for that path. If
-    the symbol's source can't be read, or its excerpt doesn't fit even
-    after earlier Pass-1 excerpts, it is omitted explicitly -- never
-    truncated, and never silently replaced by that file's full content.
+    Pass 1 -- verified symbol excerpts, fairly admitted:
+
+      1a (fair-share admission): every candidate with a verified Planner
+      symbol gets ONE turn, in candidate order, against an equal share of
+      the shared budget (`budget // count of symbol-resolved candidates`).
+      A candidate whose own excerpt fits inside that share is admitted
+      immediately. One that doesn't is deferred -- NOT consumed from the
+      shared budget yet -- so a single oversized symbol can never be read
+      before, and so starve, an otherwise-admissible sibling merely
+      because of candidate order (see FIX 3 / the forensic report's Run-3
+      analysis: a coarse class-level target consuming the whole window
+      before two narrower sibling targets ever got a turn).
+
+      1b (grow pass): whatever was deferred in 1a gets a second look, in
+      the SAME original order, against whatever budget genuinely remains
+      after every candidate already had its fair-share turn -- so a large
+      candidate can still be included in full if enough was left over,
+      but never ahead of a smaller sibling's own admission above.
+
+      Never the enrichment pipeline's own containing-function guess (for a
+      file-only candidate that is the whole-module catch-all, not a real
+      symbol) -- only `symbol_locations.get(path)`, which holds nothing
+      unless a Planner symbol was independently verified for that path. If
+      the symbol's source can't be read, or its excerpt doesn't fit in
+      either 1a or 1b, it is omitted explicitly -- never truncated, and
+      never silently replaced by that file's full content.
 
     Pass 2: full-file fallback, and ONLY for candidates whose Planner
     symbol never resolved at all (not for one whose excerpt merely failed
     to fit in Pass 1 -- that stays omitted, per above). Runs strictly
-    after every Pass-1 excerpt has already had first claim on the shared
-    budget, so a lower-priority fallback can never consume budget a
-    higher-priority verified symbol still needed.
+    after every Pass-1 excerpt (1a AND 1b) has already had first claim on
+    the shared budget, so a lower-priority fallback can never consume
+    budget a higher-priority verified symbol still needed. Unaffected by
+    the 1a/1b fairness split -- still first-come/whole-block-or-omit
+    within its own, strictly lower-priority tier.
+
+    The rendered block ORDER is always restored to match `candidates`'
+    own original order before this returns, regardless of which sub-pass
+    (1a, 1b, or 2) actually admitted a given candidate -- the fairness
+    split changes WHEN a candidate's admission is decided, never WHERE it
+    appears in the output once admitted.
 
     Never raises -- any failure is reflected as an empty/partial plan so
     callers fall back to their own existing degradation.
@@ -1123,7 +1244,6 @@ def _compute_source_excerpt_plan(
     else:
         _budget = max_chars
 
-    blocks: "list[str]" = []
     included_labels: "set[str]" = set()
     symbol_omitted: "list[str]" = []
     fallback_omitted: "list[str]" = []
@@ -1131,29 +1251,47 @@ def _compute_source_excerpt_plan(
     omitted_sizes: "dict[str, int]" = {}
     running = 0
     seen: set = set()
-    fallback_eligible: "list[str]" = []
+    ordered_blocks: "list[tuple[int, str]]" = []  # (original candidate index, rendered block)
 
-    # Pass 1 -- verified symbol excerpts only.
-    for candidate in candidates:
+    # Pre-pass: split into the Pass-1 (symbol-resolved) tier and the
+    # Pass-2 (fallback-eligible) tier, preserving each candidate's
+    # original index so the final output order can be restored below --
+    # uses only the already-available symbol_locations dict, no I/O.
+    resolved: "list[tuple[int, str, _SymbolMatch]]" = []
+    fallback_eligible: "list[tuple[int, str]]" = []
+    for index, candidate in enumerate(candidates):
         path = candidate.path
         if path in seen:
             continue  # defensive: build_planner_candidates already dedupes by path
         seen.add(path)
-
         match = symbol_locations.get(path)
         if match is None:
-            fallback_eligible.append(path)
-            continue
+            fallback_eligible.append((index, path))
+        else:
+            resolved.append((index, path, match))
 
+    # Pass 1a -- fair-share admission.
+    fair_share = _budget // len(resolved) if resolved else _budget
+    deferred: "list[tuple[int, str, str]]" = []  # (index, label, block)
+    for index, _path, match in resolved:
         label = f"{match.file}:{match.label}"
         source = _read_symbol_source(match, context)
         if source is None:
             read_failed.append(label)
             continue
-
         block = _render_source_excerpt(match.file, match.label, match.line, match.end_line, source)
+        if len(block) <= fair_share and running + len(block) <= _budget:
+            ordered_blocks.append((index, block))
+            included_labels.add(label)
+            running += len(block)
+        else:
+            deferred.append((index, label, block))
+
+    # Pass 1b -- grow pass, same original order, against whatever budget
+    # genuinely remains after every candidate's Pass 1a turn.
+    for index, label, block in deferred:
         if running + len(block) <= _budget:
-            blocks.append(block)
+            ordered_blocks.append((index, block))
             included_labels.add(label)
             running += len(block)
         else:
@@ -1163,7 +1301,7 @@ def _compute_source_excerpt_plan(
     # Pass 2 -- full-file fallback, only for candidates with no resolved
     # symbol at all (never for one whose symbol excerpt was itself omitted
     # above -- that stays omitted, it is not "upgraded" to a full file).
-    for path in fallback_eligible:
+    for index, path in fallback_eligible:
         try:
             full_text = (repo_root / path).read_text(encoding="utf-8", errors="ignore")
         except Exception:
@@ -1172,15 +1310,20 @@ def _compute_source_excerpt_plan(
         n_lines = len(full_text.splitlines())
         block = _render_source_excerpt(path, None, 1, n_lines, full_text)
         if running + len(block) <= _budget:
-            blocks.append(block)
+            ordered_blocks.append((index, block))
             included_labels.add(path)
             running += len(block)
         else:
             fallback_omitted.append(path)
             omitted_sizes[path] = len(block)
 
+    # Restore original candidate order for the final rendered sequence --
+    # see the docstring's own note on this above.
+    ordered_blocks.sort(key=lambda pair: pair[0])
+    blocks = tuple(block for _, block in ordered_blocks)
+
     return _SourceExcerptPlan(
-        blocks=tuple(blocks), included_labels=frozenset(included_labels),
+        blocks=blocks, included_labels=frozenset(included_labels),
         symbol_omitted=tuple(symbol_omitted), fallback_omitted=tuple(fallback_omitted),
         read_failed=tuple(read_failed), budget=_budget, omitted_sizes=omitted_sizes,
     )
@@ -1214,6 +1357,127 @@ def _render_source_excerpt_plan(plan: "_SourceExcerptPlan") -> str:
         lines.extend(f"*{n}.*" for n in notes)
 
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Baseline-evidence preservation for the named-target authority-gap
+# reacquisition (scope-v4/authority-v1 forensic finding): the reacquisition
+# seeds `build_planner_evidence_with_budget` from Strategy #1's OWN selected
+# target only (see pipeline.py's evidence-gap fallback call site) -- correct
+# for FOCUSING the reacquisition on the specific dependency Strategy #1 named
+# as unresolved, but this means the freshly-rebuilt PlannerEvidenceResult has
+# no memory of whatever OTHER candidates Strategy #1's own (broader) evidence
+# construction already resolved and rendered. Passing that fresh result alone
+# as Strategy #2's `planner_evidence_ctx` silently drops it. The two
+# functions below combine Strategy #1's own already-rendered evidence with
+# the fresh reacquisition's own evidence -- a pure, deterministic text
+# operation over already-computed results: no new repository read, no new
+# LLM call, no new context-budget window request, and no keyword/prose
+# inspection of anything either result's evidence actually says.
+# ---------------------------------------------------------------------------
+
+_VERIFIED_SOURCE_LABEL_RE = re.compile(r"^#### Verified source: `([^`]+)`")
+
+
+def _dedupe_source_excerpt_blocks(
+    blocks: "tuple[str, ...]", already_included_labels: "frozenset[str]",
+) -> "tuple[str, ...]":
+    """Drop any rendered source-excerpt block whose own label -- parsed
+    from its first line, the exact, fixed header `_render_source_excerpt`
+    itself writes ("#### Verified source: `path[:label]` (...)") --
+    already appears in `already_included_labels`. This is the SAME label
+    string `_compute_source_excerpt_plan` uses to populate
+    `_SourceExcerptPlan.included_labels`, so this is a structural-identity
+    comparison, never prose/keyword matching, and never re-derives or
+    re-reads anything: the block is already-rendered text, only its own
+    already-computed header is inspected.
+
+    A block whose first line does not match this exact, code-generated
+    format (should never happen for a real `_SourceExcerptPlan.blocks`
+    entry -- every block is produced by `_render_source_excerpt`, which
+    always writes this header first) is conservatively KEPT, never
+    dropped on an unrecognized shape -- fail closed toward preserving
+    evidence, never toward silently discarding it."""
+    kept: "list[str]" = []
+    for block in blocks:
+        first_line = block.splitlines()[0] if block else ""
+        match = _VERIFIED_SOURCE_LABEL_RE.match(first_line)
+        label = match.group(1) if match else None
+        if label is not None and label in already_included_labels:
+            continue
+        kept.append(block)
+    return tuple(kept)
+
+
+def merge_baseline_and_reacquired_planner_evidence(
+    baseline: "PlannerEvidenceResult", fresh: "PlannerEvidenceResult",
+) -> str:
+    """Combine `baseline` (Strategy #1's own already-rendered Planner
+    evidence, computed once before Strategy #1 ever ran) with `fresh`
+    (the named-target authority-gap reacquisition's own newly-built
+    evidence) into ONE rendered string for the one allowed Strategy
+    rerun -- UNION, never replacement.
+
+    `baseline.rendered` is preserved completely unchanged -- never
+    re-derived, never re-fetched, never re-rendered, never truncated.
+    Only `fresh`'s own source-excerpt blocks are deduplicated (via
+    `_dedupe_source_excerpt_blocks`, structural-identity only) against
+    `baseline.excerpt_plan.included_labels` before being appended under a
+    clearly separate heading -- a label baseline already fully rendered
+    (whole-block-or-omit, so "already included" always means "already
+    complete") is never duplicated. Fresh's own structural-facts prose
+    (everything before `_SOURCE_SUBHEADING` in `fresh.rendered`) and its
+    own omission notes (`symbol_omitted`/`fallback_omitted`/`read_failed`,
+    preserved via `_replace` on `fresh.excerpt_plan`) survive unchanged
+    regardless of whether any block was deduplicated -- reuses
+    `_render_source_excerpt_plan`, the ONE existing renderer, rather than
+    a second rendering implementation.
+
+    Pure text combination: no new repository read, no new LLM call, no
+    new context-budget window request beyond whatever `baseline` and
+    `fresh` already separately, legitimately consumed to reach their own
+    (already-bounded) rendered form. The caller is responsible for also
+    recording the combined length via the shared `ContextBudgetController`
+    (observability only -- see `record_used`'s own docstring: it never
+    gates anything) so the run's own trace accurately reflects what was
+    actually sent, even though nothing here requests additional budget.
+
+    Degenerate inputs: returns `fresh.rendered` unchanged if `baseline` is
+    empty (nothing to preserve), `baseline.rendered` unchanged if `fresh`
+    is empty (nothing new to add) or if deduplication leaves fresh with
+    no surviving contribution at all.
+    """
+    if not baseline.rendered.strip():
+        return fresh.rendered
+    if not fresh.rendered.strip():
+        return baseline.rendered
+
+    deduped_blocks = _dedupe_source_excerpt_blocks(
+        fresh.excerpt_plan.blocks, baseline.excerpt_plan.included_labels,
+    )
+    if deduped_blocks == fresh.excerpt_plan.blocks:
+        fresh_contribution = fresh.rendered
+    else:
+        # Some of fresh's own blocks were already fully present in
+        # baseline -- split fresh's own rendered text at the same fixed
+        # subheading _render_source_excerpt_plan always starts with, so
+        # fresh's structural-facts portion survives untouched and only
+        # its source-excerpt portion is rebuilt from the deduped blocks.
+        structural_part = fresh.rendered.split(_SOURCE_SUBHEADING, 1)[0].rstrip()
+        deduped_plan = fresh.excerpt_plan._replace(blocks=deduped_blocks)
+        rebuilt_source_part = _render_source_excerpt_plan(deduped_plan)
+        fresh_contribution = (
+            f"{structural_part}\n\n{rebuilt_source_part}" if rebuilt_source_part else structural_part
+        )
+
+    if not fresh_contribution.strip():
+        return baseline.rendered
+
+    return (
+        f"{baseline.rendered.rstrip()}\n\n"
+        "## Additional Verified Evidence (Authority-Gap Reacquisition)\n\n"
+        f"{fresh_contribution.rstrip()}\n"
+    )
 
 
 def build_planner_source_excerpts(
@@ -1536,6 +1800,431 @@ def build_planner_evidence_with_budget(
         result = candidate  # no new coverage yet, but still reachable -- keep expanding
 
 
+# ---------------------------------------------------------------------------
+# Bounded iterative Planning evidence acquisition ("Fix A")
+#
+# Lets the Planner explicitly request additional repository evidence before
+# its plan becomes authoritative, instead of being forced to turn a
+# self-reported evidence gap into a remediation hypothesis. Structural
+# bounds (MAX_PLANNING_ATTEMPTS/MAX_EVIDENCE_REQUESTS_PER_ROUND) are plain
+# module-level ints, independent of ContextBudgetController -- resource
+# budgeting (window/character ceilings) remains entirely the job of
+# build_planner_evidence_with_budget, called unmodified below; this section
+# owns only (a) the structural loop bound and (b) deterministic resolution
+# of a request's existence/uniqueness, never how much of it ends up
+# rendered. See RemediationPlanResult.additional_evidence_required's own
+# docstring for the governing authority contract.
+# ---------------------------------------------------------------------------
+
+MAX_PLANNING_ATTEMPTS = 3
+"""Initial Planning attempt + at most 2 acquisition rounds. Mirrors
+MAX_GUIDED_ACQUISITION_ROUNDS's own bound and rationale: one round already
+resolves the overwhelming majority of genuine evidence gaps; a second
+exists only to cover a gap the first round's own new evidence reveals. A
+third has never been shown necessary anywhere in this codebase and would
+only add cost/drift risk -- independent of any context-budget policy."""
+
+MAX_EVIDENCE_REQUESTS_PER_ROUND = 3
+"""At most this many of one attempt's own evidence_requests are even
+attempted -- any beyond this are ignored this round, never queued for a
+later round. Mirrors MAX_CONTEXT_REQUESTS_PER_ROUND's own convention,
+sized slightly larger since Planning-time requests are coarser (whole
+files) and a genuine gap often spans more than 2 related files."""
+
+PLANNING_REQUEST_TYPES = ("file_source", "symbol_definition")
+"""The only two request shapes Planning's own evidence_requests support --
+deliberately narrower than GUIDED_REQUEST_TYPES (which also has
+enclosing_symbol/identifier_usage): those are edit-level refinements
+meaningful once concrete edits already exist (Strategy/Slice 3's job).
+Planning's own gaps are earlier and coarser -- "I don't have this file at
+all" or "I don't have this symbol's definition at all"."""
+
+PLANNING_REQUEST_FAILURE_REASONS = (
+    "unsupported_request_type",
+    "missing_required_field",
+    "unresolved_file",
+    "unresolved_symbol",
+    "ambiguous_symbol",
+    "ambiguous_identifier",
+    "cross_file_mismatch",
+    "duplicate_request",
+)
+"""The full, closed reason vocabulary PlanningRequestResolution.failure_reason
+draws from -- every rejection sets exactly one of these, never a freeform
+string. Deliberately smaller than GUIDED_REQUEST_FAILURE_REASONS (no
+"context_request_limit_reached"/"target_budget_exhausted"/
+"missing_target_source"/"unrelated_to_unready_edit"/"unverified_file_hint":
+those are Slice-3-specific gates -- e.g. edit attribution, target
+character budgets -- that do not exist at Planning time)."""
+
+
+class PlanningEvidenceRequest(NamedTuple):
+    """One Planner-proposed evidence request, parsed from JSON but not yet
+    validated or resolved -- mirrors GuidedContextRequest's own
+    parse-then-validate-later split. Only ever built from
+    `request_type`/`file_hint`/`symbol`/`reason`; any other key the
+    model's response JSON might contain (a line number, source code, a
+    shell command) is never read into this structure at all."""
+
+    request_type: "str | None"
+    file_hint: "str | None"
+    symbol: "str | None"
+    reason: "str | None"
+
+
+class PlanningRequestResolution(NamedTuple):
+    """One deterministic resolution attempt for a single
+    PlanningEvidenceRequest. `resolved=True` only when the request
+    deterministically resolved to a real, unambiguous repository
+    file/symbol -- independent of whether that content later fits inside
+    build_planner_evidence_with_budget's own (pre-existing, unmodified)
+    character ceiling; see this module's own section docstring above on
+    why resolution and rendering are kept as two separate concerns."""
+
+    request: "PlanningEvidenceRequest"
+    resolved: bool
+    failure_reason: "str | None"
+    resolved_file: "str | None"
+    resolved_symbol: "str | None"
+
+
+class PlanningAttemptRecord(NamedTuple):
+    """One full Planning attempt's own forensic record -- what the Planner
+    said, what it requested, and what happened as a result. `outcome` is
+    one of "grounded", "continue", or an "ungrounded_<reason>" string (see
+    `_planning_gate_outcome`/`run_planning_evidence_acquisition`)."""
+
+    attempt: int
+    llm_tag: str
+    gate_state: str
+    evidence_requests: "list[PlanningEvidenceRequest]"
+    invalid_requests: "list[tuple]"
+    resolutions: "list[PlanningRequestResolution]"
+    outcome: str
+
+
+class PlanningAcquisitionResult(NamedTuple):
+    """run_planning_evidence_acquisition's own output. `grounded=True`
+    only when the FINAL attempt's own gate state was exactly
+    `additional_evidence_required=false` with zero evidence_requests --
+    see `_planning_gate_outcome`'s own docstring for the full truth table.
+    `terminal_state` is "grounded" or an "ungrounded_<reason>" string,
+    identical to the final attempt's own `outcome`."""
+
+    plan_result: "RemediationPlanResult"
+    planner_evidence_result: "PlannerEvidenceResult"
+    grounded: bool
+    terminal_state: str
+    attempts: "list[PlanningAttemptRecord]"
+
+
+def _validate_planning_request_schema(request: "PlanningEvidenceRequest") -> "str | None":
+    """Returns a PLANNING_REQUEST_FAILURE_REASONS value if `request`'s own
+    shape is rejected outright, else None. Never inspects repository
+    state -- purely a shape check, mirroring
+    _validate_guided_request_schema exactly."""
+    if request.request_type not in PLANNING_REQUEST_TYPES:
+        return "unsupported_request_type"
+    if request.request_type == "file_source" and not request.file_hint:
+        return "missing_required_field"
+    if request.request_type == "symbol_definition" and not request.symbol:
+        return "missing_required_field"
+    return None
+
+
+def _planning_request_key(request: "PlanningEvidenceRequest") -> tuple:
+    """Cross-round duplicate-detection key -- a request whose own
+    (request_type, normalized file/symbol) tuple was already attempted in
+    an earlier round is never re-resolved (re-running a pure function of
+    the same inputs could only reproduce the same result), mirroring
+    run_guided_acquisition's own duplicate-request guard."""
+    if request.request_type == "file_source":
+        return ("file_source", (request.file_hint or "").strip().lower())
+    return (
+        "symbol_definition",
+        (request.symbol or "").strip().lower(),
+        (request.file_hint or "").strip().lower(),
+    )
+
+
+def _resolve_planning_evidence_request(
+    request: "PlanningEvidenceRequest", repo_root, context,
+) -> "tuple[str | None, str | None, str | None]":
+    """Deterministic, no-LLM-call resolution of one evidence request --
+    returns (resolved_file, resolved_symbol, failure_reason); exactly one
+    of (resolved_file/resolved_symbol) or failure_reason is non-None.
+    "Resolved" means only "exists and is unique" -- entirely independent
+    of any character budget, new or pre-existing (see this module's
+    section docstring above).
+
+    `file_source` reuses `_verify_file` unchanged -- the same primitive
+    build_planner_evidence_with_budget's own candidate verification
+    already uses for target_files. `symbol_definition` reuses
+    `_resolve_guided_symbol` unchanged -- the same repo-wide,
+    ambiguity-fail-closed search guided acquisition already uses for its
+    own symbol_definition/enclosing_symbol requests. No new resolution
+    logic is introduced; this function is only a thin dispatch over two
+    already-existing, already-tested primitives."""
+    if request.request_type == "file_source":
+        vf = _verify_file(request.file_hint, Path(repo_root)) if repo_root else None
+        if vf is None:
+            return None, None, "unresolved_file"
+        return vf, None, None
+
+    match, reason = _resolve_guided_symbol(request.symbol, request.file_hint, repo_root, context)
+    if match is None:
+        return None, None, reason or "unresolved_symbol"
+    return match.file, match.label, None
+
+
+def _planning_gate_outcome(
+    plan_result: "RemediationPlanResult",
+) -> "tuple[bool, list[PlanningEvidenceRequest], str]":
+    """The ONE place Planning's authority-gate invariant is decided.
+    Returns (grounded, actionable_requests, reason).
+
+    Exactly two states are authoritative:
+      - `additional_evidence_required == "explicit_false"` AND zero
+        evidence_requests: GROUNDED. This is the only combination that
+        may certify a plan sufficiently evidenced to finalize.
+      - `additional_evidence_required == "explicit_true"` AND at least
+        one schema-valid evidence_request: NOT grounded, but
+        `actionable_requests` (the schema-valid subset) is worth
+        attempting resolution on.
+
+    Every other combination fails closed -- never reinterpreted by giving
+    one field precedence over another, and never treated as "close enough"
+    to either authoritative state:
+      - explicit_false + non-empty evidence_requests: contradictory --
+        the model both certified sufficiency AND asked for more evidence.
+        Neither field is trusted over the other.
+      - explicit_true + zero schema-valid evidence_requests: nothing
+        actionable was named despite declaring insufficiency.
+      - "missing" (key absent): silence is never trusted as sufficiency,
+        REGARDLESS of what evidence_requests happens to contain -- only
+        an explicit, valid `false` may certify grounded.
+      - "malformed" (null / wrong type): same treatment as missing -- an
+        explicit-but-unparseable attempt is not silence, but it is also
+        not a trusted `false`.
+
+    `actionable_requests` is non-empty ONLY for the one "continue" case
+    above -- every fail-closed case returns `[]`, even when
+    `evidence_requests` itself is non-empty, so a caller can never
+    accidentally act on requests from a contradictory or untrustworthy
+    response."""
+    gate = plan_result.additional_evidence_required
+    valid_requests = [
+        r for r in plan_result.evidence_requests
+        if _validate_planning_request_schema(r) is None
+    ]
+
+    if gate == "explicit_false" and not plan_result.evidence_requests:
+        return True, [], "grounded"
+    if gate == "explicit_true" and valid_requests:
+        return False, valid_requests, "continue"
+    if gate == "explicit_false":
+        return False, [], "contradictory_false_with_requests"
+    if gate == "explicit_true":
+        return False, [], "no_actionable_requests_declared_insufficient"
+    if gate == "missing":
+        return False, [], "missing_gate"
+    return False, [], "malformed_gate"
+
+
+def _merge_planner_evidence_results(
+    baseline: "PlannerEvidenceResult", fresh: "PlannerEvidenceResult",
+) -> "PlannerEvidenceResult":
+    """Like `merge_baseline_and_reacquired_planner_evidence`, but also
+    combines the two results' own `_SourceExcerptPlan.blocks`/
+    `included_labels` (that function returns only the merged rendered
+    STRING) -- needed so a downstream `.blocks` consumer (Slice 3's own
+    one-hop scan input, see pipeline.py's `_run_guided_context_
+    acquisition`) sees newly-acquired evidence too, not just whichever of
+    baseline/fresh happened to be rendered last. Reuses the exact same
+    text-merge (`merge_baseline_and_reacquired_planner_evidence`) and the
+    exact same structural dedup (`_dedupe_source_excerpt_blocks`) already
+    used elsewhere -- no new merge or dedup logic, and no new character
+    ceiling: `.budget` is carried through from whichever side actually
+    has one, never recomputed."""
+    merged_rendered = merge_baseline_and_reacquired_planner_evidence(baseline, fresh)
+    if not baseline.rendered.strip():
+        return fresh
+    if not fresh.rendered.strip():
+        return baseline
+
+    fresh_new_blocks = _dedupe_source_excerpt_blocks(
+        fresh.excerpt_plan.blocks, baseline.excerpt_plan.included_labels,
+    )
+    merged_plan = _SourceExcerptPlan(
+        blocks=baseline.excerpt_plan.blocks + fresh_new_blocks,
+        included_labels=baseline.excerpt_plan.included_labels | fresh.excerpt_plan.included_labels,
+        symbol_omitted=tuple(dict.fromkeys(
+            baseline.excerpt_plan.symbol_omitted + fresh.excerpt_plan.symbol_omitted
+        )),
+        fallback_omitted=tuple(dict.fromkeys(
+            baseline.excerpt_plan.fallback_omitted + fresh.excerpt_plan.fallback_omitted
+        )),
+        read_failed=tuple(dict.fromkeys(
+            baseline.excerpt_plan.read_failed + fresh.excerpt_plan.read_failed
+        )),
+        budget=fresh.excerpt_plan.budget or baseline.excerpt_plan.budget,
+        omitted_sizes={**baseline.excerpt_plan.omitted_sizes, **fresh.excerpt_plan.omitted_sizes},
+    )
+    return PlannerEvidenceResult(rendered=merged_rendered, excerpt_plan=merged_plan)
+
+
+def _render_planning_acquisition_context(
+    base_evidence: str, acquired_evidence: str, prior_resolutions: "list[PlanningRequestResolution]",
+) -> str:
+    """The `code_context` fed to each Planning attempt after the first --
+    the SAME base evidence every attempt has always received, plus
+    whatever evidence_requests have resolved so far, plus (only once a
+    prior round exists) a compact "already attempted" list so the model
+    does not simply repeat an already-failed or already-satisfied
+    request. On attempt 1 (no acquired evidence, no prior resolutions)
+    this returns `base_evidence` completely unchanged -- byte-identical
+    to Planning's own pre-Fix-A `code_context`, so the common "grounded on
+    attempt 1" case is entirely unaffected."""
+    parts = [p for p in (base_evidence, acquired_evidence) if p and p.strip()]
+    if prior_resolutions:
+        lines = ["## Evidence requests already attempted this run -- do not repeat these", ""]
+        for r in prior_resolutions:
+            req = r.request
+            label = req.file_hint or req.symbol or "(unnamed)"
+            outcome = "resolved -- see verified evidence above" if r.resolved else (r.failure_reason or "failed")
+            lines.append(f"- {req.request_type}: {label} -- {outcome}")
+        parts.append("\n".join(lines) + "\n")
+    return "\n\n".join(parts)
+
+
+def run_planning_evidence_acquisition(
+    vulnerability_text: str, llm, repo_root, context, *, base_evidence: str = "", budget_controller=None,
+) -> PlanningAcquisitionResult:
+    """Bounded iterative Planning: attempt #1 -> (if the Planner explicitly
+    requests evidence) deterministic bounded acquisition -> attempt #2 with
+    prior evidence plus newly acquired evidence -> either a sufficiently
+    grounded plan or a fail-closed ungrounded result. See this module's own
+    section docstring above for the governing design, and
+    `_planning_gate_outcome` for the exact authority truth table.
+
+    Every attempt calls `generate_remediation_plan` unchanged (attempt 1
+    uses stage="remediation_planning"; every reattempt uses
+    stage="remediation_planning_reattempt" -- a single reused tag, mirroring
+    how the Evidence-Gap Strategy Fallback's own rerun reuses
+    "remediation_strategy" rather than minting a new tag per attempt).
+
+    Evidence acquired via evidence_requests is merged monotonically across
+    rounds via `_merge_planner_evidence_results` (never rebuilt from
+    scratch, never dropped). The FINAL plan's own `target_files`/
+    `target_symbols` are ALSO verified via `build_planner_evidence_with_
+    budget` -- exactly what pre-Fix-A Planning always did -- and merged in
+    as the last, freshest addition: a plan that finalizes without ever
+    using evidence_requests (the common, everyday case) produces evidence
+    byte-identical to pre-Fix-A behavior, since merging a populated result
+    against an empty baseline returns the populated side unchanged.
+
+    Resolution (does a requested file/symbol exist) is entirely
+    independent of any character budget; rendering (does it fit) is
+    entirely delegated to the pre-existing, unmodified
+    `build_planner_evidence_with_budget` -- this function introduces no
+    new character ceiling and no new budget-related outcome. See this
+    module's own section docstring above."""
+    attempts: "list[PlanningAttemptRecord]" = []
+    seen_keys: set = set()
+    all_resolutions: "list[PlanningRequestResolution]" = []
+    requested_evidence = PlannerEvidenceResult(rendered="", excerpt_plan=_EMPTY_SOURCE_EXCERPT_PLAN)
+    plan_result = _EMPTY_PLAN_RESULT
+
+    def _finalize(grounded: bool, terminal_state: str) -> PlanningAcquisitionResult:
+        own_target_evidence = build_planner_evidence_with_budget(
+            plan_result, repo_root, vulnerability_text, context, budget_controller=budget_controller,
+        )
+        final_evidence = _merge_planner_evidence_results(requested_evidence, own_target_evidence)
+        return PlanningAcquisitionResult(plan_result, final_evidence, grounded, terminal_state, list(attempts))
+
+    for attempt_num in range(1, MAX_PLANNING_ATTEMPTS + 1):
+        tag = "remediation_planning" if attempt_num == 1 else "remediation_planning_reattempt"
+        code_context = _render_planning_acquisition_context(
+            base_evidence, requested_evidence.rendered, all_resolutions,
+        )
+        plan_result = generate_remediation_plan(vulnerability_text, llm, code_context=code_context, stage=tag)
+
+        grounded, actionable, gate_reason = _planning_gate_outcome(plan_result)
+        invalid_requests: "list[tuple]" = []
+        for r in plan_result.evidence_requests:
+            reason = _validate_planning_request_schema(r)
+            if reason is not None:
+                invalid_requests.append((r, reason))
+
+        if grounded:
+            attempts.append(PlanningAttemptRecord(
+                attempt_num, tag, plan_result.additional_evidence_required,
+                list(plan_result.evidence_requests), invalid_requests, [], "grounded",
+            ))
+            return _finalize(True, "grounded")
+
+        if not actionable:
+            outcome = f"ungrounded_{gate_reason}"
+            attempts.append(PlanningAttemptRecord(
+                attempt_num, tag, plan_result.additional_evidence_required,
+                list(plan_result.evidence_requests), invalid_requests, [], outcome,
+            ))
+            return _finalize(False, outcome)
+
+        capped = actionable[:MAX_EVIDENCE_REQUESTS_PER_ROUND]
+        round_resolutions: "list[PlanningRequestResolution]" = []
+        new_files: "list[str]" = []
+        new_symbols: "list[str]" = []
+        for req in capped:
+            key = _planning_request_key(req)
+            if key in seen_keys:
+                round_resolutions.append(PlanningRequestResolution(req, False, "duplicate_request", None, None))
+                continue
+            seen_keys.add(key)
+            rf, rs, reason = _resolve_planning_evidence_request(req, repo_root, context)
+            if reason is not None:
+                round_resolutions.append(PlanningRequestResolution(req, False, reason, None, None))
+            else:
+                round_resolutions.append(PlanningRequestResolution(req, True, None, rf, rs))
+                if req.request_type == "file_source":
+                    new_files.append(rf)
+                else:
+                    new_symbols.append(f"{rf}:{rs}" if rf else rs)
+
+        all_resolutions.extend(round_resolutions)
+        any_new = any(r.resolved for r in round_resolutions)
+
+        if not any_new:
+            attempts.append(PlanningAttemptRecord(
+                attempt_num, tag, plan_result.additional_evidence_required,
+                list(plan_result.evidence_requests), invalid_requests, round_resolutions, "ungrounded_unresolvable",
+            ))
+            return _finalize(False, "ungrounded_unresolvable")
+
+        if attempt_num >= MAX_PLANNING_ATTEMPTS:
+            attempts.append(PlanningAttemptRecord(
+                attempt_num, tag, plan_result.additional_evidence_required,
+                list(plan_result.evidence_requests), invalid_requests, round_resolutions, "ungrounded_max_attempts",
+            ))
+            return _finalize(False, "ungrounded_max_attempts")
+
+        synthetic = RemediationPlanResult(rendered="", target_files=new_files, target_symbols=new_symbols)
+        fresh = build_planner_evidence_with_budget(
+            synthetic, repo_root, vulnerability_text, context, budget_controller=budget_controller,
+        )
+        requested_evidence = _merge_planner_evidence_results(requested_evidence, fresh)
+
+        attempts.append(PlanningAttemptRecord(
+            attempt_num, tag, plan_result.additional_evidence_required,
+            list(plan_result.evidence_requests), invalid_requests, round_resolutions, "continue",
+        ))
+
+    # Defensive backstop -- unreachable in practice: the attempt_num >=
+    # MAX_PLANNING_ATTEMPTS branch above always returns before the loop
+    # would naturally exhaust range().
+    return _finalize(False, "ungrounded_max_attempts")
+
+
 def resolved_source_coverage(
     plan: RemediationPlanResult,
     repo_root,
@@ -1689,6 +2378,61 @@ class RemediationStrategyResult(NamedTuple):
     (see `_render_strategy_target_block`) so a target Strategy explicitly
     rejected stays visible to Patch Generation without also carrying
     Strategy's mechanism-bearing prose.
+
+    `rejected_target_symbols` is additive, mirroring the same pattern:
+    the raw, model-proposed `target_symbols` strings that
+    `_verify_strategy_targets` could NOT independently verify (dropped
+    from `target_symbols`, recorded only as prose in `warnings` until
+    now). Kept here structurally for exactly ONE narrow, downstream use
+    (see `_build_final_target_slice_inner`'s `target_class_identities`
+    construction): extracting a candidate CLASS QUALIFIER from a rejected
+    qualified proposal (e.g. "Container" from "Container.runtime_limit")
+    so that qualifier can be INDEPENDENTLY re-resolved and confirmed
+    through the exact same deterministic machinery used everywhere else
+    (`_resolve_symbol_details`/`_label_is_confirmed_class`), scoped to
+    this same Strategy's own already-verified `target_files`. The
+    rejected string itself is NEVER treated as evidence of anything -- it
+    is discarded the moment its qualifier substring has been extracted;
+    only independent re-verification against real repository structure
+    can ever add anything to `target_class_identities`. This can never
+    rehabilitate the rejected member symbol itself: it never re-enters
+    `target_symbols`, `symbol_matches`, or any edit-target category, and
+    it never changes `_verify_strategy_targets`'s own verification
+    outcome for anything.
+
+    `target_authority_unresolved` is a SECOND, independent structured
+    signal from `insufficient_evidence` -- additive, and, unlike every
+    other field on this NamedTuple, load-bearing: it is the ONE Strategy-
+    level field a caller (see pipeline.py's `_evidence_gap_fallback_trigger`
+    and `_run_guided_context_acquisition`) is authorized to read to decide
+    whether a NAMED target/mechanism is safe to hand to Patch Generation.
+    `insufficient_evidence` itself remains exactly as before -- an
+    observability-only free-text list never read by any gate (see that
+    field's own docstring) -- specifically because prose is not a safe
+    basis for an authority decision; this field exists so the model has a
+    single, explicit, structured way to say the same thing without
+    requiring downstream code to parse or keyword-match that prose.
+
+    Deliberately ASYMMETRIC, never a positive certification: `True` means
+    "at least one evidence gap I reported is load-bearing for whether my
+    own selected target_files/target_symbols/mechanism is the correct
+    remediation location" -- a withholding claim only. `False` (the
+    default, and the value for every response that predates this field's
+    existence) means only "no such withholding was asserted" -- it is
+    NEVER read, here or by any caller, as "the target is verified",
+    "evidence-backed", "trusted", "proven", or "semantically validated".
+    Repository existence/resolution verification (`_verify_strategy_
+    targets`) is completely independent of this field in both directions:
+    it neither sets nor reads it, and this field never widens or narrows
+    which files/symbols count as existing.
+
+    Parsed by `_parse_target_authority_unresolved` (below): a genuinely
+    absent key (the old-format/backward-compatible case) and a valid
+    `True`/`False` JSON boolean are the two trusted shapes; anything else
+    the model writes for this key (wrong type, or an explicit JSON `null`)
+    is a malformed-but-EXPLICIT attempt to say something, which must never
+    be silently coerced to the permissive `False` -- see that function's
+    own docstring for the exact three-way rule and why.
     """
 
     rendered: str
@@ -1701,24 +2445,27 @@ class RemediationStrategyResult(NamedTuple):
     insufficient_evidence: "list[str]" = []
     evaluated: bool = False
     rejected_targets: "list[str]" = []
+    rejected_target_symbols: "list[str]" = []
+    target_authority_unresolved: bool = False
 
 
 _EMPTY_STRATEGY_RESULT = RemediationStrategyResult(
     rendered="", target_files=[], target_symbols=[], warnings=[],
     extended_mechanism=None, required_edits=[], security_invariant=None,
     insufficient_evidence=[], evaluated=False, rejected_targets=[],
+    rejected_target_symbols=[], target_authority_unresolved=False,
 )
 
 
 def _verify_strategy_targets(
     raw_files: "list[str]", raw_symbols: "list[str]", repo_root, context
-) -> "tuple[list[str], list[str], list[str]]":
+) -> "tuple[list[str], list[str], list[str], list[str]]":
     """Re-verify the Final Strategy's own proposed files/symbols using the
     exact same path/symbol verification already used for the first
     Planner's proposals -- no second implementation, no broader policy
-    engine. Returns (kept_files, kept_symbols, warnings); an item that
-    doesn't verify is dropped and recorded in `warnings`, never silently
-    lost and never allowed to abort the call.
+    engine. Returns (kept_files, kept_symbols, warnings, rejected_symbols);
+    an item that doesn't verify is dropped and recorded in `warnings`,
+    never silently lost and never allowed to abort the call.
 
     Symbol verification also passes `kept_files` (this call's own
     already-verified files, built above, first) into
@@ -1728,7 +2475,15 @@ def _verify_strategy_targets(
     identifier fallback against exactly those already-verified files
     before being dropped as unverified. Never widens which files are
     searched: kept_files is the same set _verify_file already confirmed
-    real, nothing added and nothing else considered."""
+    real, nothing added and nothing else considered.
+
+    `rejected_symbols` is the raw proposed strings that did NOT verify --
+    additive output, never consulted by this function's own kept/dropped
+    decision. Its only sanctioned downstream use is
+    `_build_final_target_slice_inner` extracting a candidate class
+    qualifier from a rejected QUALIFIED proposal for independent
+    re-verification (see `RemediationStrategyResult.rejected_target_symbols`);
+    it must never be treated as confirming the rejected symbol itself."""
     warnings: "list[str]" = []
     kept_files: "list[str]" = []
     root = Path(repo_root) if repo_root else None
@@ -1743,6 +2498,7 @@ def _verify_strategy_targets(
             warnings.append(f"unverified target_file removed: {raw}")
 
     kept_symbols: "list[str]" = []
+    rejected_symbols: "list[str]" = []
     seen_symbols: set = set()
     for raw in raw_symbols:
         match = (
@@ -1754,8 +2510,51 @@ def _verify_strategy_targets(
             kept_symbols.append(raw)
         else:
             warnings.append(f"unverified target_symbol removed: {raw}")
+            rejected_symbols.append(raw)
 
-    return kept_files, kept_symbols, warnings
+    return kept_files, kept_symbols, warnings, rejected_symbols
+
+
+def _parse_target_authority_unresolved(plan: dict) -> bool:
+    """Parse Strategy's `target_authority_unresolved` field -- see
+    RemediationStrategyResult.target_authority_unresolved's own docstring
+    for the field's meaning. Three input shapes, two trusted, one not:
+
+      1. Key genuinely ABSENT from `plan` (old-format response, or the
+         model simply omitted it): backward-compatible default, `False` --
+         identical to this field never having existed, so every pre-
+         existing trace/response is completely unaffected by this field's
+         addition.
+      2. Key present with a real JSON boolean (`isinstance(value, bool)`,
+         never a truthy/falsy coercion of some other type -- same strict-
+         type convention already used for this codebase's other trust-
+         critical model-produced booleans, see
+         remediation_verifier._parse_response's `counterexample_reaches_
+         unsafe_state`/`authoritative_remediation_matches_selected_
+         alternative`): trusted, returned as-is.
+      3. Key present but NOT a real boolean -- a non-bool string, a
+         number, an explicit JSON `null`, or any other type: this is an
+         EXPLICIT attempt to say something that does not parse, which is
+         a materially different situation from case 1 (silence) and must
+         not collapse to the same permissive `False`. Per this field's own
+         asymmetric, withholding-only contract (True can only ever ADD
+         scrutiny, never remove it), the conservative reading of "the
+         model explicitly touched this trust-critical field but got the
+         shape wrong" is `True`, not `False` -- fails closed toward more
+         scrutiny (bounded re-acquisition), never toward silently granting
+         authority to a target this exact field exists to gate.
+
+    Deliberately narrow and self-contained, matching the existing
+    `_opt_str`/`_opt_decision`-style small parse helpers elsewhere in this
+    module: no keyword/prose inspection of `insufficient_evidence` or any
+    other field happens here or anywhere this return value is consumed.
+    """
+    if "target_authority_unresolved" not in plan:
+        return False
+    value = plan.get("target_authority_unresolved")
+    if isinstance(value, bool):
+        return value
+    return True
 
 
 def _render_strategy(
@@ -1843,7 +2642,7 @@ def generate_remediation_strategy(
 
     raw_files = _string_list(plan.get("target_files"))
     raw_symbols = _string_list(plan.get("target_symbols"))
-    verified_files, verified_symbols, warnings = _verify_strategy_targets(
+    verified_files, verified_symbols, warnings, rejected_symbols = _verify_strategy_targets(
         raw_files, raw_symbols, repo_root, context
     )
 
@@ -1867,6 +2666,8 @@ def generate_remediation_strategy(
         # own docstring on why `evaluated` is never inferred from the other fields).
         evaluated=True,
         rejected_targets=_string_list(plan.get("rejected_targets")),
+        rejected_target_symbols=rejected_symbols,
+        target_authority_unresolved=_parse_target_authority_unresolved(plan),
     )
 
 
@@ -2389,6 +3190,90 @@ def _lookup_identifier_definition(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Method-call one-hop, repository-wide fallback (scopefix-v1 forensic
+# finding): _lookup_identifier_definition's own preferred_files bound is
+# intentional and correct for every OTHER caller (Strategy-term lookups,
+# usage-scan seeding, target-identity-bound lookups) -- a strategy-derived
+# term genuinely has no business resolving outside the files Strategy/
+# Planner already connected. But the method-call one-hop path in
+# _build_final_target_slice_inner is different in kind: it is not resolving
+# an LLM-proposed term, it is resolving a call target the ALREADY-VERIFIED,
+# ALREADY-SELECTED consumer source structurally, deterministically
+# references (see _extract_source_dot_call_refs) -- e.g. PoolManager.
+# urlopen's own verified source literally contains `conn.is_same_host(...)`.
+# Whether that predicate's OWN definition is available to Challenger/
+# Calibration should not depend on whether an earlier, low-evidence Planner
+# stage happened to already guess its file into preferred_files -- see the
+# forensic comparison between scopefix-v1 Run 1 (connectionpool.py never in
+# Planner's own target_files -> is_same_host unresolved) and Run 3
+# (connectionpool.py incidentally already there -> resolved cleanly).
+#
+# This function is a NARROW, single-purpose wrapper, never a parameter on
+# _lookup_identifier_definition itself, precisely so no existing call site's
+# behavior can silently widen: only the method-call one-hop loop below calls
+# this; every other caller keeps calling _lookup_identifier_definition
+# directly, unchanged.
+# ---------------------------------------------------------------------------
+
+def _lookup_identifier_definition_or_unique_repo_match(
+    identifier: str, preferred_files: "list[str]", context,
+) -> "_IdentifierMatch | None":
+    """Tries the normal, unchanged `_lookup_identifier_definition` first --
+    identical result whenever that already resolves (including its own
+    constants-first, target_identity, and preferred_files behavior). Only
+    when that returns None does this perform exactly one additional,
+    repository-WIDE `index.search_definitions(identifier)` lookup, and
+    accepts its result ONLY when it names EXACTLY ONE distinct function/
+    method repository-wide.
+
+    Uniqueness is safe to establish this way: `RepositoryIndex.search_
+    definitions` -> `search_by_name(exact=True)` returns one entry per
+    `self.by_name[name]` id, and `by_name` is built by iterating `self.
+    functions` (itself keyed one-to-one by the analyzer's own unique
+    `func_id` per physical declaration -- see RepositoryIndex._build_index)
+    -- so `len(matches) == 1` genuinely means "exactly one concrete
+    repository definition", never an aggregation artifact of the same
+    declaration counted twice. Two or more matches, zero matches, or no
+    index at all all return None -- fails closed, never guesses, exactly
+    like `_lookup_identifier_definition`'s own failure mode.
+
+    Deliberately function-only (never checks `context.constants`): a
+    dot-qualified call site (`receiver.name(...)`, the only shape
+    `_extract_source_dot_call_refs` ever produces) can never be a constant
+    reference, so re-running the constants-first check here would be dead
+    code, not an additional safety property.
+
+    Exactly one hop, non-recursive, by construction: this function's own
+    return value is never fed back into this function, into
+    `_extract_source_dot_call_refs`, or into any other one-hop input --
+    the caller renders and commits its source directly. Never mutates
+    `preferred_files` -- the resolved definition's file is used only to
+    read and render its own source for THIS candidate; it is never added to
+    the shared `preferred_files` list, so it confers no broader search
+    opportunity to any other lookup in this same run."""
+    direct = _lookup_identifier_definition(identifier, preferred_files, context)
+    if direct is not None:
+        return direct
+
+    index = getattr(context, "index", None)
+    if index is None:
+        return None
+    matches = index.search_definitions(identifier)
+    if len(matches) != 1:
+        return None  # zero or ambiguous repository-wide -- fail closed
+    match = matches[0]
+    func_id = match.get("id", "")
+    candidate_file = _file_part(func_id)
+    line = match.get("startLine")
+    if not candidate_file or line is None:
+        return None
+    return _IdentifierMatch(
+        kind="function", file=candidate_file, label=match.get("name") or identifier,
+        line=line, end_line=match.get("endLine"), func_id=func_id,
+    )
+
+
 def _lookup_identifier_usages(
     identifier: str, preferred_files: "list[str]", context
 ) -> "list[tuple[str, str, int, int, list[int]]]":
@@ -2441,6 +3326,54 @@ def _class_of_label(label: "str | None") -> "str | None":
     return label.rsplit(".", 1)[0]
 
 
+def _label_is_confirmed_class(label: str, context, func_id: "str | None" = None) -> bool:
+    """True only when `label` is CONFIRMED, via already-parsed structural
+    data, to be the name of a real class somewhere in this repository.
+    Two independent, already-existing signals, either sufficient alone:
+
+    1. `func_id`'s own already-parsed index record reports
+       `unitType == "class"` -- the analyzer's OWN direct classification
+       of the exact matched declaration (already computed by
+       `RepositoryIndex.search_by_name`/`get_function`, no new parse, no
+       new search). `func_id` is optional and only ever supplied by a
+       caller that already resolved a match carrying one (see
+       `_SymbolMatch.func_id`) -- an ordinary bare identifier proposal
+       with no known func_id simply skips straight to signal 2. This
+       signal is the reason an ORDINARY FUNCTION can never be
+       misclassified: a real function's own index record reports
+       `unitType` as "function"/"method"/"constructor"/etc. -- literally
+       never "class" -- so this check is a direct read of the analyzer's
+       existing, authoritative fact about what kind of declaration this
+       is, not an inference from name, shape, or resolution path.
+
+    2. InvestigationContext.constants' own already-parsed `class_name`
+       field (the same field _constant_group_bounds/
+       _disambiguate_constant_candidates already read -- no new parse, no
+       new search): does at least one constant anywhere in the repository
+       record this exact name as its enclosing class? This is the
+       original, still-needed fallback for a match with no func_id at all
+       (e.g. one resolved via _deterministic_identifier_fallback, which
+       never assigns one) -- a real class with zero recorded class-level
+       constants AND no func_id conservatively returns False (no false
+       positive risk, only a missed opportunity) -- never worse than the
+       pre-existing behavior.
+
+    Never inferred merely from a bare identifier resolving at all, from
+    `kind`, from capitalization, or from name/shape alone -- both signals
+    above read an already-computed structural fact, never a guess."""
+    index = getattr(context, "index", None)
+    if index is not None and func_id:
+        record = index.get_function(func_id)
+        if record is not None and record.get("unitType") == "class":
+            return True
+    constants = getattr(context, "constants", None) or {}
+    for records in constants.values():
+        for record in records.values():
+            if record.get("class_name") == label:
+                return True
+    return False
+
+
 def _contains_any_strategy_identifier(text: str, terms: "list[str]") -> bool:
     """True if `text` contains at least one of `terms` verbatim, OR (for a
     dotted term like "Class.NAME") its own bare suffix after the last
@@ -2487,6 +3420,39 @@ def _extract_source_constant_refs(code: str) -> "list[str]":
     return found
 
 
+_SOURCE_DOT_CALL_REF_RE = re.compile(r"\.([A-Za-z_][A-Za-z0-9_]*)\(")
+
+
+def _extract_source_dot_call_refs(code: str, connected_terms: "list[str]") -> "list[str]":
+    """Sibling to `_extract_source_constant_refs`, for the one-hop
+    METHOD-CALL expansion instead of the ALL-CAPS constant expansion:
+    order-preserving, first-occurrence-deduplicated dot-qualified call
+    names extracted from already-selected Python SOURCE, but ONLY from a
+    line that already contains at least one of `connected_terms` (a term
+    already tied to the Strategy -- see `_extract_strategy_identifiers`)
+    verbatim. This is the exact structural relevance rule: SAME-LINE
+    co-location with an already strategy-connected identifier, never
+    "every call in the admitted function/block" -- a call on a different
+    line of the same already-selected source gains no opportunity here,
+    no matter how resolvable it might otherwise be. Not a parser: a
+    single regex pass per line, same conservative-MVP shape as
+    `_extract_source_constant_refs` (string-literal content not
+    otherwise excluded)."""
+    if not code or not connected_terms:
+        return []
+    found: "list[str]" = []
+    seen: set = set()
+    for line in code.split("\n"):
+        if not any(term in line for term in connected_terms):
+            continue
+        for m in _SOURCE_DOT_CALL_REF_RE.finditer(line):
+            name = m.group(1)
+            if name not in seen:
+                seen.add(name)
+                found.append(name)
+    return found
+
+
 def _extract_fenced_code(rendered_block: "str | None") -> "str | None":
     """Recovers the raw source text from a block this module itself
     rendered via _render_definition_block/_render_usage_window_block --
@@ -2503,6 +3469,100 @@ def _extract_fenced_code(rendered_block: "str | None") -> "str | None":
     if end == -1 or end <= start:
         return None
     return rendered_block[start:end]
+
+
+# ---------------------------------------------------------------------------
+# Class-level same-file assignment evidence -- given a verified target's
+# deterministically established owning class (the SAME signal
+# `target_class_identities` is built from, in _build_final_target_slice_inner
+# below, just paired with the file that class was actually resolved in),
+# discover an explicit module-scope `OwningClass.member = ...` rebind
+# elsewhere in that SAME file, for ANY member of that class -- not only the
+# specific member Strategy happened to verify. Closes a real, observed gap:
+# a class attribute's own in-class declaration (e.g. `DEFAULT:
+# ClassVar[Retry]`, a type annotation with no value) can be reconstructed at
+# module scope hundreds of lines later in the same file (`Retry.DEFAULT =
+# Retry(3)`), invisible to both the existing constants table
+# (candidate_enrichment.py's _extract_literal_constants deliberately excludes
+# any ast.Attribute target -- "not a single-name assignment at all") and the
+# padded per-symbol definition window (too far away). This is a NEW, small,
+# Auto-Patcher-owned addition -- it does not modify, wrap, or duplicate
+# _extract_literal_constants; the two intentionally have disjoint LHS shapes
+# (bare name vs. qualified attribute) and disjoint purposes (constant-value
+# table vs. one-shot supporting evidence).
+# ---------------------------------------------------------------------------
+
+def _find_module_scope_class_attribute_assignments(
+    file_text: str, class_name: str,
+) -> "list[tuple[str, int, int]]":
+    """Module-scope-only scan for an explicit assignment/rebinding whose LHS
+    is EXACTLY `<class_name>.<member>` -- e.g. `Retry.DEFAULT = Retry(3)`.
+
+    Returns a list of (member_name, line, end_line) tuples, in source
+    (ascending line) order, one entry per qualifying statement -- never
+    deduplicated by member name: multiple exact writes to the SAME member
+    are each independently, structurally real and are all returned (the one
+    caller renders each as its own supporting-evidence block; see its own
+    docstring for why admitting all of them, rather than picking one, is the
+    correct behavior here).
+
+    Scope is deliberately narrow, and every exclusion below is a structural
+    fact about the AST node, never a guess or an inference:
+      - MODULE LEVEL ONLY: only direct children of the parsed Module node
+        are inspected (`ast.iter_child_nodes(tree)`) -- mirrors
+        candidate_enrichment.py's own `_extract_literal_constants` module-
+        scope restriction exactly. A same-shaped assignment nested inside
+        any function/method/if/try/class body is invisible here, not
+        filtered out after the fact -- it is never visited at all.
+      - EXACT CLASS MATCH: the LHS must be an `ast.Attribute` whose own
+        `.value` is a bare `ast.Name` with `.id == class_name` (the class's
+        own name, as literally written in this file's own `class`
+        statement -- never resolved through an import alias). `Other.
+        DEFAULT` (a different class), a bare `DEFAULT = ...` (an
+        `ast.Name` target -- the shape `_extract_literal_constants` already
+        owns, never conflated with this one), a subscript/call/dynamic
+        target (`setattr(...)`, a plain `ast.Call`, never an assignment
+        target at all), and a multi-target or starred assignment all fail
+        this one structural check and are never specially handled.
+      - `ast.Assign` (any RHS shape, never required to be a literal) and
+        `ast.AnnAssign` WITH a non-None value (an annotated rebind is still
+        an explicit rebind) both qualify; `ast.AnnAssign` with `value is
+        None` (a bare declaration, e.g. `DEFAULT: ClassVar[Retry]` with no
+        `=`) is excluded -- that is the declaration this mechanism exists
+        to supplement, not a rebind. `ast.AugAssign` (`+=`, `|=`, ...) is
+        excluded -- it presupposes an existing value being mutated, a
+        different and more complex runtime claim than a plain rebind.
+
+    Returns [] (never raises) when `file_text` does not parse as Python --
+    the same fail-closed posture `_extract_literal_constants` already uses.
+    """
+    try:
+        tree = ast.parse(file_text)
+    except (SyntaxError, ValueError):
+        return []
+
+    found: "list[tuple[str, int, int]]" = []
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            if node.value is None:
+                continue  # declaration only, no rebind to admit
+            targets = [node.target]
+        else:
+            continue
+        if len(targets) != 1:
+            continue  # multi-target assignment -- out of scope, not a guess
+        target = targets[0]
+        if not (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == class_name
+        ):
+            continue
+        end_line = getattr(node, "end_lineno", node.lineno) or node.lineno
+        found.append((target.attr, node.lineno, end_line))
+    return found
 
 
 def _find_constant_candidates_by_name(
@@ -2762,6 +3822,7 @@ def build_final_target_slice(
     context,
     planner_evidence_files: "list[str] | tuple" = (),
     max_chars: "int | None" = None,
+    planner_excerpt_blocks: "list[str] | tuple" = (),
 ) -> FinalTargetSliceResult:
     """
     Build the '## Final-Target Remediation Slice' from
@@ -2782,6 +3843,13 @@ def build_final_target_slice(
     (FINAL_TARGET_SLICE_MAX_CHARS) strictly in that order, whole-block-or-
     omitted -- so an earlier category's block can never be displaced by a
     later one.
+
+    `planner_excerpt_blocks` (default `()`, backward compatible): the
+    already-rendered Markdown blocks from a prior
+    `PlannerEvidenceResult.excerpt_plan.blocks` (see pipeline.py's own
+    caller). Used ONLY as additional scan input for the method-call
+    one-hop expansion below -- never re-parsed into new preferred_files,
+    never re-fetched, never a second Planner-evidence acquisition.
 
     "Exact definition" (categories 1, 2, and the one-hop dependency
     expansion) means patch-ready repository source, not merely a
@@ -2827,7 +3895,10 @@ def build_final_target_slice(
 
     resolved_max_chars = FINAL_TARGET_SLICE_MAX_CHARS if max_chars is None else max_chars
     try:
-        return _build_final_target_slice_inner(strategy, repo_root, context, planner_evidence_files, resolved_max_chars)
+        return _build_final_target_slice_inner(
+            strategy, repo_root, context, planner_evidence_files, resolved_max_chars,
+            planner_excerpt_blocks=planner_excerpt_blocks,
+        )
     except Exception:
         return FinalTargetSliceResult(
             rendered=(
@@ -2884,6 +3955,7 @@ def _render_coverage_warning(
 def _build_final_target_slice_inner(
     strategy: RemediationStrategyResult, repo_root, context, planner_evidence_files,
     max_chars: int = FINAL_TARGET_SLICE_MAX_CHARS,
+    planner_excerpt_blocks: "list[str] | tuple" = (),
 ) -> FinalTargetSliceResult:
     root = Path(repo_root) if repo_root else None
     if root is None:
@@ -3095,15 +4167,164 @@ def _build_final_target_slice_inner(
     # several coincidental matches could consume this shared budget ahead
     # of a term that actually names the mechanism, discovered only later
     # in strategy_terms' own order.
+    # Every term deterministically derived from an ALREADY-RESOLVED,
+    # QUALIFIED target symbol's own identity (its resolved label's full
+    # form and specific suffix, split the same way
+    # _extract_strategy_identifiers splits a qualified target_symbol) --
+    # used at commit time, below, to classify each discovered consumer
+    # window as Band A (deterministically tied to a resolved target) or
+    # Band B (found only via a general mechanism/context term), never by
+    # file locality. A BARE, class-unqualified label (e.g. a class-only
+    # target with no dot) deliberately contributes nothing here: it is
+    # exactly the "coarse" case _mechanism_terms_first already exists to
+    # deprioritize (see TestMechanismTermsPrioritizedOverTargetSymbol) --
+    # a literal, coincidental text match on the bare class name alone
+    # (e.g. inside an unrelated string literal) is not a stronger tie to
+    # the target than a genuinely mechanism-derived term, and treating it
+    # as one here would silently re-admit the exact starvation bug that
+    # earlier fix was built to prevent. Which SPECIFIC term(s) actually
+    # produced a given function's hit is recorded in `function_terms`
+    # below and consulted once more at commit time, once the one-hop pass
+    # further down has also had a chance to contribute (see
+    # `one_hop_discovered_terms`) -- a target-connected constant that
+    # one-hop discovers from the target's OWN already-selected source is
+    # exactly as strong a tie as a qualified target symbol's own suffix,
+    # so both must be able to earn Band A for the SAME consumer window,
+    # regardless of which of the two happens to be known first. This is
+    # also how a BARE target (no qualified-symbol terms at all) still
+    # gets genuine Band A coverage: entirely through one-hop.
+    target_derived_terms: "set[str]" = set()
+    for match in symbol_matches.values():
+        if "." in match.label:
+            target_derived_terms.add(match.label)
+            target_derived_terms.add(match.label.rsplit(".", 1)[-1])
+
+    # Every class name a resolved target is CONFIRMED to itself BE (never
+    # inferred from a bare fallback match alone -- see
+    # _label_is_confirmed_class) -- lets an EXISTING category-3a candidate
+    # earn Band A by target-owned-class membership: a term-relevant window
+    # this scan already discovered that additionally belongs to the SAME
+    # class as the resolved target is exactly as strong a tie as the
+    # target's own qualified-symbol suffix above. This is deliberately not
+    # a constructor concept -- ANY member of the target's own class
+    # qualifies equally, __init__ included but never special-cased -- and
+    # it never triggers a new search: only class-qualifiers already
+    # attached to candidates this scan (or the one below) already found.
+    target_class_identities: "set[str]" = set()
+    for match in symbol_matches.values():
+        if "." in match.label:
+            target_class_identities.add(_class_of_label(match.label))
+        elif _label_is_confirmed_class(match.label, context, func_id=match.func_id):
+            # Deliberately NOT gated on match.kind == "constant": a bare
+            # class-shaped target resolves via TWO independent paths in
+            # _resolve_symbol_details -- RepositoryIndex.search_by_name
+            # (the shape a real parsed repository actually produces for a
+            # class, reported as kind="function" regardless of the
+            # matched entry's own unitType) and, only when the index has
+            # no such entry, _deterministic_identifier_fallback (always
+            # kind="constant"). Gating on kind=="constant" here silently
+            # excluded the first, far more common shape. _label_is_
+            # confirmed_class's own independent check against parsed
+            # constants' class_name field is what actually guards against
+            # a false positive -- kind was never load-bearing for that.
+            target_class_identities.add(match.label)
+
+    # Evidence-continuity after a rejected QUALIFIED target-symbol
+    # proposal: a member proposal like "Container.runtime_limit" can fail
+    # normal target-symbol verification (correctly -- e.g. it may name an
+    # instance attribute, not any real declaration) and vanish from
+    # `target_symbols` entirely, taking every trace of the class it named
+    # with it. `strategy.rejected_target_symbols` (additive, see
+    # RemediationStrategyResult's own docstring) retains the raw rejected
+    # strings for exactly this one purpose: extracting a candidate class
+    # QUALIFIER and independently re-resolving it -- via the SAME
+    # `_resolve_symbol_details` used for every other symbol in this
+    # function, scoped to this Strategy's own already-verified
+    # `target_files` (never a wider search) -- then confirming it via the
+    # SAME `_label_is_confirmed_class` used just above. The rejected
+    # string itself is never treated as evidence of anything: only an
+    # independently, deterministically re-verified class identity can
+    # ever be added here. This never re-adds the rejected member to
+    # `symbol_matches`, `target_symbols`, or any edit-target category --
+    # it can only ever widen `target_class_identities`, the SAME
+    # supporting-evidence Band-A signal used above, nothing else.
+    for raw in strategy.rejected_target_symbols:
+        if "." not in raw:
+            continue  # no class qualifier to extract from a bare proposal
+        qualifier = raw.rsplit(".", 1)[0]
+        if qualifier in target_class_identities:
+            continue  # already independently confirmed above
+        qualifier_match = _resolve_symbol_details(
+            qualifier, root, context, verified_files=strategy.target_files,
+        )
+        if qualifier_match is None:
+            continue  # qualifier itself does not independently resolve -- fail closed
+        if "." in qualifier_match.label:
+            target_class_identities.add(_class_of_label(qualifier_match.label))
+        elif _label_is_confirmed_class(qualifier_match.label, context, func_id=qualifier_match.func_id):
+            target_class_identities.add(qualifier_match.label)
+
+    # --- Class-level same-file assignment evidence (SUPPORTING-context
+    # role, Category 2 -- never an edit target): reuses the exact same
+    # deterministic ownership signal `target_class_identities` above is
+    # built from, but paired with the FILE each class was actually resolved
+    # in (target_class_identities itself is a flat set of class names only
+    # -- reusing it unpaired here would risk matching a same-named class in
+    # a different file, which must never happen). For each such
+    # (file, class) pair, scan ONLY that already-approved file (never a new
+    # file, never preferred_files growth) for an explicit module-scope
+    # `OwningClass.member = ...` rebind naming ANY member of that class --
+    # not only whichever member Strategy happened to verify. Every match is
+    # rendered as its own small, padded, Category-2-headed block and
+    # committed through the EXISTING category2_candidates/_try_add_to
+    # budget path below -- no new category, no new budget, no recursion
+    # (the rendered text is appended only to category2_candidates, never
+    # back into scan_sources/dot_call_scan_texts or any other one-hop
+    # input).
+    owning_class_files: "set[tuple[str, str]]" = set()
+    for match in symbol_matches.values():
+        if "." in match.label:
+            owning_class_files.add((match.file, _class_of_label(match.label)))
+        elif _label_is_confirmed_class(match.label, context, func_id=match.func_id):
+            owning_class_files.add((match.file, match.label))
+
+    index = getattr(context, "index", None)
+    for (owner_file, owner_class) in sorted(owning_class_files):
+        try:
+            owner_file_text = (root / owner_file).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        assignments = _find_module_scope_class_attribute_assignments(owner_file_text, owner_class)
+        for (member, line, end_line) in sorted(assignments, key=lambda item: item[1]):
+            key = (owner_file, line, end_line)
+            if key in used_definition_keys:
+                continue
+            if index is None:
+                continue
+            read_start, read_end = _padded_line_range(line, end_line, _DEFINITION_CONTEXT_LINES)
+            source_text = index.read_file_section(owner_file, read_start, read_end)
+            if source_text is None:
+                continue
+            render_end = _rendered_end_line(read_start, source_text)
+            text = _render_definition_block(
+                owner_file, f"{owner_class}.{member}", read_start, render_end, source_text,
+                heading_label=_CATEGORY2_HEADING_LABEL,
+            )
+            used_definition_keys.add(key)
+            category2_candidates.append((text, owner_file))
+
     per_function_hits: "dict[tuple[str, str], dict]" = {}
     function_order: "list[tuple[str, str]]" = []
+    function_terms: "dict[tuple[str, str], set]" = {}
     for term in _mechanism_terms_first(strategy_terms, strategy):
         for (f, label, fn_start, fn_end, offsets) in _lookup_identifier_usages(term, preferred_files, context):
             fkey = (f, label)
             if fkey not in per_function_hits:
                 per_function_hits[fkey] = {"fn_start": fn_start, "fn_end": fn_end, "offsets": set()}
                 function_order.append(fkey)
+                function_terms[fkey] = set()
             per_function_hits[fkey]["offsets"].update(offsets)
+            function_terms[fkey].add(term)
 
     for (f, label) in function_order:
         hit = per_function_hits[(f, label)]
@@ -3221,6 +4442,9 @@ def _build_final_target_slice_inner(
             scan_sources.append((f, _class_of_label(label), code))
 
     seen_refs: set = set()
+    one_hop_discovered_terms: "list[str]" = []  # bare names of every constant
+    # this pass deterministically disambiguated -- see the usage-search
+    # re-seed pass directly below, which is the ONLY consumer of this list.
     for (source_file, source_class, code) in scan_sources:
         for ref in _extract_source_constant_refs(code):
             if ref in seen_refs:
@@ -3233,6 +4457,15 @@ def _build_final_target_slice_inner(
             if chosen is None:
                 continue
             found_file, qualified_name, record = chosen
+            # Repository-grounded the moment disambiguation succeeds --
+            # independent of whether the one-hop DEFINITION block itself
+            # goes on to fit the budget below. A usage-search seed costs
+            # nothing to try and needs no separate budget slot, so it is
+            # collected here unconditionally on a successful, unambiguous
+            # match, not gated on _try_add_to's own render/budget outcome.
+            bare_name = record.get("name") or qualified_name
+            if bare_name:
+                one_hop_discovered_terms.append(bare_name)
             line, end_line = record.get("line"), record.get("end_line")
             if line is None or end_line is None:
                 continue
@@ -3250,6 +4483,127 @@ def _build_final_target_slice_inner(
                 used_definition_keys.add(key)  # key stays unpadded -- see _padded_line_range
                 covered_files.add(found_file)
 
+    # --- Method-call one-hop (SUPPORTING-context role, added on top of the
+    # constant one-hop above -- exactly one additional bounded lookup
+    # opportunity, never a second traversal mechanism). Structural
+    # relevance rule: a dot-qualified call co-located, on the SAME source
+    # line, with an already strategy-connected identifier (`strategy_
+    # terms`) inside source ALREADY selected for the slice. A call on a
+    # different line -- even in the very same already-admitted function --
+    # gains no opportunity (see `_extract_source_dot_call_refs`). Scans
+    # the exact same `scan_sources` the constant one-hop already built,
+    # PLUS the already-computed Planner excerpt blocks
+    # (`planner_excerpt_blocks`, i.e. `PlannerEvidenceResult.excerpt_plan.
+    # blocks` -- see build_final_target_slice's own docstring): this is
+    # what closes the stage-boundary gap where the qualifying line lives
+    # in already-rendered Planner evidence rather than in this function's
+    # own scan_sources. No new repository search, no Planner re-run, no
+    # rendering from scratch -- `_extract_fenced_code` recovers the exact
+    # same raw source text these blocks were rendered from. Resolution uses
+    # `_lookup_identifier_definition_or_unique_repo_match` -- the normal
+    # `preferred_files`-bound lookup first, falling back to exactly one
+    # additional, uniqueness-gated repository-wide lookup ONLY for this
+    # call site (see that function's own docstring for why this path, and
+    # only this path, may look outside preferred_files: it resolves a call
+    # target the already-verified consumer source itself references, not
+    # an LLM-proposed term). Every other one-hop/usage lookup in this
+    # function keeps calling `_lookup_identifier_definition` directly and
+    # is completely unaffected. Every resolution is rendered under Category
+    # 2's own "context only, not an approved edit target" heading and
+    # merged into `category2_candidates` -- so it is committed by that
+    # exact existing whole-block-or-omit loop below, against the SAME
+    # shared budget, and can never become an edit target. Never recurses:
+    # `dot_call_scan_texts` is fixed before this loop runs, and a
+    # resolved definition's own source is never appended back to it.
+    dot_call_scan_texts: "list[str]" = [code for (_f, _c, code) in scan_sources]
+    for _block in planner_excerpt_blocks:
+        _code = _extract_fenced_code(_block)
+        if _code is not None:
+            dot_call_scan_texts.append(_code)
+
+    seen_dot_call_refs: set = set()
+    for code in dot_call_scan_texts:
+        for name in _extract_source_dot_call_refs(code, strategy_terms):
+            if name in seen_dot_call_refs:
+                continue
+            seen_dot_call_refs.add(name)
+            found = _lookup_identifier_definition_or_unique_repo_match(name, preferred_files, context)
+            if found is None:
+                continue
+            key = (found.file, found.line, found.end_line)
+            if key in used_definition_keys:
+                continue
+            if found.kind == "constant":
+                dc_label = found.label
+                index = getattr(context, "index", None)
+                read_start, read_end = _padded_line_range(found.line, found.end_line, _DEFINITION_CONTEXT_LINES)
+                dc_source = index.read_file_section(found.file, read_start, read_end) if index else None
+                dc_render_start = read_start
+                dc_render_end = _rendered_end_line(dc_render_start, dc_source) if dc_source else found.end_line
+            else:
+                dc_label = found.label
+                index = getattr(context, "index", None)
+                if index is not None and found.func_id:
+                    func_record = index.get_function(found.func_id)
+                    if func_record and func_record.get("className"):
+                        dc_label = f"{func_record.get('className')}.{found.label}"
+                dc_source = _read_symbol_source(
+                    _SymbolMatch(file=found.file, label=found.label, kind="function",
+                                 line=found.line, end_line=found.end_line, func_id=found.func_id),
+                    context,
+                )
+                dc_render_start, dc_render_end = found.line, found.end_line
+            if dc_source is None:
+                continue
+            used_definition_keys.add(key)  # decided now; committed later, same as category 2 above
+            dc_text = _render_definition_block(
+                found.file, dc_label, dc_render_start, dc_render_end, dc_source,
+                heading_label=_CATEGORY2_HEADING_LABEL,
+            )
+            category2_candidates.append((dc_text, found.file))
+
+    # --- Usage-search re-seed (SUPPORTING-context role, same tier as 3a
+    # below -- this IS 3a, just re-run once more with additional terms):
+    # once the one-hop pass above has deterministically resolved a
+    # repository-grounded constant identifier that the resolved target's
+    # OWN already-selected source references (e.g. a class-level default
+    # threaded through __init__'s own signature), that SAME identifier is
+    # eligible to seed the identical bounded usage search category 3a
+    # already runs -- never a new search mechanism, never a wider file
+    # scope (still `preferred_files` only), never LLM-prose-derived. This
+    # is what lets a same-file constructor/normalization consumer that
+    # _mechanism_terms_first(strategy_terms, ...) alone didn't happen to
+    # name be found anyway, WITHOUT recursing into whatever that consumer
+    # itself references (one_hop_blocks/one_hop_discovered_terms are never
+    # themselves re-scanned) and WITHOUT touching edit-target authority --
+    # every result lands in `category3_candidates` with raw_symbol=None,
+    # the exact same SUPPORTING-context shape 3a's own hits already use.
+    if one_hop_discovered_terms:
+        seed_hits: "dict[tuple[str, str], dict]" = {}
+        seed_order: "list[tuple[str, str]]" = []
+        for term in one_hop_discovered_terms:
+            for (f, label, fn_start, fn_end, offsets) in _lookup_identifier_usages(term, preferred_files, context):
+                fkey = (f, label)
+                if fkey not in seed_hits:
+                    seed_hits[fkey] = {"fn_start": fn_start, "fn_end": fn_end, "offsets": set()}
+                    seed_order.append(fkey)
+                seed_hits[fkey]["offsets"].update(offsets)
+
+        for (f, label) in seed_order:
+            hit = seed_hits[(f, label)]
+            ranges = _windows_for(hit["fn_start"], hit["fn_end"], sorted(hit["offsets"]))
+            key = (f, label, tuple(ranges))
+            if key in used_usage_keys:
+                continue  # already found via strategy_terms' own scan above -- never duplicated
+            text = _render_usage_window_block(f, label, ranges, context)
+            if text is None:
+                continue
+            used_usage_keys.add(key)
+            # A re-seed hit's connecting term is always a one_hop_discovered_
+            # terms entry, folded into `target_derived_terms` below for band
+            # classification -- so it does not need its own separate marker.
+            category3_candidates.append((text, f, label, None))
+
     # --- Commit category 2's candidates now (SUPPORTING-context role,
     # tier 3) -- after every edit-target candidate AND the one-hop step
     # above have already had first claim on the budget.
@@ -3259,10 +4613,54 @@ def _build_final_target_slice_inner(
             identifier_definition_covered.add(f)
 
     # --- Commit category 3a's SUPPORTING-context candidates now (tier 4)
-    # -- 3b's edit-target candidates were already committed above.
-    for (text, f, _label, raw_symbol) in category3_candidates:
+    # -- 3b's edit-target candidates were already committed above. Within
+    # this tier, Band A (a window discovered via a term deterministically
+    # tied to an already-resolved target's own identity -- either the
+    # target's own resolved label, dot-split, OR a constant the one-hop
+    # pass above deterministically found the target's OWN already-selected
+    # source referencing) is committed ahead of Band B (discovered only via
+    # a general mechanism/context term), so a focused, target-connected
+    # consumer never loses this shared budget to a larger, less directly
+    # connected candidate merely because the latter happened to be scanned
+    # first -- an incidental side effect of prose-mention order in
+    # Strategy's own free text, not a deliberate priority. `function_terms`
+    # only has an entry for a window found via the ORIGINAL strategy-term
+    # scan above (3a proper) -- a re-seed hit (found only via a term in
+    # `one_hop_discovered_terms`, never in `strategy_terms` at all) has no
+    # entry there and so is classified purely by the `in reseed_terms`
+    # check, which is exactly what it needs: re-seed hits exist ONLY
+    # because one-hop tied them to the target, so they are always Band A.
+    # Purely a local reordering of THIS tier's own commit order -- category
+    # 1/2/3b/4/one-hop/5's relative priority is unchanged, and nothing here
+    # grows preferred_files, widens the search, or raises the shared budget.
+    # A candidate also independently earns Band A when it is a member of
+    # the SAME class as the resolved target (`target_class_identities`,
+    # above) -- checked first, and purely from the candidate's own
+    # already-computed label, so it applies equally to a term-scan hit and
+    # a re-seed hit without needing a separate per-candidate marker.
+    reseed_terms = set(one_hop_discovered_terms)
+    final_target_derived_terms = target_derived_terms | reseed_terms
+
+    def _is_band_a(f: str, label: str) -> bool:
+        if _class_of_label(label) in target_class_identities:
+            return True
+        terms = function_terms.get((f, label))
+        if terms is None:
+            return True  # a re-seed-only hit -- see docstring above
+        return bool(terms & final_target_derived_terms)
+
+    for (text, f, label, raw_symbol) in category3_candidates:
         if raw_symbol is not None:
             continue  # 3b (edit-target) -- already committed above
+        if not _is_band_a(f, label):
+            continue
+        if _try_add_to(blocks_by_category[3], text):
+            covered_files.add(f)
+    for (text, f, label, raw_symbol) in category3_candidates:
+        if raw_symbol is not None:
+            continue  # 3b (edit-target) -- already committed above
+        if _is_band_a(f, label):
+            continue  # already committed in the Band A pass above
         if _try_add_to(blocks_by_category[3], text):
             covered_files.add(f)
 

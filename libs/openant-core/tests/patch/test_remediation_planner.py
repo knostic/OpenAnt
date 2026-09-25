@@ -1954,6 +1954,121 @@ class TestBuildPlannerSourceExcerptsPriority:
 
 
 # ---------------------------------------------------------------------------
+# build_planner_source_excerpts() -- fair budget allocation across verified
+# symbol candidates (FIX 3). Three deterministic Pass-1 candidates compete
+# for the shared DEFAULT_MAX_CHARS window: one oversized (cannot fit inside
+# an equal per-candidate share of the budget), two modest siblings sized to
+# each individually fit comfortably within that share, but whose COMBINED
+# size the OLD strict first-come admission cannot accommodate once the
+# oversized candidate -- processed first, per ordinary Planner target order
+# -- has already consumed most of the window. Real-trace shape: a coarse
+# class-level symbol followed by two narrower method-level symbols in
+# sibling files (see the forensic report's Run-3 analysis).
+# ---------------------------------------------------------------------------
+
+class TestBuildPlannerSourceExcerptsFairAllocation:
+    def _context_with_three_candidates(self, tmp_path, huge_lines=533, small_lines=100):
+        """One oversized function (`huge.py:C.huge_method`) ordered FIRST,
+        two modest sibling functions (`small1.py:C.small_method`,
+        `small2.py:C.small_method`) ordered after it -- exactly the
+        "coarse target consumes budget before its siblings get a turn"
+        shape. `huge_lines`/`small_lines` default to sizes empirically
+        confirmed (via `_render_source_excerpt`) to: (a) make the huge
+        candidate exceed an equal three-way share of DEFAULT_MAX_CHARS
+        (4,000 // 3 = 1,333 chars) while still being individually
+        admissible against the full budget in isolation, and (b) make each
+        small candidate comfortably fit its own equal share alone, while
+        the OLD first-come-only algorithm -- huge admitted first, then
+        small1, leaving no room for small2 -- starves exactly one of the
+        two siblings purely because of processing order, not evidence
+        value."""
+        for name in ("huge.py", "small1.py", "small2.py"):
+            (tmp_path / name).write_text("class C:\n    pass\n", encoding="utf-8")
+        huge_body = "x = 1\n" * huge_lines
+        small_body = "x = 1\n" * small_lines
+        context = _make_context(
+            functions={
+                "huge.py:C.huge_method": {
+                    "name": "huge_method", "startLine": 2, "endLine": 2 + huge_lines,
+                    "className": "C", "code": huge_body,
+                },
+                "small1.py:C.small_method": {
+                    "name": "small_method", "startLine": 2, "endLine": 2 + small_lines,
+                    "className": "C", "code": small_body,
+                },
+                "small2.py:C.small_method": {
+                    "name": "small_method", "startLine": 2, "endLine": 2 + small_lines,
+                    "className": "C", "code": small_body,
+                },
+            },
+            repo_path=tmp_path,
+        )
+        plan = RemediationPlanResult(
+            rendered="",
+            target_files=["huge.py", "small1.py", "small2.py"],
+            target_symbols=["huge.py:C.huge_method", "small1.py:C.small_method", "small2.py:C.small_method"],
+        )
+        return context, plan
+
+    def test_fair_allocation_preserves_both_small_siblings(self, tmp_path):
+        """RED-first proof of the corrected invariant (FIX 3): before the
+        fix, the oversized candidate -- processed first, per ordinary
+        Planner target order -- is admitted greedily, small1 still fits
+        after it, but small2 is omitted purely because of processing
+        order (it carries the same evidence value as small1, not less).
+        After the fix, once every verified candidate gets a fair first
+        turn before any one of them is allowed to grow beyond an equal
+        share, ordering can no longer determine which same-sized sibling
+        survives -- BOTH small candidates must be present, regardless of
+        the oversized candidate's position or fate, and the rendered
+        result must never exceed the same hard budget."""
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_planner_symbols, build_planner_candidates, build_planner_source_excerpts,
+        )
+        context, plan = self._context_with_three_candidates(tmp_path)
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+
+        result = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert "#### Verified source: `small1.py:C.small_method`" in result
+        assert "#### Verified source: `small2.py:C.small_method`" in result  # no longer starved by candidate order
+        # The oversized candidate genuinely cannot join both now-guaranteed
+        # siblings within the same hard budget -- it is correctly omitted,
+        # never truncated, never silently upgraded, and the omission is
+        # still reported explicitly (named in the note, not rendered as a
+        # source block).
+        assert "#### Verified source: `huge.py:C.huge_method`" not in result
+        assert "huge.py:C.huge_method" in result
+        assert "symbol excerpt(s) omitted" in result
+        assert len(result) <= DEFAULT_MAX_CHARS + 2000  # generous slack for headers/prose, still hard-bounded
+
+    def test_balanced_candidates_are_unaffected_non_interference(self, tmp_path):
+        """Non-interference control: when every verified candidate already
+        fits comfortably (individually AND combined) within the budget,
+        the fair-allocation pass must produce the exact same outcome as
+        the simple first-come admission it replaces -- nothing is
+        deferred, nothing is omitted, and candidate order is preserved."""
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_planner_symbols, build_planner_candidates, build_planner_source_excerpts,
+        )
+        context, plan = self._context_with_three_candidates(tmp_path, huge_lines=20, small_lines=20)
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+
+        result = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert "huge.py:C.huge_method" in result
+        assert "small1.py:C.small_method" in result
+        assert "small2.py:C.small_method" in result
+        assert "omitted" not in result
+        # Original candidate order preserved end to end.
+        assert result.index("huge.py:C.huge_method") < result.index("small1.py:C.small_method")
+        assert result.index("small1.py:C.small_method") < result.index("small2.py:C.small_method")
+
+
+# ---------------------------------------------------------------------------
 # build_planner_evidence() -- full bridge: verify -> enrich -> fuse -> render
 # ---------------------------------------------------------------------------
 
@@ -2504,6 +2619,12 @@ class TestPipelineWiring:
     grounding found anything."""
 
     def _run_with_mocks(self, plan_result, repo_root=None, extra_patches=()):
+        # Fix A: these tests are about how plan/evidence TEXT flows into
+        # code_context, not about the evidence-sufficiency gate itself --
+        # force every plan_result passed in here to read as explicitly
+        # grounded so the pre-existing pipeline flow they test is
+        # unaffected by the new gate.
+        plan_result = plan_result._replace(additional_evidence_required="explicit_false")
         patches = [
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
             mock.patch("utilities.autopatcher.remediation_planner.generate_remediation_plan",
@@ -2611,6 +2732,7 @@ class TestPipelineWiring:
             rendered="## Remediation Plan (experimental — not verified against the repository)\n\nPLAN_MARKER\n",
             target_files=["src/urllib3/util/retry.py"],
             target_symbols=["src/urllib3/util/retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"],
+            additional_evidence_required="explicit_false",
         )
         # Names the real path explicitly so ordinary Repository Grounding
         # also selects it (Pass 1, explicit path) -- that is what makes
@@ -2910,7 +3032,13 @@ class TestFinalStrategySemanticNarrownessContract:
         itself must declare exactly the same seven pre-existing field names,
         same convention as TestPlannerSchemaFieldSet below (plain regex, not
         json.loads -- the schema block's type placeholders aren't valid JSON
-        values, only valid JSON keys)."""
+        values, only valid JSON keys).
+
+        `target_authority_unresolved` is the one intentional, separately
+        approved exception (scope-v4 Run 5 authority-gap fix): the set below
+        was updated to include it, rather than this test being loosened to
+        stop checking field-set exactness -- any FUTURE unapproved field
+        addition still fails this test exactly as before."""
         text = _STRATEGY_PROMPT_PATH_TEXT()
         schema_start = text.index("## Output schema")
         schema_block = text[schema_start:]
@@ -2918,7 +3046,7 @@ class TestFinalStrategySemanticNarrownessContract:
         assert found == {
             "extended_mechanism", "target_files", "target_symbols",
             "required_edits", "rejected_targets", "security_invariant",
-            "insufficient_evidence",
+            "insufficient_evidence", "target_authority_unresolved",
         }
 
     def test_new_ground_rules_wording_is_domain_neutral(self):
@@ -3086,9 +3214,15 @@ class TestPlannerSchemaFieldSet:
         "security_invariant", "narrower_alternative_decision",
         "narrower_alternative_considered",
         "required_edits", "approaches_to_avoid", "explicit_unknowns",
+        # Fix A: bounded iterative Planning evidence acquisition --
+        # additional_evidence_required/evidence_requests are the top-level
+        # schema fields; request_type/file_hint/symbol/reason are the
+        # nested fields of each evidence_requests entry.
+        "additional_evidence_required", "evidence_requests",
+        "request_type", "file_hint", "symbol", "reason",
     }
 
-    def test_schema_has_exactly_the_expected_nine_fields(self):
+    def test_schema_has_exactly_the_expected_fifteen_fields(self):
         text = _PLANNER_PROMPT_PATH_TEXT()
         schema_start = text.index("## Output schema")
         next_heading = text.index("\n## ", schema_start + 1)
@@ -3270,6 +3404,191 @@ class TestPlannerPromptGenuineNarrowerAlternative:
         text = _PLANNER_PROMPT_NORMALIZED()
         assert "no genuine narrower alternative can be identified from the verified source" in text
         assert "say so plainly" in text
+
+
+class TestTargetAuthorityUnresolvedField:
+    """Direct unit tests for `_parse_target_authority_unresolved` -- the
+    three-way parse rule (absent -> False, valid bool -> itself, malformed-
+    but-explicit -> True) documented on both the function itself and
+    RemediationStrategyResult.target_authority_unresolved. No repo/LLM
+    machinery needed: this is a pure function over a plain dict."""
+
+    def test_absent_key_defaults_false(self):
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        assert _parse_target_authority_unresolved({}) is False
+
+    def test_valid_true_is_trusted(self):
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        assert _parse_target_authority_unresolved({"target_authority_unresolved": True}) is True
+
+    def test_valid_false_is_trusted(self):
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        assert _parse_target_authority_unresolved({"target_authority_unresolved": False}) is False
+
+    def test_malformed_string_value_fails_closed_to_true(self):
+        """Explicit, malformed trust-critical metadata must never be
+        silently coerced to the permissive False -- see this function's
+        own docstring."""
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        assert _parse_target_authority_unresolved({"target_authority_unresolved": "maybe"}) is True
+
+    def test_explicit_null_fails_closed_to_true(self):
+        """Explicit JSON null is grouped with 'wrong type', not with
+        'absent key' -- same convention as remediation_verifier.py's own
+        strict-bool parsing for its trust-critical fields."""
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        assert _parse_target_authority_unresolved({"target_authority_unresolved": None}) is True
+
+    def test_malformed_int_value_fails_closed_to_true(self):
+        """Also proves the check is isinstance(x, bool), never truthiness
+        -- a JSON `0`/`1` deserializes to a plain Python int, never a
+        bool, so `1` must NOT pass as True by truthy coercion; it must
+        fail closed to the conservative True exactly like any other wrong
+        type, not be silently accepted as 'true-ish'."""
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        assert _parse_target_authority_unresolved({"target_authority_unresolved": 1}) is True
+        assert _parse_target_authority_unresolved({"target_authority_unresolved": 0}) is True
+
+    def test_default_result_field_matches_backward_compatible_default(self):
+        from utilities.autopatcher.remediation_planner import RemediationStrategyResult
+        result = RemediationStrategyResult(
+            rendered="", target_files=[], target_symbols=[], warnings=[],
+            extended_mechanism=None, required_edits=[],
+        )
+        assert result.target_authority_unresolved is False
+
+    def test_empty_strategy_sentinel_has_field_false(self):
+        from utilities.autopatcher.remediation_planner import _EMPTY_STRATEGY_RESULT
+        assert _EMPTY_STRATEGY_RESULT.target_authority_unresolved is False
+
+    def test_no_prose_or_keyword_inspection_anywhere_in_the_parser(self):
+        """Regression guard: the parser reads ONLY the
+        `target_authority_unresolved` key -- a non-empty `insufficient_
+        evidence`/`rejected_targets` full of exactly the forbidden keywords
+        must never influence the result on its own."""
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        plan = {
+            "insufficient_evidence": [
+                "override the default; custom, non-default, low-level, broader, "
+                "narrower, must inspect PoolManager first, upstream did not fix it"
+            ],
+            "rejected_targets": ["some/other/file.py -- override, non-default"],
+        }
+        assert _parse_target_authority_unresolved(plan) is False  # key absent -> backward-compatible default
+
+
+class TestTargetAuthorityUnresolvedEndToEnd:
+    """Mocked-LLM, real-repo-root tests proving the field flows correctly
+    from a Strategy JSON response into the actual, verified
+    RemediationStrategyResult generate_remediation_strategy returns."""
+
+    def _well_formed_with(self, tmp_path, **overrides):
+        (tmp_path / "target.py").write_text("class Target:\n    pass\n", encoding="utf-8")
+        payload = dict(_STRATEGY_WELL_FORMED)
+        payload["target_files"] = ["target.py"]
+        payload["target_symbols"] = ["Target"]
+        payload.update(overrides)
+        return payload
+
+    def test_old_format_response_without_field_defaults_false(self, tmp_path):
+        """Backward compatibility: a response predating this field's
+        existence (the key is simply absent) must parse identically to
+        today -- target_authority_unresolved=False, no new behavior."""
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(self._well_formed_with(tmp_path))
+        result = generate_remediation_strategy(
+            "v", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE_MARKER",
+        )
+        assert result.target_files == ["target.py"]
+        assert result.target_authority_unresolved is False
+
+    def test_explicit_true_is_parsed_through(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(
+            self._well_formed_with(tmp_path, target_authority_unresolved=True)
+        )
+        result = generate_remediation_strategy(
+            "v", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE_MARKER",
+        )
+        assert result.target_files == ["target.py"]  # existence verification unaffected
+        assert result.target_authority_unresolved is True
+
+    def test_explicit_false_is_parsed_through(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(
+            self._well_formed_with(tmp_path, target_authority_unresolved=False)
+        )
+        result = generate_remediation_strategy(
+            "v", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE_MARKER",
+        )
+        assert result.target_authority_unresolved is False
+
+    def test_malformed_value_fails_closed_to_true(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(
+            self._well_formed_with(tmp_path, target_authority_unresolved="unsure")
+        )
+        result = generate_remediation_strategy(
+            "v", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE_MARKER",
+        )
+        assert result.target_files == ["target.py"]  # existence verification still unaffected
+        assert result.target_authority_unresolved is True
+
+
+class TestTargetAuthorityUnresolvedPromptContract:
+    def test_ground_rule_present_with_true_false_criteria(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert "set `target_authority_unresolved` to `true`" in text
+        assert (
+            "you cannot yet determine whether the `target_files`/`target_symbols`/mechanism "
+            "you selected above is actually the correct remediation location" in text
+        )
+        assert "set it to `false` when every remaining gap in `insufficient_evidence` concerns only" in text
+        assert "validation, testing, behavioral confirmation, or hardening evidence" in text
+
+    def test_false_is_not_a_certification(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "`target_authority_unresolved: false` is not a claim that "
+            "`target_files`/`target_symbols` is correct" in text
+        )
+        assert "it only means you are not withholding authority" in text
+
+    def test_no_keyword_shortcuts_taught(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "never from whether the target or mechanism happens to be described as an "
+            "override, custom, non-default, low-level, broader, or narrower than some "
+            "alternative" in text
+        )
+        assert "those words alone never determine the value either way" in text
+
+    def test_schema_key_present(self):
+        text = _STRATEGY_PROMPT_PATH_TEXT()
+        schema_start = text.index("## Output schema")
+        schema_block = text[schema_start:]
+        assert '"target_authority_unresolved": boolean' in schema_block
+
+    def test_new_ground_rule_wording_is_domain_neutral(self):
+        text = _STRATEGY_PROMPT_PATH_TEXT()
+        start = text.index("Additionally, set `target_authority_unresolved`")
+        end = text.index("Do not propose unrelated changes.")
+        added_text = text[start:end].lower()
+        for forbidden in (
+            "urllib3", "cookie", "header", "redirect", "python", "poolmanager",
+            "httpconnectionpool", "retry", "minimist", "javascript", "prototype",
+        ):
+            assert forbidden not in added_text
+
+    def test_existing_insufficient_evidence_ground_rule_still_present(self):
+        """Additive, not a replacement."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert "if the verified evidence is insufficient to select a concrete mechanism," in text
+        assert "say so in `insufficient_evidence` rather than guessing" in text
 
 
 class TestFinalStrategyEvidenceBinding:
@@ -3604,6 +3923,8 @@ _DISCOVERY_JSON = {
     "required_edits": ["(exploratory) possibly add Cookie to the policy set"],
     "approaches_to_avoid": [],
     "explicit_unknowns": [],
+    "additional_evidence_required": False,
+    "evidence_requests": [],
 }
 
 _STRATEGY_JSON = {
@@ -3786,11 +4107,13 @@ class TestExtendExistingMechanismFixture:
 
 def _make_strategy(
     target_files=None, target_symbols=None, extended_mechanism=None, required_edits=None,
+    rejected_target_symbols=None,
 ):
     from utilities.autopatcher.remediation_planner import RemediationStrategyResult
     return RemediationStrategyResult(
         rendered="", target_files=target_files or [], target_symbols=target_symbols or [],
         warnings=[], extended_mechanism=extended_mechanism, required_edits=required_edits or [],
+        rejected_target_symbols=rejected_target_symbols or [],
     )
 
 
@@ -4854,6 +5177,699 @@ class TestFocusedWindows:
         assert "line(s) omitted" in block
 
 
+class TestOneHopDiscoveredTermsSeedUsageSearch:
+    """FIX: proof-completion for non-callable targets. A bare, unqualified
+    Strategy target_symbol (e.g. a class name, matching the real-trace
+    shape that triggered this) can deterministically resolve to a target
+    whose own already-selected source references a SEPARATE, disambiguated
+    constant (via the existing one-hop dependency expansion) -- but until
+    this fix, that constant's own identifier was never fed back into the
+    existing category-3a usage search, so a same-file consumer/normalizer
+    of it (e.g. a constructor referencing it as a default parameter value)
+    could go undiscovered even though the file was already in
+    `preferred_files` and the existing text-based usage-search machinery
+    was already fully capable of finding it, given the right term."""
+
+    def _context(self, tmp_path):
+        # Realistically sized (the gap does not reproduce in a tiny file,
+        # where padding around any match trivially covers everything) --
+        # the constant sits near the top of the class, the constructor
+        # that normalizes it into an instance attribute sits far below,
+        # separated by filler methods, mirroring the real-trace shape.
+        lines = ["class Widget:", "    DEFAULT_OPTIONS = frozenset([\"a\"])", ""]
+        for i in range(60):
+            lines += [f"    def filler_method_{i}(self):", f"        return {i}", ""]
+        init_start = len(lines) + 1
+        lines += [
+            "    def __init__(self, options=DEFAULT_OPTIONS):",
+            "        self.options = normalize(options)",
+        ]
+        init_end = len(lines)
+        lines.append("")
+        for i in range(60, 120):
+            lines += [f"    def filler_method_{i}(self):", f"        return {i}", ""]
+        (tmp_path / "widget.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        functions = {
+            "widget.py:Widget.__init__": {
+                "name": "__init__", "className": "Widget", "startLine": init_start, "endLine": init_end,
+                "code": "    def __init__(self, options=DEFAULT_OPTIONS):\n        self.options = normalize(options)\n",
+            },
+        }
+        constants = {"widget.py": {"Widget.DEFAULT_OPTIONS": {
+            "qualified_name": "Widget.DEFAULT_OPTIONS", "class_name": "Widget",
+            "name": "DEFAULT_OPTIONS", "line": 2, "end_line": 2,
+        }}}
+        return _make_context(functions=functions, constants=constants, repo_path=tmp_path)
+
+    def test_same_file_constructor_normalizer_of_a_one_hop_discovered_constant_is_found(self, tmp_path):
+        # RED-first regression: the bare "Widget" target_symbol resolves
+        # (via the existing deterministic identifier fallback) without any
+        # help from extended_mechanism/required_edits prose -- neither is
+        # set here, so the ONLY way __init__'s consumer window can be
+        # discovered is via the constant the one-hop pass itself finds.
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        context = self._context(tmp_path)
+        strategy = _make_strategy(target_files=["widget.py"], target_symbols=["Widget"])
+
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=["widget.py"])
+
+        assert "def __init__(self, options=DEFAULT_OPTIONS):" in result.rendered
+        assert "self.options = normalize(options)" in result.rendered
+        assert "Discovered consumer: `widget.py:Widget.__init__`" in result.rendered
+
+    def test_resolved_target_with_no_relevant_same_file_consumer_is_unaffected(self, tmp_path):
+        # Non-interference control: a resolved target whose one-hop
+        # discoveries have no same-file consumer at all must not cause any
+        # unrelated evidence expansion -- no phantom "Discovered consumer"
+        # block, no change to what already renders. Removes __init__
+        # entirely from the fixture's functions (nothing left to find).
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        lines = ["class Widget:", "    DEFAULT_OPTIONS = frozenset([\"a\"])", ""]
+        for i in range(60):
+            lines += [f"    def filler_method_{i}(self):", f"        return {i}", ""]
+        (tmp_path / "widget.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        constants = {"widget.py": {"Widget.DEFAULT_OPTIONS": {
+            "qualified_name": "Widget.DEFAULT_OPTIONS", "class_name": "Widget",
+            "name": "DEFAULT_OPTIONS", "line": 2, "end_line": 2,
+        }}}
+        context = _make_context(functions={}, constants=constants, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["widget.py"], target_symbols=["Widget"])
+
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=["widget.py"])
+
+        assert "Discovered consumer" not in result.rendered
+
+
+class TestFinalTargetSliceEvidenceAdmissionOrderIndependence:
+    """FIX: within category 3a's shared budget, a small consumer window
+    directly connected to the resolved target must not lose its admission
+    slot to a larger, more loosely (mechanism-term-only) connected
+    candidate merely because that larger candidate happened to be scanned
+    first -- a scan order driven by incidental prose-mention position in
+    Strategy's free-text `extended_mechanism`, not by any deliberate
+    priority. Both a resolved target-file constant and a same-file
+    consumer of it are deterministically discoverable here; a separate,
+    unrelated, larger same-file candidate is discoverable only via a
+    mechanism-derived term. Neither candidate's connecting term is itself
+    a verified target symbol (the target is the bare, unqualified class),
+    so under current code the only thing that decides commit order between
+    them is which term happens to appear first in the mechanism prose."""
+
+    def _context(self, tmp_path):
+        # Realistically sized -- the race does not reproduce in a tiny
+        # file, where any window trivially covers everything.
+        lines = ["class Config:", "    THRESHOLD_VALUE = 5", ""]
+        for i in range(30):
+            lines += [f"    def noise_{i}(self):", f"        return {i}", ""]
+        setup_start = len(lines) + 1
+        lines += [
+            "    def setup(self, value=THRESHOLD_VALUE):",
+            "        self.value = normalize(value)",
+        ]
+        setup_end = len(lines)
+        lines.append("")
+        (tmp_path / "config.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        big_body = "\n".join(f"        step_{i} = {i}" for i in range(22))
+        route_code = f"    def dispatch_request(self):\n{big_body}\n        return 1\n"
+        (tmp_path / "dispatcher.py").write_text(f"class Dispatcher:\n{route_code}", encoding="utf-8")
+
+        functions = {
+            "config.py:Config.setup": {
+                "name": "setup", "className": "Config", "startLine": setup_start, "endLine": setup_end,
+                "code": "    def setup(self, value=THRESHOLD_VALUE):\n        self.value = normalize(value)\n",
+            },
+            "dispatcher.py:Dispatcher.dispatch_request": {
+                "name": "dispatch_request", "className": "Dispatcher",
+                "startLine": 2, "endLine": 2 + len(route_code.split("\n")),
+                "code": route_code,
+            },
+        }
+        constants = {"config.py": {"Config.THRESHOLD_VALUE": {
+            "qualified_name": "Config.THRESHOLD_VALUE", "class_name": "Config",
+            "name": "THRESHOLD_VALUE", "line": 2, "end_line": 2,
+        }}}
+        return _make_context(functions=functions, constants=constants, repo_path=tmp_path)
+
+    @pytest.mark.parametrize("order", ["large_candidate_mentioned_first", "small_consumer_mentioned_first"])
+    def test_target_connected_consumer_survives_regardless_of_mention_order(self, tmp_path, monkeypatch, order):
+        from utilities.autopatcher import remediation_planner as rp
+        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 2000)
+        context = self._context(tmp_path)
+        mechanism = {
+            "large_candidate_mentioned_first": (
+                "dispatch_request already performs the relevant check. "
+                "The fix also adjusts THRESHOLD_VALUE."
+            ),
+            "small_consumer_mentioned_first": (
+                "The fix adjusts THRESHOLD_VALUE. "
+                "dispatch_request already performs the relevant check."
+            ),
+        }[order]
+        strategy = _make_strategy(
+            target_files=["config.py"], target_symbols=["Config"], extended_mechanism=mechanism,
+        )
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["dispatcher.py"],
+        )
+
+        # The small, target-connected consumer must always survive the
+        # shared budget -- regardless of which candidate the incidental
+        # prose order caused category 3a to scan first.
+        assert "def setup(self, value=THRESHOLD_VALUE):" in result.rendered
+
+    def test_generous_budget_keeps_both_regardless_of_order_non_interference(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 8000)
+        context = self._context(tmp_path)
+        for mechanism in (
+            "dispatch_request already performs the relevant check. The fix also adjusts THRESHOLD_VALUE.",
+            "The fix adjusts THRESHOLD_VALUE. dispatch_request already performs the relevant check.",
+        ):
+            strategy = _make_strategy(
+                target_files=["config.py"], target_symbols=["Config"], extended_mechanism=mechanism,
+            )
+            result = rp.build_final_target_slice(
+                strategy, str(tmp_path), context, planner_evidence_files=["dispatcher.py"],
+            )
+            assert "def setup(self, value=THRESHOLD_VALUE):" in result.rendered
+            assert "def dispatch_request(self):" in result.rendered
+
+
+class TestFinalTargetSliceTargetOwnedClassMemberPriority:
+    """FIX: within category 3a's shared budget, a focused usage window
+    belonging to the SAME class as the resolved (bare, class-shaped)
+    target must not lose its admission slot to a larger, unrelated-class
+    candidate merely because that candidate happened to be scanned first
+    -- an incidental side effect of prose-mention order. This is NOT a
+    constructor-priority rule: the same-class method used here is
+    deliberately not `__init__`, to prove the invariant is genuine
+    class-membership, not a special-cased dunder name."""
+
+    def _context(self, tmp_path):
+        # Realistically sized -- the race does not reproduce in a tiny
+        # file. `Container.MODE` is the deterministic evidence that
+        # confirms "Container" really is a class (not merely a bare
+        # function/constant fallback match) -- without at least one
+        # constant recording class_name == "Container", the target class
+        # identity must never be inferred.
+        lines = ["class Container:", "    MODE = \"default\"", ""]
+        for i in range(20):
+            lines += [f"    def noise_{i}(self):", f"        return {i}", ""]
+        cfg_start = len(lines) + 1
+        lines += ["    def configure(self, value=None):", "        self.batch_limit = value or 10"]
+        cfg_end = len(lines)
+        lines.append("")
+        (tmp_path / "container.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        big_body = "\n".join(f"        step_{i} = {i}" for i in range(22))
+        sched_code = f"    def run_batch_worker(self):\n{big_body}\n        return 1\n"
+        (tmp_path / "scheduler.py").write_text(f"class Scheduler:\n{sched_code}", encoding="utf-8")
+
+        functions = {
+            "container.py:Container.configure": {
+                "name": "configure", "className": "Container", "startLine": cfg_start, "endLine": cfg_end,
+                "code": "    def configure(self, value=None):\n        self.batch_limit = value or 10\n",
+            },
+            "scheduler.py:Scheduler.run_batch_worker": {
+                "name": "run_batch_worker", "className": "Scheduler",
+                "startLine": 2, "endLine": 2 + len(sched_code.split("\n")),
+                "code": sched_code,
+            },
+        }
+        constants = {"container.py": {"Container.MODE": {
+            "qualified_name": "Container.MODE", "class_name": "Container", "name": "MODE", "line": 2, "end_line": 2,
+        }}}
+        return _make_context(functions=functions, constants=constants, repo_path=tmp_path)
+
+    @pytest.mark.parametrize("order", ["large_candidate_mentioned_first", "small_consumer_mentioned_first"])
+    def test_same_class_member_survives_regardless_of_mention_order(self, tmp_path, monkeypatch, order):
+        from utilities.autopatcher import remediation_planner as rp
+        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 2000)
+        context = self._context(tmp_path)
+        mechanism = {
+            "large_candidate_mentioned_first": (
+                "run_batch_worker already performs the relevant check. "
+                "The fix also adjusts batch_limit."
+            ),
+            "small_consumer_mentioned_first": (
+                "The fix adjusts batch_limit. "
+                "run_batch_worker already performs the relevant check."
+            ),
+        }[order]
+        strategy = _make_strategy(
+            target_files=["container.py"], target_symbols=["Container"], extended_mechanism=mechanism,
+        )
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["scheduler.py"],
+        )
+
+        # The same-class consumer must always survive the shared budget --
+        # regardless of which candidate the incidental prose order caused
+        # category 3a to scan first.
+        assert "def configure(self, value=None):" in result.rendered
+
+    def test_generous_budget_keeps_both_regardless_of_order_non_interference(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 8000)
+        context = self._context(tmp_path)
+        for mechanism in (
+            "run_batch_worker already performs the relevant check. The fix also adjusts batch_limit.",
+            "The fix adjusts batch_limit. run_batch_worker already performs the relevant check.",
+        ):
+            strategy = _make_strategy(
+                target_files=["container.py"], target_symbols=["Container"], extended_mechanism=mechanism,
+            )
+            result = rp.build_final_target_slice(
+                strategy, str(tmp_path), context, planner_evidence_files=["scheduler.py"],
+            )
+            assert "def configure(self, value=None):" in result.rendered
+            assert "def run_batch_worker(self):" in result.rendered
+
+
+class TestFinalTargetSliceTargetOwnedClassMemberPriorityIndexResolvedClass:
+    """FIX GAP: `_resolve_symbol_details` has TWO independent ways a bare
+    class-shaped target can resolve -- RepositoryIndex.search_by_name
+    (when the upstream analyzer indexed the class itself, e.g. any real
+    parsed repository) and, only as a fallback when the index has no such
+    entry, `_deterministic_identifier_fallback` (a synthetic fixture with
+    no class-shaped index entry always takes this second path). Both
+    return a `_SymbolMatch`, but only the fallback path's `kind` happens
+    to be "constant" -- the index path always reports `kind="function"`
+    regardless of the matched entry's own `unitType` (e.g. "class").
+    `target_class_identities`'s bare-label branch was gated on
+    `match.kind == "constant"`, so a target resolved via the INDEX path --
+    the shape every real repository actually produces for a class name --
+    never reaches `_label_is_confirmed_class` at all, and the target-owned
+    Band-A invariant silently never applies to it. This class reproduces
+    that exact resolution shape (an index entry for the bare class name
+    itself, `unitType="class"`) to prove the gap, distinct from
+    TestFinalTargetSliceTargetOwnedClassMemberPriority above (whose fixture
+    has no such index entry, so it always takes the fallback path and
+    never exercised this gap)."""
+
+    def _context(self, tmp_path):
+        # Category 4 ("compact full target-symbol functions") admits a
+        # kind="function" target's OWN full source whenever it fits under
+        # _PER_TARGET_FULL_FUNCTION_CAP -- a FIXED constant derived from
+        # FINAL_TARGET_SLICE_MAX_CHARS's real default at import time,
+        # unaffected by this test's own monkeypatched budget. The class
+        # body must exceed that fixed cap (comfortably: 100 noise methods,
+        # ~4800 chars, well past the ~3333-char cap) so Category 4 leaves
+        # the bare target itself uncovered -- exactly like the sibling
+        # fixture above, whose kind="constant" fallback resolution only
+        # ever captures a small fixed window near the declaration line,
+        # never the whole class. Without this, the whole class would be
+        # admitted whole via Category 4, incidentally leaving enough
+        # leftover shared budget for both other candidates below to fit
+        # regardless of Band -- masking the exact race this test exists to
+        # reproduce.
+        lines = ["class Container:", "    MODE = \"default\"", ""]
+        for i in range(100):
+            lines += [f"    def noise_{i}(self):", f"        return {i}", ""]
+        cfg_start = len(lines) + 1
+        lines += ["    def configure(self, value=None):", "        self.batch_limit = value or 10"]
+        cfg_end = len(lines)
+        lines.append("")
+        class_source = "\n".join(lines) + "\n"
+        (tmp_path / "container.py").write_text(class_source, encoding="utf-8")
+
+        big_body = "\n".join(f"        step_{i} = {i}" for i in range(22))
+        sched_code = f"    def run_batch_worker(self):\n{big_body}\n        return 1\n"
+        (tmp_path / "scheduler.py").write_text(f"class Scheduler:\n{sched_code}", encoding="utf-8")
+
+        functions = {
+            # The class itself, indexed by its own bare name -- exactly how
+            # a real parsed repository indexes a class (see
+            # RepositoryIndex.search_by_name's own "unitType" field on a
+            # live parse: {"id": "...:Retry", "name": "Retry",
+            # "unitType": "class", "className": None, ...}). This single
+            # entry is what routes _resolve_symbol_details through
+            # `index.search_by_name` instead of the deterministic
+            # identifier fallback.
+            "container.py:Container": {
+                "name": "Container", "className": None, "unitType": "class",
+                "startLine": 1, "endLine": len(lines), "code": class_source,
+            },
+            "container.py:Container.configure": {
+                "name": "configure", "className": "Container", "startLine": cfg_start, "endLine": cfg_end,
+                "code": "    def configure(self, value=None):\n        self.batch_limit = value or 10\n",
+            },
+            "scheduler.py:Scheduler.run_batch_worker": {
+                "name": "run_batch_worker", "className": "Scheduler",
+                "startLine": 2, "endLine": 2 + len(sched_code.split("\n")),
+                "code": sched_code,
+            },
+        }
+        constants = {"container.py": {"Container.MODE": {
+            "qualified_name": "Container.MODE", "class_name": "Container", "name": "MODE", "line": 2, "end_line": 2,
+        }}}
+        return _make_context(functions=functions, constants=constants, repo_path=tmp_path)
+
+    def test_target_resolves_via_index_as_kind_function(self, tmp_path):
+        """Precondition check: confirms this fixture genuinely reproduces
+        the real-world resolution shape (kind="function" via the index
+        path), not merely asserting the bug through a side door."""
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        context = self._context(tmp_path)
+        match = _resolve_symbol_details("Container", tmp_path, context, verified_files=["container.py"])
+        assert match is not None
+        assert match.kind == "function"  # the actual real-world shape -- see class docstring
+
+    def test_same_class_member_survives_when_target_resolves_via_index(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 2000)
+        context = self._context(tmp_path)
+        mechanism = (
+            "run_batch_worker already performs the relevant check. "
+            "The fix also adjusts batch_limit."
+        )
+        strategy = _make_strategy(
+            target_files=["container.py"], target_symbols=["Container"], extended_mechanism=mechanism,
+        )
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["scheduler.py"],
+        )
+
+        # Same invariant as TestFinalTargetSliceTargetOwnedClassMemberPriority:
+        # the same-class consumer must survive the shared budget regardless
+        # of which candidate the incidental prose order scans first --
+        # this must hold whichever of the two independent resolution paths
+        # produced the target's _SymbolMatch.
+        #
+        # Asserted against the CHILD's own heading, not merely the text
+        # "def configure" -- the bare "Container" label is itself ALSO a
+        # category-3a candidate here (its own indexed `code` is the whole
+        # class body, a superset that textually contains `configure` too),
+        # so a substring-only assertion would pass even when the child
+        # candidate's OWN admission slot is lost to a different, unrelated
+        # candidate -- exactly the false-positive this exact heading check
+        # exists to rule out.
+        assert "`container.py:Container.configure`" in result.rendered
+
+
+class TestFinalTargetSliceTargetOwnedClassMemberPriorityNoQualifyingConstant:
+    """REMAINING GAP (distinct from, and NOT fixed by, the kind="function"
+    fix in TestFinalTargetSliceTargetOwnedClassMemberPriorityIndexResolvedClass
+    above): that fix made `target_class_identities` reach
+    `_label_is_confirmed_class` for an index-resolved bare class target,
+    but `_label_is_confirmed_class` itself confirms class identity ONLY by
+    finding an existing parsed CONSTANT whose own `class_name` field names
+    the target -- i.e. it still depends on the class happening to own at
+    least one class-level constant the analyzer separately recorded. A
+    class with NO class-level constants at all (a completely ordinary,
+    common shape -- most classes don't have one) is resolved via the
+    IDENTICAL index path (`unitType="class"`, a real func_id, kind=
+    "function") but currently has NO way to be confirmed as a class,
+    because there is no constant anywhere to consult. The analyzer's OWN
+    direct classification of the matched declaration (`unitType="class"`,
+    already returned by `RepositoryIndex.search_by_name` and already
+    reachable via the resolved match's own `func_id` through
+    `context.index.get_function`) is not consulted at all today. This
+    class isolates exactly that remaining gap: the fixture deliberately
+    passes `constants={}` so the existing constants-based confirmation
+    path cannot succeed, while everything else mirrors the sibling fixture
+    above (index-resolved bare class target, an ordinary non-`__init__`
+    same-class member relevant to a strategy term, and a larger unrelated-
+    class candidate competing for the same bounded budget)."""
+
+    def _context(self, tmp_path):
+        lines = ["class Coordinator:", ""]
+        for i in range(100):
+            lines += [f"    def noise_{i}(self):", f"        return {i}", ""]
+        dispatch_start = len(lines) + 1
+        lines += ["    def dispatch(self, value=None):", "        self.queue_depth = value or 5"]
+        dispatch_end = len(lines)
+        lines.append("")
+        class_source = "\n".join(lines) + "\n"
+        (tmp_path / "gateway.py").write_text(class_source, encoding="utf-8")
+
+        big_body = "\n".join(f"        step_{i} = {i}" for i in range(22))
+        worker_code = f"    def process_batch(self):\n{big_body}\n        return 1\n"
+        (tmp_path / "worker.py").write_text(f"class Worker:\n{worker_code}", encoding="utf-8")
+
+        functions = {
+            "gateway.py:Coordinator": {
+                "name": "Coordinator", "className": None, "unitType": "class",
+                "startLine": 1, "endLine": len(lines), "code": class_source,
+            },
+            "gateway.py:Coordinator.dispatch": {
+                "name": "dispatch", "className": "Coordinator", "startLine": dispatch_start, "endLine": dispatch_end,
+                "code": "    def dispatch(self, value=None):\n        self.queue_depth = value or 5\n",
+            },
+            "worker.py:Worker.process_batch": {
+                "name": "process_batch", "className": "Worker",
+                "startLine": 2, "endLine": 2 + len(worker_code.split("\n")),
+                "code": worker_code,
+            },
+        }
+        # Deliberately NO constants at all -- see class docstring: this is
+        # the one difference from the sibling fixture's `Container.MODE`,
+        # and it is what isolates this specific remaining gap.
+        return _make_context(functions=functions, constants={}, repo_path=tmp_path)
+
+    def test_target_resolves_via_index_with_no_qualifying_constant(self, tmp_path):
+        """Precondition check: confirms the fixture reproduces the real
+        resolution shape (index-resolved, kind="function", real func_id)
+        AND that the existing constants-based confirmation genuinely
+        cannot fire here (no constant anywhere names this class)."""
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details, _label_is_confirmed_class
+
+        context = self._context(tmp_path)
+        match = _resolve_symbol_details("Coordinator", tmp_path, context, verified_files=["gateway.py"])
+        assert match is not None
+        assert match.kind == "function"
+        assert match.func_id == "gateway.py:Coordinator"
+        assert _label_is_confirmed_class("Coordinator", context) is False
+
+    def test_same_class_member_currently_lost_with_no_qualifying_constant(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 500)
+        context = self._context(tmp_path)
+        mechanism = (
+            "process_batch already performs the relevant check. "
+            "The fix also adjusts queue_depth."
+        )
+        strategy = _make_strategy(
+            target_files=["gateway.py"], target_symbols=["Coordinator"], extended_mechanism=mechanism,
+        )
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"],
+        )
+
+        # The same-class, term-relevant consumer survives the shared
+        # budget exactly like the sibling fixture's `Container.configure`
+        # does: `_label_is_confirmed_class` now also reads the resolved
+        # match's own `func_id` record, whose `unitType == "class"` (the
+        # analyzer's own direct classification) independently confirms
+        # `Coordinator` as a real class even though no qualifying constant
+        # exists and no dotted target-symbol form was ever proposed.
+        assert "`gateway.py:Coordinator.dispatch`" in result.rendered
+
+    def test_ordinary_bare_function_does_not_gain_class_identity(self, tmp_path, monkeypatch):
+        """Control for the `unitType`-based signal: reuses this class's own
+        already-calibrated fixture verbatim (same file, same target, same
+        mechanism text, same competing candidate, same budget -- the exact
+        race already proven above to require Band-A to win) with exactly
+        ONE field changed: the resolved target's own index record reports
+        `unitType="function"` instead of `"class"` -- i.e. an ORDINARY
+        function, not a class, but otherwise indistinguishable (same bare
+        name shape, same real func_id, still no qualifying constant). This
+        must NOT be treated as a class merely because it resolved the same
+        way a class does: `_label_is_confirmed_class` must still return
+        False, and `dispatch` must gain no Band-A authority -- the same
+        race outcome as before this fix existed."""
+        from utilities.autopatcher import remediation_planner as rp
+
+        context = self._context(tmp_path)
+        # Only this one already-parsed structural fact changes.
+        context.index.functions["gateway.py:Coordinator"]["unitType"] = "function"
+
+        match = rp._resolve_symbol_details("Coordinator", tmp_path, context, verified_files=["gateway.py"])
+        assert match is not None
+        assert match.func_id == "gateway.py:Coordinator"
+        assert rp._label_is_confirmed_class("Coordinator", context, func_id=match.func_id) is False
+
+        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 500)
+        mechanism = (
+            "process_batch already performs the relevant check. "
+            "The fix also adjusts queue_depth."
+        )
+        strategy = _make_strategy(
+            target_files=["gateway.py"], target_symbols=["Coordinator"], extended_mechanism=mechanism,
+        )
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"],
+        )
+        # No class-identity boost: `dispatch` loses the race exactly as it
+        # did before this fix existed, since `Coordinator` is (correctly,
+        # here) not a class.
+        assert "`gateway.py:Coordinator.dispatch`" not in result.rendered
+
+
+class TestFinalTargetSliceEvidenceContinuityAfterRejectedQualifiedTarget:
+    """FIX: a Strategy-proposed QUALIFIED target_symbol (e.g.
+    "Container.runtime_limit") can fail normal target-symbol verification
+    -- correctly, since the member itself may not be a real, independently
+    resolvable declaration (see the forensic investigation this fix comes
+    from: a real member-shaped LLM proposal that named an instance
+    attribute, not any actual declaration). When that happens,
+    `target_symbols` loses the rejected entry entirely, and with it EVERY
+    trace of the class the model was pointing at -- so the SAME target-
+    owned class-member Band-A invariant this module already implements
+    for a successfully-verified target (see
+    TestFinalTargetSliceTargetOwnedClassMemberPriority and its siblings
+    above) silently never applies, even when the class-qualifier portion
+    of the rejected proposal ("Container") is itself a real, independently
+    verifiable class in the Strategy's own already-verified target file.
+
+    This class proves: (1) the rejected member itself stays rejected and
+    unresolvable no matter what (it must never become a patch target),
+    (2) its class-qualifier, independently re-verified through the exact
+    same `_resolve_symbol_details`/`_label_is_confirmed_class` machinery
+    used everywhere else, MAY still earn the same-class Band-A priority
+    for an ordinary, unrelated same-class member (deliberately not
+    `__init__`), and (3) a qualifier that does NOT independently verify as
+    a real class fails closed -- exactly the sibling behavior
+    TestFinalTargetSliceTargetOwnedClassMemberPriorityNoQualifyingConstant
+    already proves for the "class exists but no constant confirms it"
+    case, mirrored here for the "no class-qualifier survived verification
+    at all" case."""
+
+    def _context(self, tmp_path):
+        (tmp_path / "container.py").write_text(
+            'class Container:\n'
+            '    MODE = "default"\n'
+            '\n'
+            '    def configure(self, value=None):\n'
+            '        self.batch_limit = value or 10\n',
+            encoding="utf-8",
+        )
+        big_body = "\n".join(f"        step_{i} = {i}" for i in range(22))
+        worker_code = f"    def process_batch(self):\n{big_body}\n        return 1\n"
+        (tmp_path / "worker.py").write_text(f"class Worker:\n{worker_code}", encoding="utf-8")
+
+        functions = {
+            "container.py:Container.configure": {
+                "name": "configure", "className": "Container", "startLine": 4, "endLine": 5,
+                "code": "    def configure(self, value=None):\n        self.batch_limit = value or 10\n",
+            },
+            "worker.py:Worker.process_batch": {
+                "name": "process_batch", "className": "Worker",
+                "startLine": 2, "endLine": 2 + len(worker_code.split("\n")),
+                "code": worker_code,
+            },
+        }
+        # Container.MODE is what makes "Container" independently
+        # verifiable as a real class via the existing constants-based
+        # `_label_is_confirmed_class` path -- exactly like the sibling
+        # fixtures above; which existing path confirms the class is not
+        # what this test is about.
+        constants = {"container.py": {"Container.MODE": {
+            "qualified_name": "Container.MODE", "class_name": "Container", "name": "MODE", "line": 2, "end_line": 2,
+        }}}
+        return _make_context(functions=functions, constants=constants, repo_path=tmp_path)
+
+    def _strategy(self, rejected_target_symbols):
+        mechanism = (
+            "process_batch already performs the relevant check. "
+            "The fix also adjusts batch_limit."
+        )
+        # target_symbols=[] mirrors the real shape this fix targets: the
+        # proposed qualified member was rejected by target-symbol
+        # verification and therefore never appears in target_symbols at
+        # all -- only target_files survives, plus (additively)
+        # rejected_target_symbols recording what was proposed and dropped.
+        return _make_strategy(
+            target_files=["container.py"], target_symbols=[], extended_mechanism=mechanism,
+            rejected_target_symbols=rejected_target_symbols,
+        )
+
+    def test_rejected_member_itself_never_becomes_resolvable(self, tmp_path):
+        """Safety property A: the rejected member stays rejected --
+        independent of this fix, which never re-resolves the member
+        itself, only extracts a qualifier substring from its own already-
+        rejected proposal string."""
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        context = self._context(tmp_path)
+        match = _resolve_symbol_details(
+            "Container.runtime_limit", tmp_path, context, verified_files=["container.py"],
+        )
+        assert match is None
+
+    def test_qualifier_alone_independently_verifies_as_a_real_class(self, tmp_path):
+        """Precondition: confirms the fixture's qualifier is genuinely,
+        independently verifiable -- not merely assumed true."""
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details, _label_is_confirmed_class
+
+        context = self._context(tmp_path)
+        match = _resolve_symbol_details("Container", tmp_path, context, verified_files=["container.py"])
+        assert match is not None
+        assert _label_is_confirmed_class(match.label, context) is True
+
+    def test_same_class_member_gains_band_a_after_rejected_qualifier_reverification(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 500)
+        context = self._context(tmp_path)
+        strategy = self._strategy(rejected_target_symbols=["Container.runtime_limit"])
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"],
+        )
+
+        # The same-class, term-relevant consumer must survive the tight
+        # shared budget once "Container" -- independently re-verified from
+        # the rejected proposal's own qualifier, never trusted as-is --
+        # earns Band-A priority, exactly like a successfully-verified
+        # target's own class members already do.
+        assert "`container.py:Container.configure`" in result.rendered
+        # The rejected member must never appear as an admitted target or
+        # consumer heading -- it was never resolvable and this fix must
+        # not change that.
+        assert "runtime_limit" not in result.rendered
+
+    def test_unverifiable_qualifier_fails_closed(self, tmp_path, monkeypatch):
+        """Safety property C: a rejected proposal whose qualifier does NOT
+        independently verify as a real class (here: not a real symbol at
+        all in the verified target file) must grant no Band-A authority --
+        same tight budget, same competing candidate, no crash, no
+        admission."""
+        from utilities.autopatcher import remediation_planner as rp
+        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 500)
+        context = self._context(tmp_path)
+        strategy = self._strategy(rejected_target_symbols=["Bogus.runtime_limit"])
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"],
+        )
+
+        assert "`container.py:Container.configure`" not in result.rendered
+        assert "`worker.py:Worker.process_batch`" in result.rendered
+
+    def test_no_rejected_symbols_behaves_exactly_as_before(self, tmp_path, monkeypatch):
+        """Safety property F: when there is nothing rejected at all (the
+        common case), behavior is byte-for-byte unchanged from before this
+        fix -- same tight-budget race, same loser."""
+        from utilities.autopatcher import remediation_planner as rp
+        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 500)
+        context = self._context(tmp_path)
+        strategy = self._strategy(rejected_target_symbols=[])
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"],
+        )
+
+        assert "`container.py:Container.configure`" not in result.rendered
+        assert "`worker.py:Worker.process_batch`" in result.rendered
+
+
 class TestCategoryPriorityAndOrdering:
     def _context(self, tmp_path):
         (tmp_path / "policy.py").write_text(
@@ -5108,12 +6124,13 @@ class TestMinimistNestedFunctionRegression:
         from utilities.autopatcher.remediation_planner import _verify_strategy_targets
         context = self._context(tmp_path)
 
-        kept_files, kept_symbols, warnings = _verify_strategy_targets(
+        kept_files, kept_symbols, warnings, rejected_symbols = _verify_strategy_targets(
             ["index.js"], ["setKey"], tmp_path, context,
         )
         assert kept_files == ["index.js"]
         assert kept_symbols == ["setKey"]
         assert warnings == []  # no "unverified target_symbol removed: setKey"
+        assert rejected_symbols == []
 
     def test_final_target_slice_covers_setkey_with_bounded_window_not_full_file(self, tmp_path):
         context = self._context(tmp_path)
@@ -5160,7 +6177,7 @@ class TestMinimistNestedFunctionRegression:
             build_intended_edits, check_edit_readiness,
         )
 
-        kept_files, kept_symbols, warnings = _verify_strategy_targets(
+        kept_files, kept_symbols, warnings, rejected_symbols = _verify_strategy_targets(
             ["index.js"], ["setKey"], tmp_path, context,
         )
         strategy = _make_strategy(target_files=kept_files, target_symbols=kept_symbols)
@@ -5203,6 +6220,8 @@ class TestPipelineContextOrderingWithSlice:
                     "remediation_mechanism": "extend policy", "target_files": ["policy.py"],
                     "target_symbols": [], "security_invariant": "stub", "required_edits": [],
                     "approaches_to_avoid": [], "explicit_unknowns": [],
+                    "additional_evidence_required": False,
+                    "evidence_requests": [],
                 })
             if stage == "remediation_strategy":
                 return json.dumps({
@@ -5259,6 +6278,8 @@ class TestPipelineContextOrderingWithSlice:
                     "remediation_mechanism": "extend policy", "target_files": ["policy.py"],
                     "target_symbols": [], "security_invariant": "stub", "required_edits": [],
                     "approaches_to_avoid": [], "explicit_unknowns": [],
+                    "additional_evidence_required": False,
+                    "evidence_requests": [],
                 })
             if stage == "remediation_strategy":
                 return json.dumps({
@@ -5315,6 +6336,8 @@ class TestPipelineContextOrderingWithSlice:
                     "remediation_mechanism": "extend policy", "target_files": ["policy.py"],
                     "target_symbols": [], "security_invariant": "stub", "required_edits": [],
                     "approaches_to_avoid": [], "explicit_unknowns": [],
+                    "additional_evidence_required": False,
+                    "evidence_requests": [],
                 })
             if stage == "remediation_strategy":
                 return json.dumps({
@@ -6321,6 +7344,8 @@ class TestEditReadinessGatesPatchGeneration:
                     "remediation_mechanism": "extend policy", "target_files": ["policy.py"],
                     "target_symbols": [], "security_invariant": "stub", "required_edits": [],
                     "approaches_to_avoid": [], "explicit_unknowns": [],
+                    "additional_evidence_required": False,
+                    "evidence_requests": [],
                 })
             if stage == "remediation_strategy":
                 return json.dumps({
@@ -8172,6 +9197,8 @@ class TestPipelineBoundedTargetFileFallback:
                     "remediation_mechanism": "restrict allowed headers", "target_files": ["config.py"],
                     "target_symbols": [], "security_invariant": "stub", "required_edits": [],
                     "approaches_to_avoid": [], "explicit_unknowns": [],
+                    "additional_evidence_required": False,
+                    "evidence_requests": [],
                 })
             if stage == "remediation_strategy":
                 return json.dumps({
@@ -8539,3 +9566,749 @@ class TestCategory2HeadingDifferentiation:
         )
         assert "Target definition: `other.py:Other.UNRELATED_NOTE`" not in result.rendered
         assert "policy.py:Policy.ALLOWED_VALUES" in result.covered_target_symbols
+
+
+# ---------------------------------------------------------------------------
+# Method-call one-hop expansion: a dot-qualified method call co-located, on
+# the same source line, with an already strategy-connected identifier
+# inside an ALREADY-ADMITTED evidence block (or an already-computed Planner
+# excerpt block) may receive one bounded lookup opportunity through the
+# existing `_lookup_identifier_definition` resolution machinery. Mirrors
+# the existing ALL-CAPS constant one-hop
+# (_extract_source_constant_refs/_disambiguate_constant_candidates) in
+# spirit, but for a method-call shape instead of a constant-shape -- closes
+# a real observed gap: the literal text `conn.is_same_host(redirect_
+# location)` sits inside an already-admitted consumer window in every run,
+# but was only ever searched for as a term when Strategy's own free text
+# happened to reproduce it verbatim -- pure LLM-wording variance.
+#
+# Every test below exercises the real, unmocked production path
+# (`build_final_target_slice` / `_lookup_identifier_definition`) -- no
+# test-side reimplementation of the extraction rule.
+# ---------------------------------------------------------------------------
+
+
+class TestIsSameHostStyleOneHopMethodCallExpansion:
+    """Method-call one-hop expansion, per the forensic investigation's
+    PART 1-4/6. Generic fixture, no urllib3/CVE names."""
+
+    def _coordinator_context(self, tmp_path):
+        source = (
+            "    def process(self):\n"
+            "        if self.enabled_flag and not helper.is_ready(self.context):\n"
+            "            return\n"
+            "        helper.log_event()\n"
+        )
+        (tmp_path / "coordinator.py").write_text("class Coordinator:\n" + source, encoding="utf-8")
+        (tmp_path / "helper_module.py").write_text(
+            "class Helper:\n"
+            "    def is_ready(self, context):\n"
+            "        return context is not None\n"
+            "\n"
+            "    def log_event(self):\n"
+            "        pass\n",
+            encoding="utf-8",
+        )
+        functions = {
+            "coordinator.py:Coordinator.process": {
+                "name": "process", "className": "Coordinator", "startLine": 2, "endLine": 5,
+                "code": source,
+            },
+            "helper_module.py:Helper.is_ready": {
+                "name": "is_ready", "className": "Helper", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return context is not None\n",
+            },
+            "helper_module.py:Helper.log_event": {
+                "name": "log_event", "className": "Helper", "startLine": 5, "endLine": 6,
+                "code": "    def log_event(self):\n        pass\n",
+            },
+        }
+        return _make_context(functions=functions, constants={}, repo_path=tmp_path), source
+
+    # --- PART 1: same-line connected call gains one-hop supporting
+    # evidence (real build_final_target_slice, unmocked) ---
+    def test_part1_same_line_connected_call_becomes_supporting_evidence(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context, _source = self._coordinator_context(tmp_path)
+        strategy = _make_strategy(
+            target_files=["coordinator.py"], target_symbols=["Coordinator"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper_module.py"],
+        )
+        # Precondition: the consumer window IS admitted, via the existing,
+        # unrelated "enabled_flag" term-discovery path -- proving this is a
+        # genuine evidence-continuity fix, not a fixture that fails to
+        # reach the admitted-evidence stage at all.
+        assert "`coordinator.py:Coordinator.process`" in result.rendered
+        # Helper.is_ready's own definition is represented in the bounded
+        # supporting evidence, since its call is co-located, on the same
+        # source line, with the already strategy-connected `enabled_flag`.
+        assert "`helper_module.py:Helper.is_ready`" in result.rendered
+        # Supporting evidence only -- never promoted to an edit target.
+        assert (
+            "Related definition (context only, not an approved edit target): "
+            "`helper_module.py:Helper.is_ready`" in result.rendered
+        )
+        assert "Target definition: `helper_module.py:Helper.is_ready`" not in result.rendered
+
+    # --- PART 2: different-line negative control (real production path) ---
+    def test_part2_different_line_call_not_admitted_by_rule(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context, _source = self._coordinator_context(tmp_path)
+        strategy = _make_strategy(
+            target_files=["coordinator.py"], target_symbols=["Coordinator"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper_module.py"],
+        )
+        assert "`helper_module.py:Helper.is_ready`" in result.rendered      # same line -- discovered
+        assert "`helper_module.py:Helper.log_event`" not in result.rendered  # different line -- must NOT be
+        # Confirms this is not "expand every callee in the function":
+        # log_event is a real, resolvable callee of the SAME admitted
+        # function and still correctly gains no opportunity.
+
+    # --- PART 3: same-line stress control (fan-out measurement, real
+    # production path) ---
+    def test_part3_same_line_stress_measures_bounded_fanout(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = (
+            "    def process(self):\n"
+            "        if self.enabled_flag and a.ready(x) and b.allowed(y) and c.check(z):\n"
+            "            return\n"
+        )
+        (tmp_path / "gate.py").write_text("class Gate:\n" + source, encoding="utf-8")
+        (tmp_path / "helpers3.py").write_text(
+            "class A:\n    def ready(self, x):\n        return True\n\n"
+            "class B:\n    def allowed(self, y):\n        return True\n\n"
+            "class C:\n    def check(self, z):\n        return True\n",
+            encoding="utf-8",
+        )
+        functions = {
+            "gate.py:Gate.process": {
+                "name": "process", "className": "Gate", "startLine": 2, "endLine": 4, "code": source,
+            },
+            "helpers3.py:A.ready": {"name": "ready", "className": "A", "startLine": 2, "endLine": 3, "code": "    def ready(self, x):\n        return True\n"},
+            "helpers3.py:B.allowed": {"name": "allowed", "className": "B", "startLine": 5, "endLine": 6, "code": "    def allowed(self, y):\n        return True\n"},
+            "helpers3.py:C.check": {"name": "check", "className": "C", "startLine": 8, "endLine": 9, "code": "    def check(self, z):\n        return True\n"},
+        }
+        context = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["gate.py"], target_symbols=["Gate"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helpers3.py"],
+        )
+
+        # Measured, not assumed: a single densely-packed line DOES surface
+        # every co-located call -- this is the real, honest fan-out shape.
+        # No new arbitrary numeric cap is needed: every discovered
+        # candidate still must pass through the EXISTING shared
+        # Final-Target-Slice budget (whole-block-or-omit, a pure
+        # running-total size check with no count-based limit anywhere in
+        # its implementation) before any of its source is actually
+        # rendered -- exactly as already proven for the constant one-hop's
+        # own multi-candidate case (see TestBudgetBoundedness).
+        for label in ("A.ready", "B.allowed", "C.check"):
+            marker = f"`helpers3.py:{label}`"
+            assert marker in result.rendered
+            assert result.rendered.count(marker) == 1  # deduplicated, never rendered twice
+
+    # --- PART 4: large-source control (no candidate explosion, real
+    # production path) ---
+    def test_part4_large_source_only_co_located_line_surfaces(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        lines = ["    def process(self):"]
+        for i in range(60):
+            lines.append(f"        other.unrelated_call_{i}(step_{i})")
+        lines.insert(30, "        if self.enabled_flag and not helper.is_ready(self.context):")
+        # A call that IS equally resolvable (same preferred_files scope)
+        # yet sits on an unrelated line -- proves the boundary holds even
+        # when a large admitted source makes an unrelated resolution
+        # technically available.
+        lines.append("        other.definitely_resolvable_call(9)")
+        lines.append("        return")
+        source = "\n".join(lines) + "\n"
+
+        (tmp_path / "big.py").write_text("class Big:\n" + source, encoding="utf-8")
+        (tmp_path / "helper_module4.py").write_text(
+            "class Helper:\n    def is_ready(self, context):\n        return True\n", encoding="utf-8",
+        )
+        (tmp_path / "other_calls4.py").write_text(
+            "class Other:\n    def definitely_resolvable_call(self, x):\n        return x\n", encoding="utf-8",
+        )
+        functions = {
+            "big.py:Big.process": {
+                "name": "process", "className": "Big", "startLine": 2, "endLine": 2 + len(lines), "code": source,
+            },
+            "helper_module4.py:Helper.is_ready": {
+                "name": "is_ready", "className": "Helper", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return True\n",
+            },
+            "other_calls4.py:Other.definitely_resolvable_call": {
+                "name": "definitely_resolvable_call", "className": "Other", "startLine": 2, "endLine": 3,
+                "code": "    def definitely_resolvable_call(self, x):\n        return x\n",
+            },
+        }
+        context = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["big.py"], target_symbols=["Big"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context,
+            planner_evidence_files=["helper_module4.py", "other_calls4.py"],
+        )
+
+        # (A) scans the whole source but emits only the structurally
+        # co-located candidate -- not (B) unrelated-line leakage, not (C)
+        # candidate explosion across 60 unrelated calls.
+        assert "`helper_module4.py:Helper.is_ready`" in result.rendered
+        assert "`other_calls4.py:Other.definitely_resolvable_call`" not in result.rendered
+
+    # --- PART 6: existing resolution machinery -- ambiguity/scope proof ---
+    def test_part6_resolution_stays_within_preferred_files_and_matches_existing_ambiguity_behavior(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _lookup_identifier_definition
+
+        (tmp_path / "helper_module6.py").write_text(
+            "class Helper:\n    def is_ready(self, context):\n        return True\n", encoding="utf-8")
+        (tmp_path / "other_module6.py").write_text(
+            "class Other:\n    def is_ready(self, context):\n        return False\n", encoding="utf-8")
+        (tmp_path / "unrelated6.py").write_text(
+            "class Unrelated:\n    def is_ready(self, context):\n        return None\n", encoding="utf-8")
+
+        # A definition that exists in the repository but was never passed
+        # in `preferred_files` must never be reachable -- proving no
+        # repo-wide fallback exists in the resolver this rule reuses.
+        functions = {
+            "helper_module6.py:Helper.is_ready": {
+                "name": "is_ready", "className": "Helper", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return True\n",
+            },
+            "unrelated6.py:Unrelated.is_ready": {
+                "name": "is_ready", "className": "Unrelated", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return None\n",
+            },
+        }
+        context = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        match = _lookup_identifier_definition("is_ready", ["helper_module6.py"], context)
+        assert match is not None
+        assert match.file == "helper_module6.py"  # never unrelated6.py, which was never preferred
+
+        # Ambiguous case (two same-named methods, BOTH in preferred_files):
+        # `_lookup_identifier_definition` is documented to accept the same
+        # residual ambiguity `search_definitions()` itself already has for
+        # a bare, class-unqualified term (see its own docstring) -- this
+        # proposed rule inherits that EXISTING, already-accepted
+        # deterministic behavior unchanged; it introduces no new, worse
+        # ambiguity risk of its own.
+        functions_ambiguous = {
+            "helper_module6.py:Helper.is_ready": {
+                "name": "is_ready", "className": "Helper", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return True\n",
+            },
+            "other_module6.py:Other.is_ready": {
+                "name": "is_ready", "className": "Other", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return False\n",
+            },
+        }
+        context2 = _make_context(functions=functions_ambiguous, constants={}, repo_path=tmp_path)
+        match2 = _lookup_identifier_definition("is_ready", ["helper_module6.py", "other_module6.py"], context2)
+        assert match2 is not None
+        assert match2.file in ("helper_module6.py", "other_module6.py")  # bounded; never a third file
+
+
+# ---------------------------------------------------------------------------
+# One-hop, repository-wide unique-match fallback (scopefix-v1 forensic
+# finding, Shape A): a directly-called predicate/helper's own definition
+# should not depend on whether an earlier, low-evidence Planner stage
+# happened to already guess its file into preferred_files. Generic fixture,
+# no urllib3/CVE names. Behavior-level proof (real build_final_target_slice)
+# plus direct unit tests of the new fallback function's own uniqueness gate.
+# ---------------------------------------------------------------------------
+
+class TestOneHopRepoWideUniqueFallback:
+    def _predicate_context(self, tmp_path, *, second_definition=False, ambiguous_name=None):
+        """A consumer file (in preferred_files) whose already-admitted
+        source directly calls `conn.is_ready(...)` -- a predicate defined
+        in a SEPARATE file that is never passed as planner_evidence_files
+        or a target file, mirroring is_same_host living in connectionpool.py
+        while PoolManager.urlopen (the consumer) lives in poolmanager.py."""
+        source = (
+            "    def process(self):\n"
+            "        if self.enabled_flag and not conn.is_ready(self.context):\n"
+            "            return\n"
+        )
+        (tmp_path / "consumer.py").write_text("class Consumer:\n" + source, encoding="utf-8")
+        (tmp_path / "predicate_module.py").write_text(
+            "class Conn:\n    def is_ready(self, context):\n        return context is not None\n",
+            encoding="utf-8",
+        )
+        functions = {
+            "consumer.py:Consumer.process": {
+                "name": "process", "className": "Consumer", "startLine": 2, "endLine": 4, "code": source,
+            },
+            "predicate_module.py:Conn.is_ready": {
+                "name": "is_ready", "className": "Conn", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return context is not None\n",
+            },
+        }
+        if second_definition:
+            (tmp_path / "other_predicate_module.py").write_text(
+                "class OtherConn:\n    def is_ready(self, context):\n        return False\n",
+                encoding="utf-8",
+            )
+            functions["other_predicate_module.py:OtherConn.is_ready"] = {
+                "name": "is_ready", "className": "OtherConn", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return False\n",
+            }
+        return _make_context(functions=functions, constants={}, repo_path=tmp_path)
+
+    def _strategy(self):
+        return _make_strategy(
+            target_files=["consumer.py"], target_symbols=["Consumer"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+
+    # --- 1. Existing preferred-file resolution unchanged ---
+    def test_1_helper_already_in_preferred_files_resolves_exactly_as_before(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context = self._predicate_context(tmp_path)
+        result = build_final_target_slice(
+            self._strategy(), str(tmp_path), context,
+            planner_evidence_files=["predicate_module.py"],  # already preferred -- no fallback needed
+        )
+        assert "`predicate_module.py:Conn.is_ready`" in result.rendered
+
+    # --- 2. Unique definition outside preferred_files ---
+    def test_2_unique_definition_outside_preferred_files_is_included(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context = self._predicate_context(tmp_path)
+        result = build_final_target_slice(
+            self._strategy(), str(tmp_path), context,
+            planner_evidence_files=[],  # predicate_module.py is NOT preferred at all
+        )
+        assert "`predicate_module.py:Conn.is_ready`" in result.rendered
+        # No unrelated source added.
+        assert "other_predicate_module" not in result.rendered
+
+    def test_2b_helper_file_never_promoted_into_preferred_files(self, tmp_path):
+        """The resolved helper's file must confer no broader search
+        opportunity to any OTHER lookup in the same run -- proven by a
+        second, unrelated identifier that exists ONLY in the helper's file
+        and is never itself referenced by any already-selected source."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context = self._predicate_context(tmp_path)
+        # Add a second, unrelated symbol to predicate_module.py that is
+        # never called from consumer.py at all -- if the helper's file were
+        # promoted into preferred_files, later strategy-term/usage lookups
+        # could start finding it; it must not appear at all.
+        (tmp_path / "predicate_module.py").write_text(
+            "class Conn:\n"
+            "    def is_ready(self, context):\n"
+            "        return context is not None\n"
+            "\n"
+            "    def unrelated_sibling(self):\n"
+            "        pass\n",
+            encoding="utf-8",
+        )
+        functions = {
+            "consumer.py:Consumer.process": {
+                "name": "process", "className": "Consumer", "startLine": 2, "endLine": 4,
+                "code": (
+                    "    def process(self):\n"
+                    "        if self.enabled_flag and not conn.is_ready(self.context):\n"
+                    "            return\n"
+                ),
+            },
+            "predicate_module.py:Conn.is_ready": {
+                "name": "is_ready", "className": "Conn", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return context is not None\n",
+            },
+            "predicate_module.py:Conn.unrelated_sibling": {
+                "name": "unrelated_sibling", "className": "Conn", "startLine": 5, "endLine": 6,
+                "code": "    def unrelated_sibling(self):\n        pass\n",
+            },
+        }
+        context2 = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        result = build_final_target_slice(
+            self._strategy(), str(tmp_path), context2, planner_evidence_files=[],
+        )
+        assert "`predicate_module.py:Conn.is_ready`" in result.rendered
+        assert "unrelated_sibling" not in result.rendered
+
+    # --- 3. Zero matches ---
+    def test_3_zero_matches_adds_no_evidence_and_does_not_raise(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = (
+            "    def process(self):\n"
+            "        if self.enabled_flag and not conn.nonexistent_predicate(self.context):\n"
+            "            return\n"
+        )
+        (tmp_path / "consumer3.py").write_text("class Consumer:\n" + source, encoding="utf-8")
+        functions = {
+            "consumer3.py:Consumer.process": {
+                "name": "process", "className": "Consumer", "startLine": 2, "endLine": 4, "code": source,
+            },
+        }
+        context = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["consumer3.py"], target_symbols=["Consumer"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=[])
+        # No SEPARATE definition block was added for the unresolvable call
+        # target -- the raw substring legitimately appears only inside
+        # Consumer's own already-included source (the class-level target
+        # definition, and/or its own discovered-usage window), never as
+        # its own "Related definition" one-hop block.
+        assert "Related definition" not in result.rendered
+        assert "`consumer3.py:Consumer`" in result.rendered  # existing evidence unaffected
+
+    # --- 4. Multiple repository-wide matches -- fail closed ---
+    def test_4_ambiguous_repo_wide_matches_selects_nothing(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context = self._predicate_context(tmp_path, second_definition=True)
+        result = build_final_target_slice(
+            self._strategy(), str(tmp_path), context, planner_evidence_files=[],
+        )
+        assert "predicate_module.py:Conn.is_ready" not in result.rendered
+        assert "other_predicate_module.py:OtherConn.is_ready" not in result.rendered
+
+    def test_4b_unit_ambiguous_returns_none_directly(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import (
+            _lookup_identifier_definition_or_unique_repo_match,
+        )
+
+        context = self._predicate_context(tmp_path, second_definition=True)
+        match = _lookup_identifier_definition_or_unique_repo_match("is_ready", [], context)
+        assert match is None
+
+    def test_unit_zero_matches_returns_none(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import (
+            _lookup_identifier_definition_or_unique_repo_match,
+        )
+
+        context = self._predicate_context(tmp_path)
+        match = _lookup_identifier_definition_or_unique_repo_match("totally_unknown_name", [], context)
+        assert match is None
+
+    def test_unit_unique_match_outside_preferred_files_resolves(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import (
+            _lookup_identifier_definition_or_unique_repo_match,
+        )
+
+        context = self._predicate_context(tmp_path)
+        match = _lookup_identifier_definition_or_unique_repo_match("is_ready", [], context)
+        assert match is not None
+        assert match.file == "predicate_module.py"
+        assert match.label == "is_ready"
+
+    def test_unit_prefers_preferred_files_result_without_needing_repo_scan(self, tmp_path):
+        """When the normal, unchanged lookup already resolves, the result
+        must be identical to calling it directly -- the fallback path is
+        never consulted."""
+        from utilities.autopatcher.remediation_planner import (
+            _lookup_identifier_definition, _lookup_identifier_definition_or_unique_repo_match,
+        )
+
+        context = self._predicate_context(tmp_path)
+        direct = _lookup_identifier_definition("is_ready", ["predicate_module.py"], context)
+        widened = _lookup_identifier_definition_or_unique_repo_match(
+            "is_ready", ["predicate_module.py"], context,
+        )
+        assert widened == direct
+
+    # --- 5. No recursive expansion ---
+    def test_5_newly_acquired_helper_own_call_is_not_automatically_acquired(self, tmp_path):
+        """The resolved helper (`is_ready`) itself calls a second,
+        uniquely-defined helper (`inner.confirm()`) on its own source line
+        -- that second helper must NOT be automatically acquired: this
+        one-hop fallback is not itself re-scanned for further one-hop
+        opportunities."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = (
+            "    def process(self):\n"
+            "        if self.enabled_flag and not conn.is_ready(self.context):\n"
+            "            return\n"
+        )
+        (tmp_path / "consumer5.py").write_text("class Consumer:\n" + source, encoding="utf-8")
+        (tmp_path / "predicate_module5.py").write_text(
+            "class Conn:\n"
+            "    def is_ready(self, context):\n"
+            "        return inner.confirm(context)\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "inner_module5.py").write_text(
+            "class Inner:\n    def confirm(self, context):\n        return True\n", encoding="utf-8",
+        )
+        functions = {
+            "consumer5.py:Consumer.process": {
+                "name": "process", "className": "Consumer", "startLine": 2, "endLine": 4, "code": source,
+            },
+            "predicate_module5.py:Conn.is_ready": {
+                "name": "is_ready", "className": "Conn", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return inner.confirm(context)\n",
+            },
+            "inner_module5.py:Inner.confirm": {
+                "name": "confirm", "className": "Inner", "startLine": 2, "endLine": 3,
+                "code": "    def confirm(self, context):\n        return True\n",
+            },
+        }
+        context = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["consumer5.py"], target_symbols=["Consumer"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=[])
+        assert "`predicate_module5.py:Conn.is_ready`" in result.rendered
+        # "confirm" legitimately appears once, inside is_ready's OWN
+        # rendered body (`return inner.confirm(context)`) -- but
+        # Inner.confirm must never gain its OWN, separate definition block.
+        assert "inner_module5.py:Inner.confirm" not in result.rendered
+        assert result.rendered.count("confirm") == 1
+
+    # --- 6. Call-site isolation ---
+    def test_6_strategy_term_lookup_call_site_remains_preferred_files_only(self, tmp_path):
+        """The Strategy-term usage/definition lookup (a DIFFERENT call site
+        of `_lookup_identifier_definition`, used for strategy-derived
+        terms named only in Strategy's own mechanism prose, never for
+        one-hop dot-calls) must still find nothing for a symbol outside
+        preferred_files -- the new widened fallback is never consulted
+        there. Uses a DIFFERENT bare name than the one-hop fixtures above,
+        deliberately never referenced on any already-admitted source line,
+        so this isolates the strategy-term path from the one-hop path --
+        a term that is BOTH a strategy term AND a same-line dot-call target
+        would exercise one-hop too, which is not what this test is for."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = (
+            "    def process(self):\n"
+            "        if self.enabled_flag:\n"
+            "            return\n"
+        )
+        (tmp_path / "consumer6.py").write_text("class Consumer:\n" + source, encoding="utf-8")
+        (tmp_path / "predicate_module6.py").write_text(
+            "class Conn:\n    def other_gate(self, context):\n        return True\n",
+            encoding="utf-8",
+        )
+        functions = {
+            "consumer6.py:Consumer.process": {
+                "name": "process", "className": "Consumer", "startLine": 2, "endLine": 4, "code": source,
+            },
+            "predicate_module6.py:Conn.other_gate": {
+                "name": "other_gate", "className": "Conn", "startLine": 2, "endLine": 3,
+                "code": "    def other_gate(self, context):\n        return True\n",
+            },
+        }
+        context = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        # Names "other_gate" in mechanism prose ONLY -- never on any
+        # already-admitted source line -- so only the strategy-term lookup
+        # path (never the one-hop dot-call path) could ever look it up.
+        strategy = _make_strategy(
+            target_files=["consumer6.py"], target_symbols=["Consumer"],
+            extended_mechanism="The fix relies on other_gate to gate the change.",
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=[],
+        )
+        assert "predicate_module6.py:Conn.other_gate" not in result.rendered
+
+    # --- 7. Budget behavior ---
+    def test_7_helper_omitted_whole_block_when_budget_exhausted(self, tmp_path):
+        """A unique, resolvable helper outside preferred_files that cannot
+        fit the remaining slice budget must be omitted entirely -- never
+        truncated -- and must not cause the run to exceed budget."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context = self._predicate_context(tmp_path)
+        tiny_budget = 10  # far smaller than even the target definition alone
+        result = build_final_target_slice(
+            self._strategy(), str(tmp_path), context,
+            planner_evidence_files=[], max_chars=tiny_budget,
+        )
+        assert "predicate_module.py:Conn.is_ready" not in result.rendered
+        assert len(result.rendered) <= tiny_budget or result.rendered == ""
+
+
+# ---------------------------------------------------------------------------
+# Class-level same-file assignment evidence: a verified target's own
+# deterministically established owning class can have a DIFFERENT member
+# reassigned at module scope, far from the class body, in the SAME file --
+# e.g. a ClassVar declaration (no value) whose real runtime construction
+# lives hundreds of lines later (`Retry.DEFAULT = Retry(3)`, discovered even
+# though the verified target is the unrelated `Retry.DEFAULT_REMOVE_
+# HEADERS_ON_REDIRECT` constant). Generic fixture, no urllib3/CVE names.
+# ---------------------------------------------------------------------------
+
+class TestClassLevelSameFileAssignmentEvidence:
+    def _widget_source(self, extra_class_body="", tail_statement="Widget.DEFAULT = Widget(3)"):
+        lines = [
+            "class Widget:",
+            '    POLICY = "value"',
+            '    DEFAULT: "Widget"',
+            "",
+            "    def __init__(self, n):",
+            "        self.n = n",
+            "",
+        ]
+        if extra_class_body:
+            lines.append(extra_class_body)
+        # Unrelated padding, far exceeding _DEFINITION_CONTEXT_LINES (3), so
+        # POLICY's own padded window cannot reach the tail statement below.
+        for i in range(40):
+            lines.append(f"def unrelated_helper_{i}():")
+            lines.append(f"    return {i}")
+            lines.append("")
+        lines.append(tail_statement)
+        return "\n".join(lines) + "\n"
+
+    def _context_and_strategy(self, tmp_path, source, constants=None, functions=None):
+        (tmp_path / "widget.py").write_text(source, encoding="utf-8")
+        constants = constants or {
+            "widget.py": {
+                "Widget.POLICY": {
+                    "qualified_name": "Widget.POLICY", "class_name": "Widget",
+                    "name": "POLICY", "line": 2, "end_line": 2,
+                },
+            },
+        }
+        context = _make_context(functions=functions or {}, constants=constants, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["widget.py"], target_symbols=["Widget.POLICY"],
+            extended_mechanism="Adjust Widget's policy configuration.",
+        )
+        return context, strategy
+
+    # --- PRIMARY RED ---
+    def test_distant_module_level_assignment_to_different_member_is_admitted(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = self._widget_source()
+        context, strategy = self._context_and_strategy(tmp_path, source)
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        # Precondition: the verified target's own evidence is present --
+        # proving the fixture reaches the admitted-evidence stage at all.
+        assert "`widget.py:Widget.POLICY`" in result.rendered
+        # The actual invariant under test: a DIFFERENT member of the SAME
+        # verified owning class, reassigned far away at module scope, must
+        # also be admitted as supporting evidence -- genuinely absent today
+        # (no existing mechanism reaches an ast.Attribute-targeted,
+        # module-scope assignment: not the padded per-symbol window, which
+        # cannot reach 120+ lines away; not the constants table, which
+        # excludes attribute targets entirely; not the consumer scan, which
+        # only scans function bodies, never module-level statements; not
+        # the full-file fallback, since Category 1 already covers this file).
+        assert "Widget.DEFAULT = Widget(3)" in result.rendered
+
+    # --- Control 1: a different class's same-named member must not match ---
+    def test_other_class_same_member_name_not_admitted(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = self._widget_source()
+        source += (
+            "\nclass Other:\n"
+            '    DEFAULT: "Other"\n'
+            "\n"
+            "Other.DEFAULT = Other(3)\n"
+        )
+        context, strategy = self._context_and_strategy(tmp_path, source)
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "Widget.DEFAULT = Widget(3)" in result.rendered
+        assert "Other.DEFAULT = Other(3)" not in result.rendered
+
+    # --- Control 2: function-local assignment must not be admitted ---
+    def test_function_local_assignment_not_admitted(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = self._widget_source(
+            tail_statement="def configure():\n    Widget.DEFAULT = Widget(3)\n    return Widget.DEFAULT",
+        )
+        context, strategy = self._context_and_strategy(tmp_path, source)
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "`widget.py:Widget.POLICY`" in result.rendered
+        assert "Widget.DEFAULT = Widget(3)" not in result.rendered
+
+    # --- Control 3: same assignment in a different file must not be
+    # discovered -- the scan is scoped to the verified target's OWN
+    # resolved file only, never any other file. ---
+    def test_assignment_in_different_file_not_discovered(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = self._widget_source(tail_statement="# no assignment in this file")
+        (tmp_path / "other_file.py").write_text(
+            "from widget import Widget\nWidget.DEFAULT = Widget(3)\n", encoding="utf-8",
+        )
+        context, strategy = self._context_and_strategy(tmp_path, source)
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "`widget.py:Widget.POLICY`" in result.rendered
+        assert "Widget.DEFAULT = Widget(3)" not in result.rendered
+
+    # --- Control 4: supporting context only -- never edit-target authority ---
+    def test_admitted_assignment_never_becomes_edit_target(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = self._widget_source()
+        context, strategy = self._context_and_strategy(tmp_path, source)
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "Widget.DEFAULT = Widget(3)" in result.rendered
+        assert "Widget.DEFAULT" not in result.covered_target_symbols
+        assert (
+            "Related definition (context only, not an approved edit target): "
+            "`widget.py:Widget.DEFAULT`" in result.rendered
+        )
+        assert "Target definition: `widget.py:Widget.DEFAULT`" not in result.rendered
+
+    # --- Control 5: no recursive discovery from the newly admitted RHS ---
+    def test_no_recursive_discovery_from_admitted_assignment(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        # "Widget" is itself a strategy term (dot-split from "Widget.POLICY"),
+        # and this line contains a dot-call co-located with it -- exactly
+        # the shape the EXISTING method-call one-hop rule looks for. The
+        # claim under test is that the class-level assignment mechanism
+        # never feeds its own admitted text back into that (or any other)
+        # discovery pass.
+        source = self._widget_source(tail_statement="Widget.DEFAULT = Widget(helper.compute())")
+        (tmp_path / "helper_mod.py").write_text(
+            "class Helper:\n    def compute(self):\n        return 3\n", encoding="utf-8",
+        )
+        functions = {
+            "helper_mod.py:Helper.compute": {
+                "name": "compute", "className": "Helper", "startLine": 2, "endLine": 3,
+                "code": "    def compute(self):\n        return 3\n",
+            },
+        }
+        context, strategy = self._context_and_strategy(tmp_path, source, functions=functions)
+
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper_mod.py"],
+        )
+
+        assert "Widget.DEFAULT = Widget(helper.compute())" in result.rendered
+        assert "helper_mod.py:Helper.compute" not in result.rendered

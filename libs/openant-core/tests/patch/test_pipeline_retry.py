@@ -9,6 +9,21 @@ from unittest import mock
 
 import pytest
 
+_MOCK_GROUNDED_PLANNER_JSON = (
+    '{"remediation_mechanism": null, "target_files": [], "target_symbols": [], '
+    '"security_invariant": null, "narrower_alternative_decision": "NONE_IDENTIFIED", '
+    '"narrower_alternative_considered": null, "required_edits": [], "approaches_to_avoid": [], '
+    '"explicit_unknowns": [], "additional_evidence_required": false, "evidence_requests": []}'
+)
+"""Fix A: a schema-valid, GROUNDED (additional_evidence_required: false) empty
+Planner JSON response -- these tests stub `LLMClient` entirely with a bare
+MagicMock() and never configure `.complete` themselves (they mock
+generate_patch_raw/challenge_patch/etc. directly instead, so the raw LLM
+object is only ever actually asked for the Planning/Strategy calls) -- without
+this, an unconfigured MagicMock().complete(...) return value fails Planning's
+JSON parse and the new evidence-sufficiency gate correctly (but, for these
+unrelated tests, undesirably) blocks Patch Generation entirely."""
+
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -269,6 +284,7 @@ class TestRetryNotTriggered:
             mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
         ):
             mock_llm_cls.return_value = mock.MagicMock()
+            mock_llm_cls.return_value.complete.return_value = _MOCK_GROUNDED_PLANNER_JSON
             from utilities.autopatcher.pipeline import run
             run(vuln, api_key="", repo_root=repo_root)
             return mock_gen.call_count
@@ -343,6 +359,7 @@ class TestRetryTriggered:
             mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
         ):
             mock_llm_cls.return_value = mock.MagicMock()
+            mock_llm_cls.return_value.complete.return_value = _MOCK_GROUNDED_PLANNER_JSON
             from utilities.autopatcher.pipeline import run
             run("pip vuln", api_key="", repo_root=str(tmp_path))
             assert mock_gen.call_count == 2
@@ -350,7 +367,10 @@ class TestRetryTriggered:
     def test_retry_call_includes_retry_hint(self, tmp_path):
         first_app, retry_app = self._setup_mocks(tmp_path, retry_applicable=True)
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_PIP_DIFF_ORIG, _PIP_DIFF_RETRY]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
@@ -396,7 +416,10 @@ class TestRetryMultiFile:
 
         first_app, retry_app = self._setup_mocks(retry_applicable=True)
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
@@ -430,7 +453,10 @@ class TestRetryMultiFile:
 
         first_app, retry_app = self._setup_mocks(retry_applicable=True)
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
@@ -455,7 +481,10 @@ class TestRetryMultiFile:
         # included at all, so the retry must not be attempted a second time.
         first_app, _retry_app = self._setup_mocks(retry_applicable=True)
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value=_CLEAN_DIFF) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
@@ -488,7 +517,10 @@ class TestRetryMultiFile:
 
         first_app, retry_app = self._setup_mocks(retry_applicable=True)
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
@@ -526,7 +558,10 @@ class TestRetryMultiFile:
 
         first_app, _retry_app = self._setup_mocks(retry_applicable=True)
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value=_CLEAN_DIFF) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
@@ -561,7 +596,10 @@ class TestRetryMultiFile:
             return original_build_report(r)
 
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]),
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
@@ -613,7 +651,10 @@ class TestRetryOutcomes:
             return original_build_report(r)
 
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_PIP_DIFF_ORIG, _PIP_DIFF_RETRY]),
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
@@ -682,7 +723,10 @@ class TestRetryMetadata:
             return original_build_report(r)
 
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", return_value=_CLEAN_DIFF),
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability", return_value=app),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
@@ -788,7 +832,10 @@ class TestRetryNoticeInReport:
             app_side_effect = [clean_app]
 
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", side_effect=gen_side_effect),
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability", side_effect=app_side_effect),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
@@ -897,7 +944,10 @@ class TestDeterministicContextReconstructionSuccess:
             return original_build_report(r)
 
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value=_URLLIB3_MALFORMED_DIFF) as mock_gen,
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
@@ -963,7 +1013,10 @@ class TestDeterministicContextReconstructionFallbackPreservesRetry:
             return original_build_report(r)
 
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_PIP_DIFF_ORIG, _PIP_DIFF_RETRY]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
@@ -1038,7 +1091,10 @@ class TestEmptyHunkRemovalAvoidsRetry:
 ```"""
 
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value=multi_file_diff) as mock_gen,
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
@@ -1088,7 +1144,10 @@ class TestEmptyHunkRemovalAvoidsRetry:
  unrelated
 ```"""
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value=multi_file_diff) as mock_gen,
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
@@ -1156,7 +1215,10 @@ class TestRetrySemanticPreservation:
             return original_build_report(r)
 
         with (
-            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
             mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[self._ORIGINAL_DIFF, retry_diff]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",

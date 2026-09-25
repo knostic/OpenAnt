@@ -2539,16 +2539,28 @@ class TestVerifiedFixedValidationGapReconciliation:
         finding ("cannot verify ...") alongside VERIFIED_FIXED must
         reconcile to INSUFFICIENT_EVIDENCE, still_vulnerable=True -- never
         RESIDUAL_VULNERABILITY (absence of verification is not affirmative
-        evidence of a remaining vulnerability)."""
-        from utilities.autopatcher.pipeline import _classify_challenger
+        evidence of a remaining vulnerability).
+
+        Post-semantic-reconciliation ownership: this narrowing is no longer
+        performed by `_classify_challenger` alone (it never had a semantic
+        calibration signal to consult) -- with NO calibration available,
+        `_reconcile_verification_status_with_calibration` falls back to the
+        exact same base presumption the old branch always applied
+        unconditionally: a validation_gap finding blocks by default. See
+        TestSemanticRemediationProofReconciliation for the calibration-aware
+        behavior this ownership change actually exists for."""
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
 
         challenger = self._challenger(
             "VERIFIED_FIXED", False,
             potential_issues=["Cannot verify whether the consuming code normalizes this value as shown"],
         )
-        result = _classify_challenger(challenger)
+        classified = _classify_challenger(challenger)
+        assert classified["validation_gap_count"] > 0
+        result = _reconcile_verification_status_with_calibration(classified, None)
 
-        assert result["validation_gap_count"] > 0
         assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
         assert result["still_vulnerable"] is True
 
@@ -2669,12 +2681,14 @@ class TestVerifiedFixedValidationGapReconciliation:
         assert rec["decision"] == "Manual Review Required"
 
     def test_no_repository_specific_strings_in_reconciliation(self):
-        """Case 9: the reconciliation added to _classify_challenger must
-        contain no repository- or CVE-specific production logic."""
+        """Case 9: the semantic reconciliation function (which now owns the
+        VERIFIED_FIXED + validation_gap narrowing -- see
+        _reconcile_verification_status_with_calibration) must contain no
+        repository- or CVE-specific production logic."""
         import inspect
-        from utilities.autopatcher.pipeline import _classify_challenger
+        from utilities.autopatcher.pipeline import _reconcile_verification_status_with_calibration
 
-        source = inspect.getsource(_classify_challenger)
+        source = inspect.getsource(_reconcile_verification_status_with_calibration)
         for needle in ("urllib3", "Cookie", "GHSA", "CVE-", "retry.py", "poolmanager"):
             assert needle not in source
 
@@ -2684,10 +2698,16 @@ class TestVerifiedFixedValidationGapReconciliation:
         """Composition test: a finding that is recognized as validation_gap
         ONLY via the new evidence-supply idiom (_has_evidence_gap_signal --
         not the pre-existing testing-coverage _VALIDATION_GAP_RE) must still
-        flow through the unmodified reconciliation end-to-end: VERIFIED_FIXED
-        -> INSUFFICIENT_EVIDENCE -> still_vulnerable=True -> no Deploy After
-        Validation."""
-        from utilities.autopatcher.pipeline import PipelineResult, _build_report, _classify_challenger
+        flow through the (now calibration-aware) reconciliation end-to-end:
+        VERIFIED_FIXED -> INSUFFICIENT_EVIDENCE -> still_vulnerable=True ->
+        no Deploy After Validation. No calibration is supplied here, so the
+        base (no-calibration) presumption applies -- see
+        TestSemanticRemediationProofReconciliation for the calibration-aware
+        cases."""
+        from utilities.autopatcher.pipeline import (
+            PipelineResult, _build_report, _classify_challenger,
+            _reconcile_verification_status_with_calibration,
+        )
 
         evidence_supply_gap_finding = (
             "Correctness depends on a transformation whose implementation was "
@@ -2701,8 +2721,9 @@ class TestVerifiedFixedValidationGapReconciliation:
         challenger = self._challenger("VERIFIED_FIXED", False, potential_issues=[evidence_supply_gap_finding])
         classified = _classify_challenger(challenger)
         assert classified["validation_gap_count"] > 0
-        assert classified["verification_status"] == "INSUFFICIENT_EVIDENCE"
-        assert classified["still_vulnerable"] is True
+        reconciled = _reconcile_verification_status_with_calibration(classified, None)
+        assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled["still_vulnerable"] is True
 
         kwargs = TestWhyManualReview()._base_kwargs(tmp_path, challenger=challenger)
         report = _build_report(PipelineResult(**kwargs))
@@ -2750,6 +2771,7 @@ class TestVerifiedFixedValidationGapReconciliation:
         evidence" or "residual vulnerability" wording."""
         from utilities.autopatcher.pipeline import (
             _build_recommendation_v1, _classify_challenger, _compute_trust_signals,
+            _reconcile_verification_status_with_calibration,
         )
 
         challenger = self._challenger(
@@ -2765,15 +2787,17 @@ class TestVerifiedFixedValidationGapReconciliation:
         # Documented, deliberate side effect of this reconciliation's
         # narrow condition -- inert for the recommendation below, since
         # defect_count > 0 always routes through the independent
-        # Misaligned gate first.
-        assert classified["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        # Misaligned gate first. No calibration supplied -> base
+        # presumption (validation_gap blocks by default) applies.
+        reconciled = _reconcile_verification_status_with_calibration(classified, None)
+        assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
 
-        signals = _compute_trust_signals([], {"applicable": True}, classified, "Good", "low")
+        signals = _compute_trust_signals([], {"applicable": True}, reconciled, "Good", "low")
         rec = _build_recommendation_v1(
             signals,
-            still_vulnerable=classified["still_vulnerable"],
-            defect_count=classified["confirmed_defect_count"],
-            verification_status=classified["verification_status"],
+            still_vulnerable=reconciled["still_vulnerable"],
+            defect_count=reconciled["confirmed_defect_count"],
+            verification_status=reconciled["verification_status"],
         )
 
         assert rec["decision"] == "Manual Review Required"
@@ -2891,16 +2915,22 @@ class TestResidualVulnerabilityUnsupportedDefectReconciliation:
         assert result["still_vulnerable"] is True
 
     def test_verified_fixed_reconciliation_unaffected_by_new_branch(self):
-        """Non-interference: the pre-existing VERIFIED_FIXED + validation_gap
-        reconciliation must still fire exactly as before -- this new branch
-        is additive, never a replacement."""
-        from utilities.autopatcher.pipeline import _classify_challenger
+        """Non-interference: the VERIFIED_FIXED + validation_gap narrowing
+        (now owned by _reconcile_verification_status_with_calibration, run
+        after _classify_challenger -- see that function's own docstring)
+        must still fire exactly as before when no calibration is available
+        -- the RESIDUAL_VULNERABILITY symmetric branch tested by this class
+        is additive to it, never a replacement."""
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
 
         challenger = self._challenger(
             "VERIFIED_FIXED", False,
             potential_issues=["Cannot verify whether the consuming code normalizes this value as shown"],
         )
-        result = _classify_challenger(challenger)
+        classified = _classify_challenger(challenger)
+        result = _reconcile_verification_status_with_calibration(classified, None)
 
         assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
         assert result["still_vulnerable"] is True
@@ -2942,6 +2972,571 @@ class TestResidualVulnerabilityUnsupportedDefectReconciliation:
         source = inspect.getsource(_classify_challenger)
         for needle in ("FATE", "CVE-", "weight", "split_maskdict", "sitename", "hetero", "guest"):
             assert needle not in source
+
+
+# ---------------------------------------------------------------------------
+# Semantic remediation-proof reconciliation (Challenger finding-severity
+# nondeterminism fix): materially equivalent unresolved factual dependencies
+# must receive materially equivalent remediation-proof authority regardless
+# of the lexical category _classify_finding happened to assign. Generic
+# fixture -- no urllib3/CVE names. See finding_calibration.py's
+# "Remediation impact" field and pipeline._reconcile_verification_status_
+# with_calibration, the sole function authorized to turn that field into
+# blocking authority.
+# ---------------------------------------------------------------------------
+
+class TestSemanticRemediationProofReconciliation:
+    @staticmethod
+    def _challenger(verification_status, still_vulnerable, edge_cases=None, potential_issues=None):
+        return {
+            "verification_status": verification_status,
+            "still_vulnerable": still_vulnerable,
+            "edge_cases": edge_cases or [],
+            "potential_issues": potential_issues or [],
+            "summary": "",
+        }
+
+    # Same underlying unresolved dependency (helper.same_origin's own
+    # comparison scope), worded two different ways so _classify_finding
+    # sorts them into different lexical categories.
+    FINDING_PLAUSIBLE_RISK = (
+        "the operation is gated on helper.same_origin(target), whose exact "
+        "comparison scope is not included in the evidence"
+    )
+    FINDING_VALIDATION_GAP = (
+        "the result depends on helper.same_origin treating the target as a "
+        "different origin -- not shown in evidence"
+    )
+    UNRESOLVED_DEPENDENCY = "helper.same_origin comparison scope"
+
+    def test_fixture_precondition_lexical_categories_actually_differ(self):
+        """Confirms the fixture reproduces the real wording-dependent split
+        this whole class is about -- if this ever stops being true, the
+        fixture (not the production code) needs to change."""
+        from utilities.autopatcher.pipeline import _classify_finding
+
+        assert _classify_finding(self.FINDING_PLAUSIBLE_RISK) == "plausible_risk"
+        assert _classify_finding(self.FINDING_VALIDATION_GAP) == "validation_gap"
+
+    def test_equivalent_unresolved_dependency_produces_equivalent_authority(self):
+        """PRIMARY RED: two findings expressing the SAME unresolved factual
+        dependency -- one plausible_risk-worded, one validation_gap-worded
+        -- given equivalent proof_required calibration metadata, starting
+        from an otherwise equivalent raw VERIFIED_FIXED challenger, must
+        reconcile to the identical verification_status/still_vulnerable,
+        both blocking for the same semantic reason. Must fail before the
+        production fix: _reconcile_verification_status_with_calibration
+        does not exist prior to it."""
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        challenger_a = self._challenger("VERIFIED_FIXED", False, potential_issues=[self.FINDING_PLAUSIBLE_RISK])
+        challenger_b = self._challenger("VERIFIED_FIXED", False, edge_cases=[self.FINDING_VALIDATION_GAP])
+
+        calibration_a = [{
+            "original": self.FINDING_PLAUSIBLE_RISK,
+            "unresolved_dependencies": [self.UNRESOLVED_DEPENDENCY],
+            "remediation_impact": "proof_required",
+        }]
+        calibration_b = [{
+            "original": self.FINDING_VALIDATION_GAP,
+            "unresolved_dependencies": [self.UNRESOLVED_DEPENDENCY],
+            "remediation_impact": "proof_required",
+        }]
+
+        classified_a = _classify_challenger(challenger_a)
+        classified_b = _classify_challenger(challenger_b)
+        # Precondition: the raw lexical split is real (a is plausible_risk-
+        # only, b is validation_gap-only) -- proving the equivalence below
+        # is not a coincidence of identical raw classification.
+        assert classified_a["plausible_risk_count"] == 1 and classified_a["validation_gap_count"] == 0
+        assert classified_b["validation_gap_count"] == 1 and classified_b["plausible_risk_count"] == 0
+
+        reconciled_a = _reconcile_verification_status_with_calibration(classified_a, calibration_a)
+        reconciled_b = _reconcile_verification_status_with_calibration(classified_b, calibration_b)
+
+        assert reconciled_a["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled_b["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled_a["still_vulnerable"] is True
+        assert reconciled_b["still_vulnerable"] is True
+
+    # --- Control 1: proof_required blocks regardless of lexical category ---
+    def test_control_proof_required_blocks_regardless_of_lexical_category(self):
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        generic_finding = "Tests should be added for this edge case, which is not otherwise addressed."
+
+        for finding, expected_category in (
+            (self.FINDING_PLAUSIBLE_RISK, "plausible_risk"),
+            (self.FINDING_VALIDATION_GAP, "validation_gap"),
+            (generic_finding, "generic"),
+        ):
+            challenger = self._challenger("VERIFIED_FIXED", False, potential_issues=[finding])
+            classified = _classify_challenger(challenger)
+            assert classified["classified_potential_issues"][0]["category"] == expected_category
+            calibration = [{
+                "original": finding,
+                "unresolved_dependencies": [self.UNRESOLVED_DEPENDENCY],
+                "remediation_impact": "proof_required",
+            }]
+            reconciled = _reconcile_verification_status_with_calibration(classified, calibration)
+            assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE", expected_category
+            assert reconciled["still_vulnerable"] is True, expected_category
+
+    # --- Control 2: validation_only is NOT blocking merely because the
+    # lexical classifier called it validation_gap -- proves the old regex
+    # is no longer independently authoritative. ---
+    def test_control_validation_only_defeats_lexical_validation_gap_blocking(self):
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        challenger = self._challenger("VERIFIED_FIXED", False, edge_cases=[self.FINDING_VALIDATION_GAP])
+        classified = _classify_challenger(challenger)
+        assert classified["validation_gap_count"] == 1  # the old regex DOES fire on this wording
+
+        calibration = [{
+            "original": self.FINDING_VALIDATION_GAP,
+            "unresolved_dependencies": [self.UNRESOLVED_DEPENDENCY],
+            "remediation_impact": "validation_only",
+        }]
+        reconciled = _reconcile_verification_status_with_calibration(classified, calibration)
+
+        # The lexical validation_gap classification alone would have forced
+        # INSUFFICIENT_EVIDENCE under the old (now-removed) branch -- a
+        # semantic validation_only tag must override that.
+        assert reconciled["verification_status"] == "VERIFIED_FIXED"
+        assert reconciled["still_vulnerable"] is False
+
+    # --- Control 3: missing/failed/malformed/unknown semantic value fails
+    # closed (blocking). ---
+    def test_control_missing_or_unclear_calibration_fails_closed(self):
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        challenger = self._challenger("VERIFIED_FIXED", False, potential_issues=[self.FINDING_PLAUSIBLE_RISK])
+        classified = _classify_challenger(challenger)
+
+        # (a) calibration entirely absent (None) -- but this finding is
+        # plausible_risk, not validation_gap, so the NO-calibration base
+        # presumption alone would NOT block it (see the "no manufactured
+        # dependency" control below). This sub-case instead proves the
+        # "unclear" *value* -- present but unresolved -- fails closed.
+        for calibration in (
+            [{"original": self.FINDING_PLAUSIBLE_RISK,
+              "unresolved_dependencies": [self.UNRESOLVED_DEPENDENCY],
+              "remediation_impact": "unclear"}],
+            [{"original": self.FINDING_PLAUSIBLE_RISK,
+              "unresolved_dependencies": [self.UNRESOLVED_DEPENDENCY],
+              "remediation_impact": "not_a_real_value"}],
+            [{"original": self.FINDING_PLAUSIBLE_RISK,
+              "unresolved_dependencies": [self.UNRESOLVED_DEPENDENCY]}],  # field missing entirely
+        ):
+            reconciled = _reconcile_verification_status_with_calibration(classified, calibration)
+            assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
+            assert reconciled["still_vulnerable"] is True
+
+    # --- Control 4/5: confirmed_defect / behavioral_defect authority
+    # unchanged -- this axis never touches them. ---
+    def test_control_confirmed_defect_authority_unchanged(self):
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        finding = "The patch is still vulnerable to the same attack vector"
+        challenger = self._challenger("VERIFIED_FIXED", False, potential_issues=[finding])
+        classified = _classify_challenger(challenger)
+        assert classified["confirmed_defect_count"] == 1
+
+        # Even an (implausible, but adversarially chosen) calibration entry
+        # for this exact confirmed_defect finding must be ignored entirely.
+        calibration = [{
+            "original": finding, "unresolved_dependencies": ["irrelevant"],
+            "remediation_impact": "validation_only",
+        }]
+        reconciled = _reconcile_verification_status_with_calibration(classified, calibration)
+        assert reconciled["verification_status"] == classified["verification_status"] == "VERIFIED_FIXED"
+        assert reconciled["confirmed_defect_count"] == 1
+
+    def test_control_behavioral_defect_authority_unchanged(self):
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        finding = "The patch now rejects a previously valid input value"
+        challenger = self._challenger("VERIFIED_FIXED", False, potential_issues=[finding])
+        classified = _classify_challenger(challenger)
+        assert classified["behavioral_defect_count"] == 1
+
+        calibration = [{
+            "original": finding, "unresolved_dependencies": ["irrelevant"],
+            "remediation_impact": "validation_only",
+        }]
+        reconciled = _reconcile_verification_status_with_calibration(classified, calibration)
+        assert reconciled["verification_status"] == classified["verification_status"] == "VERIFIED_FIXED"
+        assert reconciled["behavioral_defect_count"] == 1
+
+    # --- Control 6: an already-blocking raw verdict is never cleared by a
+    # validation_only finding alongside it. ---
+    def test_control_validation_only_does_not_clear_independently_blocking_verdict(self):
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        challenger = self._challenger(
+            "RESIDUAL_VULNERABILITY", True,
+            potential_issues=[
+                "The patch is still vulnerable to the same attack vector",
+                self.FINDING_VALIDATION_GAP,
+            ],
+        )
+        classified = _classify_challenger(challenger)
+        assert classified["confirmed_defect_count"] == 1
+
+        calibration = [{
+            "original": self.FINDING_VALIDATION_GAP,
+            "unresolved_dependencies": [self.UNRESOLVED_DEPENDENCY],
+            "remediation_impact": "validation_only",
+        }]
+        reconciled = _reconcile_verification_status_with_calibration(classified, calibration)
+
+        # Never touched -- this function only ever narrows a VERIFIED_FIXED
+        # verdict, never a RESIDUAL_VULNERABILITY/INSUFFICIENT_EVIDENCE one.
+        assert reconciled["verification_status"] == "RESIDUAL_VULNERABILITY"
+        assert reconciled["still_vulnerable"] is True
+
+    # --- Control 7: no unresolved dependency -> the axis must not
+    # manufacture one. ---
+    def test_control_no_unresolved_dependency_is_not_manufactured(self):
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        benign_finding = "Some minor edge case that is not a defect or a verification gap"
+        challenger = self._challenger("VERIFIED_FIXED", False, edge_cases=[benign_finding])
+        classified = _classify_challenger(challenger)
+        assert classified["plausible_risk_count"] == 1
+
+        # Calibration examined this finding and found NOTHING unresolved --
+        # even a (contradictory/malformed) "proof_required" value alongside
+        # an empty unresolved_dependencies list must not manufacture
+        # blocking authority out of it.
+        calibration = [{
+            "original": benign_finding, "unresolved_dependencies": [],
+            "remediation_impact": "proof_required",
+        }]
+        reconciled = _reconcile_verification_status_with_calibration(classified, calibration)
+        assert reconciled["verification_status"] == "VERIFIED_FIXED"
+        assert reconciled["still_vulnerable"] is False
+
+        # And the plain "no calibration at all" case for the same benign,
+        # plausible_risk-only finding must equally not manufacture blocking.
+        reconciled_none = _reconcile_verification_status_with_calibration(classified, None)
+        assert reconciled_none["verification_status"] == "VERIFIED_FIXED"
+        assert reconciled_none["still_vulnerable"] is False
+
+    # --- Control 8: `group` has no blocking authority in either direction --
+    # _finding_blocks_remediation_proof reads only unresolved_dependencies/
+    # remediation_impact (see its own source), never `group`. These two
+    # controls make that explicit at the reconciliation layer, complementing
+    # finding_calibration.py's own parser-level proof
+    # (test_does_not_replace_observed_hypothesis_hardening_axis) that the
+    # combination survives parsing unmodified. ---
+    def test_control_hardening_group_does_not_grant_non_blocking_authority(self):
+        """A Hardening-grouped finding with a genuinely unresolved,
+        proof_required dependency must still block -- Hardening is a
+        presentation label (`_GROUP_LABELS`), not a blocking-authority
+        override. Guards against a future change accidentally making
+        `group` load-bearing here without updating this function."""
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        challenger = self._challenger("VERIFIED_FIXED", False, potential_issues=[self.FINDING_PLAUSIBLE_RISK])
+        classified = _classify_challenger(challenger)
+
+        calibration = [{
+            "original": self.FINDING_PLAUSIBLE_RISK,
+            "group": "hardening",
+            "unresolved_dependencies": [self.UNRESOLVED_DEPENDENCY],
+            "remediation_impact": "proof_required",
+        }]
+        reconciled = _reconcile_verification_status_with_calibration(classified, calibration)
+        assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled["still_vulnerable"] is True
+
+    def test_control_hypothesis_group_does_not_force_blocking_authority(self):
+        """A Hypothesis-grouped finding whose calibrated remediation_impact
+        is validation_only (or whose unresolved list is empty) must NOT
+        block merely because `group` says Hypothesis -- the epistemic-
+        confidence axis and the remediation-proof axis are independent, and
+        neither may be inferred from the other."""
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        challenger = self._challenger("VERIFIED_FIXED", False, potential_issues=[self.FINDING_PLAUSIBLE_RISK])
+        classified = _classify_challenger(challenger)
+
+        for calibration in (
+            [{
+                "original": self.FINDING_PLAUSIBLE_RISK,
+                "group": "hypothesis",
+                "unresolved_dependencies": [self.UNRESOLVED_DEPENDENCY],
+                "remediation_impact": "validation_only",
+            }],
+            [{
+                "original": self.FINDING_PLAUSIBLE_RISK,
+                "group": "hypothesis",
+                "unresolved_dependencies": [],
+                "remediation_impact": "validation_only",
+            }],
+        ):
+            reconciled = _reconcile_verification_status_with_calibration(classified, calibration)
+            assert reconciled["verification_status"] == "VERIFIED_FIXED"
+            assert reconciled["still_vulnerable"] is False
+
+    def test_end_to_end_parser_normalization_prevents_manufactured_blocking(self):
+        """Integration (real calibrate_findings, mocked LLM only): a raw
+        calibration response containing the exact contract-violating shape
+        (Unresolved: none + Remediation impact: proof_required) must not
+        manufacture blocking authority once parsed and reconciled -- the
+        parser's own deterministic normalization keeps the stored record
+        internally consistent, and reconciliation's pre-existing emptiness
+        check already treated this as non-blocking regardless of
+        remediation_impact's value."""
+        from unittest import mock
+        from utilities.autopatcher.finding_calibration import calibrate_findings
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        finding_text = "Some minor edge case that is not a defect or a verification gap"
+        challenger = self._challenger("VERIFIED_FIXED", False, edge_cases=[finding_text])
+        classified = _classify_challenger(challenger)
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Claims:\n"
+            "   - The evidence directly establishes the claim.\n"
+            "   Unresolved: none\n"
+            "   Remediation impact: proof_required\n"
+            "   Group: Observed\n"
+            "   Reworded: The evidence directly establishes the claim.\n"
+        )
+        calibration = calibrate_findings("vuln text", "patch", [finding_text], llm, code_context="ctx")
+        assert calibration[0]["remediation_impact"] == "validation_only"  # normalized by the parser
+
+        reconciled = _reconcile_verification_status_with_calibration(classified, calibration)
+        assert reconciled["verification_status"] == "VERIFIED_FIXED"
+        assert reconciled["still_vulnerable"] is False
+
+
+# ---------------------------------------------------------------------------
+# Finding Calibration scope rules (forensic urllib3 green->orange regression
+# fix): two recurring scope patterns -- (A) an existing predicate/helper the
+# Security Invariant merely defers to, and (B) a scenario reachable only via
+# an explicit non-default caller configuration -- were being marked
+# `proof_required` by default, silently expanding the proof obligation
+# beyond what the supplied Security Invariant actually establishes. The
+# fix is prompt-only (prompts/finding_calibration.md); these tests exercise
+# the REAL, unchanged parse+reconciliation pipeline
+# (calibrate_findings -> _parse_response -> _reconcile_verification_status_
+# with_calibration) against hand-authored response text that documents
+# exactly what a rule-compliant model response looks like for each side of
+# each rule -- the strongest deterministic proof available without a live
+# LLM call. Domain-neutral fixtures (no urllib3/Cookie/Retry/PoolManager/
+# HTTPConnectionPool/is_same_host) -- this is a general scope contract, not
+# a urllib3-specific fix.
+# ---------------------------------------------------------------------------
+
+class TestInvariantDeferredPredicateAndNonDefaultOverrideScope:
+    @staticmethod
+    def _challenger(finding_text):
+        return {
+            "verification_status": "VERIFIED_FIXED", "still_vulnerable": False,
+            "edge_cases": [], "potential_issues": [finding_text], "summary": "",
+        }
+
+    @staticmethod
+    def _calibrate_and_reconcile(finding_text, response_text):
+        from unittest import mock
+        from utilities.autopatcher.finding_calibration import calibrate_findings
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        classified = _classify_challenger(
+            TestInvariantDeferredPredicateAndNonDefaultOverrideScope._challenger(finding_text)
+        )
+        llm = mock.MagicMock()
+        llm.complete.return_value = response_text
+        calibration = calibrate_findings("vuln text", "patch", [finding_text], llm, code_context="ctx")
+        reconciled = _reconcile_verification_status_with_calibration(classified, calibration)
+        return calibration, reconciled
+
+    # --- Rule A: existing predicate/helper the invariant merely defers to ---
+
+    PREDICATE_FINDING = (
+        "the boundary check delegates to an existing helper predicate whose own "
+        "comparison semantics are not shown in the evidence"
+    )
+
+    def test_1_predicate_deferred_by_invariant_is_validation_only_and_does_not_block(self):
+        """Case 1: the Security Invariant defines the boundary BY REFERENCE
+        to an existing, unmodified predicate; no evidence contradicts that
+        predicate. A rule-compliant response marks this validation_only,
+        and VERIFIED_FIXED must survive."""
+        response = (
+            "1. Claims:\n"
+            "   - The remediation's boundary check is gated on an existing predicate.\n"
+            "   - The Security Invariant defines the boundary as whatever that predicate determines, without independently specifying its internal comparison mode.\n"
+            "   Unresolved: whether the predicate's own comparison mode matches some broader definition\n"
+            "   Remediation impact: validation_only\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: The predicate's own comparison semantics were not shown; the Security Invariant defines the boundary in terms of this existing, unmodified predicate rather than independently requiring a specific comparison mode, so this does not affect whether the claimed remediation is established.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(self.PREDICATE_FINDING, response)
+        assert calibration[0]["remediation_impact"] == "validation_only"
+        assert reconciled["verification_status"] == "VERIFIED_FIXED"
+        assert reconciled["still_vulnerable"] is False
+
+    def test_2_predicate_explicitly_in_scope_or_contradicted_is_proof_required_and_blocks(self):
+        """Case 2: the Security Invariant (or verified evidence) makes a
+        property of the SAME predicate part of the required remediation --
+        proof_required, and the fix must not have created a blanket
+        exemption for existing predicates/helpers."""
+        response = (
+            "1. Claims:\n"
+            "   - The remediation's boundary check is gated on an existing predicate.\n"
+            "   - The Security Invariant explicitly requires that predicate's own comparison mode to reject the broader case.\n"
+            "   Unresolved: whether the predicate's own comparison mode matches some broader definition\n"
+            "   Remediation impact: proof_required\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: The Security Invariant explicitly makes the predicate's own comparison mode part of the required remediation; its implementation was not shown, so this remains an open remediation question.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(self.PREDICATE_FINDING, response)
+        assert calibration[0]["remediation_impact"] == "proof_required"
+        assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled["still_vulnerable"] is True
+
+    # --- Rule B: explicit non-default caller configuration ---
+
+    OVERRIDE_FINDING = (
+        "a caller can pass an explicit non-default configuration parameter that "
+        "bypasses the normal call path validated by this remediation"
+    )
+
+    def test_3_non_default_override_outside_invariant_is_validation_only_and_does_not_block(self):
+        """Case 3: the remediation contract is about the default/normal
+        path; the Security Invariant says nothing about the non-default
+        override. A rule-compliant response marks this validation_only,
+        and VERIFIED_FIXED must survive."""
+        response = (
+            "1. Claims:\n"
+            "   - A caller can bypass the normal path via an explicit, non-default configuration parameter.\n"
+            "   - The Security Invariant is stated only for the default/normal path.\n"
+            "   Unresolved: whether the required behavior still applies under the non-default configuration\n"
+            "   Remediation impact: validation_only\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: A caller can bypass the default path via an explicit non-default configuration; the Security Invariant does not extend the required remediation to that configuration, so resolving this does not affect whether the claimed remediation is established.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(self.OVERRIDE_FINDING, response)
+        assert calibration[0]["remediation_impact"] == "validation_only"
+        assert reconciled["verification_status"] == "VERIFIED_FIXED"
+        assert reconciled["still_vulnerable"] is False
+
+    def test_4_non_default_override_included_in_invariant_is_proof_required_and_blocks(self):
+        """Case 4: the Security Invariant explicitly extends the required
+        remediation to the same non-default override -- proof_required,
+        proving Rule B is not a blanket "custom configuration never
+        matters" exemption."""
+        response = (
+            "1. Claims:\n"
+            "   - A caller can bypass the normal path via an explicit, non-default configuration parameter.\n"
+            "   - The Security Invariant explicitly requires the remediation to hold even under that non-default configuration.\n"
+            "   Unresolved: whether the required behavior still applies under the non-default configuration\n"
+            "   Remediation impact: proof_required\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: The Security Invariant explicitly extends the required remediation to this non-default configuration; whether it still holds there is not shown, so this remains an open remediation question.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(self.OVERRIDE_FINDING, response)
+        assert calibration[0]["remediation_impact"] == "proof_required"
+        assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled["still_vulnerable"] is True
+
+    # --- Ambiguity remains fail-closed ---
+
+    def test_5_ambiguous_scope_is_not_forced_to_validation_only(self):
+        """Case 5: it is genuinely unclear whether the non-default
+        configuration/predicate scenario is part of the security contract.
+        The fix must not force validation_only for ambiguous scope --
+        an honestly-`unclear` (or otherwise non-`validation_only`) response
+        must still fail closed and block, exactly as before this fix."""
+        response = (
+            "1. Claims:\n"
+            "   - A caller can reach the alternate configuration described in the finding.\n"
+            "   - The Security Invariant's own scope relative to that configuration cannot be confidently determined from the supplied evidence.\n"
+            "   Unresolved: whether the alternate configuration is within the Security Invariant's required scope\n"
+            "   Remediation impact: unclear\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: Whether the alternate configuration is within the Security Invariant's required scope cannot be confidently determined from the supplied evidence.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(self.OVERRIDE_FINDING, response)
+        assert calibration[0]["remediation_impact"] == "unclear"
+        assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled["still_vulnerable"] is True
+
+    # --- Demonstrated in-scope bypass still blocks, even via a helper or
+    # an alternate configuration -- no blanket exemption. ---
+
+    def test_6_demonstrated_in_scope_contradiction_via_helper_still_blocks(self):
+        """Case 6: verified evidence directly demonstrates that the
+        existing predicate/configuration CONTRADICTS the stated invariant
+        (not merely "unconfirmed", but shown to conflict) -- proof_required
+        must survive regardless of the finding involving a helper/
+        alternate-configuration shape Rule A/B would otherwise soften."""
+        response = (
+            "1. Claims:\n"
+            "   - Verified evidence shows the existing predicate accepts a case the Security Invariant requires it to reject.\n"
+            "   - The Security Invariant explicitly defines this exact case as in scope.\n"
+            "   Unresolved: whether the demonstrated acceptance is reachable through the remediation's normal call path\n"
+            "   Remediation impact: proof_required\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: Verified evidence shows the existing predicate accepting a case the Security Invariant explicitly requires it to reject; whether this is reachable through the remediation's normal call path remains an open remediation question.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(self.PREDICATE_FINDING, response)
+        assert calibration[0]["remediation_impact"] == "proof_required"
+        assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled["still_vulnerable"] is True
+
+    # --- Group independence: the fix must not manipulate Group to
+    # influence remediation_impact. ---
+
+    def test_7_validation_only_case_keeps_its_own_correct_group_classification(self):
+        """Case 7: both non-blocking (validation_only) fixtures above are
+        legitimately `Hypothesis` (the predicate/configuration's own
+        behavior is not directly shown) -- proving non-blocking status
+        comes from `remediation_impact` alone, never from silently
+        promoting the finding to `Observed` or demoting it to `Hardening`
+        to manufacture a non-blocking outcome."""
+        response = (
+            "1. Claims:\n"
+            "   - The remediation's boundary check is gated on an existing predicate.\n"
+            "   - The Security Invariant defines the boundary as whatever that predicate determines.\n"
+            "   Unresolved: whether the predicate's own comparison mode matches some broader definition\n"
+            "   Remediation impact: validation_only\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: The predicate's own comparison semantics were not shown; the Security Invariant defines the boundary in terms of this existing, unmodified predicate, so this does not affect whether the claimed remediation is established.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(self.PREDICATE_FINDING, response)
+        assert calibration[0]["group"] == "hypothesis"
+        assert calibration[0]["remediation_impact"] == "validation_only"
+        assert reconciled["verification_status"] == "VERIFIED_FIXED"
 
 
 # ---------------------------------------------------------------------------

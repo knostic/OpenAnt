@@ -24,6 +24,21 @@ from utilities.autopatcher.existing_test_amendment import AmendmentOutcome, Amen
 from utilities.autopatcher.existing_test_regression import ExistingTestComparisonResult
 from utilities.autopatcher.test_execution_models import TestExecutionPlan
 
+_MOCK_GROUNDED_PLANNER_JSON = (
+    '{"remediation_mechanism": null, "target_files": [], "target_symbols": [], '
+    '"security_invariant": null, "narrower_alternative_decision": "NONE_IDENTIFIED", '
+    '"narrower_alternative_considered": null, "required_edits": [], "approaches_to_avoid": [], '
+    '"explicit_unknowns": [], "additional_evidence_required": false, "evidence_requests": []}'
+)
+"""Fix A: a schema-valid, GROUNDED (additional_evidence_required: false) empty
+Planner JSON response -- these tests stub `LLMClient` entirely with a bare
+MagicMock() and never configure `.complete` themselves (they mock
+generate_patch_raw/challenge_patch/etc. directly instead, so the raw LLM
+object is only ever actually asked for the Planning/Strategy calls) -- without
+this, an unconfigured MagicMock().complete(...) return value fails Planning's
+JSON parse and the new evidence-sufficiency gate correctly (but, for these
+unrelated tests, undesirably) blocks Patch Generation entirely."""
+
 
 def _fixed_pass_amendment_outcome(repo_root, patch, plan, security_invariant=None, executor=None, llm=None):
     """Fixed PASS result, wrapped as an AmendmentRerunOutcome with no
@@ -131,6 +146,7 @@ def _run_with_recorder(
         ) as mock_compare,
     ):
         mock_llm_cls.return_value = mock.MagicMock()
+        mock_llm_cls.return_value.complete.return_value = _MOCK_GROUNDED_PLANNER_JSON
         mock_impact_cls.return_value.analyze.return_value.to_dict.return_value = {}
         from utilities.autopatcher.pipeline import run
         report = run(
@@ -329,6 +345,7 @@ class TestRecorderNonePreservesBehavior:
                 ),
             ):
                 mock_llm_cls.return_value = mock.MagicMock()
+                mock_llm_cls.return_value.complete.return_value = _MOCK_GROUNDED_PLANNER_JSON
                 mock_impact_cls.return_value.analyze.return_value.to_dict.return_value = {}
                 from utilities.autopatcher.pipeline import run
                 return run(

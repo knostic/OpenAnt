@@ -4,21 +4,30 @@ acquisition): a real urllib3 full-run finding that Patch Generation ran even
 though Final Strategy had already, explicitly, found no evidence-backed
 target.
 
-The three structural states this gate distinguishes (see
+The FOUR structural states this gate distinguishes (see
 RemediationStrategyResult's own docstring):
 
   A. No authoritative Final Strategy decision exists
      (`_strategy_result is None`, or `_strategy_result.evaluated is False`
      -- e.g. `_EMPTY_STRATEGY_RESULT`, covering "no planner_evidence_ctx",
      an LLM-call failure, or a response that failed to parse).
-  B. Final Strategy ran (`evaluated=True`) and named >=1 verified target.
+  B. Final Strategy ran (`evaluated=True`), named >=1 verified target, and
+     `target_authority_unresolved` is False -- the ordinary case.
   C. Final Strategy ran (`evaluated=True`) and named ZERO verified targets
      -- regardless of whether `insufficient_evidence` happens to be
      populated (see the "subtle case" test below).
+  D. Final Strategy ran (`evaluated=True`), named >=1 verified target, BUT
+     `target_authority_unresolved` is True (scope-v4 Run 5 forensic
+     finding: a real, repository-resolvable target whose OWN evidence-
+     backed Strategy explicitly says it cannot yet justify granting edit
+     authority to it). Added by this task -- see RemediationStrategyResult.
+     target_authority_unresolved's own docstring for the full contract.
 
-Only state C must set `_skip_patch_generation = True`. States A and B must
-leave existing behavior completely unchanged -- this gate must never
-suppress Patch Generation merely because no Final Strategy decision exists.
+Only states C and D must set `_skip_patch_generation = True`. States A and B
+must leave existing behavior completely unchanged -- this gate must never
+suppress Patch Generation merely because no Final Strategy decision exists,
+and never because of a validation-only evidence gap that leaves target
+authority unresolved-free.
 """
 
 from __future__ import annotations
@@ -39,11 +48,13 @@ from utilities.autopatcher.remediation_planner import (
 
 def _strategy(
     *, evaluated: bool, target_files=(), target_symbols=(), insufficient_evidence=(),
+    target_authority_unresolved=False,
 ) -> RemediationStrategyResult:
     return RemediationStrategyResult(
         rendered="", target_files=list(target_files), target_symbols=list(target_symbols),
         warnings=[], extended_mechanism=None, required_edits=[], security_invariant=None,
         insufficient_evidence=list(insufficient_evidence), evaluated=evaluated,
+        target_authority_unresolved=target_authority_unresolved,
     )
 
 
@@ -88,6 +99,26 @@ class TestFinalStrategyRanWithTargets:
         mock_build.assert_called_once()
         # The pre-existing exception handler for THIS branch (not the new
         # gate) catches the failure and never touches _skip_patch_generation.
+        assert result["_skip_patch_generation"] is False
+
+    def test_validation_only_evidence_gap_still_enters_existing_slice_path(self):
+        """A named target with `target_authority_unresolved=False` must
+        remain eligible to proceed even when `insufficient_evidence` is
+        non-empty -- the legitimate, non-blocking shape (e.g. missing test/
+        behavioral-confirmation evidence that does not bear on whether the
+        selected target/mechanism is correct). Only `target_authority_
+        unresolved=True` (State D, below) may withhold authority."""
+        strategy = _strategy(
+            evaluated=True, target_files=["src/util.py"],
+            insufficient_evidence=["No behavioral regression test was executed for this change"],
+            target_authority_unresolved=False,
+        )
+        with mock.patch(
+            "utilities.autopatcher.remediation_planner.build_final_target_slice",
+            side_effect=RuntimeError("unrelated internal failure -- proves this branch was reached"),
+        ) as mock_build:
+            result = _run_gate(_strategy_result=strategy)
+        mock_build.assert_called_once()
         assert result["_skip_patch_generation"] is False
 
 
@@ -137,6 +168,82 @@ class TestFinalStrategyRanWithZeroTargets:
             r2 = _run_gate(_strategy_result=strategy_rendered_nonempty)
         assert r1["_skip_patch_generation"] is True
         assert r2["_skip_patch_generation"] is True
+
+
+class TestFinalStrategyRanWithNamedTargetButAuthorityUnresolved:
+    """State D (added by this task, scope-v4 Run 5 forensic finding): Final
+    Strategy named a real, repository-resolvable target/mechanism, but its
+    own structured `target_authority_unresolved` says repository evidence
+    is not yet sufficient to justify granting edit authority to it. Patch
+    Generation must be skipped -- the Final-Target Remediation Slice must
+    never even be built for a doubted target -- exactly as unsafe as State
+    C, reusing the same flag."""
+
+    def test_named_target_with_authority_unresolved_skips_patch_generation(self):
+        strategy = _strategy(
+            evaluated=True, target_files=["src/connectionpool.py"], target_symbols=["HTTPConnectionPool.urlopen"],
+            insufficient_evidence=["Whether a narrower existing mechanism should be extended instead is unknown"],
+            target_authority_unresolved=True,
+        )
+        with mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice") as mock_build:
+            result = _run_gate(_strategy_result=strategy)
+        mock_build.assert_not_called()
+        assert result["_skip_patch_generation"] is True
+
+    def test_authority_unresolved_true_without_prose_corroboration_still_skips(self):
+        """The structured boolean alone is sufficient -- no keyword/prose
+        match against `insufficient_evidence` is required or performed."""
+        strategy = _strategy(
+            evaluated=True, target_files=["src/connectionpool.py"],
+            insufficient_evidence=[],  # deliberately empty -- no corroboration
+            target_authority_unresolved=True,
+        )
+        with mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice") as mock_build:
+            result = _run_gate(_strategy_result=strategy)
+        mock_build.assert_not_called()
+        assert result["_skip_patch_generation"] is True
+
+    def test_nonempty_insufficient_evidence_without_flag_does_not_skip(self):
+        """Regression guard, the mirror image of the test above: non-empty
+        `insufficient_evidence` prose must NEVER be inferred into an
+        authority block on its own -- only the explicit structured field
+        may do that. This is the "no prose/keyword matching" requirement's
+        direct behavioral proof."""
+        strategy = _strategy(
+            evaluated=True, target_files=["src/connectionpool.py"],
+            insufficient_evidence=[
+                "override the default; custom, non-default, low-level, broader, narrower, "
+                "must inspect PoolManager first"
+            ],
+            target_authority_unresolved=False,
+        )
+        with mock.patch(
+            "utilities.autopatcher.remediation_planner.build_final_target_slice",
+            side_effect=RuntimeError("unrelated internal failure -- proves this branch was reached"),
+        ) as mock_build:
+            result = _run_gate(_strategy_result=strategy)
+        mock_build.assert_called_once()
+        assert result["_skip_patch_generation"] is False
+
+    def test_gate_does_not_read_rendered_for_authority_gap_either(self):
+        strategy_rendered_empty = _strategy(
+            evaluated=True, target_files=["src/util.py"], target_authority_unresolved=True,
+        )
+        strategy_rendered_nonempty = strategy_rendered_empty._replace(rendered="## Some Markdown\n")
+        with mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice"):
+            r1 = _run_gate(_strategy_result=strategy_rendered_empty)
+            r2 = _run_gate(_strategy_result=strategy_rendered_nonempty)
+        assert r1["_skip_patch_generation"] is True
+        assert r2["_skip_patch_generation"] is True
+
+    def test_skip_reason_mentions_target_authority(self):
+        strategy = _strategy(
+            evaluated=True, target_files=["src/util.py"], target_authority_unresolved=True,
+        )
+        with mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice"):
+            result = _run_gate(_strategy_result=strategy)
+        assert result["_skip_patch_generation_reason"] is not None
+        assert "target_authority_unresolved" in result["_skip_patch_generation_reason"]
 
 
 class TestSkipPatchGenerationReachesNoPatchProducedPathUnchanged:

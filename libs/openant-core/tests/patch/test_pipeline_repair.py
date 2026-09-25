@@ -8,6 +8,21 @@ from unittest import mock
 
 import pytest
 
+_MOCK_GROUNDED_PLANNER_JSON = (
+    '{"remediation_mechanism": null, "target_files": [], "target_symbols": [], '
+    '"security_invariant": null, "narrower_alternative_decision": "NONE_IDENTIFIED", '
+    '"narrower_alternative_considered": null, "required_edits": [], "approaches_to_avoid": [], '
+    '"explicit_unknowns": [], "additional_evidence_required": false, "evidence_requests": []}'
+)
+"""Fix A: a schema-valid, GROUNDED (additional_evidence_required: false) empty
+Planner JSON response -- these tests stub `LLMClient` entirely with a bare
+MagicMock() and never configure `.complete` themselves (they mock
+generate_patch_raw/challenge_patch/etc. directly instead, so the raw LLM
+object is only ever actually asked for the Planning/Strategy calls) -- without
+this, an unconfigured MagicMock().complete(...) return value fails Planning's
+JSON parse and the new evidence-sufficiency gate correctly (but, for these
+unrelated tests, undesirably) blocks Patch Generation entirely."""
+
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
@@ -143,6 +158,7 @@ def _capture_result(tmp_path, *, patches_gen, patches_app, patches_chall, repo_r
                    side_effect=calibration_side_effect or _calibrate_all_observed) as _mock_calibrate,
     ):
         mock_llm_cls.return_value = mock.MagicMock()
+        mock_llm_cls.return_value.complete.return_value = _MOCK_GROUNDED_PLANNER_JSON
         from utilities.autopatcher.pipeline import run
         run("test vuln", api_key="", repo_root=repo_root or str(tmp_path))
 
@@ -480,6 +496,7 @@ class TestRepairOutcomes:
             mock.patch("utilities.autopatcher.pipeline.calibrate_findings", side_effect=_calibrate_all_observed),
         ):
             mock_llm_cls.return_value = mock.MagicMock()
+            mock_llm_cls.return_value.complete.return_value = _MOCK_GROUNDED_PLANNER_JSON
             from utilities.autopatcher.pipeline import run
             run("test vuln", api_key="", repo_root=str(tmp_path))
             # review_patch first arg is vuln text, second is the patch
@@ -631,6 +648,7 @@ class TestRepairReport:
                        side_effect=calibration_side_effect or _calibrate_all_observed),
         ):
             mock_llm_cls.return_value = mock.MagicMock()
+            mock_llm_cls.return_value.complete.return_value = _MOCK_GROUNDED_PLANNER_JSON
             from utilities.autopatcher.pipeline import run
             return run("test vuln", api_key="", repo_root=str(tmp_path))
 
@@ -1196,6 +1214,7 @@ class TestStillVulnerableRegressionEndToEnd:
             ),
         ):
             mock_llm_cls.return_value = mock.MagicMock()
+            mock_llm_cls.return_value.complete.return_value = _MOCK_GROUNDED_PLANNER_JSON
             pipeline_mod.run(
                 "test vuln", api_key="", repo_root=str(tmp_path), execution_recorder=recorder,
             )
@@ -1601,6 +1620,7 @@ class TestNoUnnecessaryCalibrationCall:
             mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
         ):
             mock_llm_cls.return_value = mock.MagicMock()
+            mock_llm_cls.return_value.complete.return_value = _MOCK_GROUNDED_PLANNER_JSON
             from utilities.autopatcher.pipeline import run
             run("test vuln", api_key="", repo_root=str(tmp_path))
             mock_calibrate.assert_not_called()
@@ -1629,6 +1649,7 @@ class TestNoUnnecessaryCalibrationCall:
             mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
         ):
             mock_llm_cls.return_value = mock.MagicMock()
+            mock_llm_cls.return_value.complete.return_value = _MOCK_GROUNDED_PLANNER_JSON
             from utilities.autopatcher.pipeline import run
             run("test vuln", api_key="", repo_root=str(tmp_path))
             assert mock_calibrate.call_count == 1

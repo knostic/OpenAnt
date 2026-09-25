@@ -33,6 +33,11 @@ def _plan(
     narrower="considered a narrower mechanism, rejected because X",
     rendered="## Target Discovery Plan\n", decision=None,
 ):
+    # Fix A: additional_evidence_required="explicit_false" -- this whole
+    # file is about Plan Verification, not about the evidence-sufficiency
+    # gate that now runs BEFORE Verification (see run_planning_evidence_
+    # acquisition); every plan built here must read as already-grounded so
+    # Verification is actually reached, exactly as these tests intend.
     return RemediationPlanResult(
         rendered=rendered, target_files=["a.py"], target_symbols=["a.py:foo"],
         security_invariant="the unsafe condition must not occur",
@@ -40,6 +45,7 @@ def _plan(
         narrower_alternative_decision=decision,
         narrower_alternative_considered=narrower,
         required_edits=["edit one"], approaches_to_avoid=[], explicit_unknowns=[],
+        additional_evidence_required="explicit_false",
     )
 
 
@@ -62,6 +68,7 @@ def _plan_with_real_target(tmp_path, narrower, rendered="## Target Discovery Pla
         narrower_alternative_decision=decision,
         narrower_alternative_considered=narrower,
         required_edits=["edit one"], approaches_to_avoid=[], explicit_unknowns=[],
+        additional_evidence_required="explicit_false",
     )
 
 
@@ -231,8 +238,25 @@ class TestDispatchNarrowerModeUnit:
     def test_explicit_selected_is_returned_as_is(self):
         assert _dispatch_narrower_mode(_plan(decision="SELECTED")) == "SELECTED"
 
-    def test_explicit_none_identified_is_returned_as_is(self):
-        assert _dispatch_narrower_mode(_plan(decision="NONE_IDENTIFIED")) == "NONE_IDENTIFIED"
+    def test_explicit_none_identified_with_empty_narrative_is_returned_as_is(self):
+        # A GENUINE NONE_IDENTIFIED (schema-consistent: no narrative to
+        # record, per remediation_planner.md's own field description) is
+        # the only case where this enum value may still bypass verification.
+        assert _dispatch_narrower_mode(_plan(decision="NONE_IDENTIFIED", narrower=None)) == "NONE_IDENTIFIED"
+
+    def test_none_identified_with_substantive_narrative_falls_back_to_rejected(self):
+        # RED-first regression for the evidence-conditioned-authority fix:
+        # a NONE_IDENTIFIED decision paired with a non-empty
+        # `narrower_alternative_considered` is schema-INCONSISTENT (the
+        # prompt's own contract requires that field to be null/near-null
+        # whenever NONE_IDENTIFIED is genuinely chosen) -- exactly the same
+        # shape this function already treats as untrustworthy when the
+        # decision itself is missing/invalid (see the narrative-fallback
+        # tests below). A valid-looking NONE_IDENTIFIED must not get a free
+        # pass to bypass verification merely because the enum parsed
+        # cleanly; it must fall back to the same conservative substitution.
+        plan = _plan(decision="NONE_IDENTIFIED", narrower="the mechanism already exists in the code")
+        assert _dispatch_narrower_mode(plan) == "REJECTED"
 
     def test_missing_decision_with_narrative_defaults_to_rejected(self):
         # Conservative substitution, never prose inference: a narrative
@@ -285,6 +309,30 @@ class TestModeDispatchIntoVerifierCall:
         ):
             pipeline_mod.run(vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path))
         spy_verify.assert_not_called()
+
+    def test_none_identified_with_narrative_does_call_verifier_via_full_pipeline(self, tmp_path):
+        # RED-first regression, full-pipeline layer: the companion, WIRING
+        # proof to TestDispatchNarrowerModeUnit's unit-level test above --
+        # a NONE_IDENTIFIED decision carrying a substantive
+        # `narrower_alternative_considered` must reach the verifier at the
+        # real pipeline.run() level, not merely at the isolated
+        # _dispatch_narrower_mode() call.
+        plan_v1 = _plan_with_real_target(
+            tmp_path, narrower="the mechanism already exists in the code", decision="NONE_IDENTIFIED",
+        )
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_plan",
+                return_value=plan_v1,
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_verifier.verify_planner_claim",
+                return_value=_verdict("UNRESOLVED"),
+            ) as spy_verify,
+        ):
+            pipeline_mod.run(vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path))
+        spy_verify.assert_called_once()
+        assert spy_verify.call_args.kwargs.get("mode") == "REJECTED"
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,21 @@ from utilities.autopatcher.stage_registry import (
     REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING,
 )
 
+_MOCK_GROUNDED_PLANNER_JSON = (
+    '{"remediation_mechanism": null, "target_files": [], "target_symbols": [], '
+    '"security_invariant": null, "narrower_alternative_decision": "NONE_IDENTIFIED", '
+    '"narrower_alternative_considered": null, "required_edits": [], "approaches_to_avoid": [], '
+    '"explicit_unknowns": [], "additional_evidence_required": false, "evidence_requests": []}'
+)
+"""Fix A: a schema-valid, GROUNDED (additional_evidence_required: false) empty
+Planner JSON response -- these tests stub `LLMClient` entirely with a bare
+MagicMock() and never configure `.complete` themselves (they mock
+generate_patch_raw/challenge_patch/etc. directly instead, so the raw LLM
+object is only ever actually asked for the Planning/Strategy calls) -- without
+this, an unconfigured MagicMock().complete(...) return value fails Planning's
+JSON parse and the new evidence-sufficiency gate correctly (but, for these
+unrelated tests, undesirably) blocks Patch Generation entirely."""
+
 _CLEAN_DIFF = """\
 ```diff
 --- a/src/urllib3/util/retry.py
@@ -92,6 +107,7 @@ def _run_with_recorder(tmp_path, *, patches_gen, patches_app, patches_chall, no_
         mock.patch("utilities.autopatcher.pipeline.calibrate_findings", side_effect=_calibrate_all_observed),
     ):
         mock_llm_cls.return_value = mock.MagicMock()
+        mock_llm_cls.return_value.complete.return_value = _MOCK_GROUNDED_PLANNER_JSON
         from utilities.autopatcher.pipeline import run
         report = run("test vuln", api_key="", repo_root=str(tmp_path), execution_recorder=recorder)
 
@@ -371,10 +387,12 @@ class TestSkippedAndDegradedOutcomes:
         assert not artifact["patch"]
 
     def test_s2_s3_honestly_skip_when_no_planner_evidence(self, tmp_path):
-        """With LLMClient fully mocked away, generate_remediation_plan's own
-        best-effort fallback yields an empty (non-fabricated) plan result --
-        S2/S3 must honestly report they were skipped, never silently
-        claim readiness they don't have."""
+        """With LLMClient fully mocked away, `_run_with_recorder`'s default
+        grounded-but-empty mock Planner response (Fix A: additional_
+        evidence_required=false, but no target_files/target_symbols named)
+        still yields nothing for Strategy to work with -- S2/S3 must
+        honestly report they were skipped, never silently claim readiness
+        they don't have."""
         _, rec = _run_with_recorder(
             tmp_path, patches_gen=[_CLEAN_DIFF], patches_app=[_APPLICABILITY_CLEAN],
             patches_chall=[_CHALLENGER_CLEAN],

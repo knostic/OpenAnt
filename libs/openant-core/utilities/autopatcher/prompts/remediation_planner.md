@@ -7,6 +7,19 @@ vulnerability-class guidance, and structural analysis already gathered for
 this run) for one target repository. You do not have an upstream patch or a
 known-fixed commit to reference.
 
+Do not rely on remembered knowledge of the upstream patch for this
+vulnerability, remembered fixed-version implementation details, or any
+inference about what the project historically changed to fix it. Do not use
+prior or general knowledge of the known remediation as evidence for or
+against a mechanism or alternative — cite only the vulnerability report and
+the Repository Evidence actually supplied to you. If you are uncertain
+whether a fact came from the supplied evidence or from remembered knowledge,
+treat it as not supplied: say so in `explicit_unknowns`, or request it via
+`evidence_requests` below, rather than stating it as a basis for your
+decision. You may still reason from the vulnerability report and the
+repository evidence actually supplied — this only asks you to keep the two
+sources of knowledge separate.
+
 Your only task is to propose a narrow remediation strategy that a separate,
 later step will use to write the actual patch. You do not write code. You do
 not write a diff. You do not write pseudocode.
@@ -25,7 +38,16 @@ markdown fences, no commentary.
   "narrower_alternative_considered": string | null,
   "required_edits": [string, ...],
   "approaches_to_avoid": [string, ...],
-  "explicit_unknowns": [string, ...]
+  "explicit_unknowns": [string, ...],
+  "additional_evidence_required": boolean,
+  "evidence_requests": [
+    {
+      "request_type": "file_source" | "symbol_definition",
+      "file_hint": string | null,
+      "symbol": string | null,
+      "reason": string
+    }
+  ]
 }
 
 ## How to reason before you answer
@@ -146,14 +168,68 @@ straight from "what the exploit looks like" to "what to forbid."
    smallest change that fully closes the condition from step 1, not the
    smallest diff regardless of whether the vulnerability is actually fixed.
 
+## Requesting additional evidence
+
+Before you finalize a plan, decide whether the Repository Evidence given to
+you actually contains what you need to select the remediation mechanism —
+not just to name a plausible file, but to trace the exploit and evaluate a
+narrower alternative per the steps above. If it does not, you may request
+specific, additional repository evidence instead of guessing.
+
+You do not have repository file access yourself, and you must not need it:
+everything you ask for must already be nameable from the evidence given to
+you below (a file path mentioned in the vulnerability report or existing
+evidence, or a symbol name you already know of but whose own source is not
+yet visible). Everything you name will be independently resolved and
+verified — anything that cannot be verified is discarded, never trusted,
+and never applied.
+
+- `additional_evidence_required`: `true` only when the evidence given to you
+  is insufficient to select a concrete, evidence-backed remediation
+  mechanism AND you are naming at least one specific, resolvable
+  `evidence_requests` entry that would help close that gap. Otherwise
+  `false`. Never `true` with an empty `evidence_requests` list, and never
+  `false` while `evidence_requests` is non-empty — these are read as
+  contradictory and are never resolved in favor of one field over the
+  other. This is the ONLY field that can trigger another bounded round of
+  evidence acquisition; do not rely on `explicit_unknowns` prose for this.
+- `evidence_requests`: what you may ask for, and only when the evidence
+  below shows it is genuinely still missing:
+  - `"file_source"` — a whole file you already know the path of (named in
+    the vulnerability report or existing evidence) whose own source is not
+    yet visible below. Set `file_hint` to that exact path; leave `symbol`
+    null.
+  - `"symbol_definition"` — an exact function/method/class/constant you
+    already know the name of, whose own source is not yet visible below.
+    Set `symbol` to that exact name; set `file_hint` to the file it lives
+    in if you already know it, otherwise leave it null.
+  - `reason` must say specifically why this evidence is necessary to
+    select or validate the remediation mechanism — not a generic "for
+    context".
+  What you must never do: never include repository source code, a diff, or
+  pseudocode in a request; never include a line number or line range;
+  never include a shell command, a glob pattern, or a free-form search
+  query; never ask about a file or symbol that isn't already implied by
+  the evidence given to you; never repeat a request for something already
+  present in the evidence below; never ask about anything unrelated to
+  selecting or validating the remediation mechanism. At most a few
+  requests per round — list only what is actually necessary, in priority
+  order.
+- If, even with everything currently given to you, you can already select
+  a concrete, evidence-backed mechanism, set `additional_evidence_required`
+  to `false` and leave `evidence_requests` empty — do not request evidence
+  you do not actually need.
+
 ## Rules
 
 - Prefer files and symbols already named in the Repository Evidence given to
   you. Only name something not already present if you have a specific
   reason to believe it is relevant.
 - If you cannot identify a concrete file, symbol, or mechanism from the
-  evidence given, say so in `explicit_unknowns` rather than guessing. An
-  empty list is a better answer than a wrong one.
+  evidence given, say so in `explicit_unknowns` rather than guessing — and,
+  if the missing piece is a specific, nameable file or symbol, also request
+  it via `evidence_requests` above rather than only describing the gap in
+  prose. An empty list is a better answer than a wrong one.
 - Every item must be specific to this vulnerability and this repository —
   not generic security advice ("validate all input", "use safe APIs").
 - Propose exactly one remediation mechanism, not a menu of options. The

@@ -1871,6 +1871,7 @@ class TestSlice4PipelineIntegration:
                     "remediation_mechanism": "fix it", "target_files": planning_target_files,
                     "target_symbols": [], "security_invariant": "stub", "required_edits": [],
                     "approaches_to_avoid": [], "explicit_unknowns": [],
+                    "additional_evidence_required": False, "evidence_requests": [],
                 })
             if stage == "remediation_strategy":
                 return json.dumps({
@@ -2175,6 +2176,7 @@ class TestPostPatchRecoveryEvidenceReachesChallenger:
                     "remediation_mechanism": "fix it", "target_files": ["mod.py", "other.py"],
                     "target_symbols": [], "security_invariant": "stub", "required_edits": [],
                     "approaches_to_avoid": [], "explicit_unknowns": [],
+                    "additional_evidence_required": False, "evidence_requests": [],
                 })
             if stage == "remediation_strategy":
                 # Final Strategy narrows to mod.py only -- other.py keeps

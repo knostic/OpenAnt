@@ -245,20 +245,36 @@ STAGE_DEPENDENCIES: "dict[str, tuple[str, ...]]" = {
 # ---------------------------------------------------------------------------
 
 STAGE_OWNED_LLM_TAGS: "dict[str, tuple[str, ...]]" = {
+    # remediation_planning_reattempt: bounded iterative Planning evidence
+    # acquisition (remediation_planner.run_planning_evidence_acquisition)
+    # -- a single reused tag for every Planning call after the first
+    # (attempts 2/3, at most MAX_PLANNING_ATTEMPTS total), owned by THIS
+    # canonical stage since it is still the same logical Planning call,
+    # only repeated with additional deterministically-acquired evidence.
+    # Mirrors how the Evidence-Gap Strategy Fallback's own rerun reuses
+    # "remediation_strategy" rather than minting a new tag per attempt.
+    # Triggered only when the Planner explicitly requests more evidence
+    # (additional_evidence_required=true) -- most runs never emit this tag.
+    #
     # remediation_plan_verification/remediation_plan_revision/
     # remediation_plan_reverification: the Planner Claim Verifier
     # orchestration (pipeline.py::_run_planner_claim_verification) --
     # bounded (at most one revision, at most two verification calls) and
     # owned by THIS canonical stage, not a new one: it sits between this
-    # stage's own Planner call and S2 (Remediation Strategy), reads only
-    # evidence this stage already produced, and never touches Strategy or
-    # Patch Generation directly (see _skip_patch_generation propagation in
-    # pipeline.py for how an uncleared contradiction reaches S3/S4
-    # instead). Triggered only when the Planner's own
+    # stage's own (now possibly-iterated) Planner call and S2 (Remediation
+    # Strategy), runs only once Planning's own acquisition loop reaches a
+    # grounded terminal state (see run_planning_evidence_acquisition's own
+    # docstring -- Verification never reopens Planning for an evidence
+    # gap), reads only evidence this stage already produced, and never
+    # touches Strategy or Patch Generation directly (see
+    # _skip_patch_generation propagation in pipeline.py for how an
+    # uncleared contradiction, or an ungrounded Planning result, reaches
+    # S3/S4 instead). Triggered only when the Planner's own
     # narrower_alternative_considered is non-empty -- most runs never emit
     # any of these three tags at all.
     REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING: (
         "remediation_planning",
+        "remediation_planning_reattempt",
         "remediation_plan_verification",
         "remediation_plan_revision",
         "remediation_plan_reverification",

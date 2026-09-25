@@ -29,6 +29,21 @@ import utilities.autopatcher.post_patch_evaluation as _ppe_mod
 EXAMPLES_DIR = Path(__file__).parent / "fixtures" / "examples"
 _VULN_TEXT = (EXAMPLES_DIR / "vulnerability.md").read_text(encoding="utf-8")
 
+_MOCK_GROUNDED_PLANNER_JSON = (
+    '{"remediation_mechanism": null, "target_files": [], "target_symbols": [], '
+    '"security_invariant": null, "narrower_alternative_decision": "NONE_IDENTIFIED", '
+    '"narrower_alternative_considered": null, "required_edits": [], "approaches_to_avoid": [], '
+    '"explicit_unknowns": [], "additional_evidence_required": false, "evidence_requests": []}'
+)
+"""Fix A: a schema-valid, GROUNDED (additional_evidence_required: false) empty
+Planner JSON response -- this file stubs `LLMClient` entirely with a bare
+MagicMock() and never configures `.complete` itself (Patch Generation etc.
+are mocked directly instead, so the raw LLM object is only ever actually
+asked for the Planning/Strategy calls) -- without this, an unconfigured
+MagicMock().complete(...) return value fails Planning's JSON parse and the
+new evidence-sufficiency gate correctly (but, for these unrelated tests,
+undesirably) blocks Patch Generation entirely."""
+
 _APPLICABILITY_CLEAN = {
     "applicable": True, "skipped": False, "stderr": "",
     "exit_code": 0, "skipped_reason": None, "error": None,
@@ -143,7 +158,10 @@ def _run_pipeline(
     # with it, and generate_patch with the REMAINING items, preserves every
     # existing call's exact meaning.
     patchers = [
-        mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+        mock.patch(
+            "utilities.autopatcher.pipeline.LLMClient",
+            return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+        ),
         mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", return_value=patches_gen[0]),
         mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=patches_gen[1:]),
         mock.patch("utilities.autopatcher.patch_applicability.check_applicability", return_value=_APPLICABILITY_CLEAN),

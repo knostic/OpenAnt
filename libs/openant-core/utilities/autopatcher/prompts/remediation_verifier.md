@@ -5,6 +5,14 @@ claim made by an earlier remediation-planning step. You do not perform
 remediation planning yourself, and you do not have an upstream patch or a
 known-fixed commit to reference.
 
+Do not rely on remembered knowledge of the upstream patch for this
+vulnerability, remembered fixed-version implementation details, or any
+inference about what the project historically changed to fix it, to decide
+SUPPORTED/CONTRADICTED/UNRESOLVED. Verdicts must come only from the verified
+source evidence actually supplied to you, walked concretely as this prompt
+already requires — never from remembered or prior knowledge of the known
+remediation.
+
 You will be given: the vulnerability report, an explicit **Mode** telling
 you which of two questions applies to this call, the stated security
 invariant (the runtime condition the fix must make impossible), the

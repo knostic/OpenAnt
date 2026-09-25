@@ -990,42 +990,19 @@ def _classify_challenger(challenger: dict) -> dict:
     # plausible_risk itself means for findings that still land there.
     result["behavioral_defect_count"] = sum(1 for f in all_classified if f["category"] == "behavioral_defect")
 
-    # Consistency reconciliation (demonstrated regression: a raw Challenger
-    # response asserted verification_status="VERIFIED_FIXED" while ALSO
-    # reporting a finding classified validation_gap -- i.e. the model itself
-    # said some required verification could not be established from the
-    # supplied evidence, in the same response). VERIFIED_FIXED is a claim
-    # that the supplied evidence affirmatively supports the mechanism; an unresolved
-    # validation_gap is structurally incompatible with that claim BY
-    # DEFINITION (validation_gap = "cannot verify/confirm/test/validate...",
-    # see _classify_finding), regardless of any specific wording -- so this
-    # never inspects finding text itself, only the already-computed count.
-    #
-    # Deliberately reduces certainty ONLY (VERIFIED_FIXED ->
-    # INSUFFICIENT_EVIDENCE) here -- an unresolved validation gap is an
-    # absence of sufficient verification, not affirmative evidence the
-    # vulnerability remains, so THIS branch alone never promotes it to
-    # RESIDUAL_VULNERABILITY. See the separate, symmetric reconciliation
-    # below for the mirror-image case: a self-reported RESIDUAL_VULNERABILITY
-    # verdict that is itself unsupported by any demonstrated defect.
-    #
-    # Deliberately excludes confirmed_defect_count/behavioral_defect_count:
-    # both already have deterministic blocking behavior via the existing
-    # Misaligned path in _build_recommendation_v1 (aln_val="Misaligned" is
-    # set whenever confirmed_defect_count > 0, checked before any
-    # still_vulnerable-based branch) -- reconciling verification_status for
-    # those too is a signal-level-only concern, not the demonstrated bug
-    # this reconciliation exists to fix, and is intentionally left for a
-    # separate change if a concrete need is shown.
-    #
-    # Deliberately excludes plausible_risk_count: that category is the
-    # classifier's broad, catch-all default (see _classify_finding's own
-    # "Default -> plausible_risk (conservative)" step) and also covers
-    # entirely benign observations -- including it here would make
-    # VERIFIED_FIXED practically unreachable, not merely more conservative.
-    if result.get("verification_status") == "VERIFIED_FIXED" and result["validation_gap_count"] > 0:
-        result["verification_status"] = "INSUFFICIENT_EVIDENCE"
-        result["still_vulnerable"] = True
+    # NOTE: a VERIFIED_FIXED + validation_gap_count>0 consistency
+    # reconciliation used to live here, keyed purely on the raw lexical
+    # validation_gap count. It has been REPLACED, not merely supplemented,
+    # by `_reconcile_verification_status_with_calibration` (below in this
+    # module), which is run later -- after finding_calibration is
+    # finalized -- and decides this exact case using the semantic
+    # "Remediation impact" calibration axis instead of the raw lexical
+    # category alone. This function must no longer perform that narrowing
+    # itself: a demonstrated regression showed a validation_gap-worded and
+    # a plausible_risk-worded finding stating the SAME unresolved factual
+    # dependency received different authority purely because of which
+    # wording `_classify_finding`'s regex happened to match -- see
+    # `_reconcile_verification_status_with_calibration`'s own docstring.
 
     # Symmetric reconciliation (a second, generically-shaped regression: a
     # raw Challenger response asserted verification_status=
@@ -1063,6 +1040,169 @@ def _classify_challenger(challenger: dict) -> dict:
         result["verification_status"] = "INSUFFICIENT_EVIDENCE"
         result["still_vulnerable"] = True
 
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Semantic remediation-proof reconciliation -- sibling to _classify_challenger
+# above, but runs strictly LATER (after finding_calibration is finalized),
+# and decides remediation-proof blocking authority for an unresolved-evidence
+# finding using finding_calibration's semantic "Remediation impact" axis
+# (see finding_calibration.py) instead of the raw lexical category alone.
+#
+# Why this exists (forensic finding): a raw Challenger response can state the
+# SAME unresolved factual dependency twice, worded two different ways, and
+# _classify_finding's regex sorts one into `plausible_risk` and the other
+# into `validation_gap` purely on wording. The OLD reconciliation (removed
+# from _classify_challenger above) fired only on validation_gap_count > 0 --
+# so which of the two wordings a model happened to pick decided whether a
+# self-reported VERIFIED_FIXED verdict survived. This function replaces that
+# lexical-only trigger with a semantic one: a finding's own calibrated
+# "Remediation impact" (proof_required / validation_only / unclear) decides
+# blocking, regardless of which lexical bucket the same underlying
+# dependency happened to land in.
+#
+# Never inspects finding text itself -- only already-computed categories and
+# already-parsed calibration fields, exactly like _classify_challenger's own
+# two reconciliation branches. No new repository search, no new LLM call, no
+# regex synonym expansion.
+# ---------------------------------------------------------------------------
+
+# Categories this reconciliation ever consults. confirmed_defect/
+# behavioral_defect are deliberately excluded: their own blocking authority
+# (the Misaligned path in _build_recommendation_v1, and should_auto_repair/
+# accept_repair's own Observed-calibration gate) is untouched by this
+# function -- widening it here would change authority this task's own
+# constraints require left alone.
+_REMEDIATION_PROOF_LEXICAL_CATEGORIES = ("plausible_risk", "validation_gap", "generic")
+
+
+def _match_calibration_entries(finding_calibration: "list[dict] | None") -> "dict[str, dict | None]":
+    """Positive, text-exact association from a finding's own original text
+    to its calibration entry -- never fuzzy matching, never positional
+    borrowing (the Nth classified finding is NOT assumed to correspond to
+    the Nth calibration entry, since the two lists can diverge in order/
+    membership once repair regenerates a response -- see
+    _reconcile_verification_status_with_calibration's own docstring).
+
+    A duplicated original text mapping to two DISAGREEING calibration
+    entries is ambiguous -- there is no safe basis for picking one over the
+    other, so it maps to None (the same "no confident calibration signal"
+    fail-closed shape as a text with no entry at all), never to either
+    duplicate's value. Two entries sharing the same original text that
+    happen to agree are not ambiguous and resolve normally.
+    """
+    by_text: "dict[str, dict | None]" = {}
+    for entry in finding_calibration or []:
+        text = entry.get("original")
+        if not text:
+            continue
+        if text in by_text and by_text[text] is not None and by_text[text] != entry:
+            by_text[text] = None  # ambiguous: disagreeing duplicate -- fail closed
+        elif text not in by_text:
+            by_text[text] = entry
+    return by_text
+
+
+def _finding_blocks_remediation_proof(finding: dict, calibration_entry: "dict | None") -> bool:
+    """Whether ONE classified finding (category in
+    _REMEDIATION_PROOF_LEXICAL_CATEGORIES) should block remediation-proof
+    authority for the CURRENT run -- i.e. count toward forcing a
+    self-reported VERIFIED_FIXED down to INSUFFICIENT_EVIDENCE.
+
+    Base presumption when no positively-matched calibration entry exists
+    for this exact finding text (calibration never ran, failed outright, or
+    this text has no entry): a `validation_gap` finding blocks, by its own
+    lexical definition (_classify_finding: "cannot verify/confirm..." / an
+    evidence-gap signal IS a claim that something is unresolved) -- exactly
+    the base rate the old, now-removed lexical-only branch always applied.
+    A `plausible_risk`/`generic` finding does NOT block by default -- that
+    bucket is `_classify_finding`'s own broad, "also covers entirely benign
+    observations" catch-all default, and never independently blocked
+    before this feature existed either. No calibration signal means no
+    change from that pre-existing behavior in either direction.
+
+    Calibration OVERRIDES the base presumption only when it positively
+    names an unresolved dependency for THIS finding (`unresolved_
+    dependencies` non-empty) -- otherwise nothing here promotes or demotes
+    the base presumption, so a plausible_risk/generic finding calibration
+    never even looked at still never manufactures a blocker, and a
+    validation_gap finding calibration never looked at still falls back to
+    its own base presumption (blocking) exactly as before.
+
+    Once a positively-matched, non-empty-`unresolved_dependencies` entry
+    exists:
+      - "proof_required"                    -> blocks.
+      - "validation_only"                   -> does NOT block -- this is
+                                                what stops the raw
+                                                validation_gap regex from
+                                                being independently
+                                                authoritative.
+      - "unclear"/missing/any other value    -> fails closed -> blocks.
+        (No uncertainty may silently become non-blocking.)
+    """
+    if calibration_entry is None:
+        return finding["category"] == "validation_gap"
+
+    unresolved = calibration_entry.get("unresolved_dependencies") or []
+    if not unresolved:
+        return False  # calibration examined this finding and found nothing unresolved
+
+    impact = calibration_entry.get("remediation_impact")
+    if impact == "validation_only":
+        return False
+    return True  # "proof_required", "unclear", missing, or any unrecognized value
+
+
+def _reconcile_verification_status_with_calibration(
+    classified_challenger: dict, finding_calibration: "list[dict] | None"
+) -> dict:
+    """Deterministic reconciliation layer, run AFTER finding_calibration is
+    finalized for the CURRENT (post-repair, if applicable) Challenger
+    result -- see _build_report, the sole caller, and STEP 5's own
+    docstring below for why it must always be the calibration/challenger
+    pair that actually correspond to each other.
+
+    Only ever narrows a `VERIFIED_FIXED` verdict -- a response already
+    classified `RESIDUAL_VULNERABILITY`/`INSUFFICIENT_EVIDENCE` is returned
+    completely unchanged, regardless of what any finding's calibration
+    says: an already-blocking verdict is never cleared by a
+    `validation_only` finding alongside it, and this function never
+    promotes anything to a WEAKER state than `_classify_challenger` already
+    produced. `confirmed_defect_count`/`behavioral_defect_count` and every
+    other key are passed through byte-identical -- this function only ever
+    rewrites `verification_status`/`still_vulnerable`, and only in the
+    narrowing direction.
+
+    `calibrate_findings` itself never decides this -- see
+    finding_calibration.py's own module docstring: it only characterizes a
+    finding's `unresolved_dependencies`/`remediation_impact`. This function
+    is the only place authorized to translate that characterization into
+    remediation-proof blocking authority.
+    """
+    if not classified_challenger:
+        return classified_challenger
+    result = dict(classified_challenger)
+    if result.get("verification_status") != "VERIFIED_FIXED":
+        return result
+
+    calibration_by_text = _match_calibration_entries(finding_calibration)
+    all_classified = (
+        (result.get("classified_edge_cases") or [])
+        + (result.get("classified_potential_issues") or [])
+    )
+    blocked = False
+    for finding in all_classified:
+        if finding["category"] not in _REMEDIATION_PROOF_LEXICAL_CATEGORIES:
+            continue  # confirmed_defect/behavioral_defect authority is untouched here
+        entry = calibration_by_text.get(finding["text"])
+        if _finding_blocks_remediation_proof(finding, entry):
+            blocked = True
+            break
+
+    if blocked:
+        result["verification_status"] = "INSUFFICIENT_EVIDENCE"
+        result["still_vulnerable"] = True
     return result
 
 
@@ -3467,6 +3607,19 @@ def _build_report(result: PipelineResult) -> str:
     # Trust Package computation (uses hoisted data above)
     # -----------------------
     classified_challenger = _classify_challenger(challenger)
+    # Semantic remediation-proof reconciliation -- MUST run against
+    # `result.challenger`/`result.finding_calibration` specifically (both
+    # read from the same `result`, so both already correspond to the same,
+    # CURRENT Challenger response: post-repair if repair succeeded, the
+    # original otherwise -- see PipelineResult's own field docs and
+    # _reconcile_verification_status_with_calibration's own docstring for
+    # why a stale calibration entry from an earlier, pre-repair response
+    # can never be applied here: association is by exact finding text, and
+    # a repair's fresh re-Challenger call produces fresh finding text that
+    # simply will not match anything from the superseded response).
+    classified_challenger = _reconcile_verification_status_with_calibration(
+        classified_challenger, result.finding_calibration,
+    )
     impact_level_str = _resolve_impact_level(result.impact)  # I2
     # Calibration-aware authoritative finding state, computed before Trust
     # Signals/Recommendation so both read the SAME post-calibration defect
@@ -4110,8 +4263,22 @@ def _dispatch_narrower_mode(plan_result) -> str:
     `narrower_alternative_considered`'s prose. Returns `"REJECTED"`,
     `"SELECTED"`, or `"NONE_IDENTIFIED"` -- reusing the Planner's own enum
     values directly, so the mapping from decision to verifier mode is the
-    identity function for the two decisions that need a verifier call at
-    all; the caller treats `"NONE_IDENTIFIED"` as "make no verifier call."
+    identity function for `"SELECTED"`/`"REJECTED"`, the two decisions that
+    always need a verifier call; the caller treats `"NONE_IDENTIFIED"` as
+    "make no verifier call."
+
+    `"NONE_IDENTIFIED"` is trusted as-is ONLY when it is schema-consistent:
+    prompts/remediation_planner.md's own field description requires
+    `narrower_alternative_considered` to be null/near-empty whenever
+    `"NONE_IDENTIFIED"` is genuinely the Planner's decision -- "say so
+    plainly... never because you are merely unsure whether a real
+    alternative would work." A response that pairs `"NONE_IDENTIFIED"` with
+    a substantive narrative already violates that contract (e.g. narrative
+    text asserting the narrower mechanism already exists in the code, which
+    is a claim about unseen source, not an empty search result) and is
+    evidence-conditioned identically to a missing/invalid decision below --
+    it is never given a free pass to skip verification merely because the
+    enum value itself parsed as one of the three valid strings.
 
     Missing/invalid `narrower_alternative_decision` (a fresh response that
     omitted it, or supplied something outside the three valid values) is
@@ -4123,7 +4290,9 @@ def _dispatch_narrower_mode(plan_result) -> str:
     ever clear, so this default is safe regardless of what the Planner
     actually meant. If there is no narrative at all either, there is
     nothing to check under either mode, matching this architecture's
-    existing "nothing to verify" behavior exactly.
+    existing "nothing to verify" behavior exactly. This is now the SAME
+    rule a schema-inconsistent `"NONE_IDENTIFIED"` falls into -- one
+    substitution rule, not two.
 
     Used both for the initial (v1) dispatch and, inside
     `_run_planner_claim_verification`, to re-dispatch v2's mode from the
@@ -4131,7 +4300,7 @@ def _dispatch_narrower_mode(plan_result) -> str:
     Planner that rejected in v1 may select in v2), so this is always
     re-evaluated, never carried over from v1."""
     decision = plan_result.narrower_alternative_decision
-    if decision in ("SELECTED", "REJECTED", "NONE_IDENTIFIED"):
+    if decision in ("SELECTED", "REJECTED"):
         return decision
     narrative = (plan_result.narrower_alternative_considered or "").strip()
     return "REJECTED" if narrative else "NONE_IDENTIFIED"
@@ -4540,31 +4709,61 @@ def _run_planner_claim_verification(
 # target, the run fails closed exactly as it already does today -- this
 # module never retries a third time and never substitutes Planner data
 # for a Strategy decision.
+#
+# Second trigger case (scope-v4 Run 5 forensic finding): Final Strategy can
+# ALSO name a real, repository-resolvable target/mechanism while its own
+# structured `target_authority_unresolved` says it cannot yet justify that
+# SAME target/mechanism from available evidence -- a materially different
+# deadlock from the zero-target one above (there IS a target; it just may
+# not be the right one), which the zero-target-only trigger below cannot
+# see at all. The caller (pipeline.run(), where `_evidence_gap_fallback_
+# trigger` is invoked) is responsible for seeding reacquisition from
+# Strategy's OWN target_files/target_symbols for this case -- NOT
+# Planner's original guess -- since Strategy's own choice is the thing
+# whose authority is in doubt; see the call site's own comment. This
+# function stays a pure predicate over `strategy_result` alone and never
+# itself decides which candidates to reacquire.
 # ---------------------------------------------------------------------------
 
 def _evidence_gap_fallback_trigger(strategy_result) -> bool:
-    """True exactly when Final Strategy #1 evaluated a real response,
-    named zero authoritative targets, and explicitly reported non-empty
-    `insufficient_evidence` -- the one structural signal (no prose/keyword
-    inspection) that distinguishes "the evidence I was given was too
-    thin to decide from" from a genuine "I looked and there is no viable
-    target here" decision (which has `insufficient_evidence == []` and
-    must never trigger this fallback -- see RemediationStrategyResult's
-    own docstring on why an empty target list is never, by itself, a
-    signal to retry)."""
-    return bool(
-        strategy_result is not None
-        and strategy_result.evaluated
-        and not (strategy_result.target_files or strategy_result.target_symbols)
-        and strategy_result.insufficient_evidence
-    )
+    """True in either of two structurally-detectable cases, both requiring
+    Final Strategy #1 to have evaluated a real response:
+
+    1. Zero-target case (original): named zero authoritative targets AND
+       explicitly reported non-empty `insufficient_evidence` -- the one
+       structural signal (no prose/keyword inspection) that distinguishes
+       "the evidence I was given was too thin to decide from" from a
+       genuine "I looked and there is no viable target here" decision
+       (which has `insufficient_evidence == []` and must never trigger
+       this fallback -- see RemediationStrategyResult's own docstring on
+       why an empty target list is never, by itself, a signal to retry).
+
+    2. Named-target authority-gap case (additive): named at least one
+       target/symbol AND `target_authority_unresolved is True`. Reads
+       ONLY this one structured boolean -- never `insufficient_evidence`'s
+       text, never `rejected_targets`' text, never any keyword/file-name
+       match against either. A `True` value is honored on its own,
+       corroborating prose or not (see RemediationStrategyResult.
+       target_authority_unresolved's own docstring: this field's whole
+       purpose is to make prose-independent, so requiring prose alongside
+       it would defeat that). Conversely, non-empty `insufficient_evidence`
+       alone -- with `target_authority_unresolved` absent/False -- must
+       NEVER trigger this branch; that is the legitimate, non-blocking
+       "validation-only gap" shape and must keep proceeding exactly as
+       before this field existed."""
+    if strategy_result is None or not strategy_result.evaluated:
+        return False
+    has_target = bool(strategy_result.target_files or strategy_result.target_symbols)
+    if not has_target:
+        return bool(strategy_result.insufficient_evidence)
+    return bool(strategy_result.target_authority_unresolved)
 
 
 def _run_evidence_gap_strategy_fallback(
     *, plan_result, repo_root, vulnerability_text, investigation_context,
     budget_controller, llm,
     repo_grounding_ctx, repository_understanding_ctx, discovery_plan_ctx,
-    baseline_planner_evidence_result,
+    baseline_planner_evidence_result, merge_with_baseline=False,
 ):
     """One-shot, bounded recovery attempted only when
     `_evidence_gap_fallback_trigger` fires on Final Strategy #1's result
@@ -4596,12 +4795,54 @@ def _run_evidence_gap_strategy_fallback(
     scratch here, so this can never disagree with what Strategy #1 was
     really given.
 
-    Planner's `target_files`/`target_symbols` are used here ONLY as the
+    `plan_result.target_files`/`.target_symbols` are used here ONLY as the
     seeds `build_planner_evidence_with_budget` already verifies and reads
     source for -- nothing here constructs a RemediationStrategyResult,
     FinalTargetSliceResult, IntendedEdit, or EditReadinessResult from them.
     Only a second, genuine `generate_remediation_strategy()` call's own
     result (Strategy #2) may become authoritative for anything downstream.
+
+    `plan_result` need not be the actual Stage-1 Planner result: the two
+    `_evidence_gap_fallback_trigger` cases need different reacquisition
+    seeds, and the CALLER (not this function) is responsible for choosing
+    which one to pass -- the real Planner `RemediationPlanResult` for the
+    zero-target case (there is no other candidate list to seed from), or a
+    caller-constructed `RemediationPlanResult`-shaped stand-in carrying
+    Strategy #1's OWN `target_files`/`target_symbols` for the named-target
+    authority-gap case (that is the target/mechanism actually in doubt,
+    not Planner's original, possibly different, guess). This function
+    itself performs no branching on which case triggered it and does not
+    need to -- `build_planner_evidence_with_budget`/`_build_planner_
+    evidence_result` read only `.target_files`/`.target_symbols` from
+    whatever they are given, so either seed is a faithful input.
+
+    `merge_with_baseline` (additive, default False so the zero-target
+    case's existing behavior is completely unaffected): when True, the
+    named-target authority-gap case's own CALLER sets this so Strategy
+    #2's `planner_evidence_ctx` becomes `baseline_planner_evidence_result`
+    UNION the freshly-reacquired evidence (see
+    `remediation_planner.merge_baseline_and_reacquired_planner_evidence`),
+    never the fresh evidence alone -- fixing a forensically-confirmed
+    regression (scope-v4/authority-v1) where Strategy #1's own already-
+    acquired evidence (e.g. a consumer's full source) silently disappeared
+    from Strategy #2's prompt because the reacquisition's narrower,
+    single-target seed produced a `PlannerEvidenceResult` with no memory
+    of what Strategy #1's own (broader) construction already resolved.
+    False for the zero-target case: there, `plan_result` IS the same
+    Planner candidates `baseline_planner_evidence_result` was itself built
+    from, so `fresh` already structurally supersedes the baseline (see
+    `build_planner_evidence_with_budget`'s own monotonic-budget-growth
+    behavior for the same candidate set) and a union would be redundant.
+
+    The merge's own combined size is then accounted for against the SAME
+    "planner_evidence" ContextBudgetController stage `fresh`'s own
+    construction just used -- requesting further windows through the same
+    `request_extension()` growth/approval path (bounded by that same
+    stage's hard `max_windows`) if the union exceeds the current ceiling,
+    and failing this fallback closed (`skip_reason=
+    "preserved_evidence_budget_exhausted"`, no Strategy #2 call) if
+    sufficient budget cannot be authorized. Never truncates either evidence
+    set to make it fit -- see the merge-size accounting block below.
 
     Returns a dict (never raises -- any internal failure degrades to "no
     recovery this run", identical to every other best-effort section in
@@ -4623,7 +4864,21 @@ def _run_evidence_gap_strategy_fallback(
                                       rerun_performed.
       skip_reason                  : str | None -- why no rerun happened,
                                       for observability only (never
-                                      branched on downstream).
+                                      branched on downstream). Includes
+                                      "preserved_evidence_budget_exhausted"
+                                      when `merge_with_baseline` produced
+                                      combined evidence that could not be
+                                      brought within the "planner_evidence"
+                                      stage's budget (no controller and the
+                                      combined size exceeds the single fixed
+                                      ceiling; or a controller that refused
+                                      -- policy="never", an "ask" refusal, or
+                                      the hard max_windows cap) -- Strategy
+                                      #2 is never called in that case, and
+                                      Strategy #1's own result (including
+                                      target_authority_unresolved=True)
+                                      remains the caller's only result,
+                                      exactly like every other skip_reason.
     """
     result = {
         "attempted": True, "evidence_acquired": False, "rerun_performed": False,
@@ -4652,7 +4907,66 @@ def _run_evidence_gap_strategy_fallback(
         return result
 
     result["evidence_acquired"] = True
-    result["enriched_planner_evidence_ctx"] = fresh.rendered
+
+    if merge_with_baseline:
+        from .evidence_fusion import DEFAULT_MAX_CHARS
+        from .remediation_planner import merge_baseline_and_reacquired_planner_evidence
+        enriched_ctx = merge_baseline_and_reacquired_planner_evidence(
+            baseline_planner_evidence_result, fresh,
+        )
+
+        # The merge concatenates two independently-bounded renders, so its
+        # length can exceed the "planner_evidence" stage's CURRENT ceiling
+        # even though neither input violated it on its own. Bring the
+        # stage's own accounting into agreement with what is actually being
+        # sent -- via the SAME request_extension() growth/approval path
+        # every other budget-governed accumulation in this module already
+        # uses (see run_deterministic_acquisition's identical
+        # total_remaining/request_extension pattern for "final_target_
+        # slice") -- before ever handing this to Strategy #2. This never
+        # truncates or drops either evidence set: if sufficient budget
+        # cannot be authorized (policy="never", an "ask" refusal, or the
+        # hard max_windows cap), the fallback fails closed and returns
+        # without a Strategy #2 call, leaving Strategy #1's own result
+        # (including target_authority_unresolved=True) load-bearing --
+        # identical in shape to every other skip_reason this function
+        # already returns.
+        _STAGE = "planner_evidence"
+        if budget_controller is not None:
+            _affected = sorted(
+                fresh.excerpt_plan.included_labels
+                | baseline_planner_evidence_result.excerpt_plan.included_labels
+            )
+            ceiling = budget_controller.effective_budget(_STAGE, DEFAULT_MAX_CHARS)
+            while len(enriched_ctx) > ceiling:
+                approved = budget_controller.request_extension(
+                    _STAGE, DEFAULT_MAX_CHARS,
+                    reason="preserved_evidence_exceeds_budget",
+                    affected_targets=_affected,
+                )
+                if not approved:
+                    result["skip_reason"] = "preserved_evidence_budget_exhausted"
+                    return result
+                ceiling = budget_controller.effective_budget(_STAGE, DEFAULT_MAX_CHARS)
+            # Observability only (see ContextBudgetController.record_used's
+            # own docstring: "never consulted by request_extension()'s own
+            # decision") -- by this point the extension loop above has
+            # already ensured `enriched_ctx` fits within `ceiling`, so this
+            # purely keeps the run's own trace accurate.
+            budget_controller.record_used(_STAGE, len(enriched_ctx))
+        else:
+            # No controller: reproduce build_planner_evidence_with_budget's
+            # own no-controller behavior -- a single fixed ceiling with no
+            # extension path at all -- against the COMBINED size, so
+            # preserving baseline evidence can never open an unbounded path
+            # merely because no controller was supplied.
+            if len(enriched_ctx) > DEFAULT_MAX_CHARS:
+                result["skip_reason"] = "preserved_evidence_budget_exhausted"
+                return result
+    else:
+        enriched_ctx = fresh.rendered
+
+    result["enriched_planner_evidence_ctx"] = enriched_ctx
 
     try:
         from .remediation_planner import generate_remediation_strategy
@@ -4661,7 +4975,7 @@ def _run_evidence_gap_strategy_fallback(
             repo_grounding_ctx=repo_grounding_ctx,
             repository_understanding_ctx=repository_understanding_ctx,
             discovery_plan_ctx=discovery_plan_ctx,
-            planner_evidence_ctx=fresh.rendered,
+            planner_evidence_ctx=enriched_ctx,
         )
     except ModelUnavailableError:
         # Same explicit execution/configuration-decision exception every
@@ -5608,7 +5922,16 @@ def _run_patch_repair_and_calibration(
                 _repair_classified["classified_edge_cases"]
                 + _repair_classified["classified_potential_issues"]
             )
-            if f["category"] in (*_REPAIR_ELIGIBLE_CATEGORIES, "plausible_risk", "generic")
+            # validation_gap is included alongside plausible_risk/generic
+            # (widened for the semantic remediation-proof reconciliation --
+            # see _reconcile_verification_status_with_calibration): the new
+            # "Remediation impact" calibration axis must be available to an
+            # unresolved-evidence finding regardless of which lexical
+            # bucket _classify_finding happened to sort it into, or the
+            # axis could never normalize a validation_gap-worded finding
+            # against a plausible_risk-worded twin expressing the same
+            # unresolved dependency.
+            if f["category"] in (*_REPAIR_ELIGIBLE_CATEGORIES, "plausible_risk", "validation_gap", "generic")
         ]
         _post_patch_evidence_current_v1 = (
             _post_patch_observations is not None and patch == _investigated_patch
@@ -5769,14 +6092,19 @@ def _run_patch_repair_and_calibration(
     )
 
     # Finding calibration (evidence-quality pass) — classifies and rewords
-    # the plausible_risk/generic findings from the FINAL challenger result
-    # (post-repair, if a repair was accepted) so calibration reasons about
-    # the patch that will actually be reported. validation_gap findings are
-    # not sent here — those already have unambiguous framing from earlier
-    # report-presentation work. Best-effort: any failure leaves
-    # finding_calibration as None, and report rendering falls back to the
-    # uncalibrated classifier text rather than losing findings or crashing
-    # the run.
+    # the plausible_risk/validation_gap/generic findings from the FINAL
+    # challenger result (post-repair, if a repair was accepted) so
+    # calibration reasons about the patch that will actually be reported.
+    # validation_gap findings ARE now sent here (widened alongside the
+    # gated v1 filter above -- see that filter's own comment): the semantic
+    # "Remediation impact" axis must be available to an unresolved-evidence
+    # finding regardless of which lexical bucket _classify_finding sorted
+    # it into, and _reconcile_verification_status_with_calibration (run
+    # after this stage, in _build_report) is the only thing authorized to
+    # turn that axis into remediation-proof blocking authority. Best-effort:
+    # any failure leaves finding_calibration as None, and report rendering
+    # falls back to the uncalibrated classifier text rather than losing
+    # findings or crashing the run.
     #
     # Normally runs only when the repair block above did NOT already
     # compute the authoritative calibration (i.e. _orig_defect_count was 0
@@ -5786,12 +6114,12 @@ def _run_patch_repair_and_calibration(
     # plausible_risk/generic-only call). This is what keeps the common
     # all-clear case free of any extra LLM call. `behavioral_defect` is
     # ALSO included in this fallback's own filter (not just
-    # plausible_risk/generic) purely for resilience: if _orig_defect_count
-    # WAS > 0 but the earlier calibration_v1 call itself failed outright
-    # (finding_calibration left None by that failure, not by this block
-    # never running), this still gives a behavioral_defect finding one
-    # more best-effort chance at a calibration entry, same spirit as every
-    # other best-effort degradation in this module family.
+    # plausible_risk/validation_gap/generic) purely for resilience: if
+    # _orig_defect_count WAS > 0 but the earlier calibration_v1 call itself
+    # failed outright (finding_calibration left None by that failure, not
+    # by this block never running), this still gives a behavioral_defect
+    # finding one more best-effort chance at a calibration entry, same
+    # spirit as every other best-effort degradation in this module family.
     _finding_calibration_source = "none"
     if finding_calibration is not None:
         _finding_calibration_source = "v2" if repair_succeeded else "v1"
@@ -5803,7 +6131,7 @@ def _run_patch_repair_and_calibration(
                 _final_classified["classified_edge_cases"]
                 + _final_classified["classified_potential_issues"]
             )
-            if f["category"] in ("behavioral_defect", "plausible_risk", "generic")
+            if f["category"] in ("behavioral_defect", "plausible_risk", "validation_gap", "generic")
         ]
         if _calibration_inputs:
             try:
@@ -6033,17 +6361,83 @@ def _run_repository_analysis_and_remediation_planning(
     # observability -- never consumed as a branching condition itself.
     _active_verifier_result = None
     _plan_authority_version = None
+    # Bounded iterative Planning evidence acquisition ("Fix A") defaults --
+    # ALWAYS defined for the same "locals()/_s1_result always carries these
+    # keys" reason as the verifier defaults above. `_planning_forced_skip`
+    # mirrors `_verifier_forced_skip`'s own existing role/propagation
+    # exactly (see _run_guided_context_acquisition below, which ORs the
+    # two together) but is a SEPARATE signal -- Planning never having
+    # reached a grounded terminal state is a materially different
+    # situation from Verification finding an uncleared contradiction in an
+    # already-grounded plan, and the trace must be able to tell them apart
+    # (see run_planning_evidence_acquisition's own docstring).
+    _planning_forced_skip = False
+    _planning_skip_reason = None
+    _planning_terminal_state = None
+    _planning_attempts: "list" = []
     if not _plan_text:
         try:
-            from .remediation_planner import build_planner_evidence_with_budget, generate_remediation_plan
+            from .remediation_planner import (
+                build_planner_evidence_with_budget,
+                run_planning_evidence_acquisition,
+            )
             _evidence_so_far = "\n\n".join(
                 p for p in [_repo_code, _pattern_ctx, _repository_understanding_ctx] if p and p.strip()
             )
-            _plan_result = generate_remediation_plan(vulnerability_text, llm, code_context=_evidence_so_far)
+            # Bounded iterative Planning evidence acquisition ("Fix A"):
+            # attempt #1 -> (if the Planner explicitly requests evidence)
+            # deterministic bounded acquisition -> further attempts with
+            # prior evidence plus newly acquired evidence -> either a
+            # sufficiently grounded plan or a fail-closed ungrounded
+            # result. See run_planning_evidence_acquisition's own
+            # docstring for the full state machine and authority contract.
+            # Structural bounds only (MAX_PLANNING_ATTEMPTS/
+            # MAX_EVIDENCE_REQUESTS_PER_ROUND) -- entirely independent of
+            # budget_controller, which is still only ever used (exactly as
+            # before this existed) to gate HOW MUCH of any resolved
+            # evidence renders, never whether acquisition itself may
+            # continue.
+            _planning_acquisition = run_planning_evidence_acquisition(
+                vulnerability_text, llm, repo_root, _investigation_context,
+                base_evidence=_evidence_so_far, budget_controller=budget_controller,
+            )
+            _plan_result = _planning_acquisition.plan_result
             _plan_ctx = _plan_result.rendered
+            _planning_terminal_state = _planning_acquisition.terminal_state
+            _planning_attempts = _planning_acquisition.attempts
             if _plan_ctx:
                 progress.success("Remediation plan generated")
                 progress.verbose(f"[pipeline] Remediation plan generated ({len(_plan_ctx)} chars).")
+
+            if not _planning_acquisition.grounded:
+                # Planning never reached a grounded terminal state (see
+                # RemediationPlanResult.additional_evidence_required's own
+                # docstring for the governing invariant) -- the Planner's
+                # own hypothesis must never become authoritative merely
+                # because acquisition ran out of rounds or could not
+                # resolve what it asked for. Mirrors EXACTLY how the
+                # Planner Claim Verifier orchestration already clears
+                # these same two locals when a contradiction is never
+                # cleared (see the "authoritative == 'none'" branch
+                # below) -- reusing generate_remediation_strategy's own
+                # existing "nothing materially new to reason over" skip
+                # (see its docstring) rather than a new gate at the S2
+                # boundary. Plan Verification is never run on an
+                # ungrounded plan -- see this function's own body below,
+                # which only reaches the verifier dispatch when this
+                # branch was NOT taken.
+                _planner_evidence_ctx = ""
+                _planner_evidence_result = None
+                _planning_forced_skip = True
+                _planning_skip_reason = f"planning_ungrounded: {_planning_terminal_state}"
+                progress.warning("Remediation planning could not establish a grounded plan")
+                progress.verbose(
+                    f"[pipeline] Planning evidence acquisition ended ungrounded "
+                    f"(terminal_state={_planning_terminal_state}, "
+                    f"attempts={len(_planning_attempts)}) -- Strategy and Patch "
+                    f"Generation will be skipped for this run."
+                )
+                return locals()
 
             # Deterministic bridge: verify the Planner's proposed files/symbols
             # against the real repository, then run only what verifies through
@@ -6056,10 +6450,7 @@ def _run_repository_analysis_and_remediation_planning(
             # before this existed. Kept in its own try/except so a failure
             # here can never suppress the plan text itself, gathered above.
             try:
-                _planner_evidence_result = build_planner_evidence_with_budget(
-                    _plan_result, repo_root, vulnerability_text, _investigation_context,
-                    budget_controller=budget_controller,
-                )
+                _planner_evidence_result = _planning_acquisition.planner_evidence_result
                 _planner_evidence_ctx = _planner_evidence_result.rendered
                 if _planner_evidence_ctx:
                     progress.verbose(f"[pipeline] Planner-proposed candidate evidence rendered "
@@ -6132,6 +6523,34 @@ def _run_repository_analysis_and_remediation_planning(
                         # which verified the superseded pre-revision claim.
                         _active_verifier_result = _verifier_v2
                         _plan_authority_version = "v2"
+
+                        # The SAME evidence-sufficiency gate that gated v1
+                        # before Verification ever ran must ALSO gate v2 --
+                        # the revision call is still a generate_remediation_
+                        # plan response, still carries its own
+                        # additional_evidence_required/evidence_requests,
+                        # and a revision that itself declares evidence
+                        # insufficient must not be laundered into
+                        # authoritative just because it happened to also
+                        # resolve v1's specific CONTRADICTED coherence
+                        # issue. See run_planning_evidence_acquisition's own
+                        # docstring/_planning_gate_outcome for the contract
+                        # this reapplies; never a second acquisition round
+                        # here -- v2 gets exactly one check, no retry.
+                        from .remediation_planner import _planning_gate_outcome
+                        _v2_grounded, _v2_actionable, _v2_gate_reason = _planning_gate_outcome(_plan_result)
+                        if not _v2_grounded:
+                            _planner_evidence_ctx = ""
+                            _planner_evidence_result = None
+                            _planning_forced_skip = True
+                            _planning_terminal_state = f"ungrounded_post_revision_{_v2_gate_reason}"
+                            _planning_skip_reason = f"planning_ungrounded: {_planning_terminal_state}"
+                            progress.warning("Revised plan could not establish sufficient evidence")
+                            progress.verbose(
+                                f"[pipeline] Post-revision (v2) Planning result failed the "
+                                f"evidence-sufficiency gate: {_v2_gate_reason} -- Strategy and "
+                                f"Patch Generation will be skipped for this run."
+                            )
                     elif _verification["authoritative"] == "none":
                         # A contradiction was found and the one bounded
                         # revision did not clear it (cases C/D). Neither v1
@@ -6196,6 +6615,8 @@ def _run_guided_context_acquisition(
     *, vulnerability_text, llm, repo_root, budget_controller,
     _strategy_result, _plan_result, _investigation_context,
     _verifier_forced_skip=False, _verifier_skip_reason=None,
+    _planning_forced_skip=False, _planning_skip_reason=None,
+    _planner_evidence_result=None,
 ):
     """Reusable Stage-3 (guided_context_acquisition) executor -- the
     COMPLETE current production contract (Final-Target Remediation Slice,
@@ -6224,11 +6645,52 @@ def _run_guided_context_acquisition(
     _run_patch_generation_and_investigation) the Strategy Gate below
     already established for "a real decision exists but is not safe to
     build a patch from."
+
+    `_planning_forced_skip`/`_planning_skip_reason` (both additive, default
+    False/None, same propagation shape as `_verifier_forced_skip`/
+    `_verifier_skip_reason` immediately above -- but a SEPARATE signal, not
+    a reuse of those two): set by
+    `_run_repository_analysis_and_remediation_planning`'s own bounded
+    Planning evidence-acquisition loop when it never reached a grounded
+    terminal state (see RemediationPlanResult.additional_evidence_required's
+    own docstring) -- distinct from a Verification-found contradiction,
+    which only ever runs on an ALREADY-grounded plan (Plan Verification
+    never runs at all when Planning is ungrounded -- see that function's
+    own body). Mutually exclusive with `_verifier_forced_skip` in practice
+    (Verification cannot find anything on a plan that was never grounded
+    enough to reach it), but kept as an independent flag/reason so a
+    trace/replay can always tell WHICH mechanism caused the skip, never
+    collapsing "Planning could not establish a sufficiently grounded plan"
+    into "a logical contradiction was never cleared" or into Strategy's own
+    `target_authority_unresolved` (a materially different, later-stage
+    failure -- see the three-way Strategy Gate below, which this is
+    additive to, not a replacement for).
+
+    `_planner_evidence_result` (additive, default None so every
+    pre-existing caller -- including replay_engine.py, which has no
+    PlannerEvidenceResult to reconstruct from a recorded trace -- is
+    unaffected): when provided, its already-computed
+    `.excerpt_plan.blocks` are passed through to build_final_target_slice
+    unchanged, as additional scan input for the Final-Target Slice's own
+    method-call one-hop expansion. Never recomputed, never re-fetched.
+
+    Three-way Strategy Gate on `_strategy_result` (additive middle branch):
+    a named target/mechanism with `target_authority_unresolved` still True
+    at this point (Strategy #1's own value, or Strategy #2's if the
+    evidence-gap fallback reran it -- see pipeline.run()'s own evidence-gap
+    fallback block, which runs before this function is called) is exactly
+    as unsafe to build a patch from as naming zero targets, and reuses the
+    same `_skip_patch_generation` flag/`_skip_patch_generation_reason`
+    propagation the other two branches already use -- see
+    RemediationStrategyResult.target_authority_unresolved's own docstring.
     """
     _slice_ctx = ""
     _coverage_warning_ctx = ""
-    _skip_patch_generation = bool(_verifier_forced_skip)
-    _skip_patch_generation_reason = _verifier_skip_reason if _verifier_forced_skip else None
+    _skip_patch_generation = bool(_verifier_forced_skip) or bool(_planning_forced_skip)
+    _skip_patch_generation_reason = (
+        _planning_skip_reason if _planning_forced_skip
+        else (_verifier_skip_reason if _verifier_forced_skip else None)
+    )
     _edit_readiness = None  # EditReadinessResult | None -- see PipelineResult.edit_readiness
     _edit_acquisition = None  # AcquisitionResult | None -- see PipelineResult.edit_acquisition
     _guided_acquisition = None  # GuidedAcquisitionResult | None -- see PipelineResult.guided_acquisition
@@ -6240,13 +6702,25 @@ def _run_guided_context_acquisition(
     # reads them -- never actually reassigned above, only guaranteed defined.
     _slice_result = None  # FinalTargetSliceResult | None
     _intended_edits = []  # list[IntendedEdit]
-    if _strategy_result is not None and (_strategy_result.target_files or _strategy_result.target_symbols):
+    _strategy_has_named_target = _strategy_result is not None and (
+        _strategy_result.target_files or _strategy_result.target_symbols
+    )
+    if _strategy_has_named_target and not _strategy_result.target_authority_unresolved:
         try:
             from .remediation_planner import build_final_target_slice
             _planner_evidence_files = list(_plan_result.target_files) if _plan_result is not None else []
+            # Already-computed Planner excerpt blocks (PlannerEvidenceResult.
+            # excerpt_plan.blocks) -- passed through unchanged as additional
+            # scan input for the Final-Target Slice's own method-call
+            # one-hop expansion; never recomputed, never re-fetched, never a
+            # second Planner-evidence acquisition.
+            _planner_excerpt_blocks = (
+                _planner_evidence_result.excerpt_plan.blocks if _planner_evidence_result is not None else ()
+            )
             _slice_result = build_final_target_slice(
                 _strategy_result, repo_root, _investigation_context,
                 planner_evidence_files=_planner_evidence_files,
+                planner_excerpt_blocks=_planner_excerpt_blocks,
             )
             _slice_ctx = _slice_result.rendered
             _coverage_warning_ctx = _slice_result.warning_text
@@ -6530,6 +7004,38 @@ def _run_guided_context_acquisition(
         except Exception as exc:
             progress.warning("Target context unavailable")
             progress.verbose(f"[pipeline] Final-Target Remediation Slice unavailable: {type(exc).__name__}: {exc}")
+    elif _strategy_has_named_target:
+        # Final Strategy named a real, repository-resolvable target/
+        # mechanism, but -- even after the bounded evidence-gap
+        # reacquisition attempt above (if it fired at all; see
+        # _evidence_gap_fallback_trigger/_run_evidence_gap_strategy_
+        # fallback) -- still reports target_authority_unresolved=True: at
+        # least one evidence gap remains load-bearing for whether THIS
+        # target/mechanism is the correct remediation location, per
+        # Strategy's own structured self-report. This is exactly as unsafe
+        # to build a patch from as the "no evidence-backed target at all"
+        # branch below, so it reuses the SAME _skip_patch_generation flag,
+        # never a new terminal state, and there is no second retry --
+        # scope-v4 Run 5's own forensic finding is precisely a named
+        # target reaching Patch Generation despite this exact self-
+        # reported gap. See RemediationStrategyResult.target_authority_
+        # unresolved's own docstring: this is a withholding-only signal --
+        # honored here regardless of whether corroborating prose exists in
+        # insufficient_evidence, and never second-guessed by re-reading
+        # that prose.
+        _skip_patch_generation = True
+        _skip_patch_generation_reason = _skip_patch_generation_reason or (
+            "Final Remediation Strategy named a target/mechanism but reported "
+            "target_authority_unresolved=True -- repository evidence remains "
+            "insufficient to justify granting edit authority to it"
+        )
+        progress.warning("Target authority unresolved")
+        progress.verbose(
+            "[pipeline] Final Remediation Strategy named target_files="
+            f"{_strategy_result.target_files} target_symbols={_strategy_result.target_symbols} "
+            "but still reports target_authority_unresolved=True -- skipping Patch "
+            "Generation for this run."
+        )
     elif _strategy_result is not None and _strategy_result.evaluated:
         # Final Strategy actually ran (a real, successfully-parsed response
         # -- see RemediationStrategyResult.evaluated) and named ZERO
@@ -6734,25 +7240,62 @@ def run(
     _verifier_broadening_unresolved = _s1_result["_verifier_broadening_unresolved"]
     _active_verifier_result = _s1_result["_active_verifier_result"]
     _plan_authority_version = _s1_result["_plan_authority_version"]
+    _planning_forced_skip = _s1_result["_planning_forced_skip"]
+    _planning_skip_reason = _s1_result["_planning_skip_reason"]
+    _planning_terminal_state = _s1_result["_planning_terminal_state"]
+    _planning_attempts = _s1_result["_planning_attempts"]
 
     # Verified-narrower authority split (deterministic, structural
     # activation only -- see remediation_planner._render_verified_
     # authoritative_semantics/_render_strategy_target_block for what this
-    # gates). All three conditions are read from already-computed
-    # structured fields/enums; nothing here compares or inspects any
-    # prose. `_active_verifier_result` is already bound to whichever of
+    # gates). All conditions are read from already-computed structured
+    # fields/enums; nothing here compares or inspects any prose.
+    # `_active_verifier_result` is already bound to whichever of
     # verifier_v1/verifier_v2 vouches for the CURRENT `_plan_result`
     # (see the three-way branch in _run_repository_analysis_and_
     # remediation_planning above), so this can never bind the wrong
     # verifier to the wrong Planner version. When False (the default for
-    # every path other than SELECTED+SUPPORTED+match=True), every line
-    # below this point behaves exactly as it did before this change.
+    # every path other than SELECTED+SUPPORTED+match=True+not-post-revision),
+    # every line below this point behaves exactly as it did before this
+    # change.
+    #
+    # `_plan_authority_version != "v2"` (fail-closed authority fix): a "v2"
+    # plan only ever exists because verifier_v1 already returned
+    # CONTRADICTED once (see the bounded revision trigger above -- there is
+    # no other path that produces a v2 at all). The ONLY verification mode
+    # that can make a SELECTED-decision v2 reach this gate at all is Mode B
+    # (decision coherence -- see prompts/remediation_verifier.md's own
+    # explicit contract: "strictly a coherence check between two
+    # descriptions the planner itself produced, not an evaluation of the
+    # remediation on its own merits" and "never asks... whether the
+    # remediation is globally correct or actually closes the vulnerability").
+    # A Mode-B SUPPORTED on the revised text proves only that the revision's
+    # OWN two self-authored descriptions are now mutually consistent -- it
+    # is not, and was never designed to be, evidence that the ORIGINAL
+    # CONTRADICTED finding was resolved by anything repository-grounded.
+    # Observed directly: a real revision can remove a self-contradictory
+    # assertion (e.g. an unsupported citation) while leaving the disputed
+    # target/mechanism and the repository evidence backing it completely
+    # unchanged, and Mode B alone cannot tell that apart from a genuine
+    # correction. Excluding "v2" here does not require detecting whether the
+    # target/mechanism/evidence actually changed (no such heuristic is
+    # introduced, and none is needed): every "v2" that could reach this gate
+    # is, by construction, Mode-B-coherence-only, so this exclusion is exact,
+    # not an approximation. `_plan_authority_version` is the same pre-
+    # existing, already-computed observability field this module already
+    # carries (see its own "purely for observability" note above) -- reused
+    # here as the provenance signal, never inferred from text. A denied "v2"
+    # falls through to Strategy's own mechanism prose, exactly like any
+    # other case where this split never activates (see
+    # TestNegativeCompatibility) -- never a retry, never a second revision,
+    # never a new LLM call.
     _verified_narrower_authoritative = (
         _plan_result is not None
         and _plan_result.narrower_alternative_decision == "SELECTED"
         and _active_verifier_result is not None
         and _active_verifier_result.status == "SUPPORTED"
         and _active_verifier_result.authoritative_remediation_matches_selected_alternative is True
+        and _plan_authority_version != "v2"
     )
 
     # Batch B2: finish S1's execution -- outcome reflects which of the three
@@ -6766,7 +7309,17 @@ def run(
     # not its output).
     _s1_rec = None
     if execution_recorder is not None:
-        if _plan_result is not None:
+        if _planning_forced_skip:
+            # Distinct from "generated" below: a plan object exists (the
+            # loop's final attempt), but Planning's own evidence-
+            # sufficiency gate never certified it -- see
+            # RemediationPlanResult.additional_evidence_required's own
+            # docstring and _planning_gate_outcome. Checked FIRST so this
+            # can never be shadowed by the `_plan_result is not None`
+            # check below (the loop always returns SOME RemediationPlanResult,
+            # grounded or not).
+            _s1_outcome = "planning_ungrounded"
+        elif _plan_result is not None:
             _s1_outcome = "generated"
         elif _plan_text:
             _s1_outcome = "skipped_hand_authored_plan"
@@ -6777,6 +7330,65 @@ def run(
             outcome=_s1_outcome,
             artifact={
                 "plan_result": to_jsonable(_plan_result),
+                # Top-level, easy-to-find mirror of the terminal-state
+                # information below -- read by S2/S3 replay (see
+                # replay_engine.py's own S2/S3 run_fns) to reproduce the
+                # authoritative skip decision exactly as production made
+                # it, never re-derived from strategy_result/plan_result
+                # being empty (the same "must consume, never re-derive"
+                # discipline `planner_claim_verification.forced_skip`
+                # already established for the verifier's own skip).
+                "planning_forced_skip": _planning_forced_skip,
+                "planning_skip_reason": _planning_skip_reason,
+                # Bounded iterative Planning evidence acquisition ("Fix A")
+                # observability -- lets a trace/replay reconstruct what the
+                # Planner knew, what it requested, what was acquired, what
+                # could not be resolved, and why the loop continued or
+                # stopped, without reconstructing any of it from prose. See
+                # PlanningAttemptRecord's own docstring for field meanings.
+                "evidence_acquisition": {
+                    "terminal_state": _planning_terminal_state,
+                    "attempts_used": len(_planning_attempts),
+                    "attempts": [
+                        {
+                            "attempt": a.attempt,
+                            "llm_tag": a.llm_tag,
+                            "gate_state": a.gate_state,
+                            "evidence_requests": [
+                                {
+                                    "request_type": r.request_type,
+                                    "file_hint": r.file_hint,
+                                    "symbol": r.symbol,
+                                    "reason": r.reason,
+                                }
+                                for r in a.evidence_requests
+                            ],
+                            "invalid_requests": [
+                                {
+                                    "request_type": r.request_type,
+                                    "file_hint": r.file_hint,
+                                    "symbol": r.symbol,
+                                    "schema_failure_reason": reason,
+                                }
+                                for r, reason in a.invalid_requests
+                            ],
+                            "resolutions": [
+                                {
+                                    "request_type": res.request.request_type,
+                                    "file_hint": res.request.file_hint,
+                                    "symbol": res.request.symbol,
+                                    "resolved": res.resolved,
+                                    "failure_reason": res.failure_reason,
+                                    "resolved_file": res.resolved_file,
+                                    "resolved_symbol": res.resolved_symbol,
+                                }
+                                for res in a.resolutions
+                            ],
+                            "outcome": a.outcome,
+                        }
+                        for a in _planning_attempts
+                    ],
+                },
                 "repository_understanding": to_jsonable(_repository_understanding),
                 "pre_patch_anchors": to_jsonable(_pre_patch_anchors),
                 # Batch B7: minimal additive fields -- the ORIGINAL run-level
@@ -6888,31 +7500,45 @@ def run(
             progress.verbose(f"[pipeline] Final remediation strategy unavailable: {type(exc).__name__}: {exc}")
 
     # Evidence-Gap Strategy Fallback: Final Strategy #1 evaluated a real
-    # response, named zero authoritative targets, and explicitly reported
-    # non-empty insufficient_evidence -- a structurally-detectable "the
-    # evidence I was given was too thin" case, distinct from a genuine "no
-    # viable target" decision (insufficient_evidence == []), which must
-    # never trigger this. One-shot: this block runs at most once per run,
-    # and _run_evidence_gap_strategy_fallback itself never calls Final
-    # Strategy more than the single extra time documented in its own
-    # docstring -- if THAT second call (Strategy #2) also comes back with
-    # evaluated=True, no targets, and non-empty insufficient_evidence, no
-    # third attempt is made; the existing fail-closed behavior below
-    # (Branch B, "Final Strategy ran but selected no evidence-backed
-    # target") applies to Strategy #2's result exactly as it would have to
-    # Strategy #1's. Planner's target_files/target_symbols are used inside
-    # _run_evidence_gap_strategy_fallback ONLY as retrieval seeds for
-    # deterministic, no-LLM-call source acquisition -- never promoted into
-    # a synthetic RemediationStrategyResult/FinalTargetSliceResult/
-    # IntendedEdit/EditReadinessResult, and never returned by that
-    # function as something downstream may treat as authoritative; only
-    # Strategy #2's OWN result (also produced by the same, unmodified
-    # generate_remediation_strategy call every ordinary run already makes)
-    # is ever substituted below.
+    # response and either (a) named zero authoritative targets while
+    # explicitly reporting non-empty insufficient_evidence, or (b) named a
+    # real target/mechanism while explicitly reporting
+    # target_authority_unresolved=True -- see _evidence_gap_fallback_
+    # trigger's own docstring for the exact two-case predicate. Both are
+    # structurally-detectable deadlocks, distinct from a genuine "I looked
+    # and there is no viable target"/"I am confident in this target"
+    # decision, which must never trigger this. One-shot: this block runs
+    # at most once per run, and _run_evidence_gap_strategy_fallback itself
+    # never calls Final Strategy more than the single extra time documented
+    # in its own docstring -- if THAT second call (Strategy #2) also comes
+    # back unresolved (no targets + non-empty insufficient_evidence, or a
+    # named target + target_authority_unresolved=True), no third attempt is
+    # made; the existing fail-closed behavior below (in
+    # _run_guided_context_acquisition) applies to Strategy #2's result
+    # exactly as it would have to Strategy #1's.
+    #
+    # Reacquisition seed differs by case (see _run_evidence_gap_strategy_
+    # fallback's own docstring on why `plan_result` need not be the real
+    # Planner result): case (a) has no target of its own to seed from, so
+    # Planner's original candidates remain the only useful seed, exactly as
+    # before this field existed. Case (b) already has a target -- Strategy
+    # #1's own choice, which is the thing whose authority is actually in
+    # doubt -- so THAT is what reacquisition must expand around, not
+    # Planner's original (possibly different) guess.
     _evidence_gap_fallback = None
     if _evidence_gap_fallback_trigger(_strategy_result):
+        _fallback_has_named_target = bool(_strategy_result.target_files or _strategy_result.target_symbols)
+        if _fallback_has_named_target:
+            from .remediation_planner import RemediationPlanResult
+            _fallback_seed_plan_result = RemediationPlanResult(
+                rendered="",
+                target_files=_strategy_result.target_files,
+                target_symbols=_strategy_result.target_symbols,
+            )
+        else:
+            _fallback_seed_plan_result = _plan_result
         _evidence_gap_fallback = _run_evidence_gap_strategy_fallback(
-            plan_result=_plan_result,
+            plan_result=_fallback_seed_plan_result,
             repo_root=repo_root,
             vulnerability_text=vulnerability_text,
             investigation_context=_investigation_context,
@@ -6922,6 +7548,13 @@ def run(
             repository_understanding_ctx=_repository_understanding_ctx,
             discovery_plan_ctx=_plan_ctx,
             baseline_planner_evidence_result=_planner_evidence_result,
+            # Preserve Strategy #1's own already-acquired evidence for the
+            # named-target case only -- see _run_evidence_gap_strategy_
+            # fallback's own docstring on merge_with_baseline. The
+            # zero-target case is untouched: its seed IS the same Planner
+            # candidates the baseline was already built from, so a union
+            # would be redundant (see that same docstring).
+            merge_with_baseline=_fallback_has_named_target,
         )
         progress.verbose(f"[pipeline] Evidence-gap Strategy fallback: evidence_acquired="
             f"{_evidence_gap_fallback['evidence_acquired']} rerun_performed="
@@ -6935,7 +7568,18 @@ def run(
             _strategy_result = _evidence_gap_fallback["strategy_result"]
             _strategy_ctx = _strategy_result.rendered if _strategy_result is not None else ""
             _planner_evidence_ctx = _evidence_gap_fallback["enriched_planner_evidence_ctx"]
-            if _strategy_result is not None and (_strategy_result.target_files or _strategy_result.target_symbols):
+            # "Resolved" now means more than "a target exists" -- for case
+            # (b) above, Strategy #1 already had a target; what matters is
+            # whether Strategy #2 ALSO cleared target_authority_unresolved.
+            # For case (a), target_authority_unresolved is irrelevant (there
+            # was no target either way), so this reduces to the original
+            # "does a target exist now" check unchanged.
+            _fallback_resolved = (
+                _strategy_result is not None
+                and (_strategy_result.target_files or _strategy_result.target_symbols)
+                and not _strategy_result.target_authority_unresolved
+            )
+            if _fallback_resolved:
                 progress.recovery("Additional evidence collected")
                 progress.verbose(
                     "[pipeline] Evidence-gap Strategy fallback recovered authoritative "
@@ -6945,8 +7589,8 @@ def run(
             else:
                 progress.warning("Evidence gap could not be resolved")
                 progress.verbose(
-                    "[pipeline] Evidence-gap Strategy fallback: Strategy #2 still selected "
-                    "no evidence-backed target -- no further retry this run."
+                    "[pipeline] Evidence-gap Strategy fallback: Strategy #2 still has no "
+                    "evidence-backed, authority-resolved target -- no further retry this run."
                 )
 
     # Batch B2: finish S2. artifact is the real RemediationStrategyResult
@@ -6962,7 +7606,17 @@ def run(
     # could be read as an authoritative target list.
     _s2_rec = None
     if execution_recorder is not None:
-        if _strategy_result is not None:
+        if _planning_forced_skip:
+            # Distinct from "skipped_no_planner_evidence" below: Strategy
+            # was never even attempted because Planning itself never
+            # reached a grounded terminal state -- checked FIRST so this
+            # specific, named cause is never collapsed into the generic
+            # "no evidence" bucket (which also covers an ordinary Planner-
+            # call failure or an uncleared verifier contradiction). See
+            # _run_guided_context_acquisition's own docstring on
+            # `_planning_forced_skip`.
+            _s2_outcome = "skipped_planning_ungrounded"
+        elif _strategy_result is not None:
             _s2_outcome = "generated"
         elif not _planner_evidence_ctx:
             _s2_outcome = "skipped_no_planner_evidence"
@@ -6996,6 +7650,12 @@ def run(
                 # (see _run_guided_context_acquisition/build_intended_edits,
                 # which already derive edits from target_files/
                 # target_symbols only, never from mechanism prose).
+                # `target_authority_unresolved`, unlike every other key in
+                # this dict, mirrors a field that IS load-bearing elsewhere
+                # (_evidence_gap_fallback_trigger/_run_guided_context_
+                # acquisition) -- recorded here purely so a trace can show
+                # whether Patch Generation authority was withheld for this
+                # reason, never re-derived or re-decided from this copy.
                 "verified_authority": {
                     "verified_narrower_authoritative": _verified_narrower_authoritative,
                     "semantic_authority_source": (
@@ -7007,6 +7667,9 @@ def run(
                     ),
                     "strategy_reported_implementation_gap": bool(
                         _strategy_result is not None and _strategy_result.insufficient_evidence
+                    ),
+                    "target_authority_unresolved": bool(
+                        _strategy_result is not None and _strategy_result.target_authority_unresolved
                     ),
                 },
             },
@@ -7048,8 +7711,11 @@ def run(
         _strategy_result=_strategy_result,
         _plan_result=_plan_result,
         _investigation_context=_investigation_context,
+        _planner_evidence_result=_planner_evidence_result,
         _verifier_forced_skip=_verifier_forced_skip,
         _verifier_skip_reason=_verifier_skip_reason,
+        _planning_forced_skip=_planning_forced_skip,
+        _planning_skip_reason=_planning_skip_reason,
     )
     _slice_ctx = _s3_result["_slice_ctx"]
     _coverage_warning_ctx = _s3_result["_coverage_warning_ctx"]
@@ -7067,10 +7733,23 @@ def run(
     # only place this exists; never mere presence booleans.
     _s3_rec = None
     if execution_recorder is not None:
-        if _slice_result is not None:
+        if _planning_forced_skip:
+            # Distinct from "skipped_no_strategy_targets" below: Strategy
+            # never ran at all, so there is no "zero targets" decision to
+            # attribute this to -- Planning itself is the cause. Checked
+            # FIRST for the same reason as S2's own outcome above.
+            _s3_outcome = "skipped_planning_ungrounded"
+        elif _slice_result is not None:
             _s3_outcome = "ready"
         elif not (_strategy_result is not None and (_strategy_result.target_files or _strategy_result.target_symbols)):
             _s3_outcome = "skipped_no_strategy_targets"
+        elif _strategy_result.target_authority_unresolved:
+            # Distinct from "unavailable" below: a target WAS named and no
+            # exception occurred -- this is the deliberate, correct skip
+            # from _run_guided_context_acquisition's new authority-gap
+            # branch, not a failure. See RemediationStrategyResult.
+            # target_authority_unresolved's own docstring.
+            _s3_outcome = "skipped_target_authority_unresolved"
         else:
             _s3_outcome = "unavailable"
         _s3_rec = execution_recorder.finish(

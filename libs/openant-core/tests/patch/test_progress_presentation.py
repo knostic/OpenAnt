@@ -361,6 +361,7 @@ class TestTargetContextReadyShowsTargetFile:
         )
         strategy_result = mock.MagicMock(
             target_files=["src/urllib3/util/retry.py"], target_symbols=["Retry"], evaluated=True,
+            target_authority_unresolved=False,
         )
 
         with (
@@ -403,7 +404,10 @@ class TestTargetContextReadyShowsTargetFile:
             covered_target_files=["setup.py"], covered_target_symbols=[],
             uncovered_target_files=[], uncovered_target_symbols=[],
         )
-        strategy_result = mock.MagicMock(target_files=["setup.py"], target_symbols=[], evaluated=True)
+        strategy_result = mock.MagicMock(
+            target_files=["setup.py"], target_symbols=[], evaluated=True,
+            target_authority_unresolved=False,
+        )
 
         with (
             mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice",

@@ -60,6 +60,7 @@ def _write_s1_artifact(
             "security_invariant": "the unsafe condition", "remediation_mechanism": "the broad mechanism",
             "narrower_alternative_considered": "considered a narrower mechanism",
             "required_edits": [], "approaches_to_avoid": [], "explicit_unknowns": [],
+            "additional_evidence_required": "explicit_false", "evidence_requests": [],
         },
         "repository_understanding": None,
         "pre_patch_anchors": None,
@@ -69,6 +70,16 @@ def _write_s1_artifact(
         "plan_ctx": "## Target Discovery Plan\n",
         "repo_code": "",
         "grounding": None,
+        # Fix A: unconditionally present on every CURRENT-contract S1
+        # artifact (see pipeline.py's S1 finish() call) -- this file's own
+        # synthetic artifacts represent a Planning run that grounded
+        # normally and was THEN blocked by the (separate, unrelated)
+        # Planner Claim Verifier, never a pre-Fix-A artifact -- so this key
+        # is always present here, independent of the include_mode_fields/
+        # include_planner_claim_verification toggles above, which model a
+        # DIFFERENT feature's own backward compatibility.
+        "planning_forced_skip": False,
+        "planning_skip_reason": None,
     }
     if include_planner_claim_verification:
         artifact["planner_claim_verification"] = {
