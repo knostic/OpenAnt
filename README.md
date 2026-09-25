@@ -4,15 +4,19 @@
 
 # OpenAnt
 
-[OpenAnt](https://knostic.ai/openant) from [Knostic](https://knostic.ai) is an open source LLM-based vulnerability discovery product that helps defenders proactively find verified security flaws while minimizing both false positives and false negatives. Stage 1 detects. Stage 2 attacks. What survives is real.
+[OpenAnt](https://knostic.ai/openant) from [Knostic](https://knostic.ai) is the first open source LLM-based vulnerability discovery product (now called a harness) that helps defenders proactively find verified security flaws while minimizing both false positives and false negatives. Stage 1 detects. Stage 2 attacks. What survives is real.
 
-We're pretty proud of this product and are in the vulnerability disclosure process for its findings, but do keep in mind that this started as a research project, and some of its features are still in beta. We welcome contributions to make it better.
+Do keep in mind that this started as a research project, and as we develop new capabilities, we often release them as beta. We welcome contributions.
+
+## Paper
+
+You can find our research paper on building OpenAnt on arXive: [OpenAnt: LLM-Powered Vulnerability Discovery Through Code Decomposition, Adversarial Verification, and Dynamic Testing](https://arxiv.org/abs/2606.19149), by Nahum Korda and Gadi Evron.
 
 ## Why open source?
 
-Considering the explosion of AI-discovered vulnerabilities, we hope OpenAnt will be the tool helping open source maintainers stay ahead of attackers, where they can use it themselves or submit their repo for scanning at no cost.
+This was a relevant question in the readme when we first released OpenAnt, since, many other harnesses have been released. We still hope that with the explosion of AI-discovered vulnerabilities, OpenAnt will help open source maintainers stay ahead of attackers, where they can use it themselves. Or submit their repo for scanning at no cost.
 
-Then, since Knostic's focus is on protecting agents and coding assistants and not vulnerability research or application security, and we like open source, we decided to release OpenAnt under the Apache 2 license.
+There is also the fact that Knostic's focus is on protecting agents and coding assistants and not vulnerability research or application security, and we like open source, so we decided to release OpenAnt under the Apache 2 license.
 Besides, you may have heard about Aardvark from OpenAI (now Codex Security) and Claude Code Security from Anthropic, and we have zero intention of competing with them.
 
 ## Technical details and free scanning for open source projects
@@ -27,8 +31,8 @@ To submit your repo for scanning:
 
 - Go
 - Python
+- C/C++
 - JavaScript/TypeScript (beta)
-- C/C++ (beta)
 - PHP (beta)
 - Ruby (beta)
 - Zig (beta)
@@ -37,11 +41,12 @@ To submit your repo for scanning:
 
 ## Credits
 
-Research and ideation: [Nahum Korda](https://github.com/NahumKorda/).
+Maintainer and research: [Gadi Evron](https://github.com/gadievron/)
 
-Productization: [Alex Raihelgaus](https://github.com/ar7casper/), [Daniel Geyshis](https://github.com/dgeyshis).
+Original research, ideation, and original prototype: [Nahum Korda](https://github.com/NahumKorda/).
+Original productization: [Alex Raihelgaus](https://github.com/ar7casper/), [Daniel Geyshis](https://github.com/dgeyshis).
 
-With thanks to: [Michal Kamensky](https://github.com/kamenskymic/), [Imri Goldberg](https://github.com/lorg), [Gadi Evron](https://github.com/gadievron/), Daniel Cuthbert. Josh Grossman, and Avi Douglen.
+With thanks to: [Michal Kamensky](https://github.com/kamenskymic/), [Imri Goldberg](https://github.com/lorg), Daniel Cuthbert. Josh Grossman, and Avi Douglen.
 
 ## Check out Knostic
 
@@ -284,16 +289,6 @@ openant project list              # shows all projects, marks active
 openant project show              # details of active project
 openant project switch <org/repo> # switch active project
 ```
-
-## Roadmap
-
-Things on the list, in no particular order:
-
-- **More provider adapters.** vLLM, Cohere, Mistral, Groq, Azure OpenAI — each is a small Python adapter recipe (plus a few Go wizard/probe touch-points if you want it offered by `openant setup llm`) per the contributor guide. Lower the barrier to local / on-prem inference. (Local inference via Ollama shipped in this release — [`OLLAMA.md`](libs/openant-core/utilities/llm/providers/OLLAMA.md).)
-- **Subscription-based auth.** ChatGPT / Codex, Claude Pro / Max, and Gemini Advanced subscriptions don't currently grant API quota — users have to maintain a separate API-tier key per provider. OAuth-based adapters that ride the consumer subscription would close that gap.
-- **Cross-provider tool-call quirks.** All the shipped adapters support tool calling, but the long tail (parallel tool calls, strict-mode schema enforcement, retry semantics on partial JSON) behaves differently per provider. Real-world scans surface these — PRs welcome.
-- **More languages.** The supported-languages list above is current coverage. Java and C# come up frequently.
-- **Hosted scan service.** Knostic offers free scans for OSS projects today via the form linked above; a self-serve API for trusted partners is a future possibility.
 
 PRs welcome on any of these — open an issue first if the scope is non-trivial so we can align before you build.
 
