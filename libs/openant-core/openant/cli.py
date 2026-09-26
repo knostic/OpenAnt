@@ -1011,23 +1011,32 @@ def cmd_checkpoint_status(args):
 
 
 def _unrecognized_verdict_rows(findings, verdict_order):
-    """#679: the off-enum rows — a model-drift spelling or corrupted
-    artifact value that matches no canonical group. They were dropped
-    entirely (the omission surface of the false-clean); a local ERROR
-    display group makes them visible without touching the enum."""
-    known = set(verdict_order)
+    """#679: the off-enum rows — a verdict matching no canonical group
+    (and NOT the canonical 'error' spelling, which Stage-1 stamps for
+    analysis failures — those are RECOGNIZED). They were dropped entirely
+    (the omission surface of the false-clean); a local ERROR display
+    group makes them visible without touching the enum."""
+    known = set(verdict_order) | {"error"}
     return [f for f in findings if f.get("verdict") not in known]
 
 
 def _remediation_for_unrecognized(actionable, error_rows):
     """#679: the honest remediation message — the false-clean text is
-    suppressed when unparseable rows exist."""
+    suppressed when unclassifiable rows exist (either the canonical
+    error verdict or an off-enum spelling)."""
     if not actionable and not error_rows:
         return "<p>No vulnerabilities or security concerns found. All code units are either safe or properly protected.</p>"
     if not actionable and error_rows:
+        n_err = sum(1 for f in error_rows if f.get("verdict") == "error")
+        n_unknown = len(error_rows) - n_err
+        parts = []
+        if n_err:
+            parts.append(f"{n_err} errored")
+        if n_unknown:
+            parts.append(f"{n_unknown} with an unrecognized verdict")
         return ("<p>No actionable findings, but "
-                f"{len(error_rows)} unit(s) have an unrecognized verdict "
-                "and were not classified. Review them manually.</p>")
+                f"{', '.join(parts)} unit(s) were not classified. "
+                "Review them manually.</p>")
     return None  # the actionable path takes the LLM call
 
 
@@ -1227,7 +1236,11 @@ def cmd_report_data(args):
 
             findings_by_verdict = []
             # #679: the assembly + the message live in the testable helper
-            _error_group = _unrecognized_verdict_rows(findings, verdict_order)
+            # #679 (the T1 round): the visible-not-classified group carries
+            # BOTH the canonical error rows and the off-enum spellings —
+            # the wording distinguishes them (the html_report.py convention).
+            _error_group = ([f for f in findings if f.get("verdict") == "error"]
+                            + _unrecognized_verdict_rows(findings, verdict_order))
             if _error_group:
                 findings_by_verdict.append({
                     "verdict": "error",
