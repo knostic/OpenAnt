@@ -10,7 +10,7 @@ Do keep in mind that this started as a research project, and as we develop new c
 
 ## Paper
 
-You can find our research paper on building OpenAnt on arXive: [OpenAnt: LLM-Powered Vulnerability Discovery Through Code Decomposition, Adversarial Verification, and Dynamic Testing](https://arxiv.org/abs/2606.19149), by Nahum Korda and Gadi Evron.
+You can find our research paper on building OpenAnt on arXiv: [OpenAnt: LLM-Powered Vulnerability Discovery Through Code Decomposition, Adversarial Verification, and Dynamic Testing](https://arxiv.org/abs/2606.19149), by Nahum Korda and Gadi Evron.
 
 ## Why open source?
 
@@ -290,7 +290,7 @@ openant project show              # details of active project
 openant project switch <org/repo> # switch active project
 ```
 
-PRs welcome on any of these — open an issue first if the scope is non-trivial so we can align before you build.
+PRs welcome — open an issue first if the scope is non-trivial so we can align before you build.
 
 ## LICENSE
 
