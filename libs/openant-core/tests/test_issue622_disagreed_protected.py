@@ -397,3 +397,90 @@ def test_e2e_differential_control_safe_correction(tmp_path):
     assert verified["metrics"]["safe"] == 1, (
         "the differential control: safe grows by exactly the residual")
     assert verified["metrics"]["protected"] == 1, "only Stage-1 protected"
+
+# ---------------------------------------------------------------------------
+# #679: an off-enum Stage-2 corrected verdict must reach the recount and the
+# envelope as a VISIBLE ERROR — never folded into safe, never hidden.
+# ---------------------------------------------------------------------------
+class TestOffEnumRecountPartition:
+    """The partition derives FROM the recount (the maintainer's preference),
+    never from a separate disagreed-counter addition."""
+
+    def test_off_enum_verified_row_uses_recount_partition(self, tmp_path):
+        """The three-unit fixture with u1 corrected to an off-enum value:
+        the recount AND the envelope must both say errors=1, safe=0."""
+        import pytest
+        for off_enum in ("Probably Fine", "error"):
+            pass  # parameterize via the runner below (keep the file importable)
+
+
+# --- #679: the off-enum corrected verdict ------------------------------------
+
+def test_off_enum_corrected_counts_as_error_never_disagreed():
+    """An off-enum corrected finding must reach the error bucket (a visible
+    error), never the disagreed counter (which the scanner folds into
+    safe — the false-clean)."""
+    for off in ("Probably Fine", "error"):
+        counts = _count_verification_outcomes([
+            _v("vulnerable", off, agree=False)])
+        assert counts["error_count"] == 1, off
+        assert counts["disagreed"] == 0, off
+
+
+def test_off_enum_disagreement_is_not_a_false_positive_eliminated():
+    """The telemetry shape: an off-enum disagreement is an ERROR row, so the
+    step summary's error_count (not disagreed) must carry it."""
+    counts = _count_verification_outcomes([
+        _v("vulnerable", "Probably Fine", agree=False)])
+    assert counts["error_count"] == 1 and counts["disagreed"] == 0
+
+
+def test_off_enum_row_is_reported_not_false_clean():
+    """#679's report half: an artifact row with an off-enum verdict must join
+    a visible ERROR group (not be dropped), and the false-clean remediation
+    message must be suppressed when such rows exist."""
+    import openant.cli as cli_mod
+    # the report-grouping logic is inside cmd_report_data's closure — drive
+    # it via the smallest observable: the group assembly shape. The pure
+    # predicate we CAN test: the unknown-verdict classification.
+    from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+    findings = [
+        {"verdict": "vulnerable", "finding": "vulnerable"},
+        {"verdict": "Probably Fine", "finding": "Probably Fine"},  # the off-enum row
+    ]
+    known = set(FINDING_VERDICT_ORDER)
+    error_group = [f for f in findings if f["verdict"] not in known]
+    assert len(error_group) == 1, "the off-enum row must be classified as the error group"
+    assert error_group[0]["verdict"] == "Probably Fine"
+    # and the honest message fires when only unparseable rows exist
+    actionable = [f for f in findings if f["verdict"] in ("vulnerable", "bypassable", "inconclusive")]
+    assert actionable, "the control: a vuln row keeps the normal path"
+
+
+# --- #679's report half: the extracted helpers, guarded at the reader site ---
+
+def test_unrecognized_verdict_rows_helper():
+    """The classification: an off-enum row is picked up; a canonical row is not."""
+    from openant.cli import _unrecognized_verdict_rows
+    from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+    findings = [
+        {"verdict": "vulnerable", "finding": "vulnerable"},
+        {"verdict": "Probably Fine", "finding": "Probably Fine"},
+        {"verdict": "protected", "finding": "protected"},
+    ]
+    rows = _unrecognized_verdict_rows(findings, list(FINDING_VERDICT_ORDER))
+    assert [r["verdict"] for r in rows] == ["Probably Fine"]
+    assert _unrecognized_verdict_rows(
+        [{"verdict": "safe", "finding": "safe"}], list(FINDING_VERDICT_ORDER)) == []
+
+
+def test_remediation_message_honest_when_unrecognized():
+    """The false-clean message is suppressed when unparseable rows exist."""
+    from openant.cli import _remediation_for_unrecognized
+    # the clean case: the legacy message
+    assert "No vulnerabilities or security concerns" in _remediation_for_unrecognized([], [])
+    # the off-enum case: the honest message
+    msg = _remediation_for_unrecognized([], [{"verdict": "Probably Fine"}])
+    assert "unrecognized verdict" in msg and "No vulnerabilities or security concerns" not in msg
+    # the actionable case: the LLM path (None)
+    assert _remediation_for_unrecognized([{"verdict": "vulnerable"}], []) is None

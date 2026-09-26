@@ -510,6 +510,15 @@ def _count_verification_outcomes(verified_results: list) -> dict:
         # Stage-2 change as a disagreement.
         finding = fold_legacy_finding(
             str(r.get("finding") or r.get("verdict", "")).lower())
+        # #679: an off-enum corrected verdict ("Probably Fine", a typo, or a
+        # model-drift spelling) is a VISIBLE ERROR, never a plain
+        # disagreement — the scanner folds plain ``disagreed`` into ``safe``
+        # (the false-clean: every surface would read the unit as safe while
+        # the recount says error). The check precedes the agreement arms:
+        # agreed-or-not, an unparseable finding cannot be classified.
+        if finding not in FINDING_VERDICT_ORDER and finding != "":
+            counts["error_count"] += 1
+            continue
         if verification.get("agree", False):
             counts["agreed"] += 1
             if finding in ("vulnerable", "bypassable"):
