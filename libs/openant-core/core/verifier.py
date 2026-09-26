@@ -460,13 +460,12 @@ def _count_verification_outcomes(verified_results: list) -> dict:
       * ``agreed``       — Stage 2 completed and agreed; if the final finding is
                            vulnerable/bypassable it is a confirmed vulnerability.
       * ``disagreed``    — Stage 2 completed and actively disagreed with a
-                           corrected verdict of ``safe`` OR an unrecognised
-                           verdict string (the residual arm — anything not
-                           vulnerable/bypassable/inconclusive/protected).
+                           corrected verdict of ``safe`` (the residual arm).
                            ONLY this bucket is safe to fold into ``safe``
-                           downstream. NOTE the off-enum residual: a garbage
-                           corrected verdict still lands here and reads as
-                           safe — pre-existing behaviour, disclosed.
+                           downstream. #679: an unrecognised verdict string
+                           NO LONGER lands here — it reaches ``error_count``
+                           before the agreement arms (a garbage corrected
+                           verdict is a visible error, never a safe fold).
       * ``disagreed_inconclusive`` — #509/#510: the corrected finding is
                            ``inconclusive`` — threaded to metrics.inconclusive,
                            never folded into safe.

@@ -1284,8 +1284,10 @@ def scan_repository(
                     # it here; the scanner fold was the only divergence).
                     protected=analyze_result.metrics.protected
                     + verify_result.disagreed_protected,
-                    # #622: the residual ``disagreed`` (corrected to safe or
-                    # an unrecognised verdict) is ALL that folds into safe.
+                    # #622: the residual ``disagreed`` (corrected to
+                    # safe) is ALL that folds into safe. #679: an
+                    # unrecognised verdict no longer reaches this arm —
+                    # it counts as error_count upstream.
                     safe=analyze_result.metrics.safe + verify_result.disagreed,
                     errors=analyze_result.metrics.errors + verify_result.error_count,
                     verified=verify_result.findings_verified,

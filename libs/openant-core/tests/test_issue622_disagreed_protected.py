@@ -402,16 +402,6 @@ def test_e2e_differential_control_safe_correction(tmp_path):
 # #679: an off-enum Stage-2 corrected verdict must reach the recount and the
 # envelope as a VISIBLE ERROR — never folded into safe, never hidden.
 # ---------------------------------------------------------------------------
-class TestOffEnumRecountPartition:
-    """The partition derives FROM the recount (the maintainer's preference),
-    never from a separate disagreed-counter addition."""
-
-    def test_off_enum_verified_row_uses_recount_partition(self, tmp_path):
-        """The three-unit fixture with u1 corrected to an off-enum value:
-        the recount AND the envelope must both say errors=1, safe=0."""
-        import pytest
-        for off_enum in ("Probably Fine", "error"):
-            pass  # parameterize via the runner below (keep the file importable)
 
 
 # --- #679: the off-enum corrected verdict ------------------------------------
@@ -436,25 +426,23 @@ def test_off_enum_disagreement_is_not_a_false_positive_eliminated():
 
 
 def test_off_enum_row_is_reported_not_false_clean():
-    """#679's report half: an artifact row with an off-enum verdict must join
-    a visible ERROR group (not be dropped), and the false-clean remediation
-    message must be suppressed when such rows exist."""
-    import openant.cli as cli_mod
-    # the report-grouping logic is inside cmd_report_data's closure — drive
-    # it via the smallest observable: the group assembly shape. The pure
-    # predicate we CAN test: the unknown-verdict classification.
+    """#679's report half: the REAL helpers — the off-enum row joins the
+    visible group, the canonical error row too (F1: the split wording),
+    and the false-clean message is suppressed when either exists."""
+    from openant.cli import _unrecognized_verdict_rows, _remediation_for_unrecognized
     from core.verdict_taxonomy import FINDING_VERDICT_ORDER
     findings = [
         {"verdict": "vulnerable", "finding": "vulnerable"},
-        {"verdict": "Probably Fine", "finding": "Probably Fine"},  # the off-enum row
+        {"verdict": "Probably Fine", "finding": "Probably Fine"},
+        {"verdict": "error", "finding": "error"},
     ]
-    known = set(FINDING_VERDICT_ORDER)
-    error_group = [f for f in findings if f["verdict"] not in known]
-    assert len(error_group) == 1, "the off-enum row must be classified as the error group"
-    assert error_group[0]["verdict"] == "Probably Fine"
-    # and the honest message fires when only unparseable rows exist
-    actionable = [f for f in findings if f["verdict"] in ("vulnerable", "bypassable", "inconclusive")]
-    assert actionable, "the control: a vuln row keeps the normal path"
+    unrec = _unrecognized_verdict_rows(findings, list(FINDING_VERDICT_ORDER))
+    assert [r["verdict"] for r in unrec] == ["Probably Fine"], (
+        "the canonical 'error' spelling is RECOGNIZED — only the off-enum "
+        "spelling is 'unrecognized' (the T1 F1 split)")
+    # the honest message names both counts
+    msg = _remediation_for_unrecognized([], [{"verdict": "error"}, {"verdict": "Probably Fine"}])
+    assert "1 errored" in msg and "1 with an unrecognized verdict" in msg
 
 
 # --- #679's report half: the extracted helpers, guarded at the reader site ---
