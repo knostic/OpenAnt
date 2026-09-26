@@ -356,8 +356,10 @@ def _extract_usage_details(usage: Any) -> Optional[dict]:
     Copies ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
     VERBATIM when the provider reported them; returns ``None`` when neither
     is present (absent ≠ 0 — fabricated zeros would poison reconciliation
-    against a provider bill). These fields NEVER feed the cost formula:
-    ``TokenTracker`` stores them verbatim, unsummed. (Anthropic's
+    against a provider bill). #626 AMENDED the blanket exclusion for the CACHE
+    fields: they now price at their own multipliers (#661) and total as separate
+    line items — never into total_input_tokens. The REASONING fields remain
+    outside the cost formula verbatim: ``TokenTracker`` stores them unsummed. (Anthropic's
     ``output_tokens`` includes thinking tokens; there is no separate
     reasoning field to capture on this path.)
     """

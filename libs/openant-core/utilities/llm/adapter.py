@@ -195,9 +195,11 @@ class CompletionResult:
             fields (reasoning tokens; cache read/write tokens), copied
             VERBATIM by the adapter — present-only, absent when the
             provider reported none. Pass-through capture for #211:
-            these fields never feed the cost formula and are never
-            summed into token totals; they exist so the accounting
-            artifacts can be reconciled against a provider bill. (The
+            #626/#661 amended the blanket exclusion for the CACHE fields (they
+            price at their own multipliers now); the REASONING fields remain
+            outside the cost formula verbatim — never summed into token
+            totals — so the accounting artifacts can be reconciled against a
+            provider bill. (The
             cost-math question — whether ``output_tokens`` already
             includes reasoning on a given route — is deliberately
             unresolved; summing here would double-count on routes

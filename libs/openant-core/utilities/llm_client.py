@@ -90,7 +90,39 @@ def _warn_unknown_pricing(model: str) -> None:
 class TokenTracker:
     """
     Tracks token usage and costs across LLM calls.
+
+    #626 cache accounting: the provider-supplied cache usage fields
+    (captured verbatim per #211) feed the cost formula AT THEIR OWN RATES
+    when the model's pricing record carries cache multipliers
+    (``cache_read`` / ``cache_write``, multipliers of the base input rate);
+    they stay OUT of ``total_input_tokens`` for the EXCLUSIVE (anthropic)
+    field shapes — disjoint line items. The INCLUSIVE shapes (openai's
+    ``cached_tokens``, google's ``cached_content_token_count``) are already
+    INSIDE the provider's input count: the COST formula subtracts the
+    priced portion (never billed twice), while ``total_input_tokens``
+    stays verbatim (the provider's own number — reconciliation is
+    provider-dependent by design). Cache usage on
+    a record WITHOUT multipliers marks the run ``cost_incomplete`` and
+    names the model in ``unpriced_cache_models`` — a cached run must never
+    read as a silently-cheap complete one.
     """
+
+    # The cross-provider field shapes, normalized: every provider's
+    # "tokens served from cache" and "tokens written to cache" spelling,
+    # SPLIT BY INCLUSION SEMANTICS (F661-1, 2026-09-22): the anthropic/
+    # bedrock fields are DISJOINT from the input count (input_tokens
+    # excludes them); the openai/google fields are SUBSETS of it
+    # (prompt_tokens / prompt_token_count already contain the cached
+    # portion — pricing input as-is PLUS the cache line items bills the
+    # cached tokens twice).
+    _CACHE_READ_FIELDS_EXCLUSIVE = ("cache_read_input_tokens",)      # anthropic / bedrock
+    _CACHE_READ_FIELDS_INCLUSIVE = ("cached_tokens",                 # openai / openrouter
+                                    "cached_content_token_count")    # google
+    _CACHE_WRITE_FIELDS_EXCLUSIVE = ("cache_creation_input_tokens",)  # anthropic / bedrock
+    _CACHE_WRITE_FIELDS_INCLUSIVE = ("cache_write_tokens",)           # openrouter (inside prompt_tokens)
+    # the union (the captured-verbatim normalization, unchanged)
+    _CACHE_READ_FIELDS = _CACHE_READ_FIELDS_EXCLUSIVE + _CACHE_READ_FIELDS_INCLUSIVE
+    _CACHE_WRITE_FIELDS = _CACHE_WRITE_FIELDS_EXCLUSIVE + _CACHE_WRITE_FIELDS_INCLUSIVE
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -112,6 +144,14 @@ class TokenTracker:
             # #216: models dispatched without a pricing record (their cost
             # contributes $0 — the run's cost figure is incomplete).
             self._unpriced_models: set[str] = set()
+            # #626: models whose cache usage appeared but whose pricing
+            # record carries no cache multipliers (the cache portion is
+            # unpriceable — incomplete, never $0-silent).
+            self._unpriced_cache_models: set[str] = set()
+            # #626: the cache line items (separate from input/output —
+            # the billing-reconciliation totals).
+            self.total_cache_read_tokens = 0
+            self.total_cache_write_tokens = 0
 
     @property
     def total_tokens(self) -> int:
@@ -148,10 +188,16 @@ class TokenTracker:
                 read/write tokens) VERBATIM — a dict for a single call,
                 or a list of per-turn dicts for an agentic loop. Stored
                 on the call record for reconciliation against a provider
-                bill; NEVER summed into totals and NEVER in the cost
-                formula (whether a provider's ``completion_tokens``
-                already includes reasoning differs by route — summing
-                would double-count on including routes).
+                bill. #626 deliberately AMENDED the blanket exclusion for
+                the CACHE fields: they price at their own multipliers.
+                EXCLUSIVE shapes (anthropic) total as separate line items;
+                INCLUSIVE shapes (openai/google) sit inside the input
+                count — the cost formula subtracts the priced portion,
+                the totals stay verbatim per provider. The REASONING fields remain outside
+                the cost formula verbatim (whether a provider's
+                ``completion_tokens`` already includes reasoning differs
+                by route — summing would double-count on including
+                routes).
             turns: #624 — the number of LLM completions this record
                 covers: 1 (the default) for a single completion
                 (``usage_details`` dict/None); REQUIRED for an agentic
@@ -174,6 +220,35 @@ class TokenTracker:
                 "record_call: usage_details is a per-turn list but "
                 "turns was not passed — a conversation record must "
                 "declare its billed-turn count (#624)")
+        # #626: normalize the cache usage out of usage_details (dict or
+        # per-turn list; None entries are absent turns by the #211 contract).
+        cache_read = 0        # exclusive semantics (anthropic): NOT in input
+        cache_write = 0       # exclusive semantics
+        cache_read_incl = 0   # inclusive semantics (openai/google): already in input
+        cache_write_incl = 0  # inclusive semantics
+        _detail_rows = (usage_details if isinstance(usage_details, list)
+                        else [usage_details])
+        for _row in _detail_rows:
+            if not isinstance(_row, dict):
+                continue
+            for _f in self._CACHE_READ_FIELDS_EXCLUSIVE:
+                _v = _row.get(_f)
+                if isinstance(_v, int) and _v > 0:
+                    cache_read += _v
+            for _f in self._CACHE_READ_FIELDS_INCLUSIVE:
+                _v = _row.get(_f)
+                if isinstance(_v, int) and _v > 0:
+                    cache_read_incl += _v
+            for _f in self._CACHE_WRITE_FIELDS_EXCLUSIVE:
+                _v = _row.get(_f)
+                if isinstance(_v, int) and _v > 0:
+                    cache_write += _v
+            for _f in self._CACHE_WRITE_FIELDS_INCLUSIVE:
+                _v = _row.get(_f)
+                if isinstance(_v, int) and _v > 0:
+                    cache_write_incl += _v
+        has_cache_usage = (cache_read > 0 or cache_write > 0
+                           or cache_read_incl > 0 or cache_write_incl > 0)
         if pricing is None:
             # #598: an omitted/missing ``pricing`` is UNKNOWN pricing — the
             # #216 loud path below. The legacy Anthropic-catalogue
@@ -194,9 +269,59 @@ class TokenTracker:
             if hasattr(tl, "unit_unpriced"):
                 tl.unit_unpriced.add(model)
         else:
-            input_cost = (input_tokens / 1_000_000) * pricing["input"]
+            # F661-1: the inclusive providers' cached portion is INSIDE
+            # input_tokens — subtract it from the billed input (it prices
+            # at its own multiplier below, never twice). T1 round-2 (F-A):
+            # subtract ONLY the portion that actually prices at a
+            # multiplier — an unpriced inclusive cache (the shipped
+            # census: no openai/google cache rates) must degrade to the
+            # FULL-RATE upper bound (master's direction, over-estimate +
+            # cost_incomplete), never to a $0 under-report of the cached
+            # tokens.
+            _incl_priced = 0
+            if cache_read_incl and "cache_read" in pricing:
+                _incl_priced += cache_read_incl
+            if cache_write_incl and "cache_write" in pricing:
+                _incl_priced += cache_write_incl
+            _billed_input = input_tokens - _incl_priced
+            if _billed_input < 0:
+                _billed_input = 0
+            input_cost = (_billed_input / 1_000_000) * pricing["input"]
             output_cost = (output_tokens / 1_000_000) * pricing["output"]
             total_cost = input_cost + output_cost
+            # #626: the cache portion, priced at its own multipliers of the
+            # base input rate. Present cache usage WITHOUT multipliers
+            # (below) keeps the tokens counted, the cache cost $0, and the
+            # run marked incomplete — never a silent $0-complete read.
+            if has_cache_usage:
+                # T8 fix (2026-09-21, the retro probe): each side prices
+                # ONLY with its own multiplier — a one-sided record (read
+                # present, write absent) must not price the missing side at
+                # $0.0 and read complete; the used-but-unpriced side marks
+                # the run incomplete and names the model.
+                cache_cost = 0.0
+                unpriced_side = False
+                _cache_read_all = cache_read + cache_read_incl
+                _cache_write_all = cache_write + cache_write_incl
+                if _cache_read_all:
+                    if "cache_read" in pricing:
+                        cache_cost += (_cache_read_all / 1_000_000) * pricing[
+                            "input"] * pricing["cache_read"]
+                    else:
+                        unpriced_side = True
+                if _cache_write_all:
+                    if "cache_write" in pricing:
+                        cache_cost += (_cache_write_all / 1_000_000) * pricing[
+                            "input"] * pricing["cache_write"]
+                    else:
+                        unpriced_side = True
+                total_cost += cache_cost
+                if unpriced_side:
+                    with self._lock:
+                        self._unpriced_cache_models.add(model)
+                    tl = self._thread_local
+                    if hasattr(tl, "unit_unpriced"):
+                        tl.unit_unpriced.add(model)
 
         # #624: the turns identity — the guard above already rejected an
         # undeclared list; a single completion defaults to 1.
@@ -211,6 +336,12 @@ class TokenTracker:
             "output_tokens": output_tokens,
             "cost_usd": round(total_cost, 6),
             "turns": record_turns,
+            # #626: the cache line items (present-only — a call with no
+            # cache usage is byte-identical to the pre-#626 record shape).
+            **({"cache_read_tokens": cache_read + cache_read_incl}
+               if (cache_read or cache_read_incl) else {}),
+            **({"cache_write_tokens": cache_write + cache_write_incl}
+               if (cache_write or cache_write_incl) else {}),
             # #211 pass-through capture: stored VERBATIM (absent when the
             # provider supplied none — never a fabricated empty dict; in the
             # per-turn list form, turns without details appear as None
@@ -225,6 +356,13 @@ class TokenTracker:
             self.total_output_tokens += output_tokens
             self.total_cost_usd += total_cost
             self.total_turns += record_turns
+            # #626: cached input is a SEPARATE line item — never folded
+            # into total_input_tokens (the uncached/cached split is the
+            # billing-reconciliation shape).
+            if cache_read or cache_read_incl:
+                self.total_cache_read_tokens += cache_read + cache_read_incl
+            if cache_write or cache_write_incl:
+                self.total_cache_write_tokens += cache_write + cache_write_incl
 
         # Accumulate to thread-local unit tracking if active
         tl = self._thread_local
@@ -289,7 +427,7 @@ class TokenTracker:
             Dict with totals and per-call breakdown
         """
         with self._lock:
-            return {
+            out = {
                 "total_calls": len(self.calls),
                 "total_input_tokens": self.total_input_tokens,
                 "total_output_tokens": self.total_output_tokens,
@@ -299,11 +437,22 @@ class TokenTracker:
                 # single completion, the billed turns per conversation).
                 "total_turns": self.total_turns,
                 # #216: the cost figure is INCOMPLETE when any dispatched
-                # model had no pricing (its tokens counted, its dollars $0).
-                "cost_incomplete": bool(self._unpriced_models),
+                # model had no pricing (its tokens counted, its dollars $0)
+                # — #626: or cached usage the record could not price.
+                "cost_incomplete": bool(self._unpriced_models
+                                        or self._unpriced_cache_models),
                 "unpriced_models": sorted(self._unpriced_models),
                 "calls": list(self.calls),
             }
+            # #626/T8: the same present-only cache line items get_totals
+            # carries (the reconciliation surfaces must agree).
+            if self.total_cache_read_tokens:
+                out["total_cache_read_tokens"] = self.total_cache_read_tokens
+            if self.total_cache_write_tokens:
+                out["total_cache_write_tokens"] = self.total_cache_write_tokens
+            if self._unpriced_cache_models:
+                out["unpriced_cache_models"] = sorted(self._unpriced_cache_models)
+            return out
 
     def get_totals(self) -> dict:
         """
@@ -321,9 +470,18 @@ class TokenTracker:
                 "total_cost_usd": round(self.total_cost_usd, 6),
                 # #624: the completion count (see get_summary).
                 "total_turns": self.total_turns,
-                "cost_incomplete": bool(self._unpriced_models),
+                "cost_incomplete": bool(self._unpriced_models
+                                        or self._unpriced_cache_models),
                 "unpriced_models": sorted(self._unpriced_models),
             }
+            # #626: present-only — a run with no cache usage serializes
+            # byte-identical to the pre-#626 totals.
+            if self.total_cache_read_tokens:
+                out["total_cache_read_tokens"] = self.total_cache_read_tokens
+            if self.total_cache_write_tokens:
+                out["total_cache_write_tokens"] = self.total_cache_write_tokens
+            if self._unpriced_cache_models:
+                out["unpriced_cache_models"] = sorted(self._unpriced_cache_models)
             # #605: present-only — a healthy run's totals serialize
             # byte-identical to pre-#605.
             _errs = _accounting_error_count()

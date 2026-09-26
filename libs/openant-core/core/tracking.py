@@ -31,6 +31,9 @@ def get_usage() -> UsageInfo:
         total_cost_usd=totals["total_cost_usd"],
         cost_incomplete=totals.get("cost_incomplete", False),
         unpriced_models=totals.get("unpriced_models", []),
+        total_cache_read_tokens=totals.get("total_cache_read_tokens", 0),
+        total_cache_write_tokens=totals.get("total_cache_write_tokens", 0),
+        unpriced_cache_models=totals.get("unpriced_cache_models", []),
     )
 
 

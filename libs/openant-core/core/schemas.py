@@ -113,6 +113,14 @@ class UsageInfo:
     # flows into step reports and scan.report.json via tracking.get_usage.
     cost_incomplete: bool = False
     unpriced_models: list = field(default_factory=list)
+    # #626: the cache line items (additive with defaults — the #624
+    # asdict decision: result envelopes gain the keys, Go decoders
+    # ignore unknowns, old artifacts read as 0). Cached and uncached
+    # input stay separated; cache-unpriceable models keep the run
+    # incomplete.
+    total_cache_read_tokens: int = 0
+    total_cache_write_tokens: int = 0
+    unpriced_cache_models: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)

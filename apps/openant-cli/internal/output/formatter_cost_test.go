@@ -89,3 +89,21 @@ func TestScanSummaryRendersIncompleteness(t *testing.T) {
 		t.Fatalf("the unpriced ids line missing: %q", out)
 	}
 }
+
+// F661-2 (the #626 review): a cache-only incompleteness (unpriced_cache_models
+// set, unpriced_models empty) must still name its models — the terminal
+// printed "at least one model unpriced" with NO model before.
+func TestRenderCostBlockNamesCacheUnpricedModels(t *testing.T) {
+	usage := map[string]any{
+		"total_cost_usd":         0.00976,
+		"cost_incomplete":        true,
+		"unpriced_models":        []any{},
+		"unpriced_cache_models":  []any{"gpt-4o"},
+	}
+	// renderCostBlock writes to stdout; assert through the same capture
+	// the sibling tests use (the analyze_verify pattern).
+	out := captureUsageOutput(func() { renderCostBlock(usage) })
+	if !strings.Contains(out, "gpt-4o") {
+		t.Fatalf("the cache-unpriced model is nameless in the cost block:\n%s", out)
+	}
+}
