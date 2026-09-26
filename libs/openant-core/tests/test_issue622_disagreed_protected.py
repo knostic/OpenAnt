@@ -46,7 +46,13 @@ def _zero_counts(**overrides):
     base = dict(agreed=0, disagreed=0, disagreed_inconclusive=0,
                 disagreed_protected=0, needs_review=0,
                 confirmed_vulnerabilities=0, error_count=0,
-                downgraded=0, upgraded=0)
+                downgraded=0, upgraded=0,
+                # #681: the consistency-rewrite buckets (by destination) —
+                # all zero in this suite's shapes (none carry the
+                # consistency_update record); the dict-equality asserts
+                # stay semantically identical.
+                consistency_protected=0, consistency_safe=0,
+                consistency_inconclusive=0)
     base.update(overrides)
     return base
 
@@ -60,10 +66,13 @@ def test_agreed_vulnerable_counts_confirmed():
 
 
 def test_agreed_consistency_rewritten_to_protected_is_NOT_the_new_bucket():
-    """The new arm is gated on agree==False — an agreed record the consistency
-    pass rewrote to protected lands in `agreed` (the second, out-of-scope leak
-    the PR body scopes: the recount counts it protected; the scanner partition
-    cannot thread it, post-#622 too)."""
+    """#681 narrows this test's scope: an agreed+rewritten row WITH the
+    consistency_update record now threads consistency_protected (the
+    #681 fix, tested in test_issue681_consistency_envelope.py). THIS shape
+    — an agreed corrected-looking row with NO consistency_update record
+    (a hand-built shape (no production route writes the rewrite without the record — the apply loop writes it on every rewrite since the initial commit)) — still counts
+    agreed+downgraded only: the gate is the record the apply loop writes,
+    never a guess from the verdict delta."""
     counts = _count_verification_outcomes([
         _v("vulnerable", "protected", agree=True)])
     # vulnerable -> protected is also a DOWNGRADE (the direction computation

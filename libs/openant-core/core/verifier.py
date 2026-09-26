@@ -372,6 +372,11 @@ def run_verification(
         # #622: the protected-correction sibling — threaded to
         # metrics.protected, never folded into safe.
         disagreed_protected=_counts["disagreed_protected"],
+        # #681: the consistency-rewrite destinations — threaded to the
+        # scanner envelope's folds (the sum-to-total property).
+        consistency_protected=_counts["consistency_protected"],
+        consistency_safe=_counts["consistency_safe"],
+        consistency_inconclusive=_counts["consistency_inconclusive"],
         confirmed_vulnerabilities=confirmed_vulnerabilities,
         needs_review=needs_review,
         error_count=error_count,
@@ -483,6 +488,15 @@ def _count_verification_outcomes(verified_results: list) -> dict:
         # #622: disagreements whose corrected finding is ``protected`` —
         # threaded to metrics.protected, never folded into safe.
         "disagreed_protected": 0,
+        # #681: the consistency-rewrite buckets (by destination) — the
+        # agreed rows the post-batch consistency pass rewrote reach their
+        # own buckets so the scanner envelope can fold them (previously
+        # the row counted `agreed` only and NO envelope column received
+        # its destination: the envelope said protected=0 while the
+        # recount said protected=1 — two numbers, three surfaces).
+        "consistency_protected": 0,
+        "consistency_safe": 0,
+        "consistency_inconclusive": 0,
         "needs_review": 0,
         "confirmed_vulnerabilities": 0,
         "error_count": 0,
@@ -522,6 +536,22 @@ def _count_verification_outcomes(verified_results: list) -> dict:
             counts["agreed"] += 1
             if finding in ("vulnerable", "bypassable"):
                 counts["confirmed_vulnerabilities"] += 1
+            # #681: an agreed row the consistency pass REWROTE reaches its
+            # destination bucket — the apply loop records the rewrite in
+            # `consistency_update` (finding_verifier.py:1337) with agree
+            # untouched (True), so the rewrite was invisible to every
+            # envelope column (the analysis metrics counted the Stage-1
+            # verdict; disagreed_* counts only agree=False rows). The
+            # rewrite-to-vulnerable case is already counted as a confirmed
+            # vulnerability above.
+            _cu = r.get("consistency_update")
+            if isinstance(_cu, dict) and _cu.get("to"):
+                if finding == "protected":
+                    counts["consistency_protected"] += 1
+                elif finding == "safe":
+                    counts["consistency_safe"] += 1
+                elif finding == "inconclusive":
+                    counts["consistency_inconclusive"] += 1
         else:
             # Stage 2 disagreed. finding_verifier has already written the
             # corrected verdict onto ``r["finding"]`` (= correct_finding). A
