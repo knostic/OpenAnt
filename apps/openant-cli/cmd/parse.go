@@ -78,7 +78,13 @@ func runParse(cmd *cobra.Command, args []string) {
 		os.Exit(2)
 	}
 
-	// Apply project defaults
+	// #667 (the T1 round's F1): `parse -l <other>` performs the IDENTICAL
+	// in-place write through the step-verb surface — parseOutput defaults to
+	// ctx.ScanDir (the pin) while the requested language's dataset lands in
+	// it. The guard is generic; it rejects here too, before any write.
+	// The delta round's D2: parse passes its OWN effective output (after
+	// the defaults), so `parse -l go -o <elsewhere>` exempts honestly.
+	parseExplicitLang := cmd.Flags().Changed("language")
 	if ctx != nil {
 		if parseOutput == "" {
 			parseOutput = ctx.ScanDir
@@ -86,6 +92,10 @@ func runParse(cmd *cobra.Command, args []string) {
 		if parseLanguage == "" {
 			parseLanguage = ctx.Language
 		}
+	}
+	if err := rejectOffPinLanguage(ctx, parseExplicitLang, parseLanguage, parseOutput); err != nil {
+		output.PrintError(err.Error())
+		os.Exit(2)
 	}
 	if parseLanguage == "" {
 		parseLanguage = "auto"
