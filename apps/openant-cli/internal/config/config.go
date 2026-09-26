@@ -454,6 +454,14 @@ func ScanDir(projectName, shortSHA, language string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// #691 (the defense for persisted values): ScanDir joins the language
+	// into the artifacts path for EVERY caller (resolve, project, init) —
+	// a stale/migrated project.json carrying a traversal value must not
+	// escape here (#676's validLanguageKey guards only the meta path; the
+	// same single-element rule applies to the artifacts path).
+	if language != "" && !validLanguageKey(language) {
+		return "", fmt.Errorf("invalid language %q: must be a single path element (issue #691 — the persisted value escapes the artifacts dir; re-run openant init with a supported -l)", language)
+	}
 	return filepath.Join(projDir, "scans", shortSHA, language), nil
 }
 

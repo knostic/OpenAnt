@@ -81,7 +81,13 @@ func runProjectShow(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	scanDir, _ := config.ScanDir(project.Name, project.CommitSHAShort, project.Language)
+	// #691 + the T1's F4: the swallow printed a BLANK scan dir for a
+	// stale traversal pin while every other command printed the honest
+	// #691 diagnosis — the one inspection command must not hide it.
+	scanDir, scanDirErr := config.ScanDir(project.Name, project.CommitSHAShort, project.Language)
+	if scanDirErr != nil {
+		output.PrintWarning(scanDirErr.Error())
+	}
 	projDir, _ := config.ProjectDir(project.Name)
 
 	output.PrintHeader("Active Project")
