@@ -460,13 +460,12 @@ def _count_verification_outcomes(verified_results: list) -> dict:
       * ``agreed``       — Stage 2 completed and agreed; if the final finding is
                            vulnerable/bypassable it is a confirmed vulnerability.
       * ``disagreed``    — Stage 2 completed and actively disagreed with a
-                           corrected verdict of ``safe`` OR an unrecognised
-                           verdict string (the residual arm — anything not
-                           vulnerable/bypassable/inconclusive/protected).
+                           corrected verdict of ``safe`` (the residual arm).
                            ONLY this bucket is safe to fold into ``safe``
-                           downstream. NOTE the off-enum residual: a garbage
-                           corrected verdict still lands here and reads as
-                           safe — pre-existing behaviour, disclosed.
+                           downstream. #679: an unrecognised verdict string
+                           NO LONGER lands here — it reaches ``error_count``
+                           before the agreement arms (a garbage corrected
+                           verdict is a visible error, never a safe fold).
       * ``disagreed_inconclusive`` — #509/#510: the corrected finding is
                            ``inconclusive`` — threaded to metrics.inconclusive,
                            never folded into safe.
@@ -510,6 +509,15 @@ def _count_verification_outcomes(verified_results: list) -> dict:
         # Stage-2 change as a disagreement.
         finding = fold_legacy_finding(
             str(r.get("finding") or r.get("verdict", "")).lower())
+        # #679: an off-enum corrected verdict ("Probably Fine", a typo, or a
+        # model-drift spelling) is a VISIBLE ERROR, never a plain
+        # disagreement — the scanner folds plain ``disagreed`` into ``safe``
+        # (the false-clean: every surface would read the unit as safe while
+        # the recount says error). The check precedes the agreement arms:
+        # agreed-or-not, an unparseable finding cannot be classified.
+        if finding not in FINDING_VERDICT_ORDER and finding != "":
+            counts["error_count"] += 1
+            continue
         if verification.get("agree", False):
             counts["agreed"] += 1
             if finding in ("vulnerable", "bypassable"):

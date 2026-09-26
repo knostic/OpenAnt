@@ -397,3 +397,78 @@ def test_e2e_differential_control_safe_correction(tmp_path):
     assert verified["metrics"]["safe"] == 1, (
         "the differential control: safe grows by exactly the residual")
     assert verified["metrics"]["protected"] == 1, "only Stage-1 protected"
+
+# ---------------------------------------------------------------------------
+# #679: an off-enum Stage-2 corrected verdict must reach the recount and the
+# envelope as a VISIBLE ERROR — never folded into safe, never hidden.
+# ---------------------------------------------------------------------------
+
+
+# --- #679: the off-enum corrected verdict ------------------------------------
+
+def test_off_enum_corrected_counts_as_error_never_disagreed():
+    """An off-enum corrected finding must reach the error bucket (a visible
+    error), never the disagreed counter (which the scanner folds into
+    safe — the false-clean)."""
+    for off in ("Probably Fine", "error"):
+        counts = _count_verification_outcomes([
+            _v("vulnerable", off, agree=False)])
+        assert counts["error_count"] == 1, off
+        assert counts["disagreed"] == 0, off
+
+
+def test_off_enum_disagreement_is_not_a_false_positive_eliminated():
+    """The telemetry shape: an off-enum disagreement is an ERROR row, so the
+    step summary's error_count (not disagreed) must carry it."""
+    counts = _count_verification_outcomes([
+        _v("vulnerable", "Probably Fine", agree=False)])
+    assert counts["error_count"] == 1 and counts["disagreed"] == 0
+
+
+def test_off_enum_row_is_reported_not_false_clean():
+    """#679's report half: the REAL helpers — the off-enum row joins the
+    visible group, the canonical error row too (F1: the split wording),
+    and the false-clean message is suppressed when either exists."""
+    from openant.cli import _unrecognized_verdict_rows, _remediation_for_unrecognized
+    from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+    findings = [
+        {"verdict": "vulnerable", "finding": "vulnerable"},
+        {"verdict": "Probably Fine", "finding": "Probably Fine"},
+        {"verdict": "error", "finding": "error"},
+    ]
+    unrec = _unrecognized_verdict_rows(findings, list(FINDING_VERDICT_ORDER))
+    assert [r["verdict"] for r in unrec] == ["Probably Fine"], (
+        "the canonical 'error' spelling is RECOGNIZED — only the off-enum "
+        "spelling is 'unrecognized' (the T1 F1 split)")
+    # the honest message names both counts
+    msg = _remediation_for_unrecognized([], [{"verdict": "error"}, {"verdict": "Probably Fine"}])
+    assert "1 errored" in msg and "1 with an unrecognized verdict" in msg
+
+
+# --- #679's report half: the extracted helpers, guarded at the reader site ---
+
+def test_unrecognized_verdict_rows_helper():
+    """The classification: an off-enum row is picked up; a canonical row is not."""
+    from openant.cli import _unrecognized_verdict_rows
+    from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+    findings = [
+        {"verdict": "vulnerable", "finding": "vulnerable"},
+        {"verdict": "Probably Fine", "finding": "Probably Fine"},
+        {"verdict": "protected", "finding": "protected"},
+    ]
+    rows = _unrecognized_verdict_rows(findings, list(FINDING_VERDICT_ORDER))
+    assert [r["verdict"] for r in rows] == ["Probably Fine"]
+    assert _unrecognized_verdict_rows(
+        [{"verdict": "safe", "finding": "safe"}], list(FINDING_VERDICT_ORDER)) == []
+
+
+def test_remediation_message_honest_when_unrecognized():
+    """The false-clean message is suppressed when unparseable rows exist."""
+    from openant.cli import _remediation_for_unrecognized
+    # the clean case: the legacy message
+    assert "No vulnerabilities or security concerns" in _remediation_for_unrecognized([], [])
+    # the off-enum case: the honest message
+    msg = _remediation_for_unrecognized([], [{"verdict": "Probably Fine"}])
+    assert "unrecognized verdict" in msg and "No vulnerabilities or security concerns" not in msg
+    # the actionable case: the LLM path (None)
+    assert _remediation_for_unrecognized([{"verdict": "vulnerable"}], []) is None
