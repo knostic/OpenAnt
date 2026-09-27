@@ -57,8 +57,9 @@ LEGACY_ROW = {
 # --- T1 (RED): the prompt/schema census (D3's one-home alignment) -----------
 
 def _schema_verdict_set():
-    m = re.search(r'"verdict":\s*(.+)', _VULN_SCHEMA)
-    return set(re.findall(r'"([A-Z_]+)"', m.group(1)))
+    # #683: the schema's key is "finding" (the prompt's field name, lowercase)
+    m = re.search(r'"finding":\s*(.+)', _VULN_SCHEMA)
+    return set(re.findall(r'"([a-z_]+)"', m.group(1)))
 
 
 def _prompt_finding_set():
@@ -72,7 +73,7 @@ def test_schema_asks_exactly_the_prompt_vocabulary():
     """The rescue schema's enum == the Stage-1 prompt's finding set
     (uppercased) — the drift this issue was filed over cannot return."""
     findings = _stage1_prompt_findings()
-    assert _schema_verdict_set() == {f.upper() for f in findings}, (
+    assert _schema_verdict_set() == set(findings), (
         "the rescue schema must ask the calling phase's vocabulary")
     assert "INSUFFICIENT_CONTEXT" not in _schema_verdict_set(), (
         "the legacy value is accepted downstream but never ASKED for")
@@ -89,7 +90,8 @@ def test_prompt_offers_exactly_the_shared_constant():
 
 def test_extraction_prompt_embeds_the_aligned_enum():
     prompt = get_json_extraction_prompt("def broken_json(" * 5)
-    assert "PROTECTED" in prompt and "INCONCLUSIVE" in prompt, (
+    # #683: the vocabulary is lowercase (the prompt's canonical form)
+    assert '"protected"' in prompt and '"inconclusive"' in prompt, (
         "the extraction prompt must offer the full Stage-1 vocabulary")
     assert "INSUFFICIENT_CONTEXT" not in prompt, (
         "the legacy value must no longer be a rescue CHOICE")
@@ -99,7 +101,7 @@ def test_bypassable_is_not_a_stage1_rescue_choice():
     """BYPASSABLE originates in the Stage-2 finish enum, not the Stage-1
     prompt — offering it would let a rescue UPGRADE a reply into a
     verify-only verdict."""
-    assert "BYPASSABLE" not in _schema_verdict_set()
+    assert "bypassable" not in _schema_verdict_set()
 
 
 # --- T2 (GUARD, green at master): the rescue runtime accepts the vocabulary --
