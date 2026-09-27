@@ -11,6 +11,11 @@ into the ``pipeline_output.json`` format consumed by ``python -m report``
 and ``run_dynamic_tests()``.
 """
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from utilities.llm.registry import PhaseRegistry
+
 import json
 import os
 import re
@@ -1039,6 +1044,7 @@ def generate_summary_report(
     results_path: str,
     output_path: str,
     llm_config_name: str | None = None,
+    registry: "PhaseRegistry | None" = None,
 ) -> ReportResult:
     """Generate LLM-based summary report (Markdown).
 
@@ -1083,12 +1089,14 @@ def generate_summary_report(
         raise RuntimeError(f"Invalid pipeline output: {e}")
 
     # Resolve the report-phase binding once and pass it through.
-    # ``generate_summary_report`` is always invoked standalone via
-    # ``openant report -f summary`` — no upstream scanner has
-    # pre-validated the registry, so probe it here.
-    cf = load_config_file()
-    registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
-    probe_registry_or_raise(registry)
+    # #684: when the scanner invokes this mid-scan, it passes its own
+    # STARTUP-VALIDATED registry — the report uses the config the scan
+    # validated (no disk re-read, no second paid probe). The standalone
+    # path (no registry param) still probes.
+    if registry is None:
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+        probe_registry_or_raise(registry)
     report_binding = registry.get("report")
     report_text, usage = _generate_summary(pipeline_data, report_binding)
 
@@ -1132,6 +1140,7 @@ def generate_disclosure_docs(
     results_path: str,
     output_dir: str,
     llm_config_name: str | None = None,
+    registry: "PhaseRegistry | None" = None,
 ) -> ReportResult:
     """Generate per-vulnerability disclosure documents.
 
@@ -1177,11 +1186,12 @@ def generate_disclosure_docs(
 
     # Resolve the report-phase binding once and reuse across the
     # ThreadPoolExecutor — adapters are stateless dispatchers, safe
-    # to share. Probe the registry upfront (standalone-invocation
-    # path; same rationale as generate_summary_report).
-    cf = load_config_file()
-    registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
-    probe_registry_or_raise(registry)
+    # to share. #684: the scanner's validated registry threads through;
+    # the standalone path probes.
+    if registry is None:
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+        probe_registry_or_raise(registry)
     report_binding = registry.get("report")
 
     product_name = pipeline_data["repository"]["name"]
