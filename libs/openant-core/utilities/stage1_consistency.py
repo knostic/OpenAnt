@@ -197,6 +197,35 @@ def _group_by_signature_pattern(results: list) -> dict:
     return groups
 
 
+def _group_verdicts(group: list) -> set:
+    """The #680 testable grouping: the signature group's verdict set with
+    the equivalence classes applied (VULNERABLE=BYPASSABLE, SAFE=PROTECTED,
+    and — the #680 fix — the legacy INSUFFICIENT_CONTEXT folded to its
+    canonical INCONCLUSIVE synonym, the #655 miss)."""
+    verdicts = set()
+    for r in group:
+        # Type-guard: verdict may be present-but-non-string (None before a
+        # verdict is assigned, or a stray int/list); treat any non-str as "".
+        raw_verdict = r.get("verdict")
+        v = raw_verdict.upper() if isinstance(raw_verdict, str) else ""
+        # #680 + the T1's F1: the fold routes through the taxonomy's ONE
+        # home (fold_legacy_finding) — the hand-inlined literal was the
+        # drift shape the taxonomy's contract warns against (a NEW legacy
+        # spelling would have re-#680'd this sink). The call is verdict-keyed
+        # (a pre-existing design): the raw uppercase verdict lowercases to
+        # the finding-side key the taxonomy maps.
+        from core.verdict_taxonomy import fold_legacy_finding
+        v = fold_legacy_finding(v.lower()).upper()
+        # Treat VULNERABLE and BYPASSABLE as equivalent for grouping
+        if v in ("VULNERABLE", "BYPASSABLE"):
+            verdicts.add("VULNERABLE")
+        elif v in ("SAFE", "PROTECTED"):
+            verdicts.add("SAFE")
+        else:
+            verdicts.add(v)
+    return verdicts
+
+
 def run_stage1_consistency_check(
     results: list,
     code_by_route: dict,
@@ -232,20 +261,10 @@ def run_stage1_consistency_check(
         if len(group) < 2:
             continue
 
-        # Get verdicts (normalize to uppercase)
-        verdicts = set()
-        for r in group:
-            # Type-guard: verdict may be present-but-non-string (None before a
-            # verdict is assigned, or a stray int/list); treat any non-str as "".
-            raw_verdict = r.get("verdict")
-            v = raw_verdict.upper() if isinstance(raw_verdict, str) else ""
-            # Treat VULNERABLE and BYPASSABLE as equivalent for grouping
-            if v in ("VULNERABLE", "BYPASSABLE"):
-                verdicts.add("VULNERABLE")
-            elif v in ("SAFE", "PROTECTED"):
-                verdicts.add("SAFE")
-            else:
-                verdicts.add(v)
+        # #680: the grouping extracted to the module-level helper (the
+        # inline form was untestable without the heavy binding/tracker deps —
+        # the #679 inline-reimplementation class)
+        verdicts = _group_verdicts(group)
 
         if len(verdicts) > 1:
             inconsistent_groups.append((pattern, group))
