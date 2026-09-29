@@ -92,3 +92,52 @@ def test_standalone_still_probes(monkeypatch, tmp_path):
         generate_summary_report(str(pipeline_path), str(tmp_path / "out.md"),
                                "test-config")  # no registry param
     assert probed, "the standalone path must still probe the registry"
+
+
+def test_a_passed_registry_skips_the_disk_reload_and_probe_disclosure(
+        monkeypatch, tmp_path):
+    """THE DISCLOSURE HALF of the #684 shape (the C4 FINDING on the body
+    hunk, 2026-09-29: the disclosure path's no-re-read was untested — the
+    summary test alone left the f58bc962 revert green). When the scanner
+    passes its registry, generate_disclosure_docs does NOT re-read the
+    config from disk and does NOT re-probe."""
+    def _no_disk_reload():
+        raise AssertionError(
+            "load_config_file was called — the disclosure path re-read the "
+            "config from disk mid-scan (the #684 defect on the disclosure half)"
+        )
+    monkeypatch.setattr("utilities.llm.load_config_file", _no_disk_reload)
+    fake_registry = {"report": MagicMock(name="report-binding")}
+    import json
+    pipeline = {"repository": {"name": "test/repo", "url": "",
+                              "commit_sha": "abc"},
+                "analysis_date": "2026-01-01", "application_type": "web",
+                "pipeline_stats": {"total": 1, "vulnerable": 1, "safe": 0},
+                "results": {},
+                "findings": [{"id": "F-001", "name": "sql injection",
+                              "short_name": "sql inj",
+                              "location": {"file": "app.py", "function": "login"},
+                              "cwe_id": 89, "cwe_name": "SQL Injection",
+                              "stage1_verdict": "vulnerable",
+                              "stage2_verdict": "vulnerable"}]}
+    pipeline_path = tmp_path / "pipeline_output.json"
+    pipeline_path.write_text(json.dumps(pipeline))
+    out_dir = tmp_path / "disclosures"
+
+    with patch("report.generator.generate_disclosure",
+               return_value=("Disclosure", {"cost_usd": 0.0, "total_tokens": 0,
+                                            "input_tokens": 0,
+                                            "output_tokens": 0})) as gen:
+        result = generate_disclosure_docs(str(pipeline_path), str(out_dir),
+                                           "test-config",
+                                           registry=fake_registry)
+        gen.assert_called_once()
+        args, kwargs = gen.call_args
+        assert args[2] is fake_registry["report"], (
+            "the disclosure did not use the scan's validated registry binding"
+        )
+    files = list(out_dir.glob("DISCLOSURE_*.md"))
+    assert len(files) == 1 and files[0].read_text() == "Disclosure", (
+        "the disclosure document was not written via the passed binding"
+    )
+    assert result is not None
