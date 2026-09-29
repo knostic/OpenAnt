@@ -47,6 +47,18 @@ def _offline_registry(monkeypatch):
     import utilities.llm as llm_mod
 
     the_registry = _SentinelRegistry()
+    built = []
+
+    def _first_then_fresh(cf, name):
+        # The FIRST build is the scan's startup registry (scanner.py:337).
+        # Any LATER build (a call-site re-read — the #684 defect relocated
+        # one frame up) returns a FRESH object, so the identity assertion
+        # fails for anything that is not the scan's own registry (the T1 F1
+        # false-green fix: a re-built binding must not satisfy the test).
+        if built:
+            return _SentinelRegistry()
+        built.append(True)
+        return the_registry
 
     monkeypatch.setattr(llm_mod, "probe_registry_or_raise",
                         lambda *a, **k: None, raising=True)
@@ -55,7 +67,7 @@ def _offline_registry(monkeypatch):
                         lambda cf, name: orig_resolve(cf, None),
                         raising=True)
     monkeypatch.setattr(llm_mod, "build_phase_registry",
-                        lambda cf, name: the_registry, raising=True)
+                        _first_then_fresh, raising=True)
 
     yield the_registry
 
@@ -102,8 +114,9 @@ def _install_minimal_pipeline(monkeypatch, metrics):
 def test_the_scan_threads_its_validated_registry(monkeypatch, tmp_path,
                                                  _offline_registry):
     """THE #684 WIRING: both report entry points receive the scan's own
-    startup-validated registry (identity-asserted — a fresh re-built or None
-    binding fails)."""
+    startup-validated registry (identity-asserted — a None binding fails,
+    and so does a RE-BUILT one: only the scan's own first-build object
+    satisfies; a call-site re-read re-derives a fresh registry and fails)."""
     # vulnerable=1 => findings exist => the disclosure path runs too
     metrics = AnalysisMetrics(
         total=3, vulnerable=1, bypassable=0, inconclusive=0,

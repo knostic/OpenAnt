@@ -39,6 +39,13 @@ def test_a_passed_registry_skips_the_disk_reload_and_probe(monkeypatch, tmp_path
             "analyze and report silently switches the provider)"
         )
     monkeypatch.setattr("utilities.llm.load_config_file", _no_disk_reload)
+
+    def _no_second_probe(*args, **kwargs):
+        raise AssertionError(
+            "probe_registry_or_raise was called with a PASSED registry — the "
+            "report re-probed mid-scan (the #684 defect: a second paid probe)"
+        )
+    monkeypatch.setattr("utilities.llm.probe_registry_or_raise", _no_second_probe)
     # a fake registry with a report binding
     fake_registry = {"report": MagicMock()}
     # a minimal pipeline_output
@@ -107,6 +114,13 @@ def test_a_passed_registry_skips_the_disk_reload_and_probe_disclosure(
             "config from disk mid-scan (the #684 defect on the disclosure half)"
         )
     monkeypatch.setattr("utilities.llm.load_config_file", _no_disk_reload)
+
+    def _no_second_probe(*args, **kwargs):
+        raise AssertionError(
+            "probe_registry_or_raise was called with a PASSED registry — the "
+            "report re-probed mid-scan (the #684 defect: a second paid probe)"
+        )
+    monkeypatch.setattr("utilities.llm.probe_registry_or_raise", _no_second_probe)
     fake_registry = {"report": MagicMock(name="report-binding")}
     import json
     pipeline = {"repository": {"name": "test/repo", "url": "",
@@ -141,3 +155,34 @@ def test_a_passed_registry_skips_the_disk_reload_and_probe_disclosure(
         "the disclosure document was not written via the passed binding"
     )
     assert result is not None
+
+
+def test_standalone_still_probes_disclosure(monkeypatch, tmp_path):
+    """The standalone path for the DISCLOSURE half (no registry param): the
+    config is read and the registry is built + probed as before (the T1
+    asymmetry nit — cli.py:971 is a live consumer of this branch)."""
+    import json
+    import utilities.llm as _ullm
+
+    monkeypatch.setattr(_ullm, "load_config_file",
+                        lambda: {"default_llm": "test", "llm_configs": {}})
+    monkeypatch.setattr(_ullm, "resolve_llm_config", lambda cf, name: None)
+    monkeypatch.setattr(_ullm, "build_phase_registry",
+                        lambda cf, name: {"report": "fake-binding"})
+    probed = []
+    monkeypatch.setattr(_ullm, "probe_registry_or_raise",
+                        lambda r: probed.append(r))
+
+    pipeline = {"repository": {"name": "t", "url": "", "commit_sha": "abc"},
+                "analysis_date": "2026-01-01", "application_type": "web",
+                "pipeline_stats": {"total": 0, "vulnerable": 0, "safe": 0},
+                "results": {}, "findings": []}
+    pipeline_path = tmp_path / "p.json"
+    pipeline_path.write_text(json.dumps(pipeline))
+    with patch("report.generator.generate_disclosure",
+               return_value=("D", {"cost_usd": 0.0, "total_tokens": 0,
+                                  "input_tokens": 0, "output_tokens": 0})):
+        generate_disclosure_docs(str(pipeline_path), str(tmp_path / "disc"),
+                                 "test-config")  # no registry param
+    assert probed, ("the standalone disclosure path must still probe the "
+                   "registry")
