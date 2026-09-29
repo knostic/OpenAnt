@@ -11,11 +11,6 @@ into the ``pipeline_output.json`` format consumed by ``python -m report``
 and ``run_dynamic_tests()``.
 """
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from utilities.llm.registry import PhaseRegistry
-
 import json
 import os
 import re
@@ -1044,7 +1039,7 @@ def generate_summary_report(
     results_path: str,
     output_path: str,
     llm_config_name: str | None = None,
-    registry: "PhaseRegistry | None" = None,
+    registry=None,
 ) -> ReportResult:
     """Generate LLM-based summary report (Markdown).
 
@@ -1140,7 +1135,7 @@ def generate_disclosure_docs(
     results_path: str,
     output_dir: str,
     llm_config_name: str | None = None,
-    registry: "PhaseRegistry | None" = None,
+    registry=None,
 ) -> ReportResult:
     """Generate per-vulnerability disclosure documents.
 
