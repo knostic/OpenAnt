@@ -17,15 +17,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core.reporter import generate_summary_report, generate_disclosure_docs  # noqa: E402
 
 
-def test_the_signature_accepts_a_registry():
-    """The registry param exists on both report entry points (the scan's
-    validated binding can thread through)."""
-    for fn in (generate_summary_report, generate_disclosure_docs):
-        params = inspect.signature(fn).parameters
-        assert "registry" in params, (
-            f"{fn.__name__} has no 'registry' param — the scanner cannot "
-            "pass its validated registry (the #684 mechanism)"
-        )
+def test_the_summary_signature_accepts_a_registry():
+    """The registry param exists on generate_summary_report (split from the
+    joint form — the per-function granularity de-confounds the signature
+    hunks' C4 closure credit: the joint test failed for BOTH hunks, so no
+    single-hunk failure was attributable)."""
+    params = inspect.signature(generate_summary_report).parameters
+    assert "registry" in params, (
+        "generate_summary_report has no 'registry' param — the scanner "
+        "cannot pass its validated registry (the #684 mechanism)"
+    )
+
+
+def test_the_disclosure_signature_accepts_a_registry():
+    """The registry param exists on generate_disclosure_docs (the split
+    half of the joint form)."""
+    params = inspect.signature(generate_disclosure_docs).parameters
+    assert "registry" in params, (
+        "generate_disclosure_docs has no 'registry' param — the scanner "
+        "cannot pass its validated registry (the #684 mechanism)"
+    )
 
 
 def test_a_passed_registry_skips_the_disk_reload_and_probe(monkeypatch, tmp_path):
