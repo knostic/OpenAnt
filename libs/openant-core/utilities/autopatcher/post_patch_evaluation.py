@@ -53,7 +53,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from utilities.autopatcher.candidate_enrichment import InvestigationContext
 from utilities.autopatcher.diff_parsing import parse_diff
@@ -71,6 +71,7 @@ from utilities.autopatcher.post_patch_investigation import (
     constant_value_anchor,
     resolved_function_anchor,
 )
+from utilities.autopatcher.remediation_planner import _render_definition_block
 
 ObservationStatus = Literal["unchanged", "changed", "disappeared", "unresolved", "evaluation_error"]
 
@@ -433,8 +434,11 @@ def _resolve_patch_touched_elements(
     unattributed = 0
 
     for file_path in changed_files:
-        if not file_path.endswith((".py", ".pyi")):
-            continue
+        # Function/source-unit resolution is language-agnostic: it uses only
+        # the index's own file/id/startLine/endLine metadata. Constant
+        # resolution stays Python-only -- `context.constants` is built from
+        # the Python AST (candidate_enrichment._collect_repo_constants).
+        is_python = file_path.endswith((".py", ".pyi"))
         try:
             file_text = (repo_root / file_path).read_text(encoding="utf-8")
         except Exception:
@@ -446,7 +450,7 @@ def _resolve_patch_touched_elements(
             functions = context.index.list_functions_in_file(file_path)
         except Exception:
             functions = []
-        constants = context.constants.get(file_path, {})
+        constants = context.constants.get(file_path, {}) if is_python else {}
 
         for hunk in file_hunks.get(file_path, []):
             if analyzer._is_whitespace_only_hunk(hunk.lines):
@@ -485,13 +489,21 @@ def _resolve_element_at_line(
     fallback unit still participates here like any other function span,
     so it only ever wins when nothing finer-grained contains the line)."""
     best: "tuple[int, _PatchTouchedElement] | None" = None
+    ambiguous_span: "int | None" = None
     for f in functions:
         start, end = f.get("startLine"), f.get("endLine")
-        if start is None or end is None or not (start <= line <= end):
+        if not isinstance(start, int) or not isinstance(end, int) or not (start <= line <= end):
             continue
         span = end - start
+        if best is not None and span == best[0] and f["id"] != best[1].ref:
+            # Two distinct indexed units equally specific for this line --
+            # never pick one arbitrarily.
+            ambiguous_span = span
+            continue
         if best is None or span < best[0]:
             best = (span, _PatchTouchedElement(ref=f["id"], kind="resolved_function", file=file_path, function=f))
+    if best is not None and ambiguous_span == best[0]:
+        return None  # ambiguous function-tier match: fail closed for this line
     for qualified, entry in constants.items():
         start = entry.get("line")
         end = entry.get("end_line", start)
@@ -520,8 +532,8 @@ def compute_coverage(
     produced the tracking.
 
     Returns None (never raises) when `context` is None -- there is no
-    RepositoryIndex/constants table to resolve against. Reads only Python
-    files named in the diff, from `repo_root` (the PRE-patch repository --
+    RepositoryIndex/constants table to resolve against. Reads every file
+    named in the diff (constants: Python files only), from `repo_root` (the PRE-patch repository --
     the diff's context/removed lines describe that state, not the patched
     one). A per-file read/parse failure counts that file's hunks as
     unattributed rather than aborting the whole computation.
@@ -668,30 +680,37 @@ def _render_coverage_section(
 #
 # Mirrors evidence_fusion.py's render_repository_understanding(): a pure
 # function from data to a bounded Markdown string, with a "not a verdict"
-# preamble and a hard-clamp backstop that guarantees the result never
-# exceeds max_chars. Local constants (DEFAULT_MAX_CHARS/_MAX_LIST_ITEMS),
-# not imported from evidence_fusion.py -- that module's values are sized
-# for its own <=3-candidate assumption, which doesn't hold here (anchor
-# count per candidate is unbounded, e.g. multiple call_edge anchors).
+# preamble. Local constants (DEFAULT_MAX_CHARS/_MAX_LIST_ITEMS), not
+# imported from evidence_fusion.py -- that module's values are sized for
+# its own <=3-candidate assumption, which doesn't hold here (anchor count
+# per candidate is unbounded, e.g. multiple call_edge anchors).
 #
-# Unlike evidence_fusion's per-candidate whole-block-drop-from-budget
-# mechanism, Changed/Disappeared observations are never silently dropped
-# here -- they're the rarest and most report-worthy groups. Only a
-# per-group item count cap applies (mirroring evidence_fusion's own
-# _render_list_line "+N more" convention), with _hard_clamp as the sole,
-# unconditional final backstop.
+# Unlike evidence_fusion's per-candidate whole-block-or-omit mechanism,
+# Changed/Disappeared observations are never silently dropped ITEM BY ITEM
+# here -- they're the rarest and most report-worthy groups. A per-group
+# item count cap applies (mirroring evidence_fusion's own _render_list_line
+# "+N more" convention); the ceiling-pressure unit is instead the whole
+# SECTION (Fix B: see PostPatchInvestigationPlan/_fit_sections) -- dropped
+# least-critical first, never truncated mid-section.
 # ---------------------------------------------------------------------------
 
 DEFAULT_MAX_CHARS = 4_000
-"""Same order of magnitude as evidence_fusion.DEFAULT_MAX_CHARS, sized
-independently: anchor count per candidate is unbounded here, unlike that
-module's <=3-candidate sizing."""
+"""Fix B: no longer read as the production ceiling for evidence supplied
+to the Challenger -- the Challenger-facing call site (pipeline.py's
+`_post_patch_ctx`) now always passes an explicit technical-capacity-
+derived `max_chars` (see utilities.autopatcher.technical_capacity).
+Retained ONLY as this function's own default for the separate,
+still-bounded-as-before human/report rendering call site (pipeline.py's
+Trust Report `render_post_patch_investigation()` call) and for standalone/
+test callers -- a report-formatting bound must never be what determines
+what evidence the Challenger sees (see compute_post_patch_investigation_
+plan, the Challenger-facing entry point)."""
 
 _MAX_LIST_ITEMS = 5
 """Per-status-group item cap before a "(+N more)" note -- mirrors
-evidence_fusion._render_list_line's convention."""
-
-_TRUNCATION_MARKER = "\n\n*(truncated to fit the character budget)*\n"
+evidence_fusion._render_list_line's convention. A formatting cap on one
+already-included section's own list length, never the thing that decides
+whether a whole section reaches the LLM at all."""
 
 _HEADING = "## Post-Patch Investigation"
 
@@ -811,17 +830,152 @@ def _render_unknown(obs: AnchorObservation) -> str:
     return f"`{_display_id(obs)}` (`{obs.candidate_path}`): {obs.status}{detail}"
 
 
-def _hard_clamp(rendered: str, max_chars: int) -> str:
-    """Absolute backstop: truncate at the last full line boundary that
-    fits, so the result is never split mid-item, and append an explicit
-    marker. Guarantees len(result) <= max_chars."""
-    limit = max_chars - len(_TRUNCATION_MARKER)
-    if limit <= 0:
-        return _TRUNCATION_MARKER[:max_chars]
-    cut = rendered.rfind("\n", 0, limit)
-    if cut <= 0:
-        cut = limit
-    return rendered[:cut] + _TRUNCATION_MARKER
+class PostPatchInvestigationPlan(NamedTuple):
+    """The complete, structured result of one render_post_patch_
+    investigation() decision -- Fix B: mirrors evidence_fusion.py's
+    `RepositoryUnderstandingPlan`. This module's own sections (Changed/
+    Disappeared/Unchanged/Remaining Unknowns/Anchor Coverage) are already
+    individually bounded by `_MAX_LIST_ITEMS`/`_COVERAGE_MAX_LIST_ITEMS`
+    item counts, not per-item byte size -- so the whole-block-or-omit unit
+    here is the SECTION, not a single observation: if the fully-rendered
+    content still exceeds `max_chars` (the fixed header/preamble plus every
+    bounded section), whole sections are dropped, least-critical first,
+    never sliced mid-section. `omission_reason`/`omitted_sections` name
+    exactly which sections that happened to, structurally -- never
+    prose-only."""
+
+    rendered: str
+    omitted_sections: "tuple[str, ...]"
+    omission_reason: "dict[str, str]"
+    max_chars: int
+    fixed_sections_exceeded: bool
+    capacity: "object | None" = None
+
+
+# Drop order under real capacity pressure -- least-critical (safe to lose
+# first) to most-critical. "Anchor Coverage" and "Changed"/"Disappeared"
+# are the sections most likely to matter to a reader/Challenger and are
+# dropped last, matching this module's own pre-existing ordering rationale
+# (Coverage placed early specifically so it "survives truncation under
+# budget pressure" -- same intent, now structural instead of positional).
+_SECTION_DROP_ORDER = (
+    "no_anchors_line", "remaining_unknowns", "unchanged", "disappeared", "changed", "coverage",
+)
+
+
+def _fit_sections(
+    header: str, sections: "dict[str, str]", section_order: "tuple[str, ...]", max_chars: int,
+    capacity: "object | None",
+) -> PostPatchInvestigationPlan:
+    """Shared whole-section-or-omit assembly: render every section that
+    fits, in `section_order`, dropping sections in `_SECTION_DROP_ORDER`
+    (least-critical first) whenever the full assembly exceeds `max_chars`
+    -- never slicing a section's own content. Used by both the empty- and
+    non-empty-observations branches of `compute_post_patch_investigation_
+    plan` so they share one real fitting implementation."""
+    if len(header) > max_chars:
+        return PostPatchInvestigationPlan(
+            rendered="", omitted_sections=tuple(section_order),
+            omission_reason={s: "technical_capacity" for s in section_order},
+            max_chars=max_chars, fixed_sections_exceeded=True, capacity=capacity,
+        )
+
+    included: set[str] = {s for s in section_order if sections.get(s)}
+    omission_reason: dict[str, str] = {}
+
+    def _assemble() -> str:
+        return header + "".join(sections[s] for s in section_order if s in included)
+
+    rendered = _assemble()
+    for name in _SECTION_DROP_ORDER:
+        if len(rendered) <= max_chars:
+            break
+        if name in included:
+            included.discard(name)
+            omission_reason[name] = "technical_capacity"
+            rendered = _assemble()
+
+    return PostPatchInvestigationPlan(
+        rendered=rendered,
+        omitted_sections=tuple(s for s in section_order if sections.get(s) and s not in included),
+        omission_reason=omission_reason, max_chars=max_chars,
+        fixed_sections_exceeded=False, capacity=capacity,
+    )
+
+
+def compute_post_patch_investigation_plan(
+    observations: list[AnchorObservation],
+    coverage: "CoverageResult | None" = None,
+    *,
+    max_chars: int = DEFAULT_MAX_CHARS,
+    language: str | None = None,
+    capacity: "object | None" = None,
+) -> PostPatchInvestigationPlan:
+    """The one real implementation behind render_post_patch_investigation()
+    -- see that function's docstring for the rendered-string contract this
+    reproduces. Differs only in ALSO returning the structured per-section
+    omission provenance that function itself discards after rendering, and
+    in never truncating mid-section under capacity pressure (see
+    `PostPatchInvestigationPlan`'s own docstring for the whole-section-or-
+    omit contract this implements instead of the old hard-clamp).
+    """
+    header = _HEADING + "\n\n" + _PREAMBLE + "\n"
+    coverage_section = (
+        _render_coverage_section(coverage, language=language) if coverage is not None else ""
+    )
+
+    if not observations:
+        sections = {
+            "coverage": coverage_section,
+            "no_anchors_line": "\nNo anchors were available to re-evaluate.\n",
+        }
+        return _fit_sections(header, sections, ("coverage", "no_anchors_line"), max_chars, capacity)
+
+    changed = [o for o in observations if o.status == "changed"]
+    disappeared = [o for o in observations if o.status == "disappeared"]
+    unchanged = [o for o in observations if o.status == "unchanged"]
+    unknown = [o for o in observations if o.status in ("unresolved", "evaluation_error")]
+
+    def _changed_section() -> str:
+        return "\n### Changed\n\n" + (_render_group_items(changed, _render_changed) if changed else "None observed.\n")
+
+    def _disappeared_section() -> str:
+        return "\n### Disappeared\n\n" + (
+            _render_group_items(disappeared, _render_disappeared) if disappeared else "None observed.\n"
+        )
+
+    def _unchanged_section() -> str:
+        if not unchanged:
+            return "\n### Unchanged\n\nNone observed.\n"
+        by_kind: dict[str, int] = {}
+        for o in unchanged:
+            by_kind[o.anchor_kind] = by_kind.get(o.anchor_kind, 0) + 1
+        breakdown = ", ".join(f"{kind}: {count}" for kind, count in sorted(by_kind.items()))
+        caveat = ""
+        if coverage is not None and coverage.uncovered:
+            caveat = (
+                " -- this covers only the fact types anchors track; "
+                "see Anchor Coverage above for what else the diff changed"
+            )
+        return f"\n### Unchanged\n\n{len(unchanged)} anchor(s) confirmed unchanged ({breakdown}){caveat}.\n"
+
+    def _unknown_section() -> str:
+        return "\n### Remaining Unknowns\n\n" + (
+            _render_group_items(unknown, _render_unknown) if unknown else "None observed.\n"
+        )
+
+    sections = {
+        "coverage": coverage_section,
+        "changed": _changed_section(),
+        "disappeared": _disappeared_section(),
+        "unchanged": _unchanged_section(),
+        "remaining_unknowns": _unknown_section(),
+    }
+    # Rendered order is always the same, regardless of what (if anything)
+    # ends up dropped below -- only membership in the fitted result
+    # changes, never the relative order of what survives.
+    section_order = ("coverage", "changed", "disappeared", "unchanged", "remaining_unknowns")
+    return _fit_sections(header, sections, section_order, max_chars, capacity)
 
 
 def render_post_patch_investigation(
@@ -833,7 +987,9 @@ def render_post_patch_investigation(
 ) -> str:
     """Render a list[AnchorObservation] into one deterministic Markdown
     block, starting with a top-level ``## Post-Patch Investigation``
-    heading.
+    heading. Thin wrapper around `compute_post_patch_investigation_plan` --
+    see that function's own docstring for the exact whole-section-or-omit/
+    fail-closed contract this reproduces.
 
     ``language`` is the already-detected repository language (see
     ``language_support.detect_language``), passed through unchanged to
@@ -844,67 +1000,136 @@ def render_post_patch_investigation(
     Never mutates `observations`. No LLM calls, no I/O, no parsing.
     An optional ``coverage`` (see ``compute_coverage()``) renders as an
     "### Anchor Coverage" section immediately after the preamble --
-    before Changed/Disappeared/Unchanged/Remaining Unknowns, and
-    deliberately not last, so it survives `_hard_clamp`'s end-of-string
-    truncation under budget pressure (the one section whose entire job is
-    "here's what we did NOT check" should not be the first thing dropped).
-    Omitted entirely when ``coverage`` is ``None`` (caller didn't compute
-    it), never rendered as a fabricated zero.
+    before Changed/Disappeared/Unchanged/Remaining Unknowns. Omitted
+    entirely when ``coverage`` is ``None`` (caller didn't compute it),
+    never rendered as a fabricated zero.
 
     Observations are grouped by `status`: Changed and Disappeared are
     shown in full (capped per-group at `_MAX_LIST_ITEMS` with a "+N more"
-    note, never silently dropped to fit a byte budget); Unchanged is
-    compressed to a count/breakdown (with a one-line caveat pointing at
-    Anchor Coverage whenever `coverage` shows any uncovered elements, so
-    "N unchanged" is never misread as "everything was checked"); Unresolved
-    and evaluation_error are merged into a separate "Remaining Unknowns"
-    section, never mixed into the determinate-looking groups above. The
-    returned string never exceeds `max_chars` -- a final hard-clamp
-    backstop applies only in the unlikely case the grouped sections alone
-    exceed it.
+    note); Unchanged is compressed to a count/breakdown (with a one-line
+    caveat pointing at Anchor Coverage whenever `coverage` shows any
+    uncovered elements); Unresolved and evaluation_error are merged into a
+    separate "Remaining Unknowns" section. The returned string never
+    exceeds `max_chars` -- whole sections are dropped, least-critical
+    first, in the rare case the grouped sections alone exceed it; nothing
+    is ever truncated mid-section.
     """
-    header = _HEADING + "\n\n" + _PREAMBLE + "\n"
-    coverage_section = (
-        _render_coverage_section(coverage, language=language) if coverage is not None else ""
+    return compute_post_patch_investigation_plan(
+        observations, coverage, max_chars=max_chars, language=language,
+    ).rendered
+
+
+# ---------------------------------------------------------------------------
+# Complete post-change definitions of changed functions.
+#
+# A diff shows only a few context lines around each change, and pre-patch
+# repository evidence shows only the OLD function -- so a line the patch
+# inserts and an unchanged operation further down never appear together in
+# any one evidence block, and their order is unobservable to a block-local
+# check (patch_challenger._citation_precedes_within_one_block). The patched
+# copy this module already evaluates holds the complete post-change source
+# of every function the diff changed; this renders exactly that, from the
+# SAME InvestigationContext evaluate_anchors() was given -- no new source,
+# no new parse -- as one deterministic block per function.
+# ---------------------------------------------------------------------------
+
+POST_PATCH_DEFINITION_HEADING_LABEL = "Post-patch definition"
+"""Heading label for one changed function's complete post-change source.
+Deliberately distinct from every edit-target heading
+(remediation_planner._EDIT_TARGET_HEADING_PREFIXES) and from the
+completeness-trusted set patch_challenger uses for `preceding_guard ==
+absent` -- this block carries ordering evidence only, never edit-target
+or bounded-absence authority."""
+
+_POST_PATCH_DEFINITIONS_HEADING = "### Post-patch definitions"
+_POST_PATCH_DEFINITIONS_PREAMBLE = (
+    "*Complete source of each function the diff changed, read from the same isolated, "
+    "patched copy evaluated above. Repository source of the post-change state -- not a "
+    "verdict that the patch is correct.*"
+)
+
+
+def _post_patch_definition_block(func_id: str, context: "InvestigationContext | None") -> "str | None":
+    """One rendered block, or None (never fabricated or partial text) when
+    the patched copy cannot produce the complete source of `func_id`'s
+    indexed span. The text is read from the patched workspace for exactly
+    the index's own `startLine..endLine` (`RepositoryIndex.read_file_section`)
+    -- never the parser's `code` field, which for some parsers includes
+    leading trivia outside that span -- so the header's span and the shown
+    lines are the same lines by construction. A short read (EOF clamp), an
+    unreadable file, or invalid boundaries fail closed; there is no
+    fallback to `code`."""
+    index = getattr(context, "index", None) if context is not None else None
+    if index is None:
+        return None
+    colon = func_id.rfind(":")
+    if colon <= 0:
+        return None
+    file_path, label = func_id[:colon], func_id[colon + 1:]
+    try:
+        func = index.get_function(func_id)
+        if not func:
+            return None
+        start, end = func.get("startLine"), func.get("endLine")
+        if (
+            not isinstance(start, int) or not isinstance(end, int)
+            or isinstance(start, bool) or isinstance(end, bool)
+            or start < 1 or end < start
+        ):
+            return None
+        source = index.read_file_section(file_path, start, end)
+    except Exception:  # noqa: BLE001 -- isolate to this function, never propagate
+        return None
+    if not isinstance(source, str) or not source.strip():
+        return None
+    if len(source.splitlines()) != end - start + 1:
+        return None
+    return _render_definition_block(
+        file_path, label, start, end, source, heading_label=POST_PATCH_DEFINITION_HEADING_LABEL,
     )
 
-    if not observations:
-        rendered = header + coverage_section + "\nNo anchors were available to re-evaluate.\n"
-        return rendered if len(rendered) <= max_chars else _hard_clamp(rendered, max_chars)
 
-    changed = [o for o in observations if o.status == "changed"]
-    disappeared = [o for o in observations if o.status == "disappeared"]
-    unchanged = [o for o in observations if o.status == "unchanged"]
-    unknown = [o for o in observations if o.status in ("unresolved", "evaluation_error")]
+def render_post_patch_definitions(
+    observations: "list[AnchorObservation] | None",
+    context: "InvestigationContext | None",
+    *,
+    max_chars: int,
+) -> str:
+    """Render the complete post-change source of every `resolved_function`
+    observation whose status is `changed`, deduplicated by func_id, in
+    observation order. Whole-block-or-omit within `max_chars` (never
+    sliced); returns "" when no block is available or none fits -- a block
+    that is not shown is never citable, so omission fails closed. No LLM
+    calls, no I/O beyond the already-built index."""
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for obs in observations or ():
+        if obs.anchor_kind != "resolved_function" or obs.status != "changed":
+            continue
+        func_id = getattr(obs.anchor_key, "func_id", None)
+        if not func_id or func_id in seen:
+            continue
+        seen.add(func_id)
+        block = _post_patch_definition_block(func_id, context)
+        if block:
+            blocks.append(block)
+    if not blocks:
+        return ""
 
-    parts = ["\n### Changed\n\n"]
-    parts.append(_render_group_items(changed, _render_changed) if changed else "None observed.\n")
-
-    parts.append("\n### Disappeared\n\n")
-    parts.append(_render_group_items(disappeared, _render_disappeared) if disappeared else "None observed.\n")
-
-    parts.append("\n### Unchanged\n\n")
-    if unchanged:
-        by_kind: dict[str, int] = {}
-        for o in unchanged:
-            by_kind[o.anchor_kind] = by_kind.get(o.anchor_kind, 0) + 1
-        breakdown = ", ".join(f"{kind}: {count}" for kind, count in sorted(by_kind.items()))
-        caveat = ""
-        if coverage is not None and coverage.uncovered:
-            caveat = (
-                " -- this covers only the fact types anchors track; "
-                "see Anchor Coverage above for what else the diff changed"
-            )
-        parts.append(f"{len(unchanged)} anchor(s) confirmed unchanged ({breakdown}){caveat}.\n")
-    else:
-        parts.append("None observed.\n")
-
-    parts.append("\n### Remaining Unknowns\n\n")
-    parts.append(_render_group_items(unknown, _render_unknown) if unknown else "None observed.\n")
-
-    rendered = header + coverage_section + "".join(parts)
-
-    if len(rendered) > max_chars:
-        rendered = _hard_clamp(rendered, max_chars)
-
+    rendered = "\n" + _POST_PATCH_DEFINITIONS_HEADING + "\n\n" + _POST_PATCH_DEFINITIONS_PREAMBLE + "\n\n"
+    omitted = 0
+    for block in blocks:
+        if len(rendered) + len(block) + 1 <= max_chars:
+            rendered += block + "\n"
+        else:
+            omitted += 1
+    if omitted == len(blocks):
+        return ""
+    if omitted:
+        note = (
+            f"{omitted} further changed function definition(s) omitted for technical capacity "
+            "-- not shown, so not citable.\n"
+        )
+        if len(rendered) + len(note) <= max_chars:
+            rendered += note
     return rendered

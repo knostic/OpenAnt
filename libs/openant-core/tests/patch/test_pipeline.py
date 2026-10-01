@@ -3540,6 +3540,263 @@ class TestInvariantDeferredPredicateAndNonDefaultOverrideScope:
 
 
 # ---------------------------------------------------------------------------
+# Default-guard reachability scope rule (V7 forensic root cause): Finding
+# Calibration was given verified source containing a default-enabled guard
+# on a lower-level method that stopped a concerning execution path under
+# ordinary/default execution -- checked before that method's own later
+# branch the finding actually worried about -- and classified the concern
+# `proof_required` without ever engaging with that preceding guard, even
+# though it was quoting from the very same function. The finding's own
+# wording cited a value that was the DEFAULT of a *different* parameter,
+# giving no lexical cue to look further. The fix is prompt-only
+# (prompts/finding_calibration.md's new "Preceding guards, verified
+# defaults, and reachability under default execution" rule, a sibling of
+# the pre-existing "Explicit non-default caller configuration" rule); these
+# tests exercise the REAL, unchanged parse+reconciliation pipeline
+# (calibrate_findings -> _parse_response -> _reconcile_verification_status_
+# with_calibration) against hand-authored response text documenting exactly
+# what a rule-compliant model response looks like for each outcome -- the
+# strongest deterministic proof available without a live LLM call.
+#
+# Outcomes A-F below mirror the task's own required coverage:
+#   A. default-blocked path, override not established in scope -> validation_only, does not block.
+#   B. default-reachable path -> may remain proof_required, blocks.
+#   C. explicit override the invariant DOES establish as in scope -> proof_required, blocks.
+#   D. missing evidence about the guard/default/order -> fail-closed proof_required, blocks.
+#   E. the EXISTING "explicit non-default caller configuration" validation_only case (finding's OWN wording already names the override) -> unchanged.
+#   F. the finding's OWN text never names the gating parameter at all, yet a rule-compliant response still derives it from the surrounding evidence -> validation_only, accepted with no special-casing.
+#
+# Domain-neutral fixtures (no urllib3/HTTPConnectionPool/redirects/Cookie/
+# hosts/assert_same_host/Retry/PoolManager/CVE identifiers) -- this is a
+# general reachability-scope contract, not a case-specific fix.
+# ---------------------------------------------------------------------------
+
+class TestDefaultGuardReachabilityScope:
+    @staticmethod
+    def _challenger(finding_text):
+        return {
+            "verification_status": "VERIFIED_FIXED", "still_vulnerable": False,
+            "edge_cases": [], "potential_issues": [finding_text], "summary": "",
+        }
+
+    @staticmethod
+    def _calibrate_and_reconcile(finding_text, response_text, code_context="ctx"):
+        from unittest import mock
+        from utilities.autopatcher.finding_calibration import calibrate_findings
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        classified = _classify_challenger(
+            TestDefaultGuardReachabilityScope._challenger(finding_text)
+        )
+        llm = mock.MagicMock()
+        llm.complete.return_value = response_text
+        calibration = calibrate_findings("vuln text", "patch", [finding_text], llm, code_context=code_context)
+        reconciled = _reconcile_verification_status_with_calibration(classified, calibration)
+        return calibration, reconciled
+
+    # The finding's own text deliberately never names the guard or its
+    # gating parameter -- only the later, concerning operation -- mirroring
+    # the real V7 defect exactly. Used for outcomes A, D, and F (the "finding
+    # doesn't name the guard" property is the crux of the fix).
+    UNNAMED_GUARD_FINDING = (
+        "the operation runs on the item without further restriction, and "
+        "whether that is acceptable for an externally-sourced item is not "
+        "addressed by the supplied evidence"
+    )
+    GUARDED_CODE_CONTEXT = (
+        "def process(item, allow_external=False):\n"
+        "    if external(item) and not allow_external:\n"
+        "        return\n"
+        "    perform_sensitive_operation(item)\n"
+    )
+
+    def test_A_default_blocked_path_not_established_in_scope_is_validation_only_and_does_not_block(self):
+        response = (
+            "1. Claims:\n"
+            "   - A preceding guard, enabled by default, stops execution before the operation the finding raises a concern about.\n"
+            "   - Reaching that operation requires a caller to explicitly supply a non-default value for the guard's parameter.\n"
+            "   - The supplied Security Invariant is stated only for the default path and does not extend to that explicit override.\n"
+            "   Unresolved: whether the required behavior still applies when a caller explicitly disables the preceding guard\n"
+            "   Remediation impact: validation_only\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: A preceding, default-enabled guard stops the operation of concern under ordinary execution; reaching it requires an explicit non-default override, and the supplied Security Invariant does not extend the required remediation to that override, so resolving this does not affect whether the claimed remediation is established.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(
+            self.UNNAMED_GUARD_FINDING, response, code_context=self.GUARDED_CODE_CONTEXT,
+        )
+        assert calibration[0]["remediation_impact"] == "validation_only"
+        assert reconciled["verification_status"] == "VERIFIED_FIXED"
+        assert reconciled["still_vulnerable"] is False
+
+    def test_B_default_reachable_path_may_remain_proof_required_and_blocks(self):
+        response = (
+            "1. Claims:\n"
+            "   - The preceding guard is shown, but its default value does not stop execution before the operation the finding raises a concern about.\n"
+            "   Unresolved: whether the operation is reachable under ordinary/default execution\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: actionable\n"
+            "   Evidence request: symbol_definition | handler.py | process\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: The preceding guard's default value does not stop execution before the operation of concern, so it remains reachable under ordinary execution; whether the remediation accounts for it is an open question.\n"
+        )
+        default_reachable_context = (
+            "def process(item, allow_external=True):\n"
+            "    perform_sensitive_operation(item)\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(
+            self.UNNAMED_GUARD_FINDING, response, code_context=default_reachable_context,
+        )
+        assert calibration[0]["remediation_impact"] == "proof_required"
+        assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled["still_vulnerable"] is True
+
+    def test_C_explicit_override_established_in_scope_remains_proof_required_and_blocks(self):
+        response = (
+            "1. Claims:\n"
+            "   - A preceding guard, enabled by default, stops execution before the operation the finding raises a concern about.\n"
+            "   - The supplied Security Invariant explicitly requires the remediation to hold even when a caller explicitly disables that guard.\n"
+            "   Unresolved: whether the required behavior still applies when a caller explicitly disables the preceding guard\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: conceptual_scope\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: The supplied Security Invariant explicitly extends the required remediation to the explicit-override path; whether it still holds there is not shown, so this remains an open remediation question.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(
+            self.UNNAMED_GUARD_FINDING, response, code_context=self.GUARDED_CODE_CONTEXT,
+        )
+        assert calibration[0]["remediation_impact"] == "proof_required"
+        assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled["still_vulnerable"] is True
+
+    def test_D_missing_guard_evidence_fails_closed_proof_required_and_blocks(self):
+        """Outcome D: the guard's existence, default, or execution order
+        cannot be established from supplied evidence -- must remain
+        proof_required (fail-closed via the existing unresolved/
+        proof-required mechanism), never silently cleared."""
+        response = (
+            "1. Claims:\n"
+            "   - The finding's concern involves an operation whose preceding guard, if any, is not shown in the supplied evidence.\n"
+            "   Unresolved: whether a preceding guard exists, and if so, what its default value is and whether it executes before the operation\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: not_expressible\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: Whether a preceding guard exists, its default value, and its execution order relative to the operation are not established by the supplied evidence, so this remains an open remediation question.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(
+            self.UNNAMED_GUARD_FINDING, response,
+            code_context="only the concerning operation itself is shown; no preceding guard is shown",
+        )
+        assert calibration[0]["remediation_impact"] == "proof_required"
+        assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled["still_vulnerable"] is True
+
+    def test_E_existing_named_override_validation_only_behavior_unchanged(self):
+        """Outcome E: the PRE-EXISTING "explicit non-default caller
+        configuration" case (the finding's OWN wording already names the
+        override) must remain unaffected by this addition -- same fixture
+        shape as TestInvariantDeferredPredicateAndNonDefaultOverrideScope's
+        own Rule B case 3 above, repeated here for direct traceability to
+        this specific follow-up change."""
+        finding = (
+            "a caller can pass an explicit non-default configuration parameter that "
+            "bypasses the normal call path validated by this remediation"
+        )
+        response = (
+            "1. Claims:\n"
+            "   - A caller can bypass the normal path via an explicit, non-default configuration parameter.\n"
+            "   - The Security Invariant is stated only for the default/normal path.\n"
+            "   Unresolved: whether the required behavior still applies under the non-default configuration\n"
+            "   Remediation impact: validation_only\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: A caller can bypass the default path via an explicit non-default configuration; the Security Invariant does not extend the required remediation to that configuration, so resolving this does not affect whether the claimed remediation is established.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(finding, response)
+        assert calibration[0]["remediation_impact"] == "validation_only"
+        assert reconciled["verification_status"] == "VERIFIED_FIXED"
+        assert reconciled["still_vulnerable"] is False
+
+    def test_F_finding_never_names_gating_parameter_yet_still_derived_and_accepted(self):
+        """Outcome F -- the crux of the fix: the finding's own text (see
+        UNNAMED_GUARD_FINDING) never mentions the guard or its gating
+        parameter at all, only the later operation. A synthetic Calibration
+        response that nonetheless correctly derives the guard from the
+        surrounding evidence and returns validation_only is accepted by the
+        orchestration layer (calibrate_findings -> _parse_response ->
+        _reconcile_verification_status_with_calibration) with no special-
+        casing: this is the exact same assertion as test_A above, repeated
+        here to make the "doesn't name the guard" property the explicit
+        subject of its own test rather than an incidental fixture choice."""
+        assert "allow_external" not in self.UNNAMED_GUARD_FINDING
+        assert "guard" not in self.UNNAMED_GUARD_FINDING
+        response = (
+            "1. Claims:\n"
+            "   - A preceding guard, enabled by default, stops execution before the operation the finding raises a concern about.\n"
+            "   - Reaching that operation requires a caller to explicitly supply a non-default value for the guard's parameter.\n"
+            "   - The supplied Security Invariant is stated only for the default path and does not extend to that explicit override.\n"
+            "   Unresolved: whether the required behavior still applies when a caller explicitly disables the preceding guard\n"
+            "   Remediation impact: validation_only\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: A preceding, default-enabled guard stops the operation of concern under ordinary execution; reaching it requires an explicit non-default override, and the supplied Security Invariant does not extend the required remediation to that override, so resolving this does not affect whether the claimed remediation is established.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(
+            self.UNNAMED_GUARD_FINDING, response, code_context=self.GUARDED_CODE_CONTEXT,
+        )
+        assert calibration[0]["remediation_impact"] == "validation_only"
+        assert reconciled["verification_status"] == "VERIFIED_FIXED"
+        assert reconciled["still_vulnerable"] is False
+
+    def test_ambiguous_scope_is_not_forced_to_validation_only(self):
+        """Fail-closed control, mirroring TestInvariantDeferredPredicateAnd
+        NonDefaultOverrideScope's own Case 5: it is genuinely unclear
+        whether the override path is within the security contract -- an
+        honestly-`unclear` response must still fail closed and block."""
+        response = (
+            "1. Claims:\n"
+            "   - A preceding guard, enabled by default, stops execution before the operation the finding raises a concern about.\n"
+            "   - Whether the Security Invariant's scope extends to the explicit-override path cannot be confidently determined from the supplied evidence.\n"
+            "   Unresolved: whether the alternate configuration is within the Security Invariant's required scope\n"
+            "   Remediation impact: unclear\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: Whether the explicit-override path is within the Security Invariant's required scope cannot be confidently determined from the supplied evidence.\n"
+        )
+        calibration, reconciled = self._calibrate_and_reconcile(
+            self.UNNAMED_GUARD_FINDING, response, code_context=self.GUARDED_CODE_CONTEXT,
+        )
+        assert calibration[0]["remediation_impact"] == "unclear"
+        assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled["still_vulnerable"] is True
+
+    def test_no_special_casing_needed_group_and_evidence_fields_pass_through_normally(self):
+        """Proves the orchestration layer needs no special-casing for this
+        rule's outcomes: the SAME already-existing fields (group,
+        unresolved_dependencies, remediation_impact, evidence_acquirability,
+        evidence_request) that every other calibration outcome already
+        uses are the only fields read here -- nothing new was added to
+        _parse_response's schema or to the reconciliation functions to
+        support this rule."""
+        response = (
+            "1. Claims:\n"
+            "   - A preceding guard, enabled by default, stops execution before the operation the finding raises a concern about.\n"
+            "   - Reaching that operation requires a caller to explicitly supply a non-default value for the guard's parameter.\n"
+            "   - The supplied Security Invariant is stated only for the default path and does not extend to that explicit override.\n"
+            "   Unresolved: whether the required behavior still applies when a caller explicitly disables the preceding guard\n"
+            "   Remediation impact: validation_only\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: A preceding, default-enabled guard stops the operation of concern under ordinary execution; reaching it requires an explicit non-default override, and the supplied Security Invariant does not extend the required remediation to that override, so resolving this does not affect whether the claimed remediation is established.\n"
+        )
+        calibration, _ = self._calibrate_and_reconcile(
+            self.UNNAMED_GUARD_FINDING, response, code_context=self.GUARDED_CODE_CONTEXT,
+        )
+        assert set(calibration[0].keys()) == {
+            "original", "group", "reworded", "unresolved_dependencies",
+            "group_before_consistency_check", "remediation_impact",
+            "evidence_acquirability", "evidence_request",
+        }
+
+
+# ---------------------------------------------------------------------------
 # Vulnerability Sources (GHSA/CVE/Advisory URL — no upstream remediation links)
 # ---------------------------------------------------------------------------
 
@@ -4891,9 +5148,13 @@ class TestValidationActionPrioritizationReport:
         """The speculative finding is listed FIRST in the raw challenger
         output -- proving the reorder happens on directness, not on
         preserving the challenger's own order. suggest_tests is stubbed out
-        so the (separately re-derived, currently non-deduplicated -- cross-
-        section dedup is out of scope for this batch) Suggested-Tests path
-        doesn't add noise to this specific assertion."""
+        so the (separately re-derived) Suggested-Tests path doesn't add
+        noise to this specific assertion. (Cross-section dedup of
+        near-duplicate findings between "Edge cases" and "Potential
+        issues" is now implemented -- see _dedupe_challenger_findings and
+        TestChallengerCrossSectionDeduplication -- but SPECULATIVE_FINDING
+        and DIRECT_FINDING here are genuinely distinct concerns, so dedup
+        does not affect this test either way.)"""
         from utilities.autopatcher import pipeline as pl
         monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
 
@@ -5753,3 +6014,483 @@ class TestSecurityInvariantTopAction:
         assert "**Manual Review Required**" in report
         assert "**Why manual review:**" in report
         assert "could not be established" in report
+
+
+# ---------------------------------------------------------------------------
+# Evidence-continuity fix (Agent 2): a symbol Strategy explicitly rejected
+# (or flagged insufficient_evidence for) can still surface as Category-2
+# supporting context in the Final-Target Remediation Slice, PROVIDED
+# Planning's own bounded evidence-acquisition loop actually INCLUDED
+# (rendered) that symbol's file -- never merely RESOLVED it. See
+# `_run_guided_context_acquisition`'s widened `_planner_evidence_files`
+# seed in pipeline.py, and remediation_planner.py's own
+# `_extract_strategy_residual_concern_identifiers`/residual-concern
+# Category-2 loop in `_build_final_target_slice_inner`.
+# ---------------------------------------------------------------------------
+
+def _residual_concern_context(tmp_path):
+    """A real (not mocked) InvestigationContext with two files: `target.py`
+    (the Final Strategy's own verified target, a constant) and `helper.py`
+    (a file containing a symbol Strategy will REJECT, never selected as a
+    target_file)."""
+    from utilities.agentic_enhancer.reachability_analyzer import ReachabilityAnalyzer
+    from utilities.agentic_enhancer.repository_index import RepositoryIndex
+    from utilities.autopatcher.candidate_enrichment import InvestigationContext
+
+    (tmp_path / "target.py").write_text("class Handler:\n    LIMIT = 5\n", encoding="utf-8")
+    (tmp_path / "helper.py").write_text(
+        "class Widget:\n    def risky_call(self):\n        return 2\n", encoding="utf-8",
+    )
+    functions = {
+        "helper.py:Widget.risky_call": {
+            "name": "risky_call", "className": "Widget", "startLine": 2, "endLine": 3,
+            "code": "    def risky_call(self):\n        return 2\n",
+        },
+    }
+    constants = {"target.py": {"Handler.LIMIT": {
+        "qualified_name": "Handler.LIMIT", "class_name": "Handler", "name": "LIMIT", "line": 2, "end_line": 2,
+    }}}
+    index = RepositoryIndex({"functions": functions}, repo_path=str(tmp_path))
+    reachability = ReachabilityAnalyzer(functions, {}, set())
+    return InvestigationContext(
+        index=index, call_graph={}, reverse_call_graph={}, reachability=reachability, constants=constants,
+    )
+
+
+def _residual_concern_strategy():
+    from utilities.autopatcher.remediation_planner import RemediationStrategyResult
+    return RemediationStrategyResult(
+        rendered="", target_files=["target.py"], target_symbols=["target.py:Handler.LIMIT"],
+        warnings=[], extended_mechanism=None, required_edits=[], evaluated=True,
+        rejected_targets=["Considered Widget.risky_call but rejected because it lacks proof."],
+    )
+
+
+def _residual_concern_plan_result():
+    from utilities.autopatcher.remediation_planner import RemediationPlanResult
+    return RemediationPlanResult(rendered="", target_files=["target.py"], target_symbols=["target.py:Handler.LIMIT"])
+
+
+class TestPreferredFilesWidenedByIncludedPlannerEvidence:
+    """Tests B and C: `_run_guided_context_acquisition`'s own
+    `_planner_evidence_files` seed (feeding `build_final_target_slice`'s
+    `preferred_files`) is widened by every file Planning's own bounded
+    evidence-acquisition loop actually INCLUDED -- not merely `resolved`
+    -- even when that file is absent from the Final Strategy's own
+    selected `target_files`."""
+
+    def test_b_included_evidence_file_widens_preferred_files(self, tmp_path):
+        """Test B: `helper.py` is never in `target_files`, but its
+        `PlanningRequestResolution` WAS included (present in
+        `excerpt_plan.included_labels`) -- its residual-concern symbol
+        must surface in the Final-Target Slice."""
+        import utilities.autopatcher.pipeline as pipeline_mod
+        from utilities.autopatcher.remediation_planner import PlannerEvidenceResult, _SourceExcerptPlan
+
+        context = _residual_concern_context(tmp_path)
+        planner_evidence_result = PlannerEvidenceResult(
+            rendered="helper evidence",
+            excerpt_plan=_SourceExcerptPlan(
+                blocks=("helper evidence",), included_labels=frozenset(["helper.py:Widget.risky_call"]),
+                symbol_omitted=(), fallback_omitted=(), read_failed=(),
+                budget=4_000, omitted_sizes={}, omission_reason={},
+            ),
+        )
+        result = pipeline_mod._run_guided_context_acquisition(
+            vulnerability_text="vuln", llm=None, repo_root=str(tmp_path), budget_controller=None,
+            _strategy_result=_residual_concern_strategy(), _plan_result=_residual_concern_plan_result(),
+            _investigation_context=context, _planner_evidence_result=planner_evidence_result,
+        )
+        assert "helper.py:risky_call" in result["_slice_ctx"]
+
+    def test_c_resolved_but_not_included_does_not_widen_preferred_files(self, tmp_path):
+        """Test C (the crux negative control): a `PlanningRequestResolution`
+        with `resolved=True, included=False` -- modeled here as a label
+        that is genuinely absent from `included_labels` (e.g. it was
+        omitted for technical_capacity reasons) -- must NOT grant
+        `helper.py` continuity. This is the one property that
+        distinguishes "resolved" from "included", and it must hold even
+        though the resolution genuinely happened somewhere upstream."""
+        import utilities.autopatcher.pipeline as pipeline_mod
+        from utilities.autopatcher.remediation_planner import PlannerEvidenceResult, _SourceExcerptPlan
+
+        context = _residual_concern_context(tmp_path)
+        planner_evidence_result = PlannerEvidenceResult(
+            rendered="",
+            excerpt_plan=_SourceExcerptPlan(
+                blocks=(), included_labels=frozenset(),  # NOT included, despite having resolved upstream
+                symbol_omitted=("helper.py:Widget.risky_call",), fallback_omitted=(), read_failed=(),
+                budget=4_000, omitted_sizes={"helper.py:Widget.risky_call": 999},
+                omission_reason={"helper.py:Widget.risky_call": "technical_capacity"},
+            ),
+        )
+        result = pipeline_mod._run_guided_context_acquisition(
+            vulnerability_text="vuln", llm=None, repo_root=str(tmp_path), budget_controller=None,
+            _strategy_result=_residual_concern_strategy(), _plan_result=_residual_concern_plan_result(),
+            _investigation_context=context, _planner_evidence_result=planner_evidence_result,
+        )
+        assert "risky_call" not in result["_slice_ctx"]
+
+    def test_no_planner_evidence_result_behaves_exactly_as_before(self, tmp_path):
+        """Regression guard: when `_planner_evidence_result` is None (the
+        pre-existing default every caller that never threads it still
+        uses), `_planner_evidence_files` is seeded purely from
+        `_plan_result.target_files`, exactly as before this fix -- the
+        residual-concern symbol in a file never named anywhere must not
+        appear."""
+        import utilities.autopatcher.pipeline as pipeline_mod
+
+        context = _residual_concern_context(tmp_path)
+        result = pipeline_mod._run_guided_context_acquisition(
+            vulnerability_text="vuln", llm=None, repo_root=str(tmp_path), budget_controller=None,
+            _strategy_result=_residual_concern_strategy(), _plan_result=_residual_concern_plan_result(),
+            _investigation_context=context, _planner_evidence_result=None,
+        )
+        assert "risky_call" not in result["_slice_ctx"]
+        assert "Handler.LIMIT" in result["_slice_ctx"]
+
+
+class TestResidualConcernEvidencePreventsUnnecessaryCalibrationAcquisition:
+    """Test H: a generic, repository-neutral end-to-end scenario proving
+    already-included verified evidence prevents an unnecessary
+    Finding-Calibration acquisition round trip. Planning includes
+    `helper.py` via `file_source`; Strategy rejects `Widget.risky_call`
+    inside it (never promoting it to `target_files`); the resulting
+    Final-Target Slice / shared code_context already contains that
+    symbol's definition; and `_calibrate_findings_with_evidence_
+    acquisition` never performs a second `calibrate_findings()` call for
+    it, because the (mocked) first call already sees it and has nothing
+    left to request."""
+
+    def test_already_included_evidence_prevents_calibration_reacquisition(self, tmp_path):
+        import utilities.autopatcher.pipeline as pipeline_mod
+        from utilities.autopatcher.remediation_planner import PlannerEvidenceResult, _SourceExcerptPlan
+
+        context = _residual_concern_context(tmp_path)
+        planner_evidence_result = PlannerEvidenceResult(
+            rendered="helper evidence",
+            excerpt_plan=_SourceExcerptPlan(
+                blocks=("helper evidence",), included_labels=frozenset(["helper.py:Widget.risky_call"]),
+                symbol_omitted=(), fallback_omitted=(), read_failed=(),
+                budget=4_000, omitted_sizes={}, omission_reason={},
+            ),
+        )
+        acquisition_result = pipeline_mod._run_guided_context_acquisition(
+            vulnerability_text="vuln", llm=None, repo_root=str(tmp_path), budget_controller=None,
+            _strategy_result=_residual_concern_strategy(), _plan_result=_residual_concern_plan_result(),
+            _investigation_context=context, _planner_evidence_result=planner_evidence_result,
+        )
+        slice_ctx = acquisition_result["_slice_ctx"]
+        # Precondition: the residual concern's own definition is already
+        # visible in the shared context handed to every downstream stage,
+        # Finding Calibration included -- this is what should make a
+        # fresh acquisition request for it unnecessary.
+        assert "helper.py:risky_call" in slice_ctx
+
+        # A stand-in for "the LLM, given code_context, decides whether it
+        # still needs to ask for this evidence": it can only ask for
+        # Widget.risky_call if code_context does NOT already contain it.
+        def _fake_calibrate_findings(vulnerability_text, patch, findings, llm, code_context=""):
+            if "risky_call" in code_context:
+                return [{
+                    "original": findings[0], "remediation_impact": "verified",
+                    "evidence_acquirability": None, "evidence_request": None,
+                }]
+            return [{
+                "original": findings[0], "remediation_impact": "proof_required",
+                "evidence_acquirability": "actionable",
+                "evidence_request": {
+                    "request_type": "symbol_definition", "symbol": "Widget.risky_call",
+                    "file_hint": "helper.py",
+                },
+            }]
+
+        with mock.patch.object(pipeline_mod, "calibrate_findings", side_effect=_fake_calibrate_findings):
+            result = pipeline_mod._calibrate_findings_with_evidence_acquisition(
+                "vuln", "patch text", [{"id": "f1"}], llm=None, code_context=slice_ctx,
+                repo_root=str(tmp_path), investigation_context=context,
+                known_included_evidence_labels=planner_evidence_result.excerpt_plan.included_labels,
+            )
+
+        assert result["attempted"] is True
+        assert result["rerun_performed"] is False
+        assert result["skip_reason"] == "no_actionable_evidence_request"
+
+    def test_contrast_without_already_included_evidence_a_reacquisition_would_be_needed(self, tmp_path):
+        """Contrast case (not itself required, but demonstrates the
+        causal claim above): the SAME mocked calibrate_findings, over a
+        code_context that does NOT already contain Widget.risky_call,
+        genuinely requests it -- proving the mock's decision really is
+        conditioned on evidence visibility, not a tautology."""
+        import utilities.autopatcher.pipeline as pipeline_mod
+
+        def _fake_calibrate_findings(vulnerability_text, patch, findings, llm, code_context=""):
+            if "risky_call" in code_context:
+                return [{
+                    "original": findings[0], "remediation_impact": "verified",
+                    "evidence_acquirability": None, "evidence_request": None,
+                }]
+            return [{
+                "original": findings[0], "remediation_impact": "proof_required",
+                "evidence_acquirability": "actionable",
+                "evidence_request": {
+                    "request_type": "symbol_definition", "symbol": "Widget.risky_call",
+                    "file_hint": "helper.py",
+                },
+            }]
+
+        with mock.patch.object(pipeline_mod, "calibrate_findings", side_effect=_fake_calibrate_findings):
+            result = pipeline_mod._calibrate_findings_with_evidence_acquisition(
+                "vuln", "patch text", [{"id": "f1"}], llm=None, code_context="no residual evidence here",
+                repo_root=str(tmp_path), investigation_context=_residual_concern_context(tmp_path),
+                known_included_evidence_labels=None,
+            )
+        assert result["evidence_requests"], "the mock must have actually asked for evidence this time"
+
+
+# ---------------------------------------------------------------------------
+# Cross-section Challenger finding deduplication
+# ---------------------------------------------------------------------------
+
+class TestChallengerCrossSectionDeduplication:
+    """Nothing in the Challenger prompt/parser previously prevented the SAME
+    substantive concern from appearing, worded slightly differently, in both
+    the "Edge cases" and "Potential issues" free-text sections. A real
+    CVE-2023-43804 run (V7) hit exactly this: an "Edge cases" bullet
+    cross-referenced the other section ("... (see Potential issues)"), and
+    the fuller "Potential issues" bullet described the identical underlying
+    concern. `_dedupe_challenger_findings` is the single, pure, deterministic
+    layer that catches this -- shared by `_classify_challenger` and the
+    Suggested Tests early-hoist block in `_build_report`. All fixtures here
+    use generic/synthetic identifiers, not any real CVE's names.
+    """
+
+    # --- Fixture A: exact duplicate across sections ---
+    EXACT_TEXT = "`normalize_path()` may not resolve symlinked directories correctly"
+
+    # --- Fixture B: V7-shaped near-duplicate (self-reference + dotted-suffix
+    # identifier + partial word overlap, NOT identical wording) ---
+    EDGE_NEAR = (
+        "`build_connection_pool()` may leave stale credentials cached "
+        "across redirects (see Potential issues)."
+    )
+    ISSUE_NEAR = (
+        "The credential cache maintained by `pool.build_connection_pool` is "
+        "not cleared when a redirected request reuses a pooled connection, "
+        "allowing stale credentials to be reused across origins."
+    )
+
+    # --- Fixture C: deliberate near-miss -- same function name mentioned in
+    # both, but two genuinely UNRELATED concerns (resource-cleanup timing vs.
+    # certificate-validation bypass). Must NOT be merged. ---
+    EDGE_DISTINCT = (
+        "`close_connection()` is called before all pending writes are "
+        "flushed, risking data loss on abrupt shutdown."
+    )
+    ISSUE_DISTINCT = (
+        "`close_connection()` does not revalidate the peer certificate, "
+        "allowing a previously-rejected certificate to be silently accepted "
+        "on reuse."
+    )
+
+    def _base_kwargs(self, **overrides):
+        kwargs = dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch=(
+                "--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n"
+                " def foo():\n-    return 1\n+    return 2\n"
+            ),
+            review=(
+                "**Explanation:**\nThe code was vulnerable because of X.\n\n"
+                "**Affected areas:**\n- mod.py\n\n"
+                "**Validation notes:**\n- Test with payload Y.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            impact={
+                "impact_level": "low", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            repo_root=None,
+            detected_language="python",
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    # --- A: exact duplicate emitted once downstream ---
+
+    def test_exact_duplicate_emitted_once(self):
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        classified = _classify_challenger({
+            "edge_cases": [self.EXACT_TEXT],
+            "potential_issues": [self.EXACT_TEXT],
+            "still_vulnerable": False,
+            "summary": "",
+        })
+        combined = classified["classified_edge_cases"] + classified["classified_potential_issues"]
+        assert len(combined) == 1
+        assert combined[0]["text"] == self.EXACT_TEXT
+
+    # --- B: V7-shaped near-duplicate emitted once (the crux test) ---
+
+    def test_v7_shaped_near_duplicate_emitted_once(self):
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        classified = _classify_challenger({
+            "edge_cases": [self.EDGE_NEAR],
+            "potential_issues": [self.ISSUE_NEAR],
+            "still_vulnerable": False,
+            "summary": "",
+        })
+        combined = classified["classified_edge_cases"] + classified["classified_potential_issues"]
+        assert len(combined) == 1, combined
+        # The fuller (Potential issues) wording survives; the shorter,
+        # self-referencing Edge cases wording is the one dropped.
+        assert combined[0]["text"] == self.ISSUE_NEAR
+        assert classified["classified_edge_cases"] == []
+
+        record = classified.get("challenger_dedup_record")
+        assert record and len(record) == 1
+        assert record[0]["dropped_text"] == self.EDGE_NEAR
+        assert record[0]["kept_text"] == self.ISSUE_NEAR
+        assert record[0]["reason"] == "self_reference"
+        assert "build_connection_pool" in record[0]["shared_identifiers"]
+
+    # --- C: genuinely distinct concerns sharing a function name stay separate ---
+
+    def test_distinct_concerns_sharing_identifier_are_not_merged(self):
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        classified = _classify_challenger({
+            "edge_cases": [self.EDGE_DISTINCT],
+            "potential_issues": [self.ISSUE_DISTINCT],
+            "still_vulnerable": False,
+            "summary": "",
+        })
+        combined = classified["classified_edge_cases"] + classified["classified_potential_issues"]
+        assert len(combined) == 2
+        texts = {f["text"] for f in combined}
+        assert texts == {self.EDGE_DISTINCT, self.ISSUE_DISTINCT}
+        assert not classified.get("challenger_dedup_record")
+
+    # --- D: order/category assignment does not change the non-duplicate outcome ---
+
+    def test_non_duplicate_outcome_is_independent_of_section_assignment(self):
+        from utilities.autopatcher.pipeline import _dedupe_challenger_findings
+
+        edge_a, potential_a, record_a = _dedupe_challenger_findings(
+            [self.EDGE_DISTINCT], [self.ISSUE_DISTINCT],
+        )
+        # Swap which section holds which text.
+        edge_b, potential_b, record_b = _dedupe_challenger_findings(
+            [self.ISSUE_DISTINCT], [self.EDGE_DISTINCT],
+        )
+
+        assert set(edge_a) | set(potential_a) == {self.EDGE_DISTINCT, self.ISSUE_DISTINCT}
+        assert set(edge_b) | set(potential_b) == {self.EDGE_DISTINCT, self.ISSUE_DISTINCT}
+        assert record_a == [] and record_b == []
+
+    # --- E: the Suggested-Tests early-hoist path is a separate consumer and
+    #     must not receive both copies of a deduplicated concern either ---
+
+    def test_suggested_tests_hoist_receives_deduplicated_concern_once(self):
+        from utilities.autopatcher import pipeline as pl
+
+        captured: dict = {}
+
+        def _spy_suggest_tests(findings, behavior=None):
+            captured["findings"] = list(findings)
+            return []
+
+        original_suggest_tests = pl.suggest_tests
+        pl.suggest_tests = _spy_suggest_tests
+        try:
+            kwargs = self._base_kwargs(
+                challenger={
+                    "still_vulnerable": False,
+                    "edge_cases": [self.EDGE_NEAR],
+                    "potential_issues": [self.ISSUE_NEAR],
+                    "summary": "",
+                },
+            )
+            result = pl.PipelineResult(**kwargs)
+            pl._build_report(result)
+        finally:
+            pl.suggest_tests = original_suggest_tests
+
+        assert "findings" in captured, "suggest_tests was never called"
+        findings = captured["findings"]
+        assert len(findings) == 1, findings
+        # The edge-only phrasing ("leave stale credentials cached") must not
+        # have survived into the hoisted findings list -- only the fuller
+        # Potential-issues wording should have reached suggest_tests().
+        assert "leave stale credentials cached" not in findings[0]
+        assert "credential cache maintained" in findings[0]
+
+    # --- F: single-section findings are completely unchanged ---
+
+    def test_single_section_findings_unchanged(self):
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        edge_only = ["`alpha()` unrelated finding one", "`beta()` unrelated finding two"]
+        classified = _classify_challenger({
+            "edge_cases": edge_only,
+            "potential_issues": [],
+            "still_vulnerable": False,
+            "summary": "",
+        })
+        assert [f["text"] for f in classified["classified_edge_cases"]] == edge_only
+        assert classified["classified_potential_issues"] == []
+        assert not classified.get("challenger_dedup_record")
+
+    # --- G: existing classification/reconciliation counts remain correct
+    #     after dedup runs on a realistic, duplicate-free fixture (regression) ---
+
+    CONFIRMED_DEFECT_TEXT = "The attack vector remains, allowing an attacker to bypass the check entirely."
+    VALIDATION_GAP_TEXT = "This change cannot be confirmed without running the additional integration test suite."
+    GENERIC_TEXT = "Consider adding documentation for the new configuration flag."
+
+    def test_realistic_no_duplicate_fixture_counts_and_reconciliation_unchanged(self):
+        from utilities.autopatcher.pipeline import (
+            _classify_challenger, _reconcile_verification_status_with_calibration,
+        )
+
+        challenger = {
+            "verification_status": "VERIFIED_FIXED",
+            "still_vulnerable": False,
+            "edge_cases": [self.CONFIRMED_DEFECT_TEXT, self.VALIDATION_GAP_TEXT],
+            "potential_issues": [self.GENERIC_TEXT],
+            "summary": "",
+        }
+        classified = _classify_challenger(challenger)
+
+        assert not classified.get("challenger_dedup_record")
+        assert classified["confirmed_defect_count"] == 1
+        assert classified["validation_gap_count"] == 1
+        combined = classified["classified_edge_cases"] + classified["classified_potential_issues"]
+        assert len(combined) == 3
+
+        reconciled = _reconcile_verification_status_with_calibration(classified, None)
+        # Unchanged from pre-dedup behavior: a validation_gap finding with no
+        # calibration entry blocks remediation-proof authority by its own
+        # base presumption (see _finding_blocks_remediation_proof).
+        assert reconciled["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert reconciled["still_vulnerable"] is True
+
+    # --- H: deterministic output ordering ---
+
+    def test_dedup_output_is_byte_identical_across_repeated_calls(self):
+        from utilities.autopatcher.pipeline import _dedupe_challenger_findings
+
+        edge_cases = [self.EDGE_NEAR, self.EDGE_DISTINCT, "`gamma()` a third, unrelated edge case"]
+        potential_issues = [self.ISSUE_NEAR, self.ISSUE_DISTINCT, "an unrelated potential issue"]
+
+        result_1 = _dedupe_challenger_findings(edge_cases, potential_issues)
+        result_2 = _dedupe_challenger_findings(edge_cases, potential_issues)
+
+        assert result_1 == result_2

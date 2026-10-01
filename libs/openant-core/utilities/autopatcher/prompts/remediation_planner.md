@@ -139,6 +139,61 @@ straight from "what the exploit looks like" to "what to forbid."
      you may not claim the narrower alternative is insufficient — record
      the gap in `explicit_unknowns` instead, and do not invent a path to
      justify a broader mechanism.
+   - **This same guard-by-guard tracing requirement governs any additional
+     file, symbol, or execution path you are about to name as also
+     requiring remediation** — not only the choice between a narrower and
+     a broader mechanism for one path. Before treating a second path as
+     proof that the remediation must also cover it, walk that path's own
+     preceding guards in the verified source, in the order they execute:
+     - If the verified source shows a guard whose default value already
+       stops execution before the unsafe operation on that path, and
+       reaching the unsafe operation requires a caller to explicitly
+       supply a different, non-default value for that guard, do not treat
+       that path as evidence that the default remediation needs an
+       additional target. Record it instead as a separate, non-default
+       calling-convention concern (`explicit_unknowns` or
+       `approaches_to_avoid`, whichever fits) — unless the
+       `security_invariant`, the vulnerability report, or the verified
+       source itself establishes that this non-default path is within the
+       remediation's own scope, in which case retain it.
+     - If the verified source shows the unsafe operation on that path
+       remains reachable under ordinary/default arguments, the additional
+       target is supported by the trace and may be retained.
+     - Do not infer that a path is default-blocked merely because it has a
+       parameter, flag, or configuration option — that distinction must
+       come from the verified source actually showing the guard, its
+       default value, and that it executes before the unsafe operation.
+       If the verified source does not establish the guard, its default
+       value, or its position relative to the unsafe operation, you may
+       not assume either answer: record the gap in `explicit_unknowns`,
+       request the missing evidence via `evidence_requests` if it is a
+       specific, nameable file or symbol, and do not silently drop or
+       silently retain the path on that basis alone.
+     - For example, a function that only reaches a sensitive operation
+       when called with a non-default flag enabled:
+       ```
+       process(item, allow_external=False)
+
+       if external(item) and not allow_external:
+           return
+
+       send(item)
+       ```
+       The mere presence of `send(item)` later in the function does not
+       prove ordinary/default execution reaches it — the guard's default
+       (`allow_external=False`) stops execution first, so this path alone
+       does not justify an additional remediation target. The same
+       function called with the flag already enabled:
+       ```
+       process(item, allow_external=True)
+
+       if external(item) and not allow_external:
+           return
+
+       send(item)
+       ```
+       does reach `send(item)` under default execution, so a target built
+       on that trace is supported.
 5. **Decide between the narrower and broader mechanism using this validated
    evidence, not uncertainty.** If repository evidence supports a narrower,
    more conditional mechanism that fully restores the security invariant
@@ -162,11 +217,14 @@ straight from "what the exploit looks like" to "what to forbid."
    because it is behavior-preserving — it must still fully restore the
    security invariant across every evidence-backed path (step 4 is how you
    check that, not a reason to assume it). If the evidence shows more than
-   one path reaches the same unsafe condition, or that a narrower mechanism
-   would leave any of them reachable, address all of them — preserving
-   behavior must never leave the exploit reachable. The goal is the
-   smallest change that fully closes the condition from step 1, not the
-   smallest diff regardless of whether the vulnerability is actually fixed.
+   one path reaches the same unsafe condition under ordinary/default
+   execution (established by the same guard-by-guard trace required in
+   step 4, not merely because the same unsafe-looking operation appears on
+   that path), or that a narrower mechanism would leave any of them
+   reachable, address all of them — preserving behavior must never leave
+   the exploit reachable. The goal is the smallest change that fully closes
+   the condition from step 1, not the smallest diff regardless of whether
+   the vulnerability is actually fixed.
 
 ## Requesting additional evidence
 

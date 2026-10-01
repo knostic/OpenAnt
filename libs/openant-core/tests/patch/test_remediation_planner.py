@@ -2289,153 +2289,130 @@ def _big_function_fixture(tmp_path, n_lines, name="big_function"):
     return plan, context
 
 
+def _expected_planner_capacity(vulnerability_text="vuln"):
+    """The exact real technical-capacity ceiling `build_planner_evidence_
+    with_budget` computes for "planner_evidence" today, in this test
+    environment -- computed via the SAME production function tests
+    exercise (never a hardcoded, environment-sensitive magic number)."""
+    from utilities.autopatcher.llm_client import resolve_active_model, resolve_max_tokens
+    from utilities.autopatcher.remediation_planner import _planner_evidence_known_overhead_chars
+    from utilities.autopatcher.technical_capacity import compute_source_capacity
+    overhead = _planner_evidence_known_overhead_chars(vulnerability_text)
+    return compute_source_capacity(
+        *resolve_active_model(), reserved_output_tokens=resolve_max_tokens(),
+        known_overhead_chars=overhead,
+    ).source_capacity_chars
+
+
 class TestBuildPlannerEvidenceWithBudget:
-    """build_planner_evidence_with_budget() -- the ONE shared, deterministic
-    Planner-evidence construction/expansion path used by both Strategy #1's
-    own construction and the evidence-gap Strategy fallback (see
-    pipeline.py). No LLM call happens anywhere in this function; every
-    expansion is a deterministic, no-LLM-call re-render, gated by
-    ContextBudgetController exactly as Slice 2/3/4 already are.
+    """build_planner_evidence_with_budget() -- Fix B: the ONE shared,
+    deterministic Planner-evidence construction path used by both Strategy
+    #1's own construction and the evidence-gap Strategy fallback (see
+    pipeline.py). No LLM call happens anywhere in this function. The
+    ceiling is the real per-call technical source-capacity for the
+    "planner_evidence" stage (see utilities.autopatcher.technical_capacity)
+    -- never an arbitrary fixed-size "window" grown on request; there is no
+    more expansion loop to test, only a single real-capacity render."""
 
-    Fixture sizes (see _big_function_fixture), all well clear of their
-    threshold boundaries (>1,500-char margin either side) to avoid flaky
-    off-by-a-few-dozen-chars failures:
-      n=50   -> ~930 chars   (fits at the 4,000-char base budget)
-      n=320  -> ~5,960 chars (fits at 8,000; omitted at 4,000)
-      n=540  -> ~10,140 chars(fits at 12,000; omitted at 4,000 and 8,000)
-      n=3000 -> ~60,880 chars(exceeds even 10 windows x 4,000 = 40,000)
-    """
-
-    def test_no_controller_matches_build_planner_evidence_exactly(self, tmp_path):
-        from utilities.autopatcher.remediation_planner import (
-            build_planner_evidence, build_planner_evidence_with_budget,
-        )
+    def test_no_controller_still_computes_real_technical_capacity(self, tmp_path):
+        """A small fixture fits comfortably under the real technical
+        ceiling (now two-plus orders of magnitude larger than the old
+        4,000-char base) with no controller at all -- "no controller" has
+        never meant "no ceiling", and it never means "the old, arbitrary,
+        much smaller ceiling" either."""
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
         plan, context = _big_function_fixture(tmp_path, 50)
-        expected = build_planner_evidence(plan, tmp_path, "vuln", context)
         result = build_planner_evidence_with_budget(
             plan, tmp_path, "vuln", context, budget_controller=None,
         )
-        assert result.rendered == expected
         assert not result.excerpt_plan.symbol_omitted
+        assert result.excerpt_plan.capacity is not None
+        assert result.excerpt_plan.capacity.capacity_source in (
+            "model_registry", "conservative_fallback",
+        )
 
-    def test_fits_initially_no_extension_requested(self, tmp_path):
+    def test_fits_within_real_capacity_no_omission(self, tmp_path):
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan, context = _big_function_fixture(tmp_path, 320)
+        controller = ContextBudgetController()
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=controller,
+        )
+        assert not result.excerpt_plan.symbol_omitted
+        assert not result.excerpt_plan.omission_reason
+        state = controller.to_trace_dict()["stages"]["planner_evidence"]
+        assert state["capacity_is_approximate"] is True
+        assert "source_capacity_chars" in state
+
+    def test_ceiling_cached_across_calls_on_same_controller(self, tmp_path):
+        """The stage's real capacity is computed ONCE per run and cached --
+        a second call against the same controller (e.g. a later Fix A
+        round) reuses the exact same ceiling, never re-derived."""
         from utilities.autopatcher.context_budget import ContextBudgetController
         from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
         plan, context = _big_function_fixture(tmp_path, 50)
-        controller = ContextBudgetController(policy="always", max_windows=10)
-        result = build_planner_evidence_with_budget(
-            plan, tmp_path, "vuln", context, budget_controller=controller,
-        )
-        assert not result.excerpt_plan.symbol_omitted
-        # The stage is still auto-registered by effective_budget() (an
-        # unrelated, pre-existing ContextBudgetController behavior -- see
-        # its own docstring), but zero extensions were ever requested.
-        state = controller.to_trace_dict()["stages"]["planner_evidence"]
-        assert state["approved_windows"] == 0
-        assert state["extension_requests"] == []
+        controller = ContextBudgetController()
+        build_planner_evidence_with_budget(plan, tmp_path, "vuln", context, budget_controller=controller)
+        first = controller.capacity_result("planner_evidence").source_capacity_chars
+        build_planner_evidence_with_budget(plan, tmp_path, "vuln", context, budget_controller=controller)
+        second = controller.capacity_result("planner_evidence").source_capacity_chars
+        assert first == second
 
-    def test_one_extension_recovers_source(self, tmp_path):
+    def test_resolved_but_technically_oversized_block_recorded(self, tmp_path):
+        """A single resolved candidate too large to fit even the real
+        (much larger) technical ceiling is omitted, but never silently:
+        `resolved` still holds (build_planner_candidates/symbol resolution
+        succeeded), `included` is False, and the omission carries an
+        explicit `omission_reason == "technical_capacity"` plus its exact
+        size -- never bare prose."""
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        capacity = _expected_planner_capacity()
+        # Comfortably larger than the real ceiling regardless of environment
+        # (chars-per-line ~15; +50% margin over the computed ceiling).
+        n_lines = int((capacity * 1.5) // 15) + 10
+        plan, context = _big_function_fixture(tmp_path, n_lines)
+        result = build_planner_evidence_with_budget(plan, tmp_path, "vuln", context, budget_controller=None)
+        assert result.excerpt_plan.symbol_omitted
+        for label in result.excerpt_plan.symbol_omitted:
+            assert result.excerpt_plan.omission_reason[label] == "technical_capacity"
+            assert result.excerpt_plan.omitted_sizes[label] > 0
+        assert result.excerpt_plan.capacity is not None
+
+    def test_legacy_policy_max_windows_kwargs_accepted_but_inert(self, tmp_path):
+        """Fix B: the pre-existing policy/max_windows constructor kwargs
+        are still accepted (a caller that hasn't migrated doesn't crash)
+        but have zero effect on the computed ceiling."""
         from utilities.autopatcher.context_budget import ContextBudgetController
         from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
         plan, context = _big_function_fixture(tmp_path, 320)
-        controller = ContextBudgetController(policy="always", max_windows=10)
-        result = build_planner_evidence_with_budget(
-            plan, tmp_path, "vuln", context, budget_controller=controller,
+        legacy = ContextBudgetController(policy="never", max_windows=1)
+        plain = ContextBudgetController()
+        result_legacy = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=legacy,
         )
-        assert not result.excerpt_plan.symbol_omitted
-        state = controller.to_trace_dict()["stages"]["planner_evidence"]
-        assert state["approved_windows"] == 1
-        assert len(state["extension_requests"]) == 1
-        assert state["extension_requests"][0]["approved"] is True
-
-    def test_two_extensions_required_no_premature_stop(self, tmp_path):
-        """The core corrected invariant: intermediate renders with UNCHANGED
-        included_labels must not stop expansion while a known omitted
-        resolved block is still reachable within remaining legal windows."""
-        from utilities.autopatcher.context_budget import ContextBudgetController
-        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
-        plan, context = _big_function_fixture(tmp_path, 540)
-        controller = ContextBudgetController(policy="always", max_windows=10)
-        result = build_planner_evidence_with_budget(
-            plan, tmp_path, "vuln", context, budget_controller=controller,
+        result_plain = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=plain,
         )
-        assert not result.excerpt_plan.symbol_omitted
-        state = controller.to_trace_dict()["stages"]["planner_evidence"]
-        assert state["approved_windows"] == 2
-        assert len(state["extension_requests"]) == 2
-        assert all(r["approved"] for r in state["extension_requests"])
+        assert result_legacy.excerpt_plan.included_labels == result_plain.excerpt_plan.included_labels
 
-    def test_unreachable_size_does_not_waste_extensions(self, tmp_path):
-        from utilities.autopatcher.context_budget import ContextBudgetController
-        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
-        plan, context = _big_function_fixture(tmp_path, 3000)
-        controller = ContextBudgetController(policy="always", max_windows=10)
-        result = build_planner_evidence_with_budget(
-            plan, tmp_path, "vuln", context, budget_controller=controller,
-        )
-        assert result.excerpt_plan.symbol_omitted
-        stages = controller.to_trace_dict()["stages"]
-        assert stages.get("planner_evidence", {}).get("extension_requests", []) == []
-
-    def test_policy_never_no_expansion(self, tmp_path):
-        from utilities.autopatcher.context_budget import ContextBudgetController
-        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
-        plan, context = _big_function_fixture(tmp_path, 320)
-        controller = ContextBudgetController(policy="never", max_windows=10)
-        result = build_planner_evidence_with_budget(
-            plan, tmp_path, "vuln", context, budget_controller=controller,
-        )
-        assert result.excerpt_plan.symbol_omitted
-
-    def test_max_windows_one_no_expansion_beyond_initial(self, tmp_path):
-        from utilities.autopatcher.context_budget import ContextBudgetController
-        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
-        plan, context = _big_function_fixture(tmp_path, 320)
-        controller = ContextBudgetController(policy="always", max_windows=1)
-        result = build_planner_evidence_with_budget(
-            plan, tmp_path, "vuln", context, budget_controller=controller,
-        )
-        assert result.excerpt_plan.symbol_omitted
-
-    def test_max_windows_exhausted_before_fit_stops_deterministically(self, tmp_path):
-        """n=540 needs a 12,000-char ceiling (3 total windows) to fit.
-        Simulate a prior call against this SAME controller (e.g. Strategy
-        #1's own construction) having already spent every window this run
-        is allowed for "planner_evidence" -- this call must not loop,
-        must not request anything new (the reachability pre-check already
-        knows zero legal windows remain), and must return with the
-        candidate still omitted."""
-        from utilities.autopatcher.context_budget import ContextBudgetController
-        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
-        plan, context = _big_function_fixture(tmp_path, 540)
-        controller = ContextBudgetController(policy="always", max_windows=2)
-        controller.effective_budget("planner_evidence", 4_000)  # registers the stage (1 window)
-        assert controller.request_extension("planner_evidence", 4_000, reason="prior_call") is True
-        result = build_planner_evidence_with_budget(
-            plan, tmp_path, "vuln", context, budget_controller=controller,
-        )
-        assert result.excerpt_plan.symbol_omitted
-        state = controller.to_trace_dict()["stages"]["planner_evidence"]
-        assert state["approved_windows"] == 1  # only the pre-seeded one -- this call added none
-        assert not any(r["approved"] for r in state["extension_requests"][1:])
-
-    def test_unresolved_target_no_expansion(self, tmp_path):
+    def test_unresolved_target_produces_no_omission(self, tmp_path):
         """A target that never resolves to any real candidate produces no
-        omission at all (there is nothing to omit) -- it must never trigger
-        an extension request."""
+        omission at all (there is nothing to omit) -- and no
+        `technical_capacity` reason is ever attached to something that was
+        never resolved in the first place."""
         from utilities.autopatcher.context_budget import ContextBudgetController
         from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
         plan = RemediationPlanResult(
             rendered="", target_files=["nonexistent.py"], target_symbols=["nonexistent.py:ghost"],
         )
         context = _make_context(functions={}, repo_path=tmp_path)
-        controller = ContextBudgetController(policy="always", max_windows=10)
+        controller = ContextBudgetController()
         result = build_planner_evidence_with_budget(
             plan, tmp_path, "vuln", context, budget_controller=controller,
         )
         assert result.rendered == ""
-        stages = controller.to_trace_dict()["stages"]
-        assert stages.get("planner_evidence", {}).get("extension_requests", []) == []
+        assert not result.excerpt_plan.omission_reason
 
 
 class TestBuildPlannerEvidenceMaxCharsOverride:
@@ -3063,6 +3040,131 @@ class TestFinalStrategySemanticNarrownessContract:
             assert forbidden not in added_text
 
 
+# ---------------------------------------------------------------------------
+# Strategy reasoning-contract fix (urllib3 Fix B regression follow-up):
+# a real trace showed Strategy #2 had sufficient verified evidence to
+# resolve its own stated concern (about a DIFFERENT, unselected code path)
+# but still returned target_authority_unresolved=true, and did not
+# re-examine that concern against the evidence it had actually just been
+# given. The prompt now distinguishes "is my selected target/mechanism
+# justified" (authority-relevant) from "does some other, unselected path
+# also need independent validation" (not authority-relevant on its own),
+# and requires re-evaluating carried-forward uncertainty against current
+# evidence. These tests prove the CONTRACT TEXT states this distinction --
+# they cannot and do not prove a real model will comply (same limitation as
+# every other prompt-contract test in this file; see
+# TestFinalStrategySemanticNarrownessContract above).
+# ---------------------------------------------------------------------------
+
+class TestFinalStrategyAuthorityScopeContract:
+    def test_authority_relevance_tied_to_selected_target_or_mechanism(self):
+        """Proof point 1: true is tied to whether the SELECTED target/
+        symbol/mechanism is the justified remediation location/mechanism
+        for the supplied invariant -- not a general validation signal."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "materially prevents you from determining whether the "
+            "`target_files`/`target_symbols`/mechanism you selected above "
+            "is the justified remediation location/mechanism for the "
+            "supplied security invariant" in text
+        )
+        assert (
+            "this is not a general signal that more validation would be "
+            "useful; it means specifically that you cannot yet stand "
+            "behind your own selected target/mechanism" in text
+        )
+
+    def test_separate_path_uncertainty_is_not_automatically_blocking(self):
+        """Proof point 2: a question about a different, unselected path is
+        not by itself a target-authority blocker, and must still be
+        reported (never silently dropped)."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "a remaining question about a different, unselected code path, "
+            "entry point, calling convention, override, or adjacent "
+            "behavior is not, by itself, a target-authority blocker" in text
+        )
+        assert "keep reporting it in `insufficient_evidence`" in text
+        assert "do not drop it" in text
+
+    def test_separate_path_becomes_blocking_when_invariant_requires_it(self):
+        """Proof point 3: the "unless" clause -- a separate-path question
+        DOES become authority-blocking when resolving it could invalidate
+        or materially change the selected target/mechanism, or when the
+        invariant itself requires that path to be covered."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "unless you can explain why resolving it could invalidate or "
+            "materially change the selected target/mechanism for the "
+            "supplied security invariant" in text
+        )
+        assert (
+            "unless the invariant itself requires that alternate path to "
+            "be covered by the same mechanism" in text
+        )
+        assert (
+            "the supplied invariant does not require your selected "
+            "mechanism to cover" in text
+        )
+
+    def test_prior_uncertainty_must_be_reevaluated_against_current_evidence(self):
+        """Proof point 4: previously raised uncertainty (including from
+        this run's own earlier reasoning) must be checked against
+        currently-supplied evidence before being carried forward
+        unresolved."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "re-evaluate every uncertainty you are about to report -- "
+            "including one that also appeared in your own earlier "
+            "reasoning on this same run -- against all verified evidence "
+            "actually present in this request" in text
+        )
+        assert (
+            "if the evidence now on hand already answers a question "
+            "raised earlier, do not restate it as unresolved merely "
+            "because it was raised before" in text
+        )
+
+    def test_genuinely_unresolved_authority_remains_fail_closed(self):
+        """Proof point 5: the re-evaluation rule is one-directional -- it
+        may CLEAR a concern the evidence answers, but must never be used to
+        force `false` on a concern that remains genuinely open."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "if, after this re-evaluation, evidence genuinely remains "
+            "insufficient to determine whether your selected "
+            "target/mechanism is correct, `target_authority_unresolved` "
+            "must still be `true`" in text
+        )
+        assert (
+            "re-evaluating against current evidence is a reason to clear "
+            "a concern the evidence actually answers, never a reason to "
+            "force `false` on a concern it does not" in text
+        )
+
+    def test_new_authority_scope_wording_is_domain_neutral(self):
+        """Scoped to just this follow-up's own new paragraphs."""
+        text = _STRATEGY_PROMPT_PATH_TEXT()
+        start = text.index("Additionally, set `target_authority_unresolved`")
+        end = text.index("Do not propose unrelated changes")
+        added_text = text[start:end].lower()
+        for forbidden in (
+            "minimist", "cve-2021-44906", "constructor", "prototype", "__proto__",
+            "javascript", "prototype pollution", "urllib3", "cookie", "header",
+            "redirect", "python", "assert_same_host", "is_same_host",
+        ):
+            assert forbidden not in added_text
+
+    def test_existing_ground_rules_and_schema_still_present(self):
+        """Additive only -- the pre-existing ground rules and the schema's
+        field set (checked exhaustively by test_no_new_schema_field_
+        introduced above) must survive this follow-up unchanged."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert "every `target_file` you name must already appear in the verified evidence" in text
+        assert "do not propose unrelated changes. do not propose a menu of options" in text
+        assert "target_authority_unresolved: false` is not a claim that `target_files`/`target_symbols` is correct" in text
+
+
 def _PLANNER_PROMPT_PATH_TEXT() -> str:
     from utilities.autopatcher.remediation_planner import _PROMPT_PATH
     return _PROMPT_PATH.read_text(encoding="utf-8")
@@ -3541,14 +3643,23 @@ class TestTargetAuthorityUnresolvedEndToEnd:
 
 class TestTargetAuthorityUnresolvedPromptContract:
     def test_ground_rule_present_with_true_false_criteria(self):
+        # Fix: wording tightened to distinguish authority-relevant
+        # uncertainty from a separate-path validation/scope question (see
+        # TestFinalStrategyAuthorityScopeContract) -- the true/false
+        # criteria still exist, phrased against "the justified remediation
+        # location/mechanism for the supplied security invariant" rather
+        # than the older, less precise "actually the correct remediation
+        # location".
         text = _STRATEGY_PROMPT_NORMALIZED()
         assert "set `target_authority_unresolved` to `true`" in text
         assert (
-            "you cannot yet determine whether the `target_files`/`target_symbols`/mechanism "
-            "you selected above is actually the correct remediation location" in text
+            "materially prevents you from determining whether the "
+            "`target_files`/`target_symbols`/mechanism you selected above "
+            "is the justified remediation location/mechanism for the "
+            "supplied security invariant" in text
         )
-        assert "set it to `false` when every remaining gap in `insufficient_evidence` concerns only" in text
-        assert "validation, testing, behavioral confirmation, or hardening evidence" in text
+        assert "set `target_authority_unresolved` to `false` when every remaining gap in `insufficient_evidence` concerns only" in text
+        assert "validation, testing, behavioral confirmation, hardening evidence" in text
 
     def test_false_is_not_a_certification(self):
         text = _STRATEGY_PROMPT_NORMALIZED()
@@ -4107,13 +4218,14 @@ class TestExtendExistingMechanismFixture:
 
 def _make_strategy(
     target_files=None, target_symbols=None, extended_mechanism=None, required_edits=None,
-    rejected_target_symbols=None,
+    rejected_target_symbols=None, rejected_targets=None, insufficient_evidence=None,
 ):
     from utilities.autopatcher.remediation_planner import RemediationStrategyResult
     return RemediationStrategyResult(
         rendered="", target_files=target_files or [], target_symbols=target_symbols or [],
         warnings=[], extended_mechanism=extended_mechanism, required_edits=required_edits or [],
         rejected_target_symbols=rejected_target_symbols or [],
+        rejected_targets=rejected_targets or [], insufficient_evidence=insufficient_evidence or [],
     )
 
 
@@ -5705,7 +5817,7 @@ class TestFinalTargetSliceTargetOwnedClassMemberPriorityNoQualifyingConstant:
             target_files=["gateway.py"], target_symbols=["Coordinator"], extended_mechanism=mechanism,
         )
         result = rp.build_final_target_slice(
-            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"],
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"], max_chars=500,
         )
         # No class-identity boost: `dispatch` loses the race exactly as it
         # did before this fix existed, since `Coordinator` is (correctly,
@@ -5847,7 +5959,7 @@ class TestFinalTargetSliceEvidenceContinuityAfterRejectedQualifiedTarget:
         strategy = self._strategy(rejected_target_symbols=["Bogus.runtime_limit"])
 
         result = rp.build_final_target_slice(
-            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"],
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"], max_chars=500,
         )
 
         assert "`container.py:Container.configure`" not in result.rendered
@@ -5863,11 +5975,174 @@ class TestFinalTargetSliceEvidenceContinuityAfterRejectedQualifiedTarget:
         strategy = self._strategy(rejected_target_symbols=[])
 
         result = rp.build_final_target_slice(
-            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"],
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"], max_chars=500,
         )
 
         assert "`container.py:Container.configure`" not in result.rendered
         assert "`worker.py:Worker.process_batch`" in result.rendered
+
+
+class TestFinalTargetSliceResidualConcernEvidenceContinuity:
+    """FIX (Agent 2): a symbol the Final Strategy explicitly considered
+    and REJECTED (`rejected_targets`) or flagged as insufficiently
+    evidenced (`insufficient_evidence`) -- never `target_symbols`/
+    `extended_mechanism`/`required_edits` -- can still surface in the
+    Final-Target Remediation Slice as a Category 2 "related definition,
+    context only, not an approved edit target" block, PROVIDED its own
+    file was already connected via `planner_evidence_files` (in
+    production: pipeline.py's own widened seed, which folds in every file
+    Planning's own bounded evidence-acquisition loop actually INCLUDED,
+    not merely the Final Strategy's own selected `target_files`).
+
+    Maps to the task's required tests A, D, E, G (B/C -- the
+    resolved-vs-included distinction at the pipeline.py seed-construction
+    boundary -- live in test_pipeline.py instead, since that is where the
+    widening itself happens)."""
+
+    def _context(self, tmp_path):
+        (tmp_path / "target.py").write_text("class Handler:\n    LIMIT = 5\n", encoding="utf-8")
+        (tmp_path / "mech.py").write_text(
+            "class Helper:\n    def normalize_value(self):\n        return 1\n", encoding="utf-8",
+        )
+        (tmp_path / "helper.py").write_text(
+            "class Widget:\n    def risky_call(self):\n        return 2\n", encoding="utf-8",
+        )
+        functions = {
+            "mech.py:Helper.normalize_value": {
+                "name": "normalize_value", "className": "Helper", "startLine": 2, "endLine": 3,
+                "code": "    def normalize_value(self):\n        return 1\n",
+            },
+            "helper.py:Widget.risky_call": {
+                "name": "risky_call", "className": "Widget", "startLine": 2, "endLine": 3,
+                "code": "    def risky_call(self):\n        return 2\n",
+            },
+        }
+        constants = {"target.py": {"Handler.LIMIT": {
+            "qualified_name": "Handler.LIMIT", "class_name": "Handler", "name": "LIMIT", "line": 2, "end_line": 2,
+        }}}
+        return _make_context(functions=functions, constants=constants, repo_path=tmp_path)
+
+    def _strategy(self, rejected_targets=None, insufficient_evidence=None, extended_mechanism=None):
+        return _make_strategy(
+            target_files=["target.py"], target_symbols=["target.py:Handler.LIMIT"],
+            extended_mechanism=extended_mechanism,
+            rejected_targets=rejected_targets or [], insufficient_evidence=insufficient_evidence or [],
+        )
+
+    def test_a_rejected_symbol_surfaces_as_category2_supporting_context(self, tmp_path):
+        """Test A: a symbol named only in `rejected_targets` -- whose file
+        was connected via `planner_evidence_files` -- is rendered under
+        the Category-2 heading, never as an approved edit target."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice, _CATEGORY2_HEADING_LABEL
+        context = self._context(tmp_path)
+        strategy = self._strategy(
+            rejected_targets=["Considered Widget.risky_call but rejected because it lacks proof."],
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper.py"], max_chars=100_000,
+        )
+        assert f"#### {_CATEGORY2_HEADING_LABEL}: `helper.py:risky_call`" in result.rendered
+        assert "Target definition: `helper.py" not in result.rendered
+
+    def test_a_insufficient_evidence_symbol_also_surfaces(self, tmp_path):
+        """Test A (sibling): the same continuity applies to
+        `insufficient_evidence`, not only `rejected_targets`."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice, _CATEGORY2_HEADING_LABEL
+        context = self._context(tmp_path)
+        strategy = self._strategy(
+            insufficient_evidence=["Insufficient evidence to confirm Widget.risky_call is exploitable."],
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper.py"], max_chars=100_000,
+        )
+        assert f"#### {_CATEGORY2_HEADING_LABEL}: `helper.py:risky_call`" in result.rendered
+
+    def test_d_residual_concern_never_starves_genuine_category2_candidate(self, tmp_path, monkeypatch):
+        """Test D: under a shared budget tight enough for only ONE of the
+        two Category-2 candidates, the genuine mechanism-derived one
+        (`extended_mechanism` -> Helper.normalize_value) must win -- the
+        residual-concern-derived one (Widget.risky_call) must lose,
+        precisely because it is appended, and therefore committed, at
+        lower priority."""
+        from utilities.autopatcher import remediation_planner as rp
+        context = self._context(tmp_path)
+        strategy = self._strategy(
+            extended_mechanism="Uses Helper.normalize_value to sanitize input.",
+            rejected_targets=["Considered Widget.risky_call but rejected because it lacks proof."],
+        )
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context,
+            planner_evidence_files=["helper.py", "mech.py"], max_chars=350,
+        )
+        assert "normalize_value" in result.rendered
+        assert "risky_call" not in result.rendered
+
+    def test_e_unresolvable_residual_concern_fails_closed(self, tmp_path):
+        """Test E: a residual-concern identifier that resolves nowhere
+        within `preferred_files` produces no candidate at all -- no
+        crash, nothing invented, and normal coverage is unaffected."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        context = self._context(tmp_path)
+        strategy = self._strategy(
+            rejected_targets=["Considered NoSuchThing.completely_unresolvable_symbol but rejected."],
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper.py"], max_chars=100_000,
+        )
+        assert "unresolvable" not in result.rendered.lower()
+        assert "NoSuchThing" not in result.rendered
+        assert "`target.py:Handler.LIMIT`" in result.rendered
+
+    def test_g_no_residual_concern_terms_unaffected(self, tmp_path):
+        """Test G (regression guard): a strategy with empty
+        `rejected_targets`/`insufficient_evidence` (the overwhelmingly
+        common case) renders identically whether or not this fix exists
+        -- no residual-concern content ever appears, and ordinary
+        Category 1/2 (genuine mechanism-derived) content is untouched."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        context = self._context(tmp_path)
+        strategy = self._strategy(extended_mechanism="Uses Helper.normalize_value to sanitize input.")
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper.py", "mech.py"], max_chars=100_000,
+        )
+        assert "risky_call" not in result.rendered
+        assert "normalize_value" in result.rendered
+        assert "`target.py:Handler.LIMIT`" in result.rendered
+
+
+class TestExtractStrategyResidualConcernIdentifiers:
+    """Unit coverage for `_extract_strategy_residual_concern_identifiers`
+    itself: it reads ONLY `rejected_targets`/`insufficient_evidence`, and
+    reuses the exact same `_extract_identifiers_from_text` shape-filtered
+    extraction `_extract_strategy_identifiers` already uses -- no second,
+    different extraction algorithm."""
+
+    def test_reads_only_rejected_targets_and_insufficient_evidence(self):
+        from utilities.autopatcher.remediation_planner import _extract_strategy_residual_concern_identifiers
+        strategy = _make_strategy(
+            target_files=["a.py"], target_symbols=["a.py:Real.target_symbol"],
+            extended_mechanism="Mentions Mechanism.only_term here.",
+            required_edits=["Edit ReuiredEdits.only_term too."],
+            rejected_targets=["Rejected Widget.risky_call as a target."],
+            insufficient_evidence=["Not enough proof about Other.residual_symbol."],
+        )
+        result = _extract_strategy_residual_concern_identifiers(strategy)
+        assert "Widget.risky_call" in result
+        assert "Other.residual_symbol" in result
+        # Never leaks in anything derived from target_symbols/
+        # extended_mechanism/required_edits -- those are
+        # _extract_strategy_identifiers's own domain, not this function's.
+        assert "Real.target_symbol" not in result
+        assert "Mechanism.only_term" not in result
+        assert "ReuiredEdits.only_term" not in result
+
+    def test_empty_when_no_residual_concern_fields(self):
+        from utilities.autopatcher.remediation_planner import _extract_strategy_residual_concern_identifiers
+        strategy = _make_strategy(
+            target_files=["a.py"], target_symbols=["a.py:Real.target_symbol"],
+            extended_mechanism="Mentions Mechanism.only_term here.",
+        )
+        assert _extract_strategy_residual_concern_identifiers(strategy) == []
 
 
 class TestCategoryPriorityAndOrdering:
@@ -5936,12 +6211,17 @@ class TestCategoryPriorityAndOrdering:
 
 class TestBudgetBoundedness:
     def test_budget_is_bounded(self, tmp_path, monkeypatch):
+        """Fix B: the DEFAULT ceiling (max_chars=None) is now the real
+        per-call technical capacity, not FINAL_TARGET_SLICE_MAX_CHARS --
+        an explicit max_chars still bounds the render exactly as before."""
         from utilities.autopatcher import remediation_planner as rp
         big_body = "\n".join(f"    x{i} = {i}" for i in range(2000))
         (tmp_path / "big.py").write_text(f"class C:\n{big_body}\n", encoding="utf-8")
         context = _make_context(repo_path=tmp_path)
         strategy = _make_strategy(target_files=["big.py"])
-        result = rp.build_final_target_slice(strategy, str(tmp_path), context)
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, max_chars=rp.FINAL_TARGET_SLICE_MAX_CHARS,
+        )
         assert len(result.rendered) <= rp.FINAL_TARGET_SLICE_MAX_CHARS
 
     def test_no_block_truncated_mid_line(self, tmp_path, monkeypatch):
@@ -6049,7 +6329,9 @@ class TestCoverageReporting:
         strategy = _make_strategy(
             target_files=["policy.py", "opaque.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
         )
-        result = build_final_target_slice(strategy, str(tmp_path), context)
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, max_chars=FINAL_TARGET_SLICE_MAX_CHARS,
+        )
         assert result.coverage_complete is False
         assert "opaque.py" in result.uncovered_target_files
         assert result.has_any_coverage is True
@@ -6823,7 +7105,7 @@ class TestOneHopDependencyExpansion:
         # definition block is 221 characters; definition + consumer combined
         # is 434. 300 sits cleanly between the two.
         monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 300)
-        result = rp.build_final_target_slice(strategy, str(tmp_path), context)
+        result = rp.build_final_target_slice(strategy, str(tmp_path), context, max_chars=300)
         assert 'DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])' in result.rendered
         assert "Discovered consumer" not in result.rendered
 
@@ -7238,7 +7520,7 @@ class TestEditTargetBudgetExhaustion:
         # Both constants resolve; a budget too small to fit even ONE
         # padded definition block forces edit_target_budget_exhausted.
         monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 10)
-        result = rp.build_final_target_slice(strategy, str(tmp_path), context)
+        result = rp.build_final_target_slice(strategy, str(tmp_path), context, max_chars=10)
         assert result.edit_target_budget_exhausted is True
         # Not silently narrowed to "coverage complete" -- both remain uncovered.
         assert set(result.uncovered_target_symbols) == {"mod.py:CONST_A", "mod.py:CONST_B"}
@@ -7258,7 +7540,7 @@ class TestEditTargetBudgetExhaustion:
         )
         strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A", "mod.py:CONST_B"])
         monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 10)
-        slice_result = rp.build_final_target_slice(strategy, str(tmp_path), context)
+        slice_result = rp.build_final_target_slice(strategy, str(tmp_path), context, max_chars=10)
         intended_edits = rp.build_intended_edits(strategy)
         readiness = rp.check_edit_readiness(intended_edits, slice_result)
         assert readiness.edit_source_ready is False
@@ -7842,12 +8124,13 @@ class TestDeterministicAcquisition:
         assert final_readiness.unready_edits[0].reason == initial_readiness.unready_edits[0].reason
 
     def test_total_budget_exhaustion_fails_closed(self, tmp_path):
-        """Test 11. When the slice already consumed the entire hard total
-        budget, acquisition must refuse to add anything more (available
-        <= 0) and fail closed -- never exceed FINAL_TARGET_SLICE_MAX_CHARS."""
-        from utilities.autopatcher import remediation_planner as rp
+        """Test 11. When the slice already consumed the entire real
+        technical-capacity ceiling (Fix B: no longer
+        FINAL_TARGET_SLICE_MAX_CHARS -- see _effective_final_target_max),
+        acquisition must refuse to add anything more (available <= 0) and
+        fail closed -- never exceed that ceiling."""
         from utilities.autopatcher.remediation_planner import (
-            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+            IntendedEdit, _effective_final_target_max, check_edit_readiness, run_deterministic_acquisition,
         )
         (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
         context = _make_context(constants={"mod.py": {
@@ -7856,14 +8139,15 @@ class TestDeterministicAcquisition:
         strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
         edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
 
-        # Simulate a slice that already consumed the entire hard budget.
-        initial_slice = _make_slice_result(rendered="x" * rp.FINAL_TARGET_SLICE_MAX_CHARS)
+        # Simulate a slice that already consumed the entire real ceiling.
+        ceiling = _effective_final_target_max(None)
+        initial_slice = _make_slice_result(rendered="x" * ceiling)
         initial_readiness = check_edit_readiness([edit], initial_slice)
         result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
 
         assert result.attempts[0].success is False
         assert result.attempts[0].failure_reason == "target_budget_exhausted"
-        assert len(result.slice_result.rendered) == rp.FINAL_TARGET_SLICE_MAX_CHARS  # nothing more added
+        assert len(result.slice_result.rendered) == ceiling  # nothing more added
 
 
 class TestTransactionalAcquisition:

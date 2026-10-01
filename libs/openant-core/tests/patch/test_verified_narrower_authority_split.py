@@ -33,6 +33,7 @@ from utilities.autopatcher import pipeline as pipeline_mod
 from utilities.autopatcher.remediation_planner import (
     RemediationPlanResult,
     RemediationStrategyResult,
+    _filter_required_edits_against_superseded_targets,
     _render_strategy_target_block,
     _render_verified_authoritative_semantics,
 )
@@ -549,3 +550,240 @@ class TestRenderStrategyTargetBlock:
             insufficient_evidence=[], evaluated=False, rejected_targets=[],
         )
         assert _render_strategy_target_block(empty_strategy) == ""
+
+
+# ---------------------------------------------------------------------------
+# Patch Generation must not receive stale edit authority: a superseded
+# Planning `required_edits` bullet naming a file Strategy's own later,
+# independently re-verified `target_files` no longer includes must never
+# remain an executable edit instruction in the verified-authoritative
+# semantics block Patch Generation reads. Filtering is by exact file-path
+# string containment against Strategy's own structured `target_files` --
+# never a prose/semantic comparison, and target authority itself (Strategy's
+# target_files/target_symbols/rejected_targets) is never touched by this.
+# ---------------------------------------------------------------------------
+
+_OTHER_FILE_EDIT = "also update other.py to apply the same guard at its own call site"
+_TARGET_ONLY_EDIT = "add the narrow state-sensitive guard immediately before the unsafe call in target.py"
+
+
+def _write_other_file(tmp_path):
+    other = tmp_path / "other.py"
+    if not other.exists():
+        other.write_text("def bar():\n    pass\n", encoding="utf-8")
+    return other
+
+
+_MULTI_FILE_DIFF = """\
+```diff
+--- a/target.py
++++ b/target.py
+@@ -1,2 +1,3 @@
+ def foo():
++    pass
+     pass
+--- a/other.py
++++ b/other.py
+@@ -1,2 +1,3 @@
+ def bar():
++    pass
+     pass
+```"""
+
+_TWO_BLOCK_CONTRACT_VIOLATION = _CLEAN_DIFF + "\n\nSome trailing prose.\n\n" + _CLEAN_DIFF
+
+
+class TestFilterRequiredEditsAgainstSupersededTargets:
+    """Unit tests for the filter helper itself -- fast, deterministic, no
+    pipeline involved."""
+
+    def test_empty_superseded_set_returns_edits_unchanged(self):
+        edits = [_TARGET_ONLY_EDIT, _OTHER_FILE_EDIT]
+        assert _filter_required_edits_against_superseded_targets(edits, frozenset()) == edits
+
+    def test_bullet_naming_superseded_file_is_dropped(self):
+        edits = [_TARGET_ONLY_EDIT, _OTHER_FILE_EDIT]
+        filtered = _filter_required_edits_against_superseded_targets(edits, frozenset({"other.py"}))
+        assert filtered == [_TARGET_ONLY_EDIT]
+
+    def test_bullet_not_naming_any_superseded_file_survives(self):
+        edits = [_TARGET_ONLY_EDIT]
+        filtered = _filter_required_edits_against_superseded_targets(edits, frozenset({"other.py"}))
+        assert filtered == [_TARGET_ONLY_EDIT]
+
+
+class TestRenderVerifiedAuthoritativeSemanticsFiltersSupersededEdits:
+    def test_superseded_target_files_filters_only_required_edits(self, tmp_path):
+        plan_result = _plan(
+            tmp_path, required_edits=(_TARGET_ONLY_EDIT, _OTHER_FILE_EDIT),
+            target_files=("target.py", "other.py"), target_symbols=("target.py:foo", "other.py:bar"),
+        )
+        rendered = _render_verified_authoritative_semantics(plan_result, frozenset({"other.py"}))
+        assert _TARGET_ONLY_EDIT in rendered
+        assert _OTHER_FILE_EDIT not in rendered
+        # The other 4 fields are never filtered by this mechanism.
+        assert _NARROW_MECHANISM in rendered
+        assert _NARROW_INVARIANT in rendered
+        assert _NARROW_APPROACH_TO_AVOID in rendered
+
+    def test_default_none_superseded_files_matches_prior_unfiltered_behavior(self, tmp_path):
+        plan_result = _plan(
+            tmp_path, required_edits=(_TARGET_ONLY_EDIT, _OTHER_FILE_EDIT),
+            target_files=("target.py", "other.py"), target_symbols=("target.py:foo", "other.py:bar"),
+        )
+        rendered = _render_verified_authoritative_semantics(plan_result)
+        assert _TARGET_ONLY_EDIT in rendered
+        assert _OTHER_FILE_EDIT in rendered
+
+
+class TestFix2StaleEditAuthorityExcludedFromPatchGeneration:
+    """Fix 2 integration tests: the real `pipeline.run()` orchestration,
+    mocking only the LLM-backed Planner/Verifier/Strategy/Patch Generation
+    calls, exactly like the rest of this file."""
+
+    def test_a_single_approved_target_no_stale_instruction_for_untouched_supporting_file(self, tmp_path):
+        """No second file is even proposed -- a plain control confirming the
+        filter is a true no-op (nothing superseded) in the ordinary
+        single-target case, and an unrelated bystander file never acquires
+        an edit instruction merely by existing in the repo."""
+        _write_other_file(tmp_path)
+        plan_result = _plan(tmp_path)  # target_files=("target.py",) only
+        strategy_result = _strategy()  # target_files=("target.py",) only
+        _report, _spy_verify, _spy_strategy, mock_gen = _run_pipeline(
+            tmp_path, plan_result=plan_result,
+            verify_side_effect=[_verdict("SUPPORTED", matches_selected=True)],
+            strategy_result=strategy_result,
+        )
+        code_context = mock_gen.call_args.kwargs["code_context"]
+        assert _NARROW_REQUIRED_EDIT in code_context
+        assert _OTHER_FILE_EDIT not in code_context
+
+    def test_b_superseded_planning_proposal_excluded_but_raw_evidence_may_remain(self, tmp_path):
+        """Planner proposed edits to BOTH target.py and other.py; Strategy's
+        own, later, independently re-verified target_files narrows to
+        target.py only (rejecting other.py). The other.py edit bullet must
+        never reach Patch Generation as an executable instruction, even
+        though other.py may still legitimately appear elsewhere (e.g.
+        Strategy's own rejected-targets reporting)."""
+        _write_other_file(tmp_path)
+        plan_result = _plan(
+            tmp_path, required_edits=(_TARGET_ONLY_EDIT, _OTHER_FILE_EDIT),
+            target_files=("target.py", "other.py"), target_symbols=("target.py:foo", "other.py:bar"),
+        )
+        strategy_result = _strategy(target_files=("target.py",), target_symbols=("target.py:foo",),
+                                     rejected_targets=("other.py",))
+        _report, _spy_verify, _spy_strategy, mock_gen = _run_pipeline(
+            tmp_path, plan_result=plan_result,
+            verify_side_effect=[_verdict("SUPPORTED", matches_selected=True)],
+            strategy_result=strategy_result,
+        )
+        code_context = mock_gen.call_args.kwargs["code_context"]
+        assert _NARROW_MECHANISM in code_context
+        assert _TARGET_ONLY_EDIT in code_context
+        assert _OTHER_FILE_EDIT not in code_context
+
+    def test_c_authorized_multi_target_remediation_preserved(self, tmp_path):
+        """Both files were proposed AND both are authorized by Strategy's
+        own target decision -- neither edit bullet is superseded, so both
+        must reach Patch Generation unfiltered."""
+        _write_other_file(tmp_path)
+        plan_result = _plan(
+            tmp_path, required_edits=(_TARGET_ONLY_EDIT, _OTHER_FILE_EDIT),
+            target_files=("target.py", "other.py"), target_symbols=("target.py:foo", "other.py:bar"),
+        )
+        strategy_result = _strategy(target_files=("target.py", "other.py"), target_symbols=("target.py:foo", "other.py:bar"))
+        _report, _spy_verify, _spy_strategy, mock_gen = _run_pipeline(
+            tmp_path, plan_result=plan_result,
+            verify_side_effect=[_verdict("SUPPORTED", matches_selected=True)],
+            strategy_result=strategy_result,
+        )
+        code_context = mock_gen.call_args.kwargs["code_context"]
+        assert _TARGET_ONLY_EDIT in code_context
+        assert _OTHER_FILE_EDIT in code_context
+
+    def test_d_unauthorized_model_edit_to_superseded_file_still_rejected(self, tmp_path):
+        """Even with the corrected prompt, a model that still edits the
+        excluded file must be caught by Target Conformance (unmodified by
+        this fix) -- the fix removes the STALE INSTRUCTION, it does not (and
+        must not) rely on the model's compliance."""
+        from utilities.autopatcher.execution_recorder import ExecutionRecorder
+
+        _write_other_file(tmp_path)
+        recorder = ExecutionRecorder(
+            call_log=[], run_dir=str(tmp_path / "run"), artifacts_dir=tmp_path / "run" / "executions",
+        )
+        plan_result = _plan(
+            tmp_path, required_edits=(_TARGET_ONLY_EDIT, _OTHER_FILE_EDIT),
+            target_files=("target.py", "other.py"), target_symbols=("target.py:foo", "other.py:bar"),
+        )
+        strategy_result = _strategy(target_files=("target.py",), target_symbols=("target.py:foo",),
+                                     rejected_targets=("other.py",))
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_plan",
+                return_value=plan_result,
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_verifier.verify_planner_claim",
+                side_effect=[_verdict("SUPPORTED", matches_selected=True)],
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
+                return_value=strategy_result,
+            ),
+            mock.patch(
+                "utilities.autopatcher.pipeline.generate_patch_raw",
+                return_value=_MULTI_FILE_DIFF,
+            ),
+        ):
+            pipeline_mod.run(
+                vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path),
+                execution_recorder=recorder,
+            )
+        s4 = next(
+            e for e in recorder.executions
+            if e["canonical_stage"] == "patch_generation_and_post_patch_investigation"
+        )
+        artifact = json.loads(open(s4["artifact_path"], encoding="utf-8").read())
+        conformance = artifact["patch_target_conformance"]
+        assert conformance["all_conformant"] is False
+        assert "other.py" in conformance["unexpected_files"]
+
+    def test_e_contract_violation_retry_reuses_the_same_filtered_sections(self, tmp_path):
+        """The contract-violation retry path (generate_and_maybe_retry_
+        patch's `context_sections` refit) must reuse the SAME already-
+        filtered sections, never rebuild `verified_authoritative_semantics`
+        fresh without the filter -- so the stale bullet must be absent from
+        BOTH the first call's and the retry's code_context."""
+        _write_other_file(tmp_path)
+        plan_result = _plan(
+            tmp_path, required_edits=(_TARGET_ONLY_EDIT, _OTHER_FILE_EDIT),
+            target_files=("target.py", "other.py"), target_symbols=("target.py:foo", "other.py:bar"),
+        )
+        strategy_result = _strategy(target_files=("target.py",), target_symbols=("target.py:foo",),
+                                     rejected_targets=("other.py",))
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_plan",
+                return_value=plan_result,
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_verifier.verify_planner_claim",
+                side_effect=[_verdict("SUPPORTED", matches_selected=True)],
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
+                return_value=strategy_result,
+            ),
+            mock.patch(
+                "utilities.autopatcher.pipeline.generate_patch_raw",
+                side_effect=[_TWO_BLOCK_CONTRACT_VIOLATION, _CLEAN_DIFF],
+            ) as mock_gen,
+        ):
+            pipeline_mod.run(vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path))
+        assert mock_gen.call_count == 2
+        first_context = mock_gen.call_args_list[0].kwargs["code_context"]
+        retry_context = mock_gen.call_args_list[1].kwargs["code_context"]
+        assert _OTHER_FILE_EDIT not in first_context
+        assert _OTHER_FILE_EDIT not in retry_context
+        assert _TARGET_ONLY_EDIT in retry_context

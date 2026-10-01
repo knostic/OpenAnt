@@ -80,18 +80,20 @@ _VALID_IMPACTS = {"proof_required", "validation_only", "unclear"}
 _BLOCK_HEADER_RE = re.compile(r"^[ \t]*(\d+)\.\s*Claims:", re.MULTILINE)
 
 # Matches "   - ...\n   Unresolved: <value>\n   Remediation impact: <value>\n
-# Group: <label>\n   Reworded: <text>" WITHIN a single block's already-
-# isolated text span (see _split_blocks_by_number). Because the span
-# physically ends before the next block's header, this can never match
-# fields belonging to a different finding -- there is nothing else in the
-# string for it to match. The "Claims:" bullet lines themselves are skipped
-# non-greedily (`.*?` under DOTALL) rather than individually parsed -- the
+# Evidence request: <value>\n   Group: <label>\n   Reworded: <text>" WITHIN
+# a single block's already-isolated text span (see
+# _split_blocks_by_number). Because the span physically ends before the
+# next block's header, this can never match fields belonging to a
+# different finding -- there is nothing else in the string for it to
+# match. The "Claims:" bullet lines themselves are skipped non-greedily
+# (`.*?` under DOTALL) rather than individually parsed -- the
 # deterministic gate below only needs the "Unresolved:" value, "Remediation
-# impact:", "Group:", and "Reworded:"; requiring the model to enumerate
-# Claims: is what forces the per-dependency reasoning the gate then checks
-# for internal consistency, but the enumerated claim text itself is not
-# retained as structured data (see module docstring: this module never
-# judges evidence sufficiency, only the model's own consistency).
+# impact:", "Evidence request:", "Group:", and "Reworded:"; requiring the
+# model to enumerate Claims: is what forces the per-dependency reasoning
+# the gate then checks for internal consistency, but the enumerated claim
+# text itself is not retained as structured data (see module docstring:
+# this module never judges evidence sufficiency, only the model's own
+# consistency).
 #
 # "Remediation impact:" sits between "Unresolved:" and "Group:", and is
 # OPTIONAL in this pattern (unlike every other field here): a response in
@@ -103,13 +105,165 @@ _BLOCK_HEADER_RE = re.compile(r"^[ \t]*(\d+)\.\s*Claims:", re.MULTILINE)
 # unclear" fail-closed rule at the FIELD level rather than collapsing the
 # whole block the way a missing Group:/Reworded: already does (those two
 # remain mandatory, unchanged).
+#
+# "Evidence acquirability:" sits between "Remediation impact:" and
+# "Evidence request:", and is REGEX-OPTIONAL here for the same reason
+# every other later-added field is: a response missing the line entirely
+# must still match and parse every OTHER field exactly as before. It is
+# not optional at the CONTRACT level for a proof_required finding (see
+# prompts/finding_calibration.md's "Critical consistency contract") --
+# that requirement is enforced deterministically in Python, by
+# _parse_evidence_acquirability/_reconcile_acquirability_and_request
+# below, never by the regex itself.
+#
+# "Evidence request:" (post-calibration evidence-acquisition loop) sits
+# between "Evidence acquirability:" and "Group:", and is likewise
+# REGEX-optional: a response with no such line (every pre-existing
+# response, and every `validation_only`/`unclear` finding under the new
+# contract too) still matches and still parses every other field exactly
+# as before -- only `evidence_request` itself degrades to None (see
+# _parse_evidence_request and _parse_response's own handling of a
+# missing capture group).
 _BLOCK_FIELDS_RE = re.compile(
     r".*?Unresolved:\s*(.+?)\s*\n"
     r"(?:\s*Remediation impact:\s*(.+?)\s*\n)?"
+    r"(?:\s*Evidence acquirability:\s*(.+?)\s*\n)?"
+    r"(?:\s*Evidence request:\s*(.+?)\s*\n)?"
     r"\s*Group:\s*(\w+)\s*\n"
     r"\s*Reworded:\s*(.+?)\s*\Z",
     re.DOTALL,
 )
+
+# Closed vocabulary for the mandatory-when-proof_required "Evidence
+# acquirability:" declaration -- see prompts/finding_calibration.md.
+# "unclear" is the fail-closed default (mirrors _VALID_IMPACTS' own
+# "unclear"): a missing/malformed/unrecognized declaration on a
+# proof_required finding always parses to "unclear", never silently to
+# one of the three legitimate declared states.
+_VALID_ACQUIRABILITY = {"actionable", "not_expressible", "conceptual_scope"}
+
+# Reused verbatim from Planning's own evidence-request vocabulary
+# (remediation_planner.PLANNING_REQUEST_TYPES) -- deliberately duplicated
+# as a plain tuple literal here rather than imported, so this module keeps
+# its existing zero-cross-module-import shape (pipeline.py, which already
+# imports both modules, is where the two vocabularies are cross-checked --
+# see test_finding_calibration.py's own parity test against the Planning
+# constant). Never a third, independently-invented request-type set.
+_EVIDENCE_REQUEST_TYPES = ("file_source", "symbol_definition")
+
+
+def _parse_evidence_request(raw: "Optional[str]", impact: str) -> "Optional[Dict[str, Optional[str]]]":
+    """Parse one finding's optional "Evidence request:" field value.
+
+    Returns None (no actionable request) for: an absent/blank line, an
+    unrecognized `request_type`, a `file_source` request missing its file,
+    a `symbol_definition` request missing its file or symbol, any part
+    count other than 2 (file_source) or 3 (symbol_definition), or --
+    structurally, regardless of what the model wrote -- any finding whose
+    `impact` is not exactly "proof_required". This last rule is a
+    deterministic consistency gate, the same shape as `_parse_response`'s
+    existing Unresolved/Remediation-impact gates: the prompt already
+    instructs the model never to attach an Evidence request to a
+    validation_only/unclear finding, but this function never trusts that
+    instruction alone -- an evidence request is only ever structurally
+    retained when the SAME response's own Remediation impact field
+    independently says proof_required.
+
+    Never repairs a malformed request into a valid one (e.g. never guesses
+    a missing symbol, never drops an extra part) -- anything not exactly
+    one of the two accepted shapes fails closed to None, identically to
+    every other field in this module."""
+    if impact != "proof_required":
+        return None
+    text = (raw or "").strip()
+    if not text:
+        return None
+    parts = [p.strip() for p in text.split("|")]
+    if len(parts) not in (2, 3):
+        return None
+    request_type = parts[0].lower()
+    if request_type not in _EVIDENCE_REQUEST_TYPES:
+        return None
+    file_hint = parts[1]
+    symbol = parts[2] if len(parts) == 3 else ""
+    if not file_hint:
+        return None
+    if request_type == "file_source":
+        if symbol:
+            # A file_source request never carries a third (symbol) part --
+            # fail closed rather than silently discarding the extra part.
+            return None
+        symbol = None
+    else:  # symbol_definition
+        if not symbol:
+            return None
+    return {"request_type": request_type, "file_hint": file_hint, "symbol": symbol}
+
+
+def _parse_evidence_acquirability(raw: "Optional[str]", impact: str) -> "Optional[str]":
+    """Parse one finding's "Evidence acquirability:" field value.
+
+    Returns None when `impact` is not "proof_required" -- the concept is
+    meaningless outside a proof_required finding (mirrors `_parse_
+    evidence_request`'s own impact-gated shape exactly; a validation_
+    only/unclear finding never carries either field, structurally).
+
+    For a proof_required finding, this field is MANDATORY (see prompts/
+    finding_calibration.md's "Critical consistency contract"): returns
+    exactly one of "actionable", "not_expressible", "conceptual_scope"
+    when the model wrote exactly one of those three words, and "unclear"
+    for anything else -- missing, blank, malformed, or unrecognized.
+    "unclear" here is a REAL, distinct fail-closed signal (not merely
+    "absent"): a proof_required finding that never declared its
+    acquirability state at all is exactly as untrustworthy, for this
+    axis, as one that declared something unrecognized. Never inferred
+    from Claims/Unresolved/Reworded prose -- only this field's own
+    explicit text."""
+    if impact != "proof_required":
+        return None
+    value = (raw or "").strip().lower()
+    return value if value in _VALID_ACQUIRABILITY else "unclear"
+
+
+def _reconcile_acquirability_and_request(acquirability: "Optional[str]", evidence_request: "Optional[Dict]") -> "tuple[Optional[str], Optional[Dict]]":
+    """The ONE place the mandatory declaration/request consistency
+    contract (prompts/finding_calibration.md's "Critical consistency
+    contract") is enforced. The only two authoritative combinations for a
+    proof_required finding are `actionable` + exactly one valid request,
+    or `not_expressible`/`conceptual_scope` + no request. Every other
+    combination fails closed to `("unclear", None)`:
+      - `actionable` with no valid request (missing OR malformed --
+        `_parse_evidence_request` already returns None for both) --
+        an `actionable` declaration is only trustworthy when it is
+        actually backed by the request it claims exists.
+      - `not_expressible`/`conceptual_scope` with a request attached
+        anyway -- these two declarations forbid a request by definition;
+        one being present contradicts the declaration itself, so neither
+        may be trusted as-is.
+      - an already-"unclear" declaration (missing/malformed at the
+        single-field level -- see `_parse_evidence_acquirability`) never
+        acquires a request regardless of what text happened to follow
+        it.
+      - `acquirability is None` (a non-proof_required finding) passes
+        through unchanged -- `evidence_request` is already None for
+        every such finding via `_parse_evidence_request`'s own gate, so
+        this is a no-op, never a second place that gate is enforced.
+
+    Never invents, repairs, or infers a request from anything -- this
+    only cross-checks two already-independently-parsed, closed-
+    vocabulary fields against each other."""
+    if acquirability == "actionable":
+        if evidence_request is not None:
+            return "actionable", evidence_request
+        return "unclear", None
+    if acquirability in ("not_expressible", "conceptual_scope"):
+        if evidence_request is None:
+            return acquirability, None
+        return "unclear", None
+    # acquirability is None (not proof_required) or "unclear" (missing/
+    # malformed declaration) -- a request must never survive attached to
+    # either.
+    return acquirability, None
 
 
 def _split_blocks_by_number(resp: str) -> "Dict[int, Optional[str]]":
@@ -249,6 +403,45 @@ def _parse_response(resp: str, findings: List[str]) -> List[Dict[str, object]]:
                                         -- an empty Unresolved list leaves
                                         nothing for this axis to block on,
                                         per the prompt's own contract.
+      evidence_acquirability          : "actionable" | "not_expressible" |
+                                        "conceptual_scope" | "unclear" |
+                                        None -- see _parse_evidence_
+                                        acquirability. None whenever the
+                                        FINAL `remediation_impact` is not
+                                        "proof_required" (the concept is
+                                        meaningless there); "unclear" is a
+                                        real, distinct fail-closed value
+                                        for a proof_required finding whose
+                                        declaration was missing, malformed,
+                                        or inconsistent with its own
+                                        Evidence request (see
+                                        _reconcile_acquirability_and_
+                                        request) -- never silently
+                                        collapsed into one of the three
+                                        legitimate declared states.
+      evidence_request                : dict{"request_type", "file_hint",
+                                        "symbol"} | None -- see
+                                        _parse_evidence_request, then
+                                        _reconcile_acquirability_and_
+                                        request (the final authority).
+                                        None whenever the model wrote no
+                                        such line, wrote one that does not
+                                        parse as exactly one of the two
+                                        valid shapes, wrote one for a
+                                        finding whose FINAL `remediation_
+                                        impact` is not "proof_required",
+                                        or wrote one alongside a
+                                        `not_expressible`/`conceptual_
+                                        scope`/missing/malformed
+                                        `evidence_acquirability` (any of
+                                        which forbids a request). Only
+                                        ever non-None alongside
+                                        `evidence_acquirability ==
+                                        "actionable"`. This module never
+                                        acts on either field -- see
+                                        pipeline.py's bounded post-
+                                        calibration evidence-acquisition
+                                        orchestration, the only consumer.
     """
     blocks_by_number = _split_blocks_by_number(resp or "")
     results: List[Dict[str, object]] = []
@@ -256,7 +449,9 @@ def _parse_response(resp: str, findings: List[str]) -> List[Dict[str, object]]:
         block_text = blocks_by_number.get(i)
         fields = _BLOCK_FIELDS_RE.match(block_text) if block_text is not None else None
         if fields is not None:
-            unresolved_raw, impact_raw, group_raw, reworded = fields.groups()
+            (
+                unresolved_raw, impact_raw, acquirability_raw, evidence_request_raw, group_raw, reworded,
+            ) = fields.groups()
             group = group_raw.strip().lower()
             reworded = " ".join(reworded.split())
             impact = _parse_remediation_impact(impact_raw)
@@ -298,12 +493,34 @@ def _parse_response(resp: str, findings: List[str]) -> List[Dict[str, object]]:
                     # unparseable Unresolved field still keeps its own
                     # "unclear" impact, never "validation_only".
                     impact = "validation_only"
+            # Parsed only from the FINAL `impact` value, after every
+            # consistency gate above has already settled it -- neither
+            # the acquirability declaration nor the Evidence request can
+            # ever survive alongside a finding that isn't, in its FINAL
+            # form, proof_required, even if it started that way in the
+            # model's raw text before being normalized/downgraded above.
+            acquirability = _parse_evidence_acquirability(acquirability_raw, impact)
+            evidence_request = _parse_evidence_request(evidence_request_raw, impact)
+            # The mandatory declaration/request consistency contract --
+            # see _reconcile_acquirability_and_request's own docstring.
+            # Never skipped: a "proof_required" finding whose declaration
+            # and request contradict each other (or whose declaration is
+            # itself missing/malformed) must never surface either as
+            # authoritative.
+            acquirability, evidence_request = _reconcile_acquirability_and_request(acquirability, evidence_request)
         else:
             group = "hypothesis"
             reworded = original
             unresolved = []
             impact = "unclear"
             group_before_consistency_check = group
+            # A missing/unparseable block never acquires an authoritative
+            # acquirability state either -- impact is "unclear" here (not
+            # "proof_required"), so _parse_evidence_acquirability's own
+            # impact gate would already return None; set directly since
+            # there are no raw field strings to parse in this branch.
+            acquirability = None
+            evidence_request = None
         results.append({
             "original": original,
             "group": group,
@@ -311,6 +528,8 @@ def _parse_response(resp: str, findings: List[str]) -> List[Dict[str, object]]:
             "unresolved_dependencies": unresolved,
             "group_before_consistency_check": group_before_consistency_check,
             "remediation_impact": impact,
+            "evidence_acquirability": acquirability,
+            "evidence_request": evidence_request,
         })
     return results
 
@@ -359,21 +578,108 @@ def calibrate_findings(
 
     system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
     context_section = (
-        "## Repository evidence (selected by static analysis)\n\n" + code_context + "\n\n"
+        _EVIDENCE_HEADER + code_context + "\n\n"
     ) if code_context else ""
-    findings_section = "\n".join(f"{i}. {text}" for i, text in enumerate(findings, start=1))
+    findings_section = _render_findings_section(findings)
     user_message = (
         context_section
-        + "## Vulnerability report\n\n"
+        + _VULN_HEADER
         + vulnerability_text
-        + "\n\n## Proposed patch\n\n"
+        + _PATCH_HEADER
         + patch
-        + "\n\n## Findings to calibrate\n\n"
+        + _FINDINGS_HEADER
         + findings_section
     )
 
     resp = llm.complete(system_prompt, user_message, stage="finding_calibration")
     return _parse_response(resp, findings)
+
+
+# ---------------------------------------------------------------------------
+# Post-calibration evidence-acquisition loop: Finding Calibration's own
+# combined-request technical-capacity contract (Fix B).
+#
+# The exact fixed strings calibrate_findings() wraps around code_context/
+# vulnerability_text/patch/findings -- shared with compute_finding_
+# calibration_capacity() below so the overhead a capacity calculation
+# counts and the overhead an actual request sends can never independently
+# drift apart, exactly the same discipline patch_generator.py's
+# compute_patch_generation_capacity already established for Patch
+# Generation's own request.
+# ---------------------------------------------------------------------------
+
+_EVIDENCE_HEADER = "## Repository evidence (selected by static analysis)\n\n"
+_VULN_HEADER = "## Vulnerability report\n\n"
+_PATCH_HEADER = "\n\n## Proposed patch\n\n"
+_FINDINGS_HEADER = "\n\n## Findings to calibrate\n\n"
+
+
+def _render_findings_section(findings: List[str]) -> str:
+    return "\n".join(f"{i}. {text}" for i, text in enumerate(findings, start=1))
+
+
+def compute_finding_calibration_capacity(
+    vulnerability_text: str, patch: str, findings: "List[str]", *, reserved_output_tokens=None,
+):
+    """Real remaining capacity (in characters) for `code_context` in the
+    ACTUAL Finding Calibration request that will be sent -- accounts for
+    every fixed string calibrate_findings() itself sends alongside it: the
+    system prompt (`_PROMPT_PATH`), `_VULN_HEADER` + `vulnerability_text`,
+    `_PATCH_HEADER` + `patch`, `_FINDINGS_HEADER` + the rendered findings
+    list, and `_EVIDENCE_HEADER`'s own fixed text (code_context itself is
+    the one variable this contract is sizing, so its own length is never
+    part of the overhead).
+
+    Returns a `technical_capacity.SourceCapacityResult` -- `.source_
+    capacity_chars` is the ceiling the COMBINED (existing + newly
+    acquired) `code_context` must fit within."""
+    from .llm_client import resolve_active_model, resolve_max_tokens
+    from .technical_capacity import compute_source_capacity
+
+    system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
+    findings_section = _render_findings_section(findings or [])
+    known_overhead_chars = (
+        len(system_prompt) + len(_EVIDENCE_HEADER)
+        + len(_VULN_HEADER) + len(vulnerability_text or "")
+        + len(_PATCH_HEADER) + len(patch or "")
+        + len(_FINDINGS_HEADER) + len(findings_section)
+    )
+    provider, model = resolve_active_model()
+    return compute_source_capacity(
+        provider, model,
+        reserved_output_tokens=(resolve_max_tokens() if reserved_output_tokens is None else reserved_output_tokens),
+        known_overhead_chars=known_overhead_chars,
+    )
+
+
+def fit_calibration_evidence(existing_code_context: str, new_blocks, max_chars: int, *, capacity=None):
+    """Whole-block-or-omit fit of newly acquired evidence blocks alongside
+    the code_context Calibration #1 already used, against `max_chars` (see
+    `compute_finding_calibration_capacity`).
+
+    `existing_code_context` is treated as the one REQUIRED section --
+    Calibration #1 already relied on it, so it is reserved first and is
+    never itself dropped for capacity (see `patch_generator.
+    fit_patch_generation_context`'s own `required_label` semantics, which
+    this reuses directly rather than a second whole-block-fitting
+    implementation). `new_blocks`: an ordered list of (label, text) pairs
+    -- each included whole, in the given order, only as room remains
+    after `existing_code_context`; otherwise omitted whole (never
+    truncated) and recorded in the returned plan's own `omission_reason`/
+    `omitted_sizes`.
+
+    If `existing_code_context` alone does not fit `max_chars` (a rare,
+    defensive edge case -- Calibration #1's own capacity call already
+    should have prevented this), the returned plan's `required_missing`
+    is True and `rendered` is empty -- the caller must treat this as "no
+    rerun possible", never send an emptied-out request in its place."""
+    from .patch_generator import fit_patch_generation_context
+
+    _EXISTING_LABEL = "__existing_calibration_code_context__"
+    sections = [(_EXISTING_LABEL, existing_code_context)] + list(new_blocks)
+    return fit_patch_generation_context(
+        sections, max_chars, required_label=_EXISTING_LABEL, capacity=capacity,
+    )
 
 
 _GROUP_LABELS = {

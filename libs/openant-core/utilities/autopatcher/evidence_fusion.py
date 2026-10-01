@@ -16,6 +16,7 @@ candidate_selection.py/candidate_enrichment.py), pure data out.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from utilities.autopatcher.candidate_selection import CandidateSelection
 from utilities.autopatcher.repository_grounding_models import RepositoryCandidate
@@ -222,18 +223,20 @@ def _relationship_note(rel: CandidateRelationship) -> str:
 # ---------------------------------------------------------------------------
 
 DEFAULT_MAX_CHARS = 4_000
-"""Matches repo_locator.py's _MAX_CONTEXT_CHARS. Candidate selection is
-already bounded to at most DEFAULT_MAX_CANDIDATES (3) candidates
-(candidate_selection.py), so this budget is sized to normally preserve the
-complete deterministic understanding for all of them, not to further
-ration an already-small set."""
+"""Fix B: no longer read as the production ceiling for repository evidence
+visibility -- render_repository_understanding()'s two production callers
+(remediation_planner.py, pipeline.py) now always pass an explicit
+technical-capacity-derived `max_chars` (see utilities.autopatcher.
+technical_capacity). Retained ONLY as this function's own default for
+standalone/test callers, exactly mirroring FINAL_TARGET_SLICE_MAX_CHARS's
+post-Fix-B role in remediation_planner.py."""
 
 _MAX_LIST_ITEMS = 5
 """Per-list cap (callees, callers, tests, sinks, relationships, notes)
 before a deterministic "(+N more)" note. Keeps any single candidate's
-block bounded regardless of how noisy its enrichment is."""
-
-_TRUNCATION_MARKER = "\n\n*(truncated to fit the character budget)*\n"
+block bounded regardless of how noisy its enrichment is -- a formatting
+cap on one already-included candidate's own list length, never the thing
+that decides whether a candidate's block reaches the LLM at all."""
 
 _HEADING = "## Repository Understanding"
 
@@ -246,31 +249,94 @@ _PREAMBLE = (
 )
 
 
-def render_repository_understanding(
+class RepositoryUnderstandingPlan(NamedTuple):
+    """The complete, structured result of one render_repository_
+    understanding() decision -- Fix B: mirrors remediation_planner.py's
+    own `_SourceExcerptPlan` pattern (one real implementation of the
+    fitting decision; the plain string is only ever a projection of it).
+
+    `omission_reason`/`omitted_sizes` are populated (`"technical_capacity"`,
+    exact byte length) for every candidate this function's whole-block-or-
+    omit selection excluded -- never left as prose-only. `fixed_sections_
+    exceeded=True` marks the rare case where the mandatory scaffolding
+    (heading/preamble/relationships/notes/investigation-context -- never
+    the candidates themselves) alone exceeds `max_chars`; that case fails
+    closed to an empty `rendered` rather than truncating mid-line, exactly
+    like any other "mandatory non-source content exceeds real capacity"
+    outcome elsewhere in Fix B."""
+
+    rendered: str
+    included_paths: "frozenset[str]"
+    omitted_paths: "tuple[str, ...]"
+    omission_reason: "dict[str, str]"
+    omitted_sizes: "dict[str, int]"
+    max_chars: int
+    fixed_sections_exceeded: bool
+    capacity: "object | None" = None
+
+
+_MAX_OMISSION_NOTE_NAMES = 5
+"""At most this many omitted paths are named in the human-readable
+omission note before a "(+N more)" summary -- keeps the note's own length
+bounded regardless of how many candidates were omitted. The full,
+unbounded list always still exists structurally (see
+RepositoryUnderstandingPlan.omitted_paths) -- this only bounds the prose."""
+
+
+def _fit_omission_note(omitted_paths: "list[str]", max_chars: int, note_budget: int) -> str:
+    """The largest omission note that fits in `note_budget` chars, tried in
+    decreasing detail: full-ish name list (bounded to
+    _MAX_OMISSION_NOTE_NAMES) -> count-only -> nothing at all. The
+    structured `omission_reason`/`omitted_sizes` fields are the
+    authoritative record regardless of which variant (if any) fits here --
+    this function only ever affects the human-readable rendered text."""
+    shown = omitted_paths[:_MAX_OMISSION_NOTE_NAMES]
+    remainder = len(omitted_paths) - len(shown)
+    names_text = ", ".join(shown)
+    if remainder > 0:
+        names_text += f" (+{remainder} more)"
+    detailed = (
+        f"\n\n*{len(omitted_paths)} candidate(s) omitted to stay within the "
+        f"{max_chars}-character budget: {names_text}.*\n"
+    )
+    if len(detailed) <= note_budget:
+        return detailed
+
+    minimal = (
+        f"\n\n*{len(omitted_paths)} candidate(s) omitted to stay within the "
+        f"{max_chars}-character budget.*\n"
+    )
+    if len(minimal) <= note_budget:
+        return minimal
+
+    return ""
+
+
+def compute_repository_understanding_plan(
     understanding: RepositoryUnderstanding,
-    *,
     max_chars: int = DEFAULT_MAX_CHARS,
-) -> str:
-    """Render a RepositoryUnderstanding into one deterministic Markdown
-    block, starting with a top-level ``## Repository Understanding``
-    heading.
+    *,
+    capacity: "object | None" = None,
+) -> RepositoryUnderstandingPlan:
+    """The one real implementation behind render_repository_understanding()
+    -- see that function's docstring for the rendered-string contract this
+    reproduces exactly. Differs only in ALSO returning the structured
+    per-candidate provenance render_repository_understanding() itself
+    discards after rendering.
 
-    Candidates are rendered in the exact order already given by
+    Candidates are considered in the exact order already given by
     ``understanding.candidate_evidence`` (candidate_selection.py's
-    tier-descending, path-ascending order) -- this function never
-    re-sorts or re-selects. If the character budget cannot fit every
-    candidate, weaker (later) candidates are dropped first and an explicit
-    note names what was omitted; malformed truncation mid-candidate never
-    happens -- a candidate's block is included whole or not at all.
+    tier-descending, path-ascending order) -- never re-sorted or
+    re-selected. Every admission decision is whole-block-or-omit: a
+    candidate's block is included in full or not at all, never split
+    mid-content.
 
-    Never mutates ``understanding`` or anything it references. No LLM
-    calls, no I/O, no parsing.
-
-    The returned string never exceeds ``max_chars`` -- a final safety-net
-    truncation (at a line boundary, with an explicit marker) applies in the
-    unlikely case that even omitting every candidate can't make the fixed
-    sections (heading, preamble, relationships, notes, investigation-context
-    line) fit.
+    If the mandatory fixed sections (heading, preamble, relationships,
+    notes, investigation-context line -- never a candidate block) alone
+    exceed `max_chars`, this fails closed: every candidate is recorded
+    `omission_reason="technical_capacity"` and `rendered=""`,
+    `fixed_sections_exceeded=True` -- never a mid-line truncation of
+    whatever scaffolding didn't fit.
     """
     candidate_blocks = [
         _render_candidate(c, role)
@@ -287,46 +353,86 @@ def render_repository_understanding(
 
     if not candidate_blocks:
         body = "\nNo repository candidates were selected for investigation.\n"
+        rendered = header + body + "\n" + relationships_block + "\n" + notes_block + "\n" + context_block
+        return RepositoryUnderstandingPlan(
+            rendered=rendered, included_paths=frozenset(), omitted_paths=(),
+            omission_reason={}, omitted_sizes={}, max_chars=max_chars,
+            fixed_sections_exceeded=False, capacity=capacity,
+        )
+
+    fixed_cost = len(header) + len(relationships_block) + len(notes_block) + len(context_block)
+
+    if fixed_cost > max_chars:
+        # Mandatory non-candidate scaffolding alone exceeds real technical
+        # capacity -- fail closed rather than truncate mid-line. Every
+        # candidate is structurally recorded as omitted for this reason,
+        # even though none of them individually caused it.
+        all_paths = tuple(c.path for c in understanding.candidate_evidence)
+        return RepositoryUnderstandingPlan(
+            rendered="", included_paths=frozenset(), omitted_paths=all_paths,
+            omission_reason={p: "technical_capacity" for p in all_paths},
+            omitted_sizes={c.path: len(b) for c, b in zip(understanding.candidate_evidence, candidate_blocks)},
+            max_chars=max_chars, fixed_sections_exceeded=True, capacity=capacity,
+        )
+
+    budget_for_candidates = max_chars - fixed_cost
+
+    included: list[str] = []
+    included_paths: set[str] = set()
+    omitted_paths: list[str] = []
+    omission_reason: dict[str, str] = {}
+    omitted_sizes: dict[str, int] = {}
+    running = 0
+    for candidate, block in zip(understanding.candidate_evidence, candidate_blocks):
+        if running + len(block) <= budget_for_candidates:
+            included.append(block)
+            included_paths.add(candidate.path)
+            running += len(block)
+        else:
+            omitted_paths.append(candidate.path)
+            omission_reason[candidate.path] = "technical_capacity"
+            omitted_sizes[candidate.path] = len(block)
+
+    body = "\n" + "\n".join(included)
+    rendered_without_note = (
+        header + body + "\n" + relationships_block + "\n" + notes_block + "\n" + context_block
+    )
+
+    # The omission note is presentation only -- `omission_reason`/
+    # `omitted_sizes` above are the authoritative, structured record of
+    # what was omitted and why (Fix B). So the note is allowed to shrink,
+    # and as a last resort disappear from the rendered text entirely, but
+    # `rendered_without_note` itself (guaranteed <= max_chars by
+    # construction: fixed_cost + running <= fixed_cost + budget_for_
+    # candidates == max_chars) is NEVER truncated to make room for it.
+    if omitted_paths:
+        note_budget = max_chars - len(rendered_without_note)
+        note = _fit_omission_note(omitted_paths, max_chars, note_budget)
     else:
-        fixed_cost = len(header) + len(relationships_block) + len(notes_block) + len(context_block)
-        budget_for_candidates = max(max_chars - fixed_cost, 0)
+        note = ""
 
-        included: list[str] = []
-        omitted_paths: list[str] = []
-        running = 0
-        for candidate, block in zip(understanding.candidate_evidence, candidate_blocks):
-            if running + len(block) <= budget_for_candidates:
-                included.append(block)
-                running += len(block)
-            else:
-                omitted_paths.append(candidate.path)
+    rendered = header + body + note + "\n" + relationships_block + "\n" + notes_block + "\n" + context_block
 
-        body = "\n" + "\n".join(included)
-        if omitted_paths:
-            body += (
-                f"\n\n*{len(omitted_paths)} candidate(s) omitted to stay within the "
-                f"{max_chars}-character budget: {', '.join(omitted_paths)}.*\n"
-            )
-
-    rendered = header + body + "\n" + relationships_block + "\n" + notes_block + "\n" + context_block
-
-    if len(rendered) > max_chars:
-        rendered = _hard_clamp(rendered, max_chars)
-
-    return rendered
+    return RepositoryUnderstandingPlan(
+        rendered=rendered, included_paths=frozenset(included_paths), omitted_paths=tuple(omitted_paths),
+        omission_reason=omission_reason, omitted_sizes=omitted_sizes, max_chars=max_chars,
+        fixed_sections_exceeded=False, capacity=capacity,
+    )
 
 
-def _hard_clamp(rendered: str, max_chars: int) -> str:
-    """Absolute backstop: truncate at the last full line boundary that fits,
-    so the result is never split mid-item, and append an explicit marker.
-    Guarantees len(result) <= max_chars."""
-    limit = max_chars - len(_TRUNCATION_MARKER)
-    if limit <= 0:
-        return _TRUNCATION_MARKER[:max_chars]
-    cut = rendered.rfind("\n", 0, limit)
-    if cut <= 0:
-        cut = limit
-    return rendered[:cut] + _TRUNCATION_MARKER
+def render_repository_understanding(
+    understanding: RepositoryUnderstanding,
+    *,
+    max_chars: int = DEFAULT_MAX_CHARS,
+) -> str:
+    """Render a RepositoryUnderstanding into one deterministic Markdown
+    block, starting with a top-level ``## Repository Understanding``
+    heading. Thin wrapper around `compute_repository_understanding_plan` --
+    see that function's own docstring for the exact fitting/fail-closed
+    contract this reproduces. Never mutates ``understanding`` or anything
+    it references. No LLM calls, no I/O, no parsing.
+    """
+    return compute_repository_understanding_plan(understanding, max_chars).rendered
 
 
 _ROLE_LABELS = {

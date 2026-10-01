@@ -384,46 +384,46 @@ Why each step matters:
 
 ---
 
-## Section 5 — Baseline Run Flags
+## Section 5 — Baseline Run Flags (historical; Fix B)
 
 ```
 --context-budget-policy always
 --max-context-budget-windows 10
 ```
 
-Both flags are defined identically in the Go CLI (`patch.go`) and in
-`run_traced.py`, and are validated **only** in Python
-(`openant/cli.py:1652-1675` / `utilities/autopatcher/context_budget.py`) —
-Go is pure transport (`appendContextBudgetArgs` forwards a flag only if the
-user explicitly set it, never inferring a value).
+**Fix B (release hardening) retired the mechanism these flags used to
+control.** They are still accepted (both by the Go CLI and `run_traced.py`,
+forwarded verbatim to Python) so an existing script keeps working, but
+Python now only prints a one-time deprecation notice and otherwise ignores
+them — see `openant/cli.py`'s `cmd_patch`/`utilities.autopatcher.
+context_budget.ContextBudgetController`.
 
-What they actually govern, verified against `context_budget.py` and its
-call sites in `remediation_planner.py`:
+What governs repository-evidence visibility now, instead: every
+acquisition stage's rendering ceiling is the **real per-call technical
+source capacity** of the active model — see `utilities.autopatcher.
+technical_capacity.compute_source_capacity()`. This is derived from
+`core.model_registry.context_window_tokens()` (or one documented,
+provider-independent conservative fallback when the registry has no entry
+for the active model) minus the exact, already-known overhead of that
+call's own system prompt/vulnerability text/other non-source content,
+converted to a character ceiling via one fixed, deliberately conservative
+`CONSERVATIVE_CHARS_PER_TOKEN` ratio. There is no "window" concept left to
+extend, and no policy to choose — this ceiling applies identically whether
+or not these two flags are passed.
 
-- **`--context-budget-policy`** controls whether the pipeline is allowed to
-  request *additional fixed-size windows* of repository source text once a
-  stage's character budget for gathering context is exhausted. This is a
-  **capacity** ceiling, not a safety or verification gate.
-  - `never` — always refuses (fail-closed on exhaustion).
-  - `always` — auto-approves extensions up to the hard cap below.
-  - `ask` — interactive Y/N prompt (default No) if stdin is a TTY, otherwise
-    silently degrades to `never`.
-- **`--max-context-budget-windows`** — a hard ceiling on total windows
-  (initial + every approved extension) per acquisition stage, enforced
-  regardless of policy. Once reached, further extension requests fail
-  closed even under `always`.
+The old per-stage `"budget_trace"` field (`ContextBudgetController.
+to_trace_dict()`, embedded in `edit_readiness_*.json`/
+`post_patch_recovery_*.json`, see §10) still exists, but now reports the
+technical-capacity decision for each stage — `capacity_source`
+(`"model_registry"` or `"conservative_fallback"`), `context_window_tokens`,
+`chars_per_token_ratio`, `known_overhead_chars`, and the resulting
+`source_capacity_chars` — never a window/policy state.
 
-Using `always` + `10` for baseline/regression runs means: don't let an
-artificially small context window be the reason a run under-performs, but
-still cap total growth so a run can't spiral unboundedly. Every extension
-decision (policy, decision source, per-stage window counts) is recorded in
-`ContextBudgetController.to_trace_dict()`, which is embedded verbatim as a
-`"budget_trace"` field inside the `edit_readiness_*.json` and
-`post_patch_recovery_*.json` debug artifacts (see §10) — useful when a run's
-behavior seems context-starved.
-
-Use these two flags in every standard real-CVE regression command, unless
-the experiment is specifically about context-budget behavior itself.
+**These two flags are no longer needed in a real-CVE regression command.**
+Passing them is harmless (a deprecation notice fires, nothing else
+changes); omitting them is now the recommended default, since the default
+path already uses the real technical capacity rather than a small fixed
+ceiling.
 
 ---
 
@@ -1541,3 +1541,113 @@ per stage, each time pointing `--source-run` at the previous hop's
 `--output` — that is a real, fully-supported workflow, just not a single
 multi-stage command yet. Don't assume a flag or behavior described here
 extends beyond what's shown above.
+
+---
+
+## Section 25 — Blind Evaluation (historical regressions only)
+
+`run_traced.py --cve <id> --repo-root <checkout> --blind-evaluation` runs a
+historical CVE regression without handing the system under test the known
+remediation. It is evaluation-only and off by default. `openant patch` and
+`run_traced.py` without the flag behave exactly as before, and their
+manifests never gain a `blind_evaluation` key. Implementation:
+`blind_evaluation.py` (this directory).
+
+**Where it acts.** On the output of `cve_converter.cve_to_vuln_text`, i.e.
+*after* normal rendering (the converter's first-five-references selection is
+never refilled), and only on lines inside the rendered `## References`
+section. The raw NVD record, the converter, the fetcher and `core.patch` are
+not modified; the interception is scoped to one `run_patch_cve()` call and
+both wrapped functions are restored on exit.
+
+**Filter contract `blind-evaluation-filter/v1`.**
+
+| Reference form | Action |
+|---|---|
+| exactly `https://github.com/<owner>/<repo>/commit/<7-40 lowercase hex>` | removed (whole line) |
+| exactly `https://github.com/<owner>/<repo>/compare/<ref>...<ref>` | removed (whole line) |
+| any other `github.com` / `www.github.com` URL whose repository-relative route (after `/<owner>/<repo>/`) is `commit`, `commits`, `compare`, `pull` or `pulls` — e.g. query/fragment/trailing slash/`.patch`/`.diff` suffix, uppercase hex or route, two-dot or malformed range, `http://`, `www.`, port, userinfo, malformed owner/repo — or whose repository path ends in `.patch`/`.diff` | **abort before the pipeline**, reported, never removed |
+| non-GitHub hosts: a path segment `commit`, `commits`, `compare`, `pull`, `pulls`, `pull-requests`, `merge_requests`, `merge-requests`, `changeset(s)`, `diff`; a `.patch`/`.diff` path; a gitweb commit/commitdiff/patch query (GitLab, Bitbucket, Gitea/Codeberg, cgit `/commit/`, Trac) | **abort before the pipeline**, reported, never removed |
+| issues, advisory pages, mailing lists, NVD, project pages | kept |
+
+"Exactly" means the whole URL is `https://github.com` + the path: no query,
+fragment, trailing slash, suffix, port, userinfo, or host/scheme variant.
+`<owner>` is alphanumerics with single inner hyphens; `<repo>` is
+`[A-Za-z0-9._-]+` (not `.`/`..`); each compare `<ref>` is non-empty, does not
+start or end with `.`, contains no `..`, and does not end in `.diff`/`.patch`.
+GitHub owner and repository *names* are never inspected — an owner or repo
+called `diff`, `pull`, `compare` or `commit` does not trigger an abort.
+
+Nothing is rewritten and nothing is inserted. A removable or unsupported
+code-change URL in prose (outside References) aborts the run as well.
+Zero removable references is a valid blind run (identical hashes).
+
+**Known V1 limitation.** V1 is not a universal forge detector. Code-change
+links on other platforms — Gerrit / googlesource gitiles (`…/+/<rev>`,
+`/c/<project>/+/<n>`), Mercurial (`/rev/<hex>`), cgit `/patch/` — are **not
+recognized** and are kept as ordinary references; so are scheme-less links
+and bare revision hashes in prose. V1 was scoped to the GitHub-hosted release
+regression suite. Before using blind mode on a CVE whose references include
+another forge, review its rendered References manually, or extend the policy
+in a separately reviewed rule version.
+
+**Verification.** `pipeline.run` is guarded for the duration of the run: it
+proceeds only if the converter was intercepted exactly once and the incoming
+`vulnerability_text` hashes to the blinded SHA256. After the run, the
+`-vulnerability.md` artifact is checked against the same hash. Any deviation
+is a `BlindEvaluationError` → failure manifest, exit code 2.
+
+**Audit trail.** `run_manifest.json` → `blind_evaluation` (rule id, status,
+original/blinded SHA256, removed lines/URLs, per-reference classification,
+unsupported references, converter interception count, pipeline entry count,
+pipeline-input hash and verification result). `trace/blind_evaluation/`
+holds `original_vulnerability.md`, `blinded_vulnerability.md`,
+`removed_reference_lines.txt` and `blind_evaluation.json`; it is written only
+after the pipeline has finished, and `--output`/`--trace-dir` must be outside
+`--repo-root` so the original text is never reachable by the run. Containment
+is checked after resolving symlinks and `..`, and by filesystem identity of
+existing ancestors (`os.path.samestat`), so case-variant spellings on a
+case-insensitive filesystem and macOS `/System/Volumes/Data` aliases of the
+repository are rejected too.
+
+**Opt-in extension: `--blind-strip-same-repo-github-references`
+(`blind-evaluation-same-repo-github/v1`).** Valid only together with
+`--blind-evaluation`; supplied alone, `run_traced.py` exits 2 before doing
+anything. Without it, blind evaluation is exactly the V1 contract above.
+
+- **Target identity.** Read from `--repo-root`'s local `origin` remote
+  (`git remote get-url origin` — configuration only, never contacted). Accepted
+  forms: `https://github.com/<owner>/<repo>[.git]`, `http://`, `www.`,
+  userinfo, `ssh://git@github.com[:port]/<owner>/<repo>[.git]`, and
+  `git@github.com:<owner>/<repo>[.git]`; trailing slashes and one `.git` are
+  dropped. Anything else (no origin, another forge, a deeper path, `git://`,
+  `file://`) → exit 2 before the pipeline. `--repo-root` must itself be the
+  repository's top level (`git rev-parse --show-toplevel` is the same
+  directory, compared by filesystem identity); a subdirectory, or a plain
+  directory nested inside another repository, → exit 2 (identity is never
+  inherited from an enclosing repository). The remote is exposed — manifest,
+  sidecar, diagnostics — only with URL userinfo removed
+  (`https://user:secret@github.com/o/r.git` → `https://github.com/o/r.git`,
+  `git@github.com:o/r.git` → `github.com:o/r.git`).
+- **Rule.** Additionally remove a References line whose URL is an `http(s)`
+  `github.com`/`www.github.com` URL whose first two path segments are exactly
+  that `<owner>/<repo>` (case-insensitive, as on GitHub) — any route
+  (`pull`, `issues`, `commit`, `compare`, `releases`, `discussions`, …) or the
+  repository page itself. Matching is by repository identity and whole path
+  segments, never by route list or substring: `<owner>/<repo>-other` and
+  other owners are different repositories.
+- **Interaction with V1.** V1 runs first, unchanged. A line V1 removes is
+  attributed to V1 only (never double-counted). An unsupported same-repository
+  code-change line (e.g. a `pull` URL) is removed by this policy instead of
+  aborting. Unsupported references to any other repository or host, and every
+  code-change URL outside the References section (same repository included),
+  keep the V1 behavior (abort). Same-repository URLs in prose are never removed.
+- **Audit.** The `blind_evaluation` manifest block (and sidecar
+  `blind_evaluation.json`) gains, only in this mode: `removed_by_v1`,
+  `removed_same_repo_github`, and `same_repo_github_policy` (`policy_id`,
+  `target_repository`, `target_source`, `target_remote_url`). Existing fields
+  keep their meaning: `removed_references` / `removed_reference_lines` /
+  `removed_count` list every removed line in document order;
+  `original_sha256` / `blinded_sha256` hash the exact original and final text;
+  `rule_id` stays `blind-evaluation-filter/v1`. Default-mode manifests are
+  unchanged.

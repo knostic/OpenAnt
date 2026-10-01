@@ -177,6 +177,31 @@ def _resolve_max_tokens() -> int:
     return DEFAULT_MAX_TOKENS
 
 
+def resolve_max_tokens() -> int:
+    """Public wrapper around `_resolve_max_tokens()` -- the real output-
+    token reserve any call through this module's `complete()`/`call_llm()`
+    will actually request. Fix B: `utilities.autopatcher.technical_capacity`'s
+    per-call source-capacity equation needs this exact, already-resolved
+    number (never a guess) to compute how much of a model's total context
+    window remains available for repository source evidence."""
+    return _resolve_max_tokens()
+
+
+def resolve_active_model() -> "tuple[str, str] | tuple[None, None]":
+    """The (provider, model) pair actually in force for this run, if a
+    real LLM call has already resolved one -- (None, None) otherwise (no
+    call has run yet, or this process is in mock mode, which never
+    populates `_cached_model`). Never triggers resolution itself, never
+    raises. Fix B: lets `technical_capacity.compute_source_capacity()`
+    look up the active model's real context-window capacity from
+    `core.model_registry` without threading a new parameter through every
+    evidence-rendering call site -- mirrors how `progress`/other cross-
+    cutting run state already live as module globals in this codebase."""
+    if _cached_provider and _cached_provider in _cached_model:
+        return _cached_provider, _cached_model[_cached_provider]
+    return None, None
+
+
 # ---------------------------------------------------------------------------
 # Mock responses – keyed by the first few words of the system prompt so each
 # pipeline stage gets a realistic-looking placeholder.

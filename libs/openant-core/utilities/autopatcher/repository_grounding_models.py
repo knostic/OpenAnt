@@ -100,6 +100,15 @@ class GroundingDecision:
     snippet_ranges: "list | None"  # shape exactly as find_code_context() stores it today
     bytes_contributed: int
     truncated: bool
+    # Fix B: a candidate's proposed snippet is now whole-block-or-omit
+    # against real per-call technical capacity (see utilities.autopatcher.
+    # technical_capacity) -- `truncated` is never set True anymore (nothing
+    # is ever sliced mid-content). `omission_reason` is set to
+    # "technical_capacity" when a fully-resolved, deterministically-chosen
+    # snippet did not fit and was omitted whole, never partially included.
+    # `None` (the default) means "included" or "never a capacity question
+    # at all" (e.g. never reached this candidate).
+    omission_reason: "str | None" = None
 
 
 @dataclass

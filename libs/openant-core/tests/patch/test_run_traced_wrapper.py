@@ -117,7 +117,14 @@ class TestHelpAndValidation:
 
 
 class TestBudgetWiring:
-    def test_parsed_values_reach_production_controller(self, run_traced):
+    """Fix B: --context-budget-policy/--max-context-budget-windows are
+    deprecated no-ops -- still parsed and accepted (never a crash for an
+    unmigrated invocation), but no longer selected a policy/window-count
+    on the controller (which no longer has either concept). The real
+    technical-capacity ceiling is identical regardless of what these
+    flags say."""
+
+    def test_parsed_values_still_produce_a_real_controller(self, run_traced):
         parser = run_traced.build_parser()
         args = parser.parse_args(
             ["--cve", "X", "--repo-root", "/tmp",
@@ -126,24 +133,39 @@ class TestBudgetWiring:
         )
         controller = run_traced.resolve_budget_controller(args)
         assert isinstance(controller, run_traced.ContextBudgetController)
-        assert controller.policy == "always"
-        assert controller.max_windows == 10
+        # No policy/max_windows attributes exist anymore -- there is
+        # nothing left on the controller for these deprecated values to
+        # have set.
+        assert not hasattr(controller, "policy")
+        assert not hasattr(controller, "max_windows")
 
-    def test_default_policy_matches_cli_when_omitted_interactive(self, run_traced, monkeypatch):
+    def test_omitted_flags_produce_the_same_real_controller(self, run_traced, monkeypatch):
+        """Interactive vs. non-interactive TTY state used to change the
+        default policy -- it no longer matters at all: the controller
+        built is behaviorally identical either way."""
+        parser = run_traced.build_parser()
+        args = parser.parse_args(["--cve", "X", "--repo-root", "/tmp"])
+
         monkeypatch.setattr(run_traced.sys.stdin, "isatty", lambda: True)
-        parser = run_traced.build_parser()
-        args = parser.parse_args(["--cve", "X", "--repo-root", "/tmp"])
-        controller = run_traced.resolve_budget_controller(args)
-        assert controller.policy == "ask"
-        assert controller.max_windows == run_traced.DEFAULT_MAX_CONTEXT_BUDGET_WINDOWS
-
-    def test_default_policy_matches_cli_when_omitted_non_interactive(self, run_traced, monkeypatch):
+        interactive = run_traced.resolve_budget_controller(args)
         monkeypatch.setattr(run_traced.sys.stdin, "isatty", lambda: False)
+        non_interactive = run_traced.resolve_budget_controller(args)
+
+        assert interactive.effective_budget("planner_evidence") == non_interactive.effective_budget(
+            "planner_evidence",
+        )
+
+    def test_deprecation_notice_fires_only_when_flags_are_passed(self, run_traced, capsys):
         parser = run_traced.build_parser()
-        args = parser.parse_args(["--cve", "X", "--repo-root", "/tmp"])
-        controller = run_traced.resolve_budget_controller(args)
-        assert controller.policy == "never"
-        assert controller.max_windows == 10
+        args_with_flags = parser.parse_args(
+            ["--cve", "X", "--repo-root", "/tmp", "--context-budget-policy", "always"],
+        )
+        run_traced.resolve_budget_controller(args_with_flags)
+        assert "no longer control" in capsys.readouterr().err
+
+        args_without_flags = parser.parse_args(["--cve", "X", "--repo-root", "/tmp"])
+        run_traced.resolve_budget_controller(args_without_flags)
+        assert capsys.readouterr().err == ""
 
 
 class TestNoDuplicatedBudgetLogic:
@@ -424,8 +446,11 @@ class TestFailedRunManifest:
         assert manifest["status"] == "failed"
         assert manifest["error_type"] == "RuntimeError"
         assert "simulated pipeline failure" in manifest["error_message"]
-        assert manifest["context_budget_policy"] in ("ask", "always", "never")
-        assert isinstance(manifest["max_context_budget_windows"], int)
+        # Fix B: these deprecated flags were never passed here, and no
+        # longer get resolved to an inferred policy string -- the
+        # manifest now records exactly what the CLI received (nothing).
+        assert manifest["context_budget_policy"] is None
+        assert manifest["max_context_budget_windows"] is None
         assert manifest["checkpoints_file"] == checkpoints_path.name
         assert isinstance(manifest["llm_call_count"], int)
         assert isinstance(manifest["autopatcher_debug_artifacts"], list)
@@ -705,8 +730,9 @@ class TestCompareExistingTestsDoesNotAffectBudgetFlags:
             "--compare-existing-tests",
         ])
         controller = run_traced.resolve_budget_controller(args)
-        assert controller.policy == "always"
-        assert controller.max_windows == 10
+        assert isinstance(controller, run_traced.ContextBudgetController)
+        assert args.context_budget_policy == "always"
+        assert args.max_context_budget_windows == 10
         assert args.compare_existing_tests is True
 
     def test_budget_flags_unaffected_when_compare_existing_tests_omitted(self, run_traced):
@@ -717,8 +743,9 @@ class TestCompareExistingTestsDoesNotAffectBudgetFlags:
             "--max-context-budget-windows", "10",
         ])
         controller = run_traced.resolve_budget_controller(args)
-        assert controller.policy == "always"
-        assert controller.max_windows == 10
+        assert isinstance(controller, run_traced.ContextBudgetController)
+        assert args.context_budget_policy == "always"
+        assert args.max_context_budget_windows == 10
         assert args.compare_existing_tests is False
 
 

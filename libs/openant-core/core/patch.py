@@ -260,9 +260,14 @@ def _run_engine_and_write_artifacts(
 
     budget_controller is additive too: an optional
     utilities.autopatcher.context_budget.ContextBudgetController, threaded
-    unmodified into pipeline.run() -- omitted (None), this engine's
-    pre-existing fixed-budget, fail-closed behavior for repository source/
-    context acquisition is unchanged.
+    unmodified into pipeline.run(). Fix B: this no longer selects between
+    "a small fixed budget" and "a larger, policy-approved one" -- every
+    acquisition stage is always bounded by the real per-call technical
+    capacity of the active model (see utilities.autopatcher.
+    technical_capacity). Omitted (None), this engine computes that exact
+    same technical-capacity ceiling fresh on each call instead of caching
+    it on a controller instance -- "no controller" has never meant "no
+    ceiling", and it never means "a smaller, arbitrary ceiling" either.
 
     compare_existing_tests is additive too: threaded unmodified into
     pipeline.run()'s compare_existing_tests parameter (default False).

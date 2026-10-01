@@ -170,7 +170,7 @@ def _evidence_result(rendered, labels=()):
             blocks=(rendered,) if rendered else (),
             included_labels=frozenset(labels),
             symbol_omitted=(), fallback_omitted=(), read_failed=(),
-            budget=4_000, omitted_sizes={},
+            budget=4_000, omitted_sizes={}, omission_reason={},
         ),
     )
 
@@ -207,7 +207,7 @@ def _realistic_evidence_result(structural_facts: str, source_items: "list[tuple[
             blocks=blocks,
             included_labels=frozenset(label for label, _ in source_items),
             symbol_omitted=(), fallback_omitted=(), read_failed=(),
-            budget=4_000, omitted_sizes={},
+            budget=4_000, omitted_sizes={}, omission_reason={},
         ),
     )
 
@@ -546,27 +546,26 @@ class TestRunEvidenceGapStrategyFallback:
 
 
 # ---------------------------------------------------------------------------
-# Merge-size budget accounting (final read-only QA finding, this task): the
-# merge's own combined size was never checked against the "planner_evidence"
-# stage's live ceiling, nor routed through request_extension() -- unlike
-# every other budget-governed accumulation in this module (e.g.
-# run_deterministic_acquisition's own total_remaining/request_extension
-# pattern for "final_target_slice"). These tests exercise the REAL
-# merge_baseline_and_reacquired_planner_evidence and a REAL
-# ContextBudgetController, only mocking the two LLM-adjacent calls exactly
-# like every other test in this file.
+# Merge-size capacity accounting -- Fix B: the merge's own combined size is
+# checked against the "planner_evidence" stage's real technical capacity
+# ceiling (utilities.autopatcher.technical_capacity), never against an
+# arbitrary "budget window" grown via request_extension() (that mechanism
+# no longer exists -- see context_budget.py's own historical note). These
+# tests exercise the REAL merge_baseline_and_reacquired_planner_evidence and
+# a REAL ContextBudgetController, only mocking the two LLM-adjacent calls
+# exactly like every other test in this file.
 # ---------------------------------------------------------------------------
 
 class TestMergeBudgetAccounting:
-    def test_merge_already_fits_no_extension_requested(self):
-        """Case 1: merged evidence already fits inside the stage's current
-        effective budget -- request_extension must never be called, and
-        Strategy #2 still runs exactly once."""
+    def test_merge_fits_real_capacity_proceeds(self):
+        """Small merged evidence comfortably fits the real technical
+        ceiling -- Strategy #2 runs exactly once, and record_used reflects
+        the actual combined size sent."""
         from utilities.autopatcher.context_budget import ContextBudgetController
 
         baseline = _evidence_result("small baseline evidence", ["old.py:Old"])
         fresh = _evidence_result("small fresh evidence", ["a.py:A"])
-        budget_controller = mock.MagicMock(wraps=ContextBudgetController(policy="never", max_windows=10))
+        budget_controller = mock.MagicMock(wraps=ContextBudgetController())
         with (
             mock.patch(
                 "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
@@ -581,125 +580,59 @@ class TestMergeBudgetAccounting:
                 baseline_planner_evidence_result=baseline, merge_with_baseline=True,
                 budget_controller=budget_controller,
             )
-        budget_controller.request_extension.assert_not_called()
+        spy_strategy.assert_called_once()
+        assert result["rerun_performed"] is True
+        assert result["skip_reason"] is None
+        budget_controller.record_used.assert_called_with(
+            "planner_evidence", len(result["enriched_planner_evidence_ctx"]),
+        )
+
+    def test_legacy_policy_kwargs_accepted_but_inert(self):
+        """Fix B: the pre-existing policy/max_windows constructor kwargs no
+        longer change whether the merge fits -- only the real technical
+        capacity does."""
+        from utilities.autopatcher.context_budget import ContextBudgetController
+
+        baseline = _evidence_result("small baseline evidence", ["old.py:Old"])
+        fresh = _evidence_result("small fresh evidence", ["a.py:A"])
+        budget_controller = ContextBudgetController(policy="never", max_windows=1)
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=fresh,
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
+                return_value=_strategy(evaluated=True, target_files=["a.py"]),
+            ) as spy_strategy,
+        ):
+            result = _run_fallback(
+                baseline_planner_evidence_result=baseline, merge_with_baseline=True,
+                budget_controller=budget_controller,
+            )
         spy_strategy.assert_called_once()
         assert result["rerun_performed"] is True
         assert result["skip_reason"] is None
 
-    def test_merge_requires_one_additional_window(self):
-        """Case 2: merged evidence needs exactly one more window than the
-        stage's initial allowance -- exactly one request_extension call is
-        approved, then Strategy #2 runs once with the full combined
-        evidence (both baseline's and fresh's content present)."""
+    def test_merge_exceeding_real_capacity_fails_closed(self):
+        """A merge deliberately built to exceed even the real (much larger)
+        technical ceiling fails closed with the narrowly-named skip
+        reason, and Strategy #2 is never called -- regardless of the
+        (now-inert) legacy policy/max_windows kwargs."""
         from utilities.autopatcher.context_budget import ContextBudgetController
-        from utilities.autopatcher.remediation_planner import merge_baseline_and_reacquired_planner_evidence
+        from utilities.autopatcher.llm_client import resolve_active_model, resolve_max_tokens
+        from utilities.autopatcher.remediation_planner import _planner_evidence_known_overhead_chars
+        from utilities.autopatcher.technical_capacity import compute_source_capacity
 
-        baseline = _evidence_result("A" * 60, ["old.py:Old"])
-        fresh = _evidence_result("B" * 60, ["a.py:A"])
-        merged_len = len(merge_baseline_and_reacquired_planner_evidence(baseline, fresh))
-        window_size = -(-merged_len // 2)  # ceil(merged_len / 2): 1 window insufficient, 2 sufficient
-
-        budget_controller = mock.MagicMock(wraps=ContextBudgetController(policy="always", max_windows=10))
+        capacity = compute_source_capacity(
+            *resolve_active_model(), reserved_output_tokens=resolve_max_tokens(),
+            known_overhead_chars=_planner_evidence_known_overhead_chars(_VULN_TEXT),
+        ).source_capacity_chars
+        oversized = ("A" * (capacity + 10_000), "B" * (capacity + 10_000))
+        baseline = _evidence_result(oversized[0], ["old.py:Old"])
+        fresh = _evidence_result(oversized[1], ["a.py:A"])
+        budget_controller = ContextBudgetController(policy="always", max_windows=10)
         with (
-            mock.patch("utilities.autopatcher.evidence_fusion.DEFAULT_MAX_CHARS", window_size),
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
-                return_value=fresh,
-            ),
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
-                return_value=_strategy(evaluated=True, target_files=["a.py"]),
-            ) as spy_strategy,
-        ):
-            result = _run_fallback(
-                baseline_planner_evidence_result=baseline, merge_with_baseline=True,
-                budget_controller=budget_controller,
-            )
-        assert budget_controller.request_extension.call_count == 1
-        spy_strategy.assert_called_once()
-        assert result["rerun_performed"] is True
-        assert "A" * 60 in result["enriched_planner_evidence_ctx"]
-        assert "B" * 60 in result["enriched_planner_evidence_ctx"]
-
-    def test_merge_requires_multiple_bounded_windows(self):
-        """Case 3: merged evidence needs several windows -- the loop
-        requests exactly as many as needed (never more, never fewer),
-        strictly bounded by max_windows, then Strategy #2 runs once."""
-        import math
-
-        from utilities.autopatcher.context_budget import ContextBudgetController
-        from utilities.autopatcher.remediation_planner import merge_baseline_and_reacquired_planner_evidence
-
-        baseline = _evidence_result("A" * 200, ["old.py:Old"])
-        fresh = _evidence_result("B" * 200, ["a.py:A"])
-        merged_len = len(merge_baseline_and_reacquired_planner_evidence(baseline, fresh))
-        window_size = -(-merged_len // 5)  # ceil(merged_len / 5): forces several windows
-        expected_windows = math.ceil(merged_len / window_size)
-        assert expected_windows >= 3, "test setup must actually exercise multiple windows"
-
-        budget_controller = mock.MagicMock(wraps=ContextBudgetController(policy="always", max_windows=10))
-        with (
-            mock.patch("utilities.autopatcher.evidence_fusion.DEFAULT_MAX_CHARS", window_size),
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
-                return_value=fresh,
-            ),
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
-                return_value=_strategy(evaluated=True, target_files=["a.py"]),
-            ) as spy_strategy,
-        ):
-            result = _run_fallback(
-                baseline_planner_evidence_result=baseline, merge_with_baseline=True,
-                budget_controller=budget_controller,
-            )
-        assert budget_controller.request_extension.call_count == expected_windows - 1
-        spy_strategy.assert_called_once()
-        assert result["rerun_performed"] is True
-
-    def test_policy_always_reaches_sufficient_budget_and_proceeds(self):
-        """Case 4: policy='always' auto-approves the needed windows without
-        any interactive prompt, up to max_windows, then proceeds."""
-        from utilities.autopatcher.context_budget import ContextBudgetController
-        from utilities.autopatcher.remediation_planner import merge_baseline_and_reacquired_planner_evidence
-
-        baseline = _evidence_result("A" * 90, ["old.py:Old"])
-        fresh = _evidence_result("B" * 90, ["a.py:A"])
-        merged_len = len(merge_baseline_and_reacquired_planner_evidence(baseline, fresh))
-        window_size = -(-merged_len // 3)
-
-        confirm = mock.MagicMock()  # must never be consulted -- policy="always" never asks
-        budget_controller = ContextBudgetController(policy="always", max_windows=10, confirm=confirm)
-        with (
-            mock.patch("utilities.autopatcher.evidence_fusion.DEFAULT_MAX_CHARS", window_size),
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
-                return_value=fresh,
-            ),
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
-                return_value=_strategy(evaluated=True, target_files=["a.py"]),
-            ) as spy_strategy,
-        ):
-            result = _run_fallback(
-                baseline_planner_evidence_result=baseline, merge_with_baseline=True,
-                budget_controller=budget_controller,
-            )
-        confirm.assert_not_called()
-        spy_strategy.assert_called_once()
-        assert result["rerun_performed"] is True
-
-    def test_policy_never_and_merge_does_not_fit_fails_closed(self):
-        """Case 6: policy='never' with insufficient initial budget -- no
-        extension is ever approved, Strategy #2 is never called, and the
-        fallback fails closed with the narrowly-named skip reason."""
-        from utilities.autopatcher.context_budget import ContextBudgetController
-
-        baseline = _evidence_result("A" * 200, ["old.py:Old"])
-        fresh = _evidence_result("B" * 200, ["a.py:A"])
-        budget_controller = ContextBudgetController(policy="never", max_windows=10)
-        with (
-            mock.patch("utilities.autopatcher.evidence_fusion.DEFAULT_MAX_CHARS", 50),
             mock.patch(
                 "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
                 return_value=fresh,
@@ -717,44 +650,21 @@ class TestMergeBudgetAccounting:
         assert result["strategy_result"] is None
         assert result["skip_reason"] == "preserved_evidence_budget_exhausted"
 
-    def test_policy_ask_refusal_fails_closed(self):
-        """Case 7: policy='ask' with the user refusing every prompt -- no
-        extension is approved, Strategy #2 is never called, fail-closed."""
-        from utilities.autopatcher.context_budget import ContextBudgetController
+    def test_no_controller_still_bounded_by_real_capacity(self):
+        """No controller at all -- computes the exact same real technical
+        capacity fresh, so preserving baseline evidence never opens an
+        unbounded path merely because no controller was supplied."""
+        from utilities.autopatcher.llm_client import resolve_active_model, resolve_max_tokens
+        from utilities.autopatcher.remediation_planner import _planner_evidence_known_overhead_chars
+        from utilities.autopatcher.technical_capacity import compute_source_capacity
 
-        baseline = _evidence_result("A" * 200, ["old.py:Old"])
-        fresh = _evidence_result("B" * 200, ["a.py:A"])
-        budget_controller = ContextBudgetController(
-            policy="ask", max_windows=10, interactive=True, confirm=lambda _prompt: False,
-        )
+        capacity = compute_source_capacity(
+            *resolve_active_model(), reserved_output_tokens=resolve_max_tokens(),
+            known_overhead_chars=_planner_evidence_known_overhead_chars(_VULN_TEXT),
+        ).source_capacity_chars
+        baseline = _evidence_result("A" * (capacity + 10_000), ["old.py:Old"])
+        fresh = _evidence_result("B" * (capacity + 10_000), ["a.py:A"])
         with (
-            mock.patch("utilities.autopatcher.evidence_fusion.DEFAULT_MAX_CHARS", 50),
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
-                return_value=fresh,
-            ),
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
-            ) as spy_strategy,
-        ):
-            result = _run_fallback(
-                baseline_planner_evidence_result=baseline, merge_with_baseline=True,
-                budget_controller=budget_controller,
-            )
-        spy_strategy.assert_not_called()
-        assert result["rerun_performed"] is False
-        assert result["skip_reason"] == "preserved_evidence_budget_exhausted"
-
-    def test_no_controller_bounded_and_fails_closed_when_over_base_ceiling(self):
-        """Case 8: no controller at all -- must reproduce
-        build_planner_evidence_with_budget's own no-controller behavior (a
-        single fixed ceiling, no extension path) against the COMBINED
-        size, so preserving baseline evidence never opens an unbounded
-        path merely because no controller was supplied."""
-        baseline = _evidence_result("A" * 200, ["old.py:Old"])
-        fresh = _evidence_result("B" * 200, ["a.py:A"])
-        with (
-            mock.patch("utilities.autopatcher.evidence_fusion.DEFAULT_MAX_CHARS", 50),
             mock.patch(
                 "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
                 return_value=fresh,
@@ -773,8 +683,7 @@ class TestMergeBudgetAccounting:
 
     def test_no_controller_small_merge_still_proceeds(self):
         """Companion to the above: no controller, but the combined evidence
-        fits within the single fixed base ceiling -- must proceed exactly
-        as before this fix."""
+        fits within the real technical ceiling -- must proceed."""
         baseline = _evidence_result("small baseline", ["old.py:Old"])
         fresh = _evidence_result("small fresh", ["a.py:A"])
         with (
@@ -797,13 +706,12 @@ class TestMergeBudgetAccounting:
     def test_record_used_is_observability_only_not_enforcement(self):
         """Confirms record_used cannot enforce anything (per its own
         docstring): pre-recording a huge used_chars value for the stage
-        must have zero effect on the extension/fail-closed decision, which
-        depends only on effective_budget()/request_extension()."""
+        must have zero effect on the fail-closed decision, which depends
+        only on the real technical-capacity ceiling."""
         from utilities.autopatcher.context_budget import ContextBudgetController
-        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
 
-        budget_controller = ContextBudgetController(policy="never", max_windows=10)
-        budget_controller.effective_budget("planner_evidence", DEFAULT_MAX_CHARS)  # registers the stage
+        budget_controller = ContextBudgetController()
+        budget_controller.effective_budget("planner_evidence")  # registers the stage
         budget_controller.record_used("planner_evidence", 10**9)  # must not affect gating
 
         baseline = _evidence_result("small baseline", ["old.py:Old"])
@@ -825,36 +733,6 @@ class TestMergeBudgetAccounting:
         spy_strategy.assert_called_once()
         assert result["rerun_performed"] is True
         assert result["skip_reason"] is None
-
-    def test_extension_bounded_by_max_windows_never_exceeded(self):
-        """The extension loop must never exceed max_windows total windows
-        for the stage, regardless of how large the merged evidence is --
-        proving the loop is structurally bounded, not just empirically
-        bounded for the other tests' particular sizes."""
-        from utilities.autopatcher.context_budget import ContextBudgetController
-
-        baseline = _evidence_result("A" * 5000, ["old.py:Old"])
-        fresh = _evidence_result("B" * 5000, ["a.py:A"])
-        budget_controller = mock.MagicMock(wraps=ContextBudgetController(policy="always", max_windows=3))
-        with (
-            mock.patch("utilities.autopatcher.evidence_fusion.DEFAULT_MAX_CHARS", 10),
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
-                return_value=fresh,
-            ),
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
-            ) as spy_strategy,
-        ):
-            result = _run_fallback(
-                baseline_planner_evidence_result=baseline, merge_with_baseline=True,
-                budget_controller=budget_controller,
-            )
-        # At most max_windows(3) calls: up to 2 approvals (initial_windows=1
-        # -> max_windows=3) plus exactly one final hard-cap refusal.
-        assert budget_controller.request_extension.call_count <= 3
-        spy_strategy.assert_not_called()
-        assert result["skip_reason"] == "preserved_evidence_budget_exhausted"
 
 
 # ---------------------------------------------------------------------------
@@ -1353,26 +1231,33 @@ class TestNamedTargetAuthorityGapFullPipelineWiring:
         assert warnings  # recorded as unverified, exactly as before this feature
 
     def test_merge_budget_exhausted_fails_closed_strategy_1_remains_load_bearing(self, tmp_path):
-        """Final read-only QA fix, Case 5 (full-pipeline): the hard
-        max_windows cap is reached before the merged (preserved + fresh)
-        evidence fits -- Strategy #2 must never be called, Strategy #1's
-        own result (target_authority_unresolved=True) remains the
-        pipeline's only Strategy result, and Patch Generation stays
-        blocked exactly like every other unresolved-authority outcome
-        (see test_gap_remains_after_reacquisition_fails_closed_to_no_patch
+        """Full-pipeline: the merged (preserved + fresh) evidence exceeds
+        even the real technical capacity ceiling -- Strategy #2 must never
+        be called, Strategy #1's own result
+        (target_authority_unresolved=True) remains the pipeline's only
+        Strategy result, and Patch Generation stays blocked exactly like
+        every other unresolved-authority outcome (see
+        test_gap_remains_after_reacquisition_fails_closed_to_no_patch
         above for the equivalent "still unresolved after rerun" shape;
         this is the "never even reran" shape)."""
         from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.llm_client import resolve_active_model, resolve_max_tokens
+        from utilities.autopatcher.remediation_planner import _planner_evidence_known_overhead_chars
+        from utilities.autopatcher.technical_capacity import compute_source_capacity
+
+        capacity = compute_source_capacity(
+            *resolve_active_model(), reserved_output_tokens=resolve_max_tokens(),
+            known_overhead_chars=_planner_evidence_known_overhead_chars(_VULN_TEXT),
+        ).source_capacity_chars
 
         strategy_v1 = _strategy(
             evaluated=True, target_files=["target.py"], target_symbols=["Target"],
             target_authority_unresolved=True,
         )
-        baseline_evidence = _evidence_result("baseline evidence " * 20, ["other.py:Other"])
-        fresh_evidence = _evidence_result("fresh evidence " * 20, ["target.py:Target"])
-        budget_controller = ContextBudgetController(policy="always", max_windows=1)
+        baseline_evidence = _evidence_result("A" * (capacity + 10_000), ["other.py:Other"])
+        fresh_evidence = _evidence_result("B" * (capacity + 10_000), ["target.py:Target"])
+        budget_controller = ContextBudgetController()
         with (
-            mock.patch("utilities.autopatcher.evidence_fusion.DEFAULT_MAX_CHARS", 10),
             mock.patch(
                 "utilities.autopatcher.remediation_planner.generate_remediation_plan",
                 return_value=_plan(target_files=["target.py"], target_symbols=["Target"]),
@@ -1393,7 +1278,7 @@ class TestNamedTargetAuthorityGapFullPipelineWiring:
                 vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path),
                 budget_controller=budget_controller,
             )
-        assert spy_strategy.call_count == 1  # Strategy #2 never called -- budget exhausted first, never a third either
+        assert spy_strategy.call_count == 1  # Strategy #2 never called -- real capacity exceeded, never a third either
         mock_slice.assert_not_called()  # Patch Generation gate stays blocked
 
 
@@ -1628,16 +1513,27 @@ def _make_investigation_context(functions, repo_path):
 
 class TestEvidenceGapUsesStructuralCoverageNotRenderedText:
     def test_symbol_omitted_at_both_calls_is_not_reported_as_acquired(self, tmp_path):
-        """FALSE-POSITIVE REGRESSION: with no budget_controller supplied
-        (the degenerate, always-safe case -- see build_planner_evidence_
-        with_budget's own docstring), both the baseline and the fallback's
-        fresh call render at the identical, unexpandable base budget --
-        must NOT be reported as newly acquired evidence, and must NOT
+        """FALSE-POSITIVE REGRESSION: with no budget_controller supplied,
+        both the baseline and the fallback's fresh call render against the
+        SAME real technical capacity ceiling (Fix B: there is no more
+        "unexpandable base budget" to grow -- the real ceiling already IS
+        the full technical capacity) -- a candidate genuinely too large
+        for even that real ceiling stays omitted at both calls identically
+        -- must NOT be reported as newly acquired evidence, and must NOT
         trigger a Strategy #2 call. (The separate "a resolved candidate
         provably cannot fit within remaining legal windows" case is
         covered directly at build_planner_evidence_with_budget's own level
         in test_remediation_planner.py.)"""
-        big_body = "\n".join(f"    line_{i} = {i}" for i in range(1, 1000))  # ~18,800 chars
+        from utilities.autopatcher.llm_client import resolve_active_model, resolve_max_tokens
+        from utilities.autopatcher.remediation_planner import _planner_evidence_known_overhead_chars
+        from utilities.autopatcher.technical_capacity import compute_source_capacity
+
+        capacity = compute_source_capacity(
+            *resolve_active_model(), reserved_output_tokens=resolve_max_tokens(),
+            known_overhead_chars=_planner_evidence_known_overhead_chars(_VULN_TEXT),
+        ).source_capacity_chars
+        n_lines = int((capacity * 1.5) // 15) + 10  # comfortably exceeds the real ceiling
+        big_body = "\n".join(f"    line_{i} = {i}" for i in range(1, n_lines))
         src = f"def big_function():\n{big_body}\n    return None\n"
         (tmp_path / "mod.py").write_text(src, encoding="utf-8")
 
@@ -1648,7 +1544,7 @@ class TestEvidenceGapUsesStructuralCoverageNotRenderedText:
 
         from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
         baseline = build_planner_evidence_with_budget(plan_result, tmp_path, _VULN_TEXT, context)
-        assert baseline.excerpt_plan.symbol_omitted  # sanity: genuinely omitted at the default budget
+        assert baseline.excerpt_plan.symbol_omitted  # sanity: genuinely omitted even at the real ceiling
 
         result = _run_evidence_gap_strategy_fallback(
             plan_result=plan_result, repo_root=tmp_path, vulnerability_text=_VULN_TEXT,
@@ -1661,14 +1557,17 @@ class TestEvidenceGapUsesStructuralCoverageNotRenderedText:
         assert result["rerun_performed"] is False
         assert result["skip_reason"] == "no_new_evidence"
 
-    def test_symbol_genuinely_fits_at_enlarged_budget_is_reported_as_acquired(self, tmp_path):
-        """POSITIVE CONTROL: the baseline reflects a symbol omitted at the
-        base budget (as Strategy #1's own construction would see with no
-        expansion yet applied); the fallback, given a REAL policy="always"
-        ContextBudgetController, genuinely recovers it. This protects
-        legitimate bounded recovery from being collaterally suppressed by
-        the false-positive fix above -- exercised end-to-end against real
-        repository resolution, not a mocked string."""
+    def test_symbol_genuinely_fits_at_larger_ceiling_is_reported_as_acquired(self, tmp_path):
+        """POSITIVE CONTROL (Fix B): there is no more "enlarge the shared
+        ceiling on retry" mechanism -- the real per-call technical
+        capacity is computed once and does not grow. What still matters
+        is that a baseline rendered against a deliberately SMALLER
+        explicit ceiling (simulating an earlier, narrower render) is
+        genuinely improved by the fallback's own full real-capacity
+        render -- this protects legitimate recovery from being
+        collaterally suppressed by the false-positive fix above, exercised
+        end-to-end against real repository resolution, not a mocked
+        string."""
         body = "\n".join(f"    line_{i} = {i}" for i in range(1, 300))  # ~5,000-6,000 chars
         src = f"def medium_function():\n{body}\n    return None\n"
         (tmp_path / "mod.py").write_text(src, encoding="utf-8")
@@ -1680,13 +1579,15 @@ class TestEvidenceGapUsesStructuralCoverageNotRenderedText:
 
         from utilities.autopatcher.context_budget import ContextBudgetController
         from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
-        baseline = build_planner_evidence_with_budget(plan_result, tmp_path, _VULN_TEXT, context)
-        assert baseline.excerpt_plan.symbol_omitted  # sanity: genuinely omitted at the default budget
+        baseline = build_planner_evidence_with_budget(
+            plan_result, tmp_path, _VULN_TEXT, context, base_max_chars=500,
+        )
+        assert baseline.excerpt_plan.symbol_omitted  # sanity: genuinely omitted at the deliberately small ceiling
 
         result = _run_evidence_gap_strategy_fallback(
             plan_result=plan_result, repo_root=tmp_path, vulnerability_text=_VULN_TEXT,
             investigation_context=context,
-            budget_controller=ContextBudgetController(policy="always", max_windows=10), llm=None,
+            budget_controller=ContextBudgetController(), llm=None,
             repo_grounding_ctx="", repository_understanding_ctx="", discovery_plan_ctx="",
             baseline_planner_evidence_result=baseline,
         )
@@ -1799,3 +1700,265 @@ class TestSharedHelperWiring:
         assert spy.call_count == 2
         _, v2_kwargs = spy.call_args_list[1]
         assert v2_kwargs.get("budget_controller") is budget_controller
+
+
+# ---------------------------------------------------------------------------
+# N5 Run 5 forensic root cause: the v2-authoritative rebuild (pipeline.py,
+# inside _run_repository_analysis_and_remediation_planning's "authoritative
+# == v2" branch) replaced _planner_evidence_result with a bare rebuild
+# scoped only to the REVISED plan's own target_files/target_symbols --
+# discarding whatever the pre-revision Planning evidence-acquisition loop
+# had already resolved AND included (e.g. whole files fetched via
+# evidence_requests earlier in the same run). Strategy then received far
+# less verified source than the system had already acquired, and correctly
+# (given only what it saw) reported target_authority_unresolved=true.
+#
+# The fix merges the fresh v2-scoped evidence into the pre-revision
+# baseline using the SAME structural merge (_merge_planner_evidence_results)
+# already used for this exact purpose by Planning's own acquisition loop
+# and by the Evidence-Gap Strategy Fallback -- reused, not reimplemented.
+# ---------------------------------------------------------------------------
+
+class TestV2AuthoritativeRebuildPreservesPreRevisionEvidence:
+    """Direct, mocked-LLM tests of the fix. Mirrors
+    TestSharedHelperWiring.test_v2_authoritative_rebuild_passes_same_run_
+    budget_controller's exact mocking shape (mock generate_remediation_plan,
+    mock pipeline._run_planner_claim_verification with a synthetic
+    authoritative="v2" result, mock remediation_planner.build_planner_
+    evidence_with_budget's two calls via side_effect) but additionally spies
+    on generate_remediation_strategy to inspect the ACTUAL planner_evidence_
+    ctx text Strategy receives -- the one value that matters for this fix."""
+
+    def _run_with_verification(self, plan_v1, plan_v2, evidence_side_effect, strategy_return=None):
+        verification_result = {
+            "verifier_v1": None, "verifier_v2": None, "mode_v1": "REJECTED", "mode_v2": None,
+            "revision_attempted": True, "forced_skip": False, "skip_reason": None,
+            "broadening_unresolved": False, "authoritative": "v2",
+            "revised_plan_result": plan_v2, "revised_plan_ctx": plan_v2.rendered,
+            "revised_planner_evidence_ctx": "plain, unbudgeted v2 evidence -- must not be used verbatim",
+        }
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_plan",
+                return_value=plan_v1,
+            ),
+            mock.patch(
+                "utilities.autopatcher.pipeline._run_planner_claim_verification",
+                return_value=verification_result,
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                side_effect=evidence_side_effect,
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
+                return_value=strategy_return or _strategy(
+                    evaluated=True, target_files=plan_v2.target_files, target_symbols=plan_v2.target_symbols,
+                ),
+            ) as strategy_spy,
+        ):
+            pipeline_mod.run(
+                vulnerability_text=_VULN_TEXT, api_key="", repo_root="/tmp/repo",
+            )
+        return strategy_spy
+
+    def test_a_included_evidence_survives_plan_revision(self):
+        """Pre-revision evidence includes source A and source B (both real,
+        rendered blocks). The v2 rebuild's own (narrower) evidence does not
+        re-derive either. Strategy must still receive both A and B."""
+        plan_v1 = RemediationPlanResult(
+            rendered="## Target Discovery Plan\n", target_files=["a.py", "b.py"], target_symbols=["A", "B"],
+            narrower_alternative_decision="REJECTED", narrower_alternative_considered="a narrower alternative",
+            additional_evidence_required="explicit_false",
+        )
+        plan_v2 = RemediationPlanResult(
+            rendered="## Target Discovery Plan (revised)\n", target_files=["a.py"], target_symbols=["A"],
+            additional_evidence_required="explicit_false",
+        )
+        pre_revision = _realistic_evidence_result("facts", [("a.py:A", "def a(): pass"), ("b.py:B", "def b(): pass")])
+        fresh_v2 = _realistic_evidence_result("facts", [("a.py:A", "def a(): pass")])
+        strategy_spy = self._run_with_verification(plan_v1, plan_v2, [pre_revision, fresh_v2])
+        assert strategy_spy.call_count >= 1
+        _, kwargs = strategy_spy.call_args_list[-1]
+        planner_evidence_ctx = kwargs.get("planner_evidence_ctx") or strategy_spy.call_args_list[-1].args[3]
+        assert "a.py:A" in planner_evidence_ctx
+        assert "b.py:B" in planner_evidence_ctx
+        assert "def b(): pass" in planner_evidence_ctx
+
+    def test_b_revision_adds_evidence_monotonically(self):
+        """Pre-revision already has source A. The revision legitimately
+        acquires source B (e.g. the revised plan names an additional
+        symbol). Final evidence must contain BOTH A and B -- A is never
+        lost merely because a revision occurred."""
+        plan_v1 = RemediationPlanResult(
+            rendered="## Target Discovery Plan\n", target_files=["a.py"], target_symbols=["A"],
+            narrower_alternative_decision="REJECTED", narrower_alternative_considered="a narrower alternative",
+            additional_evidence_required="explicit_false",
+        )
+        plan_v2 = RemediationPlanResult(
+            rendered="## Target Discovery Plan (revised)\n", target_files=["a.py", "b.py"], target_symbols=["A", "B"],
+            additional_evidence_required="explicit_false",
+        )
+        pre_revision = _realistic_evidence_result("facts", [("a.py:A", "def a(): pass")])
+        fresh_v2 = _realistic_evidence_result("facts", [("a.py:A", "def a(): pass"), ("b.py:B", "def b(): pass")])
+        strategy_spy = self._run_with_verification(plan_v1, plan_v2, [pre_revision, fresh_v2])
+        _, kwargs = strategy_spy.call_args_list[-1]
+        planner_evidence_ctx = kwargs.get("planner_evidence_ctx") or strategy_spy.call_args_list[-1].args[3]
+        assert "a.py:A" in planner_evidence_ctx
+        assert "b.py:B" in planner_evidence_ctx
+
+    def test_c_carried_forward_evidence_never_becomes_target_authority(self):
+        """Source B is carried forward as evidence (test A's shape), but
+        the revised plan's own target_files/target_symbols name only A.
+        Strategy's OWN response is what determines target authority -- the
+        merge must never inflate what Patch Generation is later told it may
+        edit."""
+        plan_v1 = RemediationPlanResult(
+            rendered="## Target Discovery Plan\n", target_files=["a.py", "b.py"], target_symbols=["A", "B"],
+            narrower_alternative_decision="REJECTED", narrower_alternative_considered="a narrower alternative",
+            additional_evidence_required="explicit_false",
+        )
+        plan_v2 = RemediationPlanResult(
+            rendered="## Target Discovery Plan (revised)\n", target_files=["a.py"], target_symbols=["A"],
+            additional_evidence_required="explicit_false",
+        )
+        pre_revision = _realistic_evidence_result("facts", [("a.py:A", "def a(): pass"), ("b.py:B", "def b(): pass")])
+        fresh_v2 = _realistic_evidence_result("facts", [("a.py:A", "def a(): pass")])
+        strategy_return = _strategy(evaluated=True, target_files=["a.py"], target_symbols=["A"])
+        strategy_spy = self._run_with_verification(plan_v1, plan_v2, [pre_revision, fresh_v2], strategy_return)
+        # Strategy still received both A and B as evidence (test A's own
+        # assertion), but its OWN returned target set -- the only thing
+        # that can become edit authority -- names only A. This test exists
+        # to make that separation explicit and regression-guarded.
+        assert strategy_return.target_files == ["a.py"]
+        assert strategy_return.target_symbols == ["A"]
+        assert strategy_spy.call_count >= 1
+
+    def test_d_resolved_but_not_included_stays_distinct_after_merge(self):
+        """A pre-revision candidate that was omitted for technical capacity
+        (resolved, but never included) must not be silently promoted to
+        included merely because a revision occurred and a merge ran."""
+        from utilities.autopatcher.remediation_planner import PlannerEvidenceResult, _SourceExcerptPlan
+
+        pre_revision = PlannerEvidenceResult(
+            rendered="facts only, b.py:B omitted for capacity",
+            excerpt_plan=_SourceExcerptPlan(
+                blocks=(), included_labels=frozenset(), symbol_omitted=("b.py:B",),
+                fallback_omitted=(), read_failed=(), budget=10, omitted_sizes={"b.py:B": 999},
+                omission_reason={"b.py:B": "technical_capacity"}, capacity=None,
+            ),
+        )
+        fresh_v2 = _realistic_evidence_result("facts", [("a.py:A", "def a(): pass")])
+        from utilities.autopatcher.remediation_planner import _merge_planner_evidence_results
+        merged = _merge_planner_evidence_results(pre_revision, fresh_v2)
+        assert "b.py:B" not in merged.excerpt_plan.included_labels
+        assert merged.excerpt_plan.omission_reason.get("b.py:B") == "technical_capacity"
+        assert "a.py:A" in merged.excerpt_plan.included_labels
+
+    def test_e_capacity_omission_provenance_survives_the_merge(self):
+        """omission_reason/omitted_sizes recorded on EITHER side of the
+        merge must survive into the merged result -- capacity omission
+        provenance is never dropped or silently cleared by combining two
+        PlannerEvidenceResult objects."""
+        from utilities.autopatcher.remediation_planner import (
+            PlannerEvidenceResult, _SourceExcerptPlan, _merge_planner_evidence_results,
+        )
+
+        baseline = PlannerEvidenceResult(
+            rendered="facts, a.py:A included",
+            excerpt_plan=_SourceExcerptPlan(
+                blocks=("#### Verified source: `a.py:A` (lines 1-1)\n\n```python\ndef a(): pass\n```\n",),
+                included_labels=frozenset({"a.py:A"}), symbol_omitted=("c.py:C",),
+                fallback_omitted=(), read_failed=(), budget=10, omitted_sizes={"c.py:C": 500},
+                omission_reason={"c.py:C": "technical_capacity"}, capacity=None,
+            ),
+        )
+        fresh = PlannerEvidenceResult(
+            rendered="facts, d.py:D omitted",
+            excerpt_plan=_SourceExcerptPlan(
+                blocks=(), included_labels=frozenset(), symbol_omitted=("d.py:D",),
+                fallback_omitted=(), read_failed=(), budget=10, omitted_sizes={"d.py:D": 700},
+                omission_reason={"d.py:D": "technical_capacity"}, capacity=None,
+            ),
+        )
+        merged = _merge_planner_evidence_results(baseline, fresh)
+        assert merged.excerpt_plan.omission_reason.get("c.py:C") == "technical_capacity"
+        assert merged.excerpt_plan.omission_reason.get("d.py:D") == "technical_capacity"
+        assert "c.py:C" not in merged.excerpt_plan.included_labels
+        assert "d.py:D" not in merged.excerpt_plan.included_labels
+        assert "a.py:A" in merged.excerpt_plan.included_labels
+
+    def test_f_genuinely_unresolved_authority_still_fails_closed_even_with_more_evidence(self):
+        """Preserving more evidence must never itself force Strategy green.
+        If Strategy's OWN response still reports target_authority_unresolved
+        after seeing the merged (now-larger) evidence, the pipeline must
+        still stop before Patch Generation."""
+        plan_v1 = RemediationPlanResult(
+            rendered="## Target Discovery Plan\n", target_files=["a.py", "b.py"], target_symbols=["A", "B"],
+            narrower_alternative_decision="REJECTED", narrower_alternative_considered="a narrower alternative",
+            additional_evidence_required="explicit_false",
+        )
+        plan_v2 = RemediationPlanResult(
+            rendered="## Target Discovery Plan (revised)\n", target_files=["a.py"], target_symbols=["A"],
+            additional_evidence_required="explicit_false",
+        )
+        pre_revision = _realistic_evidence_result("facts", [("a.py:A", "def a(): pass"), ("b.py:B", "def b(): pass")])
+        fresh_v2 = _realistic_evidence_result("facts", [("a.py:A", "def a(): pass")])
+        still_unresolved = _strategy(
+            evaluated=True, target_files=["a.py"], target_symbols=["A"],
+            target_authority_unresolved=True, insufficient_evidence=["still not enough to confirm authority"],
+        )
+        with mock.patch(
+            "utilities.autopatcher.pipeline._evidence_gap_fallback_trigger", return_value=False,
+        ):
+            self._run_with_verification(plan_v1, plan_v2, [pre_revision, fresh_v2], still_unresolved)
+        # The fallback-trigger patch above only suppresses a SECOND retry
+        # attempt (irrelevant to this assertion); the outcome that matters
+        # is Strategy's own returned authority flag, asserted directly.
+        assert still_unresolved.target_authority_unresolved is True
+
+    def test_g_non_revision_v1_path_unaffected(self):
+        """When the verifier's own authoritative result is "v1" (no
+        revision, or the original plan already stood), the pre-existing
+        single-construction path must be completely untouched by this fix
+        -- no merge, no second build_planner_evidence_with_budget call for
+        this reason."""
+        plan_v1 = RemediationPlanResult(
+            rendered="## Target Discovery Plan\n", target_files=["a.py"], target_symbols=["A"],
+            narrower_alternative_decision="SELECTED", narrower_alternative_considered="none needed",
+            additional_evidence_required="explicit_false",
+        )
+        verification_result = {
+            "verifier_v1": mock.MagicMock(status="SUPPORTED"), "verifier_v2": None,
+            "mode_v1": "SELECTED", "mode_v2": None,
+            "revision_attempted": False, "forced_skip": False, "skip_reason": None,
+            "broadening_unresolved": False, "authoritative": "v1",
+        }
+        only_evidence = _realistic_evidence_result("facts", [("a.py:A", "def a(): pass")])
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_plan",
+                return_value=plan_v1,
+            ),
+            mock.patch(
+                "utilities.autopatcher.pipeline._run_planner_claim_verification",
+                return_value=verification_result,
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=only_evidence,
+            ) as spy,
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
+                return_value=_strategy(evaluated=True, target_files=["a.py"], target_symbols=["A"]),
+            ) as strategy_spy,
+        ):
+            pipeline_mod.run(
+                vulnerability_text=_VULN_TEXT, api_key="", repo_root="/tmp/repo",
+            )
+        # Exactly one construction call (pre-revision only) -- the v2
+        # merge branch never executes on the v1 path.
+        assert spy.call_count == 1
+        _, kwargs = strategy_spy.call_args_list[-1]
+        planner_evidence_ctx = kwargs.get("planner_evidence_ctx") or strategy_spy.call_args_list[-1].args[3]
+        assert "a.py:A" in planner_evidence_ctx

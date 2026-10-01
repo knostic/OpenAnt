@@ -28,8 +28,10 @@ the advisory's incidental wording). Those tokens remain useful only via Pass
 2's deterministic definition lookup, immediately above.
 
 Candidates are collected across all passes, deduped by path, and ranked.
-Returns a code context string (≤ 4 000 chars) ready to inject into the
-patch generator prompt.
+Returns a code context string, whole-block-or-omit against the real
+per-call technical-capacity ceiling passed in via `max_chars` (Fix B --
+see `find_code_context`'s own docstring; never a fixed character count),
+ready to inject into the patch generator prompt.
 """
 
 from __future__ import annotations
@@ -90,14 +92,22 @@ _IGNORED_DIRS = frozenset({".venv", "__pycache__", ".git", "node_modules", ".tox
 _SOURCE_EXTENSIONS = frozenset({".py", ".js", ".ts", ".rb", ".go", ".java", ".c", ".cpp", ".h", ".php", ".cs"})
 
 _MAX_CONTEXT_CHARS = 4_000
+"""Fix B: no longer the ceiling that gates whether grounding evidence
+reaches an LLM call -- find_code_context()/ground_repository() now accept
+an explicit `max_chars` (the real per-call technical-capacity ceiling, see
+utilities.autopatcher.technical_capacity), used unless a caller omits it.
+Retained ONLY as that fallback default for standalone/test callers -- see
+find_code_context's own docstring."""
 _CONTEXT_WINDOW_LINES = 30   # lines above/below a match for large files
 _SMALL_FILE_THRESHOLD = 150  # lines — include whole file if at or below this
 
 # If the top matched file is at or below this size, send it in full so the LLM
 # can produce accurate hunk line numbers. Files above this threshold fall back
-# to the window + code-anchor snippet approach.
+# to the window + code-anchor snippet approach. A mode-selection threshold,
+# not itself an evidence-visibility ceiling -- the admission decision that
+# follows is always whole-block-or-omit against the real technical-capacity
+# ceiling regardless of which mode this selects.
 _FULL_FILE_THRESHOLD_CHARS = 20_000
-_SECONDARY_CONTEXT_BUDGET = 4_000  # chars for snippets appended after the full-file primary
 _MIN_CLASS_NAME_LENGTH = 5  # PascalCase names shorter than this are too generic for class-def search
 
 # Pass priority tiers, highest first. A candidate's final rank is the max
@@ -350,12 +360,26 @@ def _build_grounding_result(
 # ---------------------------------------------------------------------------
 
 def find_code_context(
-    vulnerability_text: str, repo_root: Path, *, _grounding_result_out: "list | None" = None
+    vulnerability_text: str, repo_root: Path, *,
+    max_chars: "int | None" = None,
+    _grounding_result_out: "list | None" = None,
 ) -> str:
     """Return a ranked code context string extracted from repo_root.
 
     Returns an empty string if no relevant code is found.
+
+    Fix B: `max_chars` (default `None` -> `_MAX_CONTEXT_CHARS`, for
+    standalone/test callers) is the real per-call technical-capacity
+    ceiling for this grounding pass, supplied by `ground_repository()`'s
+    own caller (see pipeline.py). Deterministic search/ranking (Passes
+    1-4, dedup, scoring) is completely unaffected by this value -- it only
+    governs the existing whole-block-or-omit admission decision below,
+    replacing the old fixed `_MAX_CONTEXT_CHARS`/`_SECONDARY_CONTEXT_
+    BUDGET` ceilings as the thing that decides how much of the already-
+    ranked candidate list is included, never which candidates are found or
+    how they're ranked.
     """
+    _ceiling = _MAX_CONTEXT_CHARS if max_chars is None else max_chars
     # (score, path, content, first_hit_line)
     candidates: list[tuple[int, Path, str, int]] = []
 
@@ -596,19 +620,41 @@ def find_code_context(
             except ValueError:
                 rel_label = top_p.name
             n_lines = len(top_content.splitlines())
-            parts = [f"# {rel_label} (full file, {n_lines} lines)\n" + top_content]
+            primary_block = f"# {rel_label} (full file, {n_lines} lines)\n" + top_content
 
-            if rel_label in _debug_by_file:
-                _debug_by_file[rel_label]["selection_outcome"] = "primary_full_file"
-                _debug_by_file[rel_label]["snippet_range_1indexed"] = [1, n_lines]
-                _debug_by_file[rel_label]["bytes_contributed"] = len(parts[0])
-                _debug_by_file[rel_label]["truncated"] = False
-            if rel_label in _grounding_decisions:
-                _dec = _grounding_decisions[rel_label]
-                _dec.outcome = "primary_full_file"
-                _dec.snippet_ranges = [1, n_lines]
-                _dec.bytes_contributed = len(parts[0])
-                _dec.truncated = False
+            # Fix B: whole-block-or-omit against real technical capacity --
+            # even the primary candidate is never force-included past the
+            # real ceiling. Structurally rare (the primary is the single
+            # highest-ranked, usually-small candidate) but a genuine
+            # oversized repository file must fail closed, never be
+            # silently sliced.
+            if len(primary_block) > _ceiling:
+                if rel_label in _debug_by_file:
+                    _debug_by_file[rel_label]["selection_outcome"] = "omitted_technical_capacity"
+                    _debug_by_file[rel_label]["bytes_contributed"] = 0
+                if rel_label in _grounding_decisions:
+                    _dec = _grounding_decisions[rel_label]
+                    _dec.outcome = "omitted_technical_capacity"
+                    _dec.omission_reason = "technical_capacity"
+                parts = []
+                sec_total = 0
+                remaining = _ceiling
+            else:
+                parts = [primary_block]
+                sec_total = len(primary_block)
+                remaining = _ceiling - len(primary_block)
+
+                if rel_label in _debug_by_file:
+                    _debug_by_file[rel_label]["selection_outcome"] = "primary_full_file"
+                    _debug_by_file[rel_label]["snippet_range_1indexed"] = [1, n_lines]
+                    _debug_by_file[rel_label]["bytes_contributed"] = len(primary_block)
+                    _debug_by_file[rel_label]["truncated"] = False
+                if rel_label in _grounding_decisions:
+                    _dec = _grounding_decisions[rel_label]
+                    _dec.outcome = "primary_full_file"
+                    _dec.snippet_ranges = [1, n_lines]
+                    _dec.bytes_contributed = len(primary_block)
+                    _dec.truncated = False
 
             # Build the secondary queue from the remaining ranked candidates.
             # Files that *define* a named symbol no longer need a separate
@@ -623,114 +669,137 @@ def find_code_context(
                     _secondary_queue.append((_rank_p, _rank_content, _rank_hit))
                     _seen_secondary.add(_rank_p)
 
-            sec_total = 0
+            # Fix B: whole-block-or-omit against the genuine capacity
+            # remaining after the primary -- never a separately-sized fixed
+            # pool (the old _SECONDARY_CONTEXT_BUDGET). A candidate that
+            # doesn't fit is skipped (never sliced); a smaller LATER
+            # candidate still gets its own turn.
             for sec_p, sec_content, sec_hit in _secondary_queue[:2]:
                 try:
                     sec_label = sec_p.relative_to(repo_root).as_posix()
                 except ValueError:
                     sec_label = sec_p.name
-                budget = _SECONDARY_CONTEXT_BUDGET - sec_total - len(sec_label) - 60
-                if budget <= 0:
-                    break
-                snippet, ranges = _extract_snippet(sec_content, sec_hit, budget)
-                if not snippet:
-                    continue
+                snippet, ranges = _extract_snippet(sec_content, sec_hit)
                 if ranges:
                     range_str = ", ".join(f"{s}-{e}" for s, e in ranges)
                     sec_header = f"# {sec_label} (lines {range_str})\n"
                 else:
                     sec_header = f"# {sec_label}\n"
-                parts.append(sec_header + snippet)
-                sec_total += len(sec_header) + len(snippet)
+                entry = sec_header + snippet
+                if len(entry) > remaining:
+                    if sec_label in _debug_by_file:
+                        _debug_by_file[sec_label]["selection_outcome"] = "omitted_technical_capacity"
+                        _debug_by_file[sec_label]["bytes_contributed"] = 0
+                    if sec_label in _grounding_decisions:
+                        _dec = _grounding_decisions[sec_label]
+                        _dec.outcome = "omitted_technical_capacity"
+                        _dec.omission_reason = "technical_capacity"
+                    continue
+                parts.append(entry)
+                sec_total += len(entry)
+                remaining -= len(entry)
                 if sec_label in _debug_by_file:
                     _debug_by_file[sec_label]["selection_outcome"] = "secondary_snippet"
                     _debug_by_file[sec_label]["snippet_range_1indexed"] = ranges
-                    _debug_by_file[sec_label]["bytes_contributed"] = len(sec_header) + len(snippet)
-                    _debug_by_file[sec_label]["truncated"] = "[truncated]" in snippet
+                    _debug_by_file[sec_label]["bytes_contributed"] = len(entry)
+                    _debug_by_file[sec_label]["truncated"] = False
                 if sec_label in _grounding_decisions:
                     _dec = _grounding_decisions[sec_label]
                     _dec.outcome = "secondary_snippet"
                     _dec.snippet_ranges = ranges
-                    _dec.bytes_contributed = len(sec_header) + len(snippet)
-                    _dec.truncated = "[truncated]" in snippet
-                if sec_total >= _SECONDARY_CONTEXT_BUDGET:
-                    break
+                    _dec.bytes_contributed = len(entry)
+                    _dec.truncated = False
 
             _result = "\n\n".join(parts)
             _write_debug_artifact(_build_debug_record(
                 repo_root, _debug_signals, _debug_by_file, _result,
                 budget_model="secondary_snippet_budget",
-                budget_cap=_SECONDARY_CONTEXT_BUDGET, budget_used=sec_total,
+                budget_cap=_ceiling, budget_used=sec_total,
             ))
             if _grounding_result_out is not None:
                 _grounding_result_out.append(_build_grounding_result(
                     _grounding_candidates, _grounding_decisions, _debug_signals, _result,
                     budget_model="secondary_snippet_budget",
-                    budget_cap=_SECONDARY_CONTEXT_BUDGET, budget_used=sec_total,
+                    budget_cap=_ceiling, budget_used=sec_total,
                 ))
             return _result
 
     # Snippet mode: top file exceeds threshold — use window + code-anchor approach.
-    _HEADER_OVERHEAD = 60  # budget reserve for " (lines NNN-MMM, NNN-MMM)"
+    # Fix B: whole-block-or-omit against real technical capacity -- a
+    # candidate whose full deterministic snippet doesn't fit the remaining
+    # ceiling is omitted whole (never sliced); a smaller later candidate
+    # still gets its own turn rather than the loop stopping outright.
     parts: list[str] = []
     total = 0
+    remaining = _ceiling
     for _idx, (p, (_, content, hit_line)) in enumerate(ranked[:2]):
         try:
             rel_label = p.relative_to(repo_root).as_posix()
         except ValueError:
             rel_label = p.name  # defensive fallback
 
-        budget = _MAX_CONTEXT_CHARS - total - len(rel_label) - _HEADER_OVERHEAD
-        if budget <= 0:
-            break
-        snippet, ranges = _extract_snippet(content, hit_line, budget)
-        if snippet:
-            if ranges:
-                range_str = ", ".join(f"{s}-{e}" for s, e in ranges)
-                header = f"# {rel_label} (lines {range_str})\n"
-            else:
-                header = f"# {rel_label}\n"
-            entry = header + snippet
-            parts.append(entry)
-            total += len(entry)
+        snippet, ranges = _extract_snippet(content, hit_line)
+        if ranges:
+            range_str = ", ".join(f"{s}-{e}" for s, e in ranges)
+            header = f"# {rel_label} (lines {range_str})\n"
+        else:
+            header = f"# {rel_label}\n"
+        entry = header + snippet
+        if len(entry) > remaining:
             if rel_label in _debug_by_file:
-                _debug_by_file[rel_label]["selection_outcome"] = (
-                    "primary_snippet" if _idx == 0 else "secondary_snippet"
-                )
-                _debug_by_file[rel_label]["snippet_range_1indexed"] = ranges
-                _debug_by_file[rel_label]["bytes_contributed"] = len(entry)
-                _debug_by_file[rel_label]["truncated"] = "[truncated]" in snippet
+                _debug_by_file[rel_label]["selection_outcome"] = "omitted_technical_capacity"
+                _debug_by_file[rel_label]["bytes_contributed"] = 0
             if rel_label in _grounding_decisions:
                 _dec = _grounding_decisions[rel_label]
-                _dec.outcome = "primary_snippet" if _idx == 0 else "secondary_snippet"
-                _dec.snippet_ranges = ranges
-                _dec.bytes_contributed = len(entry)
-                _dec.truncated = "[truncated]" in snippet
-        if total >= _MAX_CONTEXT_CHARS:
-            break
+                _dec.outcome = "omitted_technical_capacity"
+                _dec.omission_reason = "technical_capacity"
+            continue
+        parts.append(entry)
+        total += len(entry)
+        remaining -= len(entry)
+        if rel_label in _debug_by_file:
+            _debug_by_file[rel_label]["selection_outcome"] = (
+                "primary_snippet" if _idx == 0 else "secondary_snippet"
+            )
+            _debug_by_file[rel_label]["snippet_range_1indexed"] = ranges
+            _debug_by_file[rel_label]["bytes_contributed"] = len(entry)
+            _debug_by_file[rel_label]["truncated"] = False
+        if rel_label in _grounding_decisions:
+            _dec = _grounding_decisions[rel_label]
+            _dec.outcome = "primary_snippet" if _idx == 0 else "secondary_snippet"
+            _dec.snippet_ranges = ranges
+            _dec.bytes_contributed = len(entry)
+            _dec.truncated = False
 
     _result = "\n\n".join(parts)
     _write_debug_artifact(_build_debug_record(
         repo_root, _debug_signals, _debug_by_file, _result,
         budget_model="snippet_mode_budget",
-        budget_cap=_MAX_CONTEXT_CHARS, budget_used=total,
+        budget_cap=_ceiling, budget_used=total,
     ))
     if _grounding_result_out is not None:
         _grounding_result_out.append(_build_grounding_result(
             _grounding_candidates, _grounding_decisions, _debug_signals, _result,
             budget_model="snippet_mode_budget",
-            budget_cap=_MAX_CONTEXT_CHARS, budget_used=total,
+            budget_cap=_ceiling, budget_used=total,
         ))
     return _result
 
 
-def ground_repository(vulnerability_text: str, repo_root: Path) -> RepositoryGroundingResult:
+def ground_repository(
+    vulnerability_text: str, repo_root: Path, *, max_chars: "int | None" = None,
+) -> RepositoryGroundingResult:
     """Run find_code_context()'s scan exactly once and return the full
     domain-object result alongside the same rendered_context string it
     returns. The only intended caller of find_code_context()'s private
-    _grounding_result_out parameter."""
+    _grounding_result_out parameter.
+
+    `max_chars` (Fix B, default `None` -> `find_code_context`'s own
+    `_MAX_CONTEXT_CHARS` fallback) is the real per-call technical-capacity
+    ceiling for this grounding pass -- see `find_code_context`'s own
+    docstring."""
     _out: list[RepositoryGroundingResult] = []
-    find_code_context(vulnerability_text, repo_root, _grounding_result_out=_out)
+    find_code_context(vulnerability_text, repo_root, max_chars=max_chars, _grounding_result_out=_out)
     return _out[0]
 
 
@@ -1151,27 +1220,28 @@ def _find_code_block_after(
 # Snippet extraction
 # ---------------------------------------------------------------------------
 
-def _extract_snippet(
-    content: str, hit_line: int, max_chars: int
-) -> tuple[str, list[tuple[int, int]]]:
-    """Return (snippet_text, line_ranges) where ranges are 1-indexed inclusive.
+def _extract_snippet(content: str, hit_line: int) -> tuple[str, list[tuple[int, int]]]:
+    """Return (snippet_text, line_ranges) where ranges are 1-indexed inclusive
+    -- the full, deterministic best candidate snippet for this hit, NEVER
+    sliced to any character budget.
 
-    For large files where the hit appears to be inside a docstring, appends
-    the nearest downstream code block (class constants, function definitions).
-    The code anchor is preserved over the docstring window when budget is tight.
+    Fix B: whole-block-or-omit is the CALLER's decision (find_code_context),
+    made against real per-call technical capacity (see utilities.
+    autopatcher.technical_capacity) -- this function only ever decides WHICH
+    deterministic window to propose (unchanged selection logic: whole file
+    for small files; a line window around the hit; the nearest downstream
+    code block instead of/alongside the window when the hit falls inside a
+    docstring), never how much of it fits. A candidate this function
+    proposes is included whole by the caller, or omitted whole with a
+    structured `technical_capacity` reason -- never truncated mid-content.
 
     Non-contiguous snippets (window + anchor) produce two range tuples.
     """
-    if max_chars <= 0:
-        return "", []
     lines = content.splitlines()
 
     if len(lines) <= _SMALL_FILE_THRESHOLD:
-        raw = content[:max_chars]
-        if len(content) > max_chars:
-            raw = raw.rsplit("\n", 1)[0] + "\n[truncated]"
-        n = len(raw.splitlines())
-        return raw, [(1, n)]
+        n = len(lines)
+        return content, [(1, n)]
 
     # Hit window (0-indexed [start, end))
     start = max(0, hit_line - _CONTEXT_WINDOW_LINES)
@@ -1190,28 +1260,14 @@ def _extract_snippet(
         anchor_end_0 = anchor_start_0 + len(code_block.splitlines())
         anchor_range = (anchor_start_0 + 1, anchor_end_0)  # 1-indexed inclusive
         sep = "\n\n"
-        anchor_len = len(code_block)
+        # Deterministically prefer the combined window+anchor (the anchor
+        # is the real code the docstring window alone wouldn't show) --
+        # always proposed together now; whether it fits is the caller's
+        # whole-block-or-omit decision, never a reason to slice either part.
+        return window + sep + code_block, [window_range, anchor_range]
 
-        if anchor_len >= max_chars:
-            raw = code_block[:max_chars]
-            if "\n" in raw:
-                raw = raw.rsplit("\n", 1)[0]
-            return raw + "\n[truncated]", [anchor_range]
-
-        window_budget = max_chars - anchor_len - len(sep)
-        if window_budget >= 80:
-            window_clip = window[:window_budget]
-            if len(window) > window_budget:
-                window_clip = window_clip.rsplit("\n", 1)[0] + "\n[truncated]"
-            return window_clip + sep + code_block, [window_range, anchor_range]
-        else:
-            return code_block, [anchor_range]
-
-    # No code anchor: standard window
-    raw = window[:max_chars]
-    if len(window) > max_chars:
-        raw = raw.rsplit("\n", 1)[0] + "\n[truncated]"
-    return raw, [window_range]
+    # No code anchor: standard window, proposed in full.
+    return window, [window_range]
 
 
 # ---------------------------------------------------------------------------

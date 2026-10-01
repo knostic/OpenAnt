@@ -150,6 +150,7 @@ from .pipeline import (
     PipelineResult,
     _adjust_confidence_score_for_challenger,
     _build_report,
+    _challenger_provenance_context,
     _classify_challenger,
     _run_constraint_signals,
     _run_guided_context_acquisition,
@@ -884,6 +885,16 @@ def _run_replay_patch_generation_and_investigation(
         "investigated_patch": s4_locals["_investigated_patch"],
         "code_context": code_context,
         "challenger_context": code_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else ""),
+        # D7: repository-derived citation-authority parts of this replayed
+        # context (by provenance of each reconstructed part: Repository
+        # Understanding, the slice and any accepted recovered slice, and
+        # the post-patch investigation text -- never plan/strategy prose).
+        "challenger_provenance_parts": [
+            repository_understanding_ctx,
+            slice_result.rendered if slice_result else "",
+            s4_locals.get("_recovered_rendered") or "",
+            _post_patch_ctx,
+        ],
         "vulnerability_text": vulnerability_text,
     }
     artifact_path = output_dir / "patch_generation_and_post_patch_investigation.json"
@@ -915,9 +926,17 @@ def _run_replay_challenger(
     vulnerability_text = s4["vulnerability_text"]
     patch = s4["patch"]
     challenger_context = s4.get("challenger_context") or ""
+    # D7: an S4 artifact predating `challenger_provenance_parts` has no
+    # recorded citation-authority boundary -- fail closed (empty corpus;
+    # only the patch can validate a citation), never fall back to the
+    # full shown context.
+    provenance_parts = s4.get("challenger_provenance_parts") or ()
 
     with LLMCallCapture() as capture:
-        challenger = challenge_patch(vulnerability_text, patch, llm, code_context=challenger_context)
+        challenger = challenge_patch(
+            vulnerability_text, patch, llm, code_context=challenger_context,
+            provenance_context=_challenger_provenance_context(provenance_parts, challenger_context),
+        )
 
     llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
     _assert_llm_ownership(capture.calls, CHALLENGER)
@@ -967,6 +986,7 @@ def _run_replay_patch_repair_and_calibration(
             applicability_result=applicability_result, hygiene_findings=hygiene_findings,
             _final_repair_meta=final_repair_meta, _post_patch_observations=post_patch_observations,
             _investigated_patch=investigated_patch,
+            _challenger_provenance_parts=s4.get("challenger_provenance_parts") or (),
         )
 
     llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)

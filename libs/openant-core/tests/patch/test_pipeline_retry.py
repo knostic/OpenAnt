@@ -502,16 +502,24 @@ class TestRetryMultiFile:
             assert mock_gen.call_count == 1
 
     def test_aggregate_budget_omission_note(self, tmp_path):
-        # Each file is well under _RETRY_CONTENT_LIMIT alone, but together
-        # they exceed it -- the first must be included in full, the second
-        # omitted (not truncated) with an explicit note naming it.
-        from utilities.autopatcher.pipeline import _RETRY_CONTENT_LIMIT
+        # Each file is well under the real Patch Generation technical-
+        # capacity ceiling alone, but together they exceed it -- the first
+        # must be included in full, the second omitted (not truncated)
+        # with an explicit note naming it. Fix B: this ceiling is no
+        # longer the removed hardcoded _RETRY_CONTENT_LIMIT constant; it's
+        # computed exactly the way pipeline.py itself computes it (see
+        # compute_patch_generation_capacity/_build_retry_hint).
+        from utilities.autopatcher.pipeline import _build_retry_hint
+        from utilities.autopatcher.patch_generator import compute_patch_generation_capacity
+
+        _hint = _build_retry_hint(_URLLIB3_MULTI_STDERR, "src/urllib3/util/retry.py")
+        _retry_limit = compute_patch_generation_capacity("urllib3 vuln", retry_hint=_hint).source_capacity_chars
 
         retry_file = tmp_path / "src/urllib3/util/retry.py"
         pool_file = tmp_path / "src/urllib3/poolmanager.py"
         retry_file.parent.mkdir(parents=True, exist_ok=True)
         pool_file.parent.mkdir(parents=True, exist_ok=True)
-        chunk = int(_RETRY_CONTENT_LIMIT * 0.6)
+        chunk = int(_retry_limit * 0.6)
         retry_file.write_text("RETRY_MARKER_CONTENT\n" + ("a" * chunk), encoding="utf-8")
         pool_file.write_text("POOLMANAGER_MARKER_CONTENT\n" + ("b" * chunk), encoding="utf-8")
 
@@ -548,12 +556,17 @@ class TestRetryMultiFile:
         # No real content survives from either file, so the retry must not
         # be attempted -- this is the regression test for the bug where
         # "any read attempt succeeded" was wrongly treated as "there is
-        # real content to send."
-        from utilities.autopatcher.pipeline import _RETRY_CONTENT_LIMIT
+        # real content to send." Fix B: same real-capacity ceiling as
+        # above, not the removed hardcoded _RETRY_CONTENT_LIMIT constant.
+        from utilities.autopatcher.pipeline import _build_retry_hint
+        from utilities.autopatcher.patch_generator import compute_patch_generation_capacity
+
+        _hint = _build_retry_hint(_URLLIB3_MULTI_STDERR, "src/urllib3/util/retry.py")
+        _retry_limit = compute_patch_generation_capacity("urllib3 vuln", retry_hint=_hint).source_capacity_chars
 
         retry_file = tmp_path / "src/urllib3/util/retry.py"
         retry_file.parent.mkdir(parents=True, exist_ok=True)
-        retry_file.write_text("a" * (_RETRY_CONTENT_LIMIT + 1_000), encoding="utf-8")
+        retry_file.write_text("a" * (_retry_limit + 1_000), encoding="utf-8")
         # src/urllib3/poolmanager.py deliberately not created on disk.
 
         first_app, _retry_app = self._setup_mocks(retry_applicable=True)
@@ -575,6 +588,57 @@ class TestRetryMultiFile:
             from utilities.autopatcher.pipeline import run
             run("urllib3 vuln", api_key="", repo_root=str(tmp_path))
             assert mock_gen.call_count == 1
+
+    def test_file_over_legacy_50k_constant_is_still_included_under_real_capacity(self, tmp_path):
+        # Fix B: the applicability-aware retry's per-file inclusion ceiling
+        # is no longer the removed hardcoded `_RETRY_CONTENT_LIMIT = 50_000`
+        # -- it is the real, active-model technical-capacity ceiling (much
+        # larger under the conservative fallback used in tests). A file
+        # comfortably over 50,000 chars but well under the real ceiling
+        # must be included WHOLE, not omitted the way the old hardcoded
+        # constant would have forced.
+        from utilities.autopatcher.pipeline import _build_retry_hint
+        from utilities.autopatcher.patch_generator import compute_patch_generation_capacity
+
+        _hint = _build_retry_hint(_URLLIB3_MULTI_STDERR, "src/urllib3/util/retry.py")
+        _real_ceiling = compute_patch_generation_capacity("urllib3 vuln", retry_hint=_hint).source_capacity_chars
+        assert _real_ceiling > 60_000  # sanity: real capacity is bigger than the old constant
+
+        retry_file = tmp_path / "src/urllib3/util/retry.py"
+        pool_file = tmp_path / "src/urllib3/poolmanager.py"
+        retry_file.parent.mkdir(parents=True, exist_ok=True)
+        pool_file.parent.mkdir(parents=True, exist_ok=True)
+        # 60,000 chars: over the old 50,000-char constant, comfortably under
+        # the real per-call ceiling computed above.
+        retry_file.write_text("RETRY_MARKER_CONTENT\n" + ("a" * 60_000), encoding="utf-8")
+        pool_file.write_text("POOLMANAGER_MARKER_CONTENT\n", encoding="utf-8")
+
+        first_app, retry_app = self._setup_mocks(retry_applicable=True)
+        with (
+            mock.patch(
+                "utilities.autopatcher.pipeline.LLMClient",
+                return_value=mock.MagicMock(complete=mock.MagicMock(return_value=_MOCK_GROUNDED_PLANNER_JSON)),
+            ),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       side_effect=_sequential_then_repeat(first_app, retry_app)),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("urllib3 vuln", api_key="", repo_root=str(tmp_path))
+            assert mock_gen.call_count == 2
+            _args, kwargs = mock_gen.call_args_list[1]
+            retry_code_context = kwargs.get("code_context", "")
+            # Included WHOLE (not omitted, not truncated) -- proves the real
+            # capacity ceiling, not the removed 50,000-char constant, governs.
+            assert "RETRY_MARKER_CONTENT" in retry_code_context
+            assert ("a" * 60_000) in retry_code_context
+            assert "POOLMANAGER_MARKER_CONTENT" in retry_code_context
 
     def test_retry_failed_file_is_first_of_multiple(self, tmp_path):
         # retry_failed_file (the report-facing field) must stay a single

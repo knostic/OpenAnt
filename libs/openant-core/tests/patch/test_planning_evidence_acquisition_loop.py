@@ -392,13 +392,18 @@ class TestRunPlanningEvidenceAcquisition:
         assert "a.py" in round_2_user_message
 
     def test_round_limit_reached_fails_closed_never_exceeds_max_attempts(self, tmp_path):
-        for name in ("a.py", "b.py", "c.py"):
+        # One evidence-requesting response per attempt, up to whatever
+        # MAX_PLANNING_ATTEMPTS currently is -- never hardcoded to a
+        # specific count, so this test keeps proving genuine exhaustion
+        # (not merely "the mock ran out of responses") regardless of the
+        # bound's own value.
+        file_names = [f"f{i}.py" for i in range(MAX_PLANNING_ATTEMPTS)]
+        for name in file_names:
             (tmp_path / name).write_text("x = 1\n", encoding="utf-8")
         llm = mock.MagicMock()
         llm.complete.side_effect = [
-            _response(True, [{"request_type": "file_source", "file_hint": "a.py", "reason": "r1"}]),
-            _response(True, [{"request_type": "file_source", "file_hint": "b.py", "reason": "r2"}]),
-            _response(True, [{"request_type": "file_source", "file_hint": "c.py", "reason": "r3"}]),
+            _response(True, [{"request_type": "file_source", "file_hint": name, "reason": f"r{i}"}])
+            for i, name in enumerate(file_names)
         ]
         result = run_planning_evidence_acquisition("vuln", llm, str(tmp_path), None, base_evidence="")
         assert result.grounded is False
@@ -409,6 +414,30 @@ class TestRunPlanningEvidenceAcquisition:
         # hypothesis: the un-grounded final plan is still returned for
         # observability, but `grounded` stays False.
         assert result.plan_result.additional_evidence_required == "explicit_true"
+
+    def test_planning_may_use_the_full_bound_and_ground_on_the_final_attempt(self, tmp_path):
+        """Proves the bound was genuinely raised (not merely that old
+        behavior still caps at whatever the constant says): every attempt
+        up to and including the LAST allowed one requests new, resolvable
+        evidence, and only the final attempt grounds -- so reaching it
+        requires the loop to actually permit MAX_PLANNING_ATTEMPTS total
+        calls, never fewer."""
+        file_names = [f"g{i}.py" for i in range(MAX_PLANNING_ATTEMPTS - 1)]
+        for name in file_names:
+            (tmp_path / name).write_text("x = 1\n", encoding="utf-8")
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            _response(True, [{"request_type": "file_source", "file_hint": name, "reason": f"r{i}"}])
+            for i, name in enumerate(file_names)
+        ] + [_response(False, [])]
+        result = run_planning_evidence_acquisition("vuln", llm, str(tmp_path), None, base_evidence="")
+        assert result.grounded is True
+        assert result.terminal_state == "grounded"
+        assert llm.complete.call_count == MAX_PLANNING_ATTEMPTS
+        assert len(result.attempts) == MAX_PLANNING_ATTEMPTS
+        assert result.attempts[-1].outcome == "grounded"
+        for name in file_names:
+            assert name in result.planner_evidence_result.rendered
 
     def test_unresolved_request_fails_closed_without_spending_extra_round(self, tmp_path):
         llm = mock.MagicMock()
@@ -500,6 +529,195 @@ class TestRunPlanningEvidenceAcquisition:
         assert len(result.attempts[0].resolutions) == MAX_EVIDENCE_REQUESTS_PER_ROUND
 
 
+def _oversized_symbol_context(tmp_path, name="big_symbol", vulnerability_text="vuln"):
+    """A single symbol whose real rendered source-excerpt block is
+    provably too large for the real technical-capacity ceiling
+    `build_planner_evidence_with_budget` computes -- so it resolves (the
+    resolver genuinely finds it) but can never be included (Fix B's real
+    whole-block-or-omit capacity fit always omits it). Computed against
+    the SAME production capacity function these tests exercise elsewhere
+    (never a hardcoded, environment-sensitive magic number); mirrors
+    test_remediation_planner.py's own `_big_function_fixture`/
+    `_expected_planner_capacity` pattern, duplicated here per this file's
+    own "each test file owns its local builders" convention."""
+    from utilities.autopatcher.llm_client import resolve_active_model, resolve_max_tokens
+    from utilities.autopatcher.remediation_planner import _planner_evidence_known_overhead_chars
+    from utilities.autopatcher.technical_capacity import compute_source_capacity
+
+    capacity = compute_source_capacity(
+        *resolve_active_model(), reserved_output_tokens=resolve_max_tokens(),
+        known_overhead_chars=_planner_evidence_known_overhead_chars(vulnerability_text),
+    ).source_capacity_chars
+    n_lines = int((capacity * 1.5) // 15) + 10
+    body = "\n".join(f"    line_{i} = {i}" for i in range(1, n_lines))
+    src = f"def {name}():\n{body}\n    return None\n"
+    (tmp_path / "mod.py").write_text(src, encoding="utf-8")
+    return _make_context(
+        functions={f"mod.py:{name}": {
+            "name": name, "startLine": 1, "endLine": len(src.splitlines()), "code": src,
+        }},
+        repo_path=tmp_path,
+    )
+
+
+class TestPlanningEvidencePersistenceAndInclusionProvenance:
+    """Regression tests for the confirmed root cause: a resolved
+    symbol_definition request's file was never added to the synthetic
+    plan's target_files (Part 1), inclusion provenance was only ever
+    computed once at the very end (Part 2), seen_keys alone permanently
+    blocked a resolved-but-not-included request (Part 3), and the
+    Planning prompt asserted "resolved -- see verified evidence above"
+    for any resolved request regardless of whether its evidence was ever
+    actually rendered (Part 4). Lettered A-G to match the fix's own
+    required-tests list."""
+
+    def test_A_symbol_definition_survives_into_next_prompt(self, tmp_path):
+        src = "def foo():\n    ALPHA_MARKER_VALUE = 12345\n    return ALPHA_MARKER_VALUE\n"
+        (tmp_path / "a.py").write_text(src, encoding="utf-8")
+        context = _make_context(
+            functions={"a.py:foo": {"name": "foo", "startLine": 1, "endLine": 3, "code": src}}, repo_path=tmp_path,
+        )
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            _response(True, [{"request_type": "symbol_definition", "symbol": "foo", "reason": "need it"}]),
+            _response(False, []),
+        ]
+        result = run_planning_evidence_acquisition("vuln", llm, str(tmp_path), context, base_evidence="")
+        assert result.grounded is True
+        assert llm.complete.call_count == 2
+        # Part 1: the resolved file must have been added to the synthetic
+        # plan's target_files, or build_planner_candidates's own
+        # `if not plan.target_files: return []` rule silently drops the
+        # symbol-only round entirely.
+        round_2_user_message = llm.complete.call_args_list[1][0][1]
+        assert "ALPHA_MARKER_VALUE" in round_2_user_message
+        assert result.attempts[0].resolutions[0].resolved is True
+        assert result.attempts[0].resolutions[0].resolved_file == "a.py"
+
+    def test_B_symbol_only_multi_round_monotonicity(self, tmp_path):
+        src_a = "def alpha():\n    ALPHA_MARK = 111\n    return ALPHA_MARK\n"
+        src_b = "def beta():\n    BETA_MARK = 222\n    return BETA_MARK\n"
+        (tmp_path / "a.py").write_text(src_a, encoding="utf-8")
+        (tmp_path / "b.py").write_text(src_b, encoding="utf-8")
+        context = _make_context(functions={
+            "a.py:alpha": {"name": "alpha", "startLine": 1, "endLine": 3, "code": src_a},
+            "b.py:beta": {"name": "beta", "startLine": 1, "endLine": 3, "code": src_b},
+        }, repo_path=tmp_path)
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            _response(True, [{"request_type": "symbol_definition", "symbol": "alpha", "reason": "r1"}]),
+            _response(True, [{"request_type": "symbol_definition", "symbol": "beta", "reason": "r2"}]),
+            _response(False, []),
+        ]
+        result = run_planning_evidence_acquisition("vuln", llm, str(tmp_path), context, base_evidence="")
+        assert result.grounded is True
+        assert llm.complete.call_count == 3
+        # After acquiring symbol B (round 2), the NEXT prompt (round 3)
+        # must still contain symbol A's previously-acquired source AND
+        # symbol B's newly-acquired evidence -- neither ever dropped.
+        round_3_user_message = llm.complete.call_args_list[2][0][1]
+        assert "ALPHA_MARK" in round_3_user_message
+        assert "BETA_MARK" in round_3_user_message
+
+    def test_C_resolved_but_not_included_is_represented_truthfully(self, tmp_path):
+        context = _oversized_symbol_context(tmp_path, "big_symbol")
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            _response(True, [{"request_type": "symbol_definition", "symbol": "big_symbol", "reason": "need it"}]),
+            _response(False, []),
+        ]
+        result = run_planning_evidence_acquisition("vuln", llm, str(tmp_path), context, base_evidence="")
+        round_1_resolution = result.attempts[0].resolutions[0]
+        assert round_1_resolution.resolved is True
+        assert round_1_resolution.included is False
+        round_2_user_message = llm.complete.call_args_list[1][0][1]
+        assert "big_symbol" in round_2_user_message
+        assert "resolved but not included" in round_2_user_message
+        assert "see verified evidence above" not in round_2_user_message
+
+    def test_D_duplicate_after_included_evidence_not_reacquired(self, tmp_path):
+        (tmp_path / "a.py").write_text("NEEDED_MARK = 999\n", encoding="utf-8")
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            _response(True, [{"request_type": "file_source", "file_hint": "a.py", "reason": "r1"}]),
+            # Asks for the SAME evidence again -- it is already included,
+            # so this must be recognized as a genuine duplicate, no
+            # reacquisition, and the run must still bound out cleanly.
+            _response(True, [{"request_type": "file_source", "file_hint": "a.py", "reason": "asking again"}]),
+        ]
+        result = run_planning_evidence_acquisition("vuln", llm, str(tmp_path), None, base_evidence="")
+        assert result.grounded is False
+        assert result.terminal_state == "ungrounded_unresolvable"
+        assert llm.complete.call_count == 2
+        r1 = result.attempts[0].resolutions[0]
+        assert r1.resolved is True and r1.included is True
+        r2 = result.attempts[1].resolutions[0]
+        assert r2.resolved is False and r2.failure_reason == "duplicate_request"
+        assert "NEEDED_MARK" in result.planner_evidence_result.rendered
+
+    def test_E_resolved_not_included_is_not_permanently_stranded(self, tmp_path):
+        context = _oversized_symbol_context(tmp_path, "big_symbol")
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            _response(True, [{"request_type": "symbol_definition", "symbol": "big_symbol", "reason": "need it"}]),
+            _response(True, [{"request_type": "symbol_definition", "symbol": "big_symbol", "reason": "still need it"}]),
+            _response(False, []),
+        ]
+        result = run_planning_evidence_acquisition("vuln", llm, str(tmp_path), context, base_evidence="")
+        assert llm.complete.call_count == 3
+        r1 = result.attempts[0].resolutions[0]
+        r2 = result.attempts[1].resolutions[0]
+        assert r1.resolved is True and r1.included is False
+        # Never converted into a stranded "duplicate_request" dead end
+        # merely because its key was already attempted -- the resolver is
+        # a pure function so it is never re-invoked, but the request
+        # itself stays live for the capacity-fit/merge machinery.
+        assert r2.resolved is True
+        assert r2.failure_reason is None
+
+    def test_F_file_source_multi_round_monotonic_accumulation_unchanged(self, tmp_path):
+        (tmp_path / "a.py").write_text("ALPHA_FILE_MARK = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("BETA_FILE_MARK = 1\n", encoding="utf-8")
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            _response(True, [{"request_type": "file_source", "file_hint": "a.py", "reason": "r1"}]),
+            _response(True, [{"request_type": "file_source", "file_hint": "b.py", "reason": "r2"}]),
+            _response(False, []),
+        ]
+        result = run_planning_evidence_acquisition("vuln", llm, str(tmp_path), None, base_evidence="")
+        assert result.grounded is True
+        assert llm.complete.call_count == 3
+        assert "ALPHA_FILE_MARK" in result.planner_evidence_result.rendered
+        assert "BETA_FILE_MARK" in result.planner_evidence_result.rendered
+        round_3_user_message = llm.complete.call_args_list[2][0][1]
+        assert "a.py" in round_3_user_message
+        assert "b.py" in round_3_user_message
+        assert result.attempts[0].resolutions[0].included is True
+        assert result.attempts[1].resolutions[0].included is True
+
+    def test_G_terminal_fail_closed_unchanged_when_evidence_never_becomes_includable(self, tmp_path):
+        context = _oversized_symbol_context(tmp_path, "big_symbol")
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            _response(True, [{"request_type": "symbol_definition", "symbol": "big_symbol", "reason": f"r{i}"}])
+            for i in range(MAX_PLANNING_ATTEMPTS)
+        ]
+        result = run_planning_evidence_acquisition("vuln", llm, str(tmp_path), context, base_evidence="")
+        assert result.grounded is False
+        assert result.terminal_state == "ungrounded_max_attempts"
+        assert llm.complete.call_count == MAX_PLANNING_ATTEMPTS
+        assert len(result.attempts) == MAX_PLANNING_ATTEMPTS
+        # Part 3's leniency (never stranding a not-yet-included resolution)
+        # must not weaken Part 5's real capacity fitting: every round
+        # genuinely re-resolves, yet inclusion never becomes possible, and
+        # the bounded process still fails closed rather than looping
+        # forever or being silently promoted to grounded.
+        for attempt in result.attempts:
+            assert attempt.resolutions[0].resolved is True
+            assert attempt.resolutions[0].failure_reason is None
+            assert attempt.resolutions[0].included is False
+
+
 # ---------------------------------------------------------------------------
 # Upstream-knowledge isolation -- minimal prompt hardening (Section 8 of
 # the approved design). Simple content assertions: this test suite cannot
@@ -528,6 +746,162 @@ class TestUpstreamKnowledgeIsolationPromptHardening:
     def test_remediation_verifier_prompt_prohibits_remembered_upstream_fix(self):
         text = self._read("remediation_verifier.md")
         assert "remembered" in text.lower()
+
+
+class TestDefaultGuardReachabilityPromptContract:
+    """Regression tests for the V6 root cause: Planning promoted an
+    additional execution path into required remediation scope even though
+    verified source showed the unsafe operation on that path was blocked by
+    a default-enabled guard, reachable only via an explicit non-default
+    override. The fix is prompt-only (prompts/remediation_planner.md's
+    existing step 4/6 reachability-tracing contract); the existing schema
+    (target_files/target_symbols/explicit_unknowns/approaches_to_avoid/
+    evidence_requests) already represents every outcome the rule can
+    produce, so no parser or orchestration field was added.
+
+    No test in this class proves actual LLM reasoning compliance -- that
+    is not deterministically testable with a mocked LLM. These tests
+    instead (1) check the exact rule content landed in the shipped prompt,
+    generically worded, and (2) prove the orchestration layer treats every
+    schema-representable outcome the rule can produce (exclude the second
+    target, retain it, retain it because the invariant says so, or defer
+    via the existing evidence_requests mechanism) as a normal, fully
+    supported result -- i.e. if a model does follow the new rule, nothing
+    downstream fights or requires special-casing that decision."""
+
+    def _read_prompt(self):
+        from pathlib import Path
+        return (
+            Path(__file__).parent.parent.parent / "utilities" / "autopatcher" / "prompts" / "remediation_planner.md"
+        ).read_text(encoding="utf-8")
+
+    def _joined(self):
+        import re
+        return re.sub(r"\s+", " ", self._read_prompt())
+
+    # -- structural: the rule itself, and its placement ------------------
+
+    def test_prompt_states_default_blocked_path_does_not_justify_additional_target(self):
+        joined = self._joined()
+        assert "default value already" in joined
+        assert "non-default" in joined
+        assert "do not treat that path as evidence that the default remediation needs an" in joined
+
+    def test_prompt_states_default_reachable_path_may_be_retained(self):
+        joined = self._joined()
+        assert "remains reachable under ordinary/default arguments" in joined
+        assert "the additional target is supported by the trace and may be retained" in joined
+
+    def test_prompt_forbids_inferring_default_blocked_from_mere_presence_of_a_flag(self):
+        joined = self._joined().lower()
+        assert "do not infer that a path is default-blocked merely because it has a" in joined
+
+    def test_prompt_preserves_fail_closed_when_guard_default_or_ordering_unknown(self):
+        joined = self._joined()
+        assert "you may not assume either answer" in joined
+        assert "request the missing evidence via `evidence_requests`" in joined
+
+    def test_prompt_examples_are_generic_and_case_specific_terms_absent(self):
+        text = self._read_prompt()
+        assert "allow_external" in text
+        lowered = text.lower()
+        for forbidden in (
+            "urllib3", "cookie", "redirect", "assert_same_host", "poolmanager",
+            "retry.py", "cve", "hostchangederror",
+        ):
+            assert forbidden not in lowered
+
+    def test_security_completeness_step_cross_references_trace_without_duplicating_rule(self):
+        joined = self._joined()
+        assert "established by the same guard-by-guard trace required in" in joined
+        text = self._read_prompt()
+        # The worked contrastive example's two code blocks must appear
+        # exactly once each -- step 6 gets a short pointer back to step 4,
+        # never a second copy of the full rule/example.
+        assert text.count("process(item, allow_external=False)") == 1
+        assert text.count("process(item, allow_external=True)") == 1
+
+    # -- orchestration: existing schema represents every outcome ---------
+
+    def test_A_default_blocked_path_excluded_is_accepted_as_grounded(self, tmp_path):
+        """A Planner response that (correctly) excludes a default-blocked
+        second path, recording it only in explicit_unknowns, must ground
+        normally -- proving no downstream code requires or expects a
+        second target merely because one was structurally possible."""
+        body = dict(_WELL_FORMED_BASE)
+        body["additional_evidence_required"] = False
+        body["target_files"] = ["primary.py"]
+        body["target_symbols"] = ["primary.py:handle"]
+        body["narrower_alternative_decision"] = "SELECTED"
+        body["explicit_unknowns"] = [
+            "A second path in other.py only reaches the sensitive operation "
+            "when called with a non-default override; the security invariant "
+            "does not require covering that explicit override, so it is not "
+            "included as a remediation target.",
+        ]
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(body)
+        result = run_planning_evidence_acquisition(_VULN_TEXT, llm, str(tmp_path), None, base_evidence="")
+        assert result.grounded is True
+        assert result.plan_result.target_files == ["primary.py"]
+        assert "non-default override" in result.plan_result.explicit_unknowns[0]
+
+    def test_B_default_reachable_second_path_is_retained_without_being_second_guessed(self, tmp_path):
+        (tmp_path / "primary.py").write_text("x = 1\n", encoding="utf-8")
+        (tmp_path / "other.py").write_text("y = 1\n", encoding="utf-8")
+        body = dict(_WELL_FORMED_BASE)
+        body["additional_evidence_required"] = False
+        body["target_files"] = ["primary.py", "other.py"]
+        body["target_symbols"] = ["primary.py:handle", "other.py:handle"]
+        body["narrower_alternative_decision"] = "SELECTED"
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(body)
+        result = run_planning_evidence_acquisition(_VULN_TEXT, llm, str(tmp_path), None, base_evidence="")
+        assert result.grounded is True
+        assert result.plan_result.target_files == ["primary.py", "other.py"]
+        assert "primary.py" in result.planner_evidence_result.rendered
+        assert "other.py" in result.planner_evidence_result.rendered
+
+    def test_C_explicit_override_declared_in_scope_retains_target(self, tmp_path):
+        (tmp_path / "primary.py").write_text("x = 1\n", encoding="utf-8")
+        (tmp_path / "other.py").write_text("y = 1\n", encoding="utf-8")
+        body = dict(_WELL_FORMED_BASE)
+        body["additional_evidence_required"] = False
+        body["security_invariant"] = (
+            "The sensitive operation must not run for any caller, including one "
+            "that explicitly supplies the non-default override; the report "
+            "identifies the override path itself as in scope."
+        )
+        body["target_files"] = ["primary.py", "other.py"]
+        body["target_symbols"] = ["other.py:handle"]
+        body["narrower_alternative_decision"] = "SELECTED"
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(body)
+        result = run_planning_evidence_acquisition(_VULN_TEXT, llm, str(tmp_path), None, base_evidence="")
+        assert result.grounded is True
+        assert "other.py" in result.plan_result.target_files
+        assert "override" in result.plan_result.security_invariant
+
+    def test_D_guard_default_unknown_uses_existing_evidence_request_mechanism(self, tmp_path):
+        """When the guard, its default, or its ordering cannot be
+        established from supplied evidence, the rule's own fallback is the
+        ALREADY EXISTING additional_evidence_required/evidence_requests
+        contract (Fix A) -- proving no new, parallel fail-open/fail-closed
+        mechanism was introduced for this rule."""
+        (tmp_path / "other.py").write_text("y = 1\n", encoding="utf-8")
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            _response(True, [{
+                "request_type": "file_source", "file_hint": "other.py",
+                "reason": "cannot determine the guard or its default value for the "
+                          "second path from the evidence given so far",
+            }]),
+            _response(False, []),
+        ]
+        result = run_planning_evidence_acquisition(_VULN_TEXT, llm, str(tmp_path), None, base_evidence="")
+        assert result.grounded is True
+        assert llm.complete.call_count == 2
+        assert "other.py" in result.planner_evidence_result.rendered
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,29 @@ from .llm_client import LLMClient
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "patch_generator.md"
 
+# The exact fixed strings generate_patch_raw() wraps around vulnerability_text/
+# code_context/retry_hint -- shared with compute_patch_generation_capacity()
+# below so the overhead a capacity calculation counts and the overhead an
+# actual request sends can never independently drift apart (one caller
+# computing a ceiling with the actual scaffolding, the request itself
+# assembled with a different one, would silently reopen the same
+# unders-counted-overhead gap Fix B exists to close).
+_VULN_HEADER = "## Vulnerability report\n\n"
+_CODE_CONTEXT_HEADER = "\n\n## Repository code context\n\n"
+_RETRY_HEADER = "\n\n## Retry instruction\n\n"
+
+# The section label treated as REQUIRED by fit_patch_generation_context() at
+# every real call site (pipeline.py) that has one: the Final-Target
+# Remediation Slice (or, for Post-Patch Recovery regeneration, its recovered
+# replacement occupying the same conceptual slot) -- the one context section
+# whose presence is not incidental but is what Edit Readiness/Post-Patch
+# Recovery's own existing deterministic gates already require before Patch
+# Generation is allowed to run at all (see pipeline.py's `_edit_readiness.
+# edit_source_ready` / `_post_patch_recovery.ready_for_regeneration` checks).
+# Reused verbatim by every call site so "required" can never mean something
+# different at one than at another.
+PATCH_GENERATION_REQUIRED_LABEL = "final_target_slice"
+
 # Matches an opening fence line tagged diff, patch, or udiff. Must start at
 # column 0 (no leading whitespace) so a diff-prefixed hunk line (" ```",
 # "+```", "-```") can never be mistaken for one — every unified-diff
@@ -220,11 +243,11 @@ def generate_patch_raw(
         The raw, unclassified LLM response text.
     """
     system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
-    user_message = "## Vulnerability report\n\n" + vulnerability_text
+    user_message = _VULN_HEADER + vulnerability_text
     if code_context:
-        user_message += "\n\n## Repository code context\n\n" + code_context
+        user_message += _CODE_CONTEXT_HEADER + code_context
     if retry_hint:
-        user_message += "\n\n## Retry instruction\n\n" + retry_hint
+        user_message += _RETRY_HEADER + retry_hint
 
     if os.environ.get("AUTOPATCHER_DEBUG"):
         _debug_dir = Path("reports") / "debug"
@@ -288,3 +311,160 @@ def generate_patch(
     """
     raw = generate_patch_raw(vulnerability_text, llm, code_context=code_context, retry_hint=retry_hint, stage=stage)
     return classify_patch_response(raw).diff
+
+
+# ---------------------------------------------------------------------------
+# Fix B: Patch Generation combined-request technical-capacity contract.
+#
+# generate_patch_raw() sends ONE real request whose total size is
+# system_prompt + _VULN_HEADER + vulnerability_text + (_CODE_CONTEXT_HEADER +
+# code_context, if code_context) + (_RETRY_HEADER + retry_hint, if
+# retry_hint). Every caller that decides what `code_context` may contain
+# must size it against what the OTHER pieces of that same request already
+# cost -- never against the system prompt and vulnerability_text alone, and
+# never independently of whether a retry_hint will also be present. The two
+# functions below are the ONE place that computation happens, so the
+# initial call and every retry call necessarily share it; see
+# utilities.autopatcher.technical_capacity for the underlying per-call
+# source-capacity equation this builds on (unchanged, reused as-is).
+# ---------------------------------------------------------------------------
+
+
+def compute_patch_generation_capacity(vulnerability_text, retry_hint="", *, reserved_output_tokens=None):
+    """Real remaining capacity (in characters) for `code_context` in the
+    ACTUAL Patch Generator request that will be sent -- accounts for every
+    fixed string generate_patch_raw() itself sends alongside it: the
+    system prompt (`_PROMPT_PATH`), `_VULN_HEADER` + `vulnerability_text`,
+    `_CODE_CONTEXT_HEADER`'s own fixed text, and -- only when a retry is
+    actually happening -- `_RETRY_HEADER` + the exact `retry_hint` text.
+    `retry_hint=""` (the default, matching the initial call) omits that
+    last term entirely, exactly mirroring generate_patch_raw()'s own `if
+    retry_hint:` guard.
+
+    Returns a `technical_capacity.SourceCapacityResult` -- `.source_capacity_
+    chars` is the ceiling `code_context` must fit within to guarantee the
+    combined request never exceeds real per-call technical capacity."""
+    from .llm_client import resolve_active_model, resolve_max_tokens
+    from .technical_capacity import compute_source_capacity
+
+    system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
+    known_overhead_chars = (
+        len(system_prompt) + len(_VULN_HEADER) + len(vulnerability_text or "") + len(_CODE_CONTEXT_HEADER)
+    )
+    if retry_hint:
+        known_overhead_chars += len(_RETRY_HEADER) + len(retry_hint)
+    provider, model = resolve_active_model()
+    return compute_source_capacity(
+        provider, model,
+        reserved_output_tokens=(resolve_max_tokens() if reserved_output_tokens is None else reserved_output_tokens),
+        known_overhead_chars=known_overhead_chars,
+    )
+
+
+class PatchGenerationContextPlan(NamedTuple):
+    """Result of fitting Patch Generation's constituent context sections
+    (Repository Grounding, Repository Understanding, the Final-Target
+    Remediation Slice, etc. -- see pipeline.py's own `_ctx_parts` ordering
+    comment) against a real `compute_patch_generation_capacity(...).
+    source_capacity_chars` ceiling. Whole-block-or-omit only -- no section's
+    text is ever sliced mid-string.
+
+    rendered:          The final "\\n\\n"-joined `code_context` string --
+                        exactly what generate_patch_raw() should receive.
+    included_sections:  (label, text) pairs actually included, in the SAME
+                        relative order they were given -- preserved (not
+                        just `included_labels`) so a caller can rebuild a
+                        modified section list later (e.g. Post-Patch
+                        Recovery swapping the required section's text)
+                        without re-parsing the flat `rendered` string.
+    included_labels:    Convenience -- just the labels of included_sections.
+    omission_reason:    label -> "technical_capacity" for every OPTIONAL
+                        section that did not fit.
+    omitted_sizes:      label -> that section's full whole-block size, for
+                        every entry in omission_reason (and, when
+                        `required_missing` is True, for `required_label`
+                        too).
+    required_missing:   True only when `required_label` was given, its
+                        section was non-empty, and it alone did not fit
+                        within `max_chars` -- the caller MUST fail closed
+                        (never send the request) rather than treat the
+                        required section as one more optional omission.
+    max_chars, capacity: The ceiling this plan was fit against, and the
+                        full `SourceCapacityResult` it came from (or
+                        whatever the caller passed), for provenance/tests.
+    """
+    rendered: str
+    included_sections: "tuple[tuple[str, str], ...]"
+    included_labels: "tuple[str, ...]"
+    omission_reason: "dict[str, str]"
+    omitted_sizes: "dict[str, int]"
+    required_missing: bool
+    max_chars: int
+    capacity: "object | None" = None
+
+
+def fit_patch_generation_context(sections, max_chars, *, required_label=None, capacity=None):
+    """Whole-block-or-omit fit of Patch Generation's context sections
+    against `max_chars` (see `compute_patch_generation_capacity`).
+
+    `sections`: an ordered list of (label, text) pairs -- pipeline.py's own
+    existing section ordering (see its `_ctx_parts` comment: hand-authored
+    plan -> grounding -> patterns -> understanding -> plan text -> planner
+    evidence -> verified/strategy semantics -> the Final-Target slice ->
+    coverage warning). Empty/blank texts are dropped up front and never
+    occupy a label.
+
+    `required_label`: when given and its section is present (non-empty),
+    that section's whole text is reserved FIRST and is never dropped for
+    capacity -- see PATCH_GENERATION_REQUIRED_LABEL. Every OTHER present
+    section is optional: included whole, in the SAME order `sections` was
+    given, as long as what remains after the required reservation still
+    fits it; otherwise omitted whole (never truncated) and recorded in
+    `omission_reason`/`omitted_sizes`. No new importance ranking is
+    introduced beyond this required/optional split -- optional sections
+    compete for remaining room in the exact order the caller already
+    renders them in, the same order pipeline.py has always assembled
+    `code_context` in; nothing here re-prioritizes them.
+
+    `required_label` given but its section does not fit `max_chars` even
+    alone: returns `required_missing=True` with an EMPTY `rendered` -- the
+    caller must fail Patch Generation closed for this request, never send
+    a request missing evidence Edit Readiness/Post-Patch Recovery already
+    established as required."""
+    present = [(label, text) for label, text in sections if text and text.strip()]
+    required_text = ""
+    if required_label is not None:
+        required_text = next((text for label, text in present if label == required_label), "")
+
+    if required_text and len(required_text) > max_chars:
+        return PatchGenerationContextPlan(
+            rendered="", included_sections=(), included_labels=(),
+            omission_reason={}, omitted_sizes={required_label: len(required_text)},
+            required_missing=True, max_chars=max_chars, capacity=capacity,
+        )
+
+    remaining = max_chars - len(required_text)
+    have_any = bool(required_text)
+    included_labels_seen = {required_label} if required_text else set()
+    omission_reason: "dict[str, str]" = {}
+    omitted_sizes: "dict[str, int]" = {}
+    for label, text in present:
+        if label == required_label:
+            continue
+        cost = len(text) + (2 if have_any else 0)  # "\n\n" join separator
+        if cost <= remaining:
+            included_labels_seen.add(label)
+            remaining -= cost
+            have_any = True
+        else:
+            omission_reason[label] = "technical_capacity"
+            omitted_sizes[label] = len(text)
+
+    included_sections = tuple((label, text) for label, text in present if label in included_labels_seen)
+    included_labels = tuple(label for label, _ in included_sections)
+    rendered = "\n\n".join(text for _, text in included_sections)
+    return PatchGenerationContextPlan(
+        rendered=rendered, included_sections=included_sections, included_labels=included_labels,
+        omission_reason=omission_reason, omitted_sizes=omitted_sizes,
+        required_missing=False, max_chars=max_chars, capacity=capacity,
+    )

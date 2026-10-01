@@ -893,15 +893,28 @@ def cmd_patch(args):
 
     output_dir = args.output or tempfile.mkdtemp(prefix="openant_patch_")
 
-    # Conservative defaults (see patch_p.add_argument("--context-budget-policy",
-    # ...) above): "ask" for an interactive run, "never" otherwise -- so a
-    # non-interactive invocation (CI, a pipe) never blocks on input just
-    # because no policy was explicitly chosen.
-    policy = getattr(args, "context_budget_policy", None) or (
-        "ask" if sys.stdin.isatty() else "never"
-    )
-    max_windows = getattr(args, "max_context_budget_windows", None) or 10
-    budget_controller = ContextBudgetController(policy=policy, max_windows=max_windows)
+    # Fix B: --context-budget-policy/--max-context-budget-windows no longer
+    # gate whether resolved repository evidence reaches an LLM call -- that
+    # is now always bounded by the real per-call technical capacity of the
+    # active model (see utilities.autopatcher.technical_capacity), never by
+    # an arbitrary "budget window" count. Both flags are still ACCEPTED
+    # (so an existing script/CI invocation that already passes them keeps
+    # working) but are otherwise inert here -- see patch_p.add_argument(...)
+    # above for the full deprecation help text. A single, one-time notice
+    # fires on this process's stderr whenever either was explicitly passed,
+    # so a caller relying on the old numeric behavior finds out immediately
+    # rather than silently getting different (correct) behavior.
+    if getattr(args, "context_budget_policy", None) is not None or getattr(
+        args, "max_context_budget_windows", None
+    ) is not None:
+        print(
+            "warning: --context-budget-policy/--max-context-budget-windows no longer "
+            "control whether repository evidence reaches an LLM call -- that is now "
+            "always bounded by the model's real technical context capacity. Both "
+            "flags are accepted for compatibility but have no further effect.",
+            file=sys.stderr,
+        )
+    budget_controller = ContextBudgetController()
     compare_existing_tests = bool(getattr(args, "compare_existing_tests", False))
 
     try:
@@ -1998,24 +2011,23 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["ask", "always", "never"],
         default=None,
         help=(
-            "How to handle a repository source/context acquisition budget "
-            "exhausted purely by character capacity (never a safety/"
-            "verification failure): 'ask' prompts for another fixed-size "
-            "context window (default No; degrades to 'never' when stdin "
-            "isn't a TTY), 'always' auto-approves up to "
-            "--max-context-budget-windows, 'never' preserves the existing "
-            "fail-closed behavior. Default: 'ask' for an interactive run, "
-            "'never' otherwise."
+            "DEPRECATED, accepted for compatibility only: no longer controls "
+            "whether repository evidence reaches an LLM call. That is now "
+            "always bounded by the active model's real technical context "
+            "capacity (see the Fix B release notes), never by an arbitrary "
+            "'budget window' count. Passing this has no further effect "
+            "beyond a one-time deprecation notice."
         ),
     )
     patch_p.add_argument(
         "--max-context-budget-windows",
         type=_positive_int,
-        default=10,
+        default=None,
         help=(
-            "Hard cap on total context-budget windows (initial + approved) "
-            "per acquisition stage, even under --context-budget-policy "
-            "always. Must be a positive integer (default: 10)."
+            "DEPRECATED, accepted for compatibility only: no longer caps "
+            "anything -- see --context-budget-policy's own help text. "
+            "Passing this has no further effect beyond a one-time "
+            "deprecation notice."
         ),
     )
     patch_p.add_argument(

@@ -78,22 +78,62 @@ pseudocode.
   say so in `insufficient_evidence` rather than guessing. An empty list is a
   better answer than a wrong one.
 - Additionally, set `target_authority_unresolved` to `true` when at least
-  one item in `insufficient_evidence` means you cannot yet determine
-  whether the `target_files`/`target_symbols`/mechanism you selected above
-  is actually the correct remediation location -- for example, evidence
-  about a narrower or existing mechanism you have not been able to inspect
-  yet, or evidence needed to confirm the selected mechanism itself (not an
-  alternative) is correct. Set it to `false` when every remaining gap in
+  one item in `insufficient_evidence` materially prevents you from
+  determining whether the `target_files`/`target_symbols`/mechanism you
+  selected above is the justified remediation location/mechanism for the
+  supplied security invariant -- for example, evidence about a narrower or
+  existing mechanism you have not been able to inspect yet, or evidence
+  needed to confirm the selected mechanism itself (not an alternative) is
+  correct. This is not a general signal that more validation would be
+  useful; it means specifically that you cannot yet stand behind your own
+  selected target/mechanism.
+- A remaining question about a DIFFERENT, unselected code path, entry
+  point, calling convention, override, or adjacent behavior is not, by
+  itself, a target-authority blocker -- even when you cannot fully resolve
+  it. Keep reporting it in `insufficient_evidence` if you judge it worth
+  flagging (do not drop it), but it does not make
+  `target_authority_unresolved` `true` unless you can explain why resolving
+  it could invalidate or materially change the selected target/mechanism
+  for the supplied security invariant. "This is a different path that
+  might independently need its own fix" and "I cannot justify my own
+  selected target/mechanism" are different claims -- only the second one
+  sets `target_authority_unresolved` to `true`.
+- Example of the distinction above: if the evidence does not establish
+  that your selected mechanism actually intercepts the behavior the
+  security invariant requires it to intercept, that is authority-relevant
+  -- `target_authority_unresolved: true`. If instead your selected
+  mechanism is evidence-backed for the supplied invariant, and the only
+  remaining question is whether some separate, non-default calling
+  convention or an alternate call path might independently need its own
+  validation, that is a validation/scope question --
+  `target_authority_unresolved: false` -- unless the invariant itself
+  requires that alternate path to be covered by the same mechanism.
+- Before reporting any uncertainty in `insufficient_evidence` or setting
+  `target_authority_unresolved`, re-evaluate every uncertainty you are
+  about to report -- including one that also appeared in your own earlier
+  reasoning on this same run -- against ALL verified evidence actually
+  present in THIS request. If the evidence now on hand already answers a
+  question raised earlier, do not restate it as unresolved merely because
+  it was raised before; report only the portion, if any, that the current
+  evidence still leaves open.
+- Set `target_authority_unresolved` to `false` when every remaining gap in
   `insufficient_evidence` concerns only validation, testing, behavioral
-  confirmation, or hardening evidence that would not change whether the
-  selected target/mechanism is correct. Decide this from what the evidence
-  itself does or does not establish -- never from whether the target or
-  mechanism happens to be described as an override, custom, non-default,
-  low-level, broader, or narrower than some alternative; those words alone
-  never determine the value either way. `target_authority_unresolved:
-  false` is not a claim that `target_files`/`target_symbols` is correct --
-  it only means you are not withholding authority over your own selected
-  target/mechanism for an evidence reason.
+  confirmation, hardening evidence, or an unselected separate path/calling
+  convention the supplied invariant does not require your selected
+  mechanism to cover -- none of that would change whether the selected
+  target/mechanism is correct. Decide this from what the evidence itself
+  does or does not establish -- never from whether the target or mechanism
+  happens to be described as an override, custom, non-default, low-level,
+  broader, or narrower than some alternative; those words alone never
+  determine the value either way. `target_authority_unresolved: false` is
+  not a claim that `target_files`/`target_symbols` is correct -- it only
+  means you are not withholding authority over your own selected
+  target/mechanism for an evidence reason. If, after this re-evaluation,
+  evidence genuinely remains insufficient to determine whether your
+  selected target/mechanism is correct, `target_authority_unresolved` must
+  still be `true` -- re-evaluating against current evidence is a reason to
+  clear a concern the evidence actually answers, never a reason to force
+  `false` on a concern it does not.
 - Do not propose unrelated changes. Do not propose a menu of options --
   select exactly one mechanism.
 

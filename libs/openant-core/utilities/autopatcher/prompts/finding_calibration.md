@@ -25,6 +25,21 @@ For each finding, do five things:
    because a Claim above already establishes the specific answer from
    what the evidence actually shows.
 
+   A Claim that an additional execution path reaches a concerning
+   operation is a reachability claim, and only "already establishes the
+   answer" for this purpose if it reflects a complete trace of the
+   supplied control flow to that operation — entry, any verified default
+   argument or configuration value, any preceding guard, the order those
+   steps actually execute in, and any early return, error, or stop the
+   supplied evidence shows before that operation. A Claim that names only
+   the later operation itself, without accounting for a guard the
+   supplied evidence also shows, does not establish the answer — it must
+   not be used to mark that dependency already-resolved, and must not be
+   omitted from Unresolved, merely because you intend to record the
+   finding as fully `Observed`. See the reachability rule under step 2
+   below — it governs this determination directly, not only when grading
+   a dependency you have already decided is unresolved.
+
 2. **Rate the remediation impact of any unresolved dependency**, independently
    of the group you will assign in step 3. This is a narrower question than
    group: given what the supplied Security Invariant (or, if none was
@@ -89,22 +104,126 @@ For each finding, do five things:
      never from a general assumption that unmodified code is automatically
      correct, and never merely because the predicate/helper/policy exists
      unexamined in the codebase.
-   - **Explicit non-default caller configuration.** A concern that exists
-     only when a caller deliberately selects an explicit non-default
-     configuration, override, lower-level entry point, disabled guard,
-     custom policy, or replacement value does not, by itself, make the
-     default remediation incomplete. When the remediation contract is
-     specifically about the default/normal path, classify such a concern
-     `validation_only` unless the supplied vulnerability description,
-     Security Invariant, or verified evidence itself extends the required
-     remediation to that alternate configuration, override, or entry point
-     — in which case it remains `proof_required`, exactly like any other
-     in-scope dependency. This is a scope decision made only from what the
-     supplied evidence and Security Invariant actually establish; it is
-     never a blanket rule that a custom configuration or non-default path
-     can never matter, and it is never decided from a keyword describing
-     the configuration (such as "override", "custom", "explicit",
-     "disabled", or "non-default") in the finding's own wording.
+   - **Explicit non-default execution.** A concern belongs to this single
+     scope pattern whenever the concerning behavior is reachable only
+     because a caller explicitly selects a non-default configuration,
+     override, lower-level entry point, custom policy, or replacement
+     value. This includes, among other generic forms:
+     - a non-default value that directly changes the later behavior
+       (a caller-supplied override, custom policy, or replacement value
+       that itself enables the concerning behavior); and
+     - a non-default value that disables, bypasses, or relaxes a
+       preceding default-enabled guard that would otherwise stop
+       execution before the concerning operation is reached.
+     These are the SAME remediation-scope pattern, not two different
+     ones — a concern must never receive different Remediation impact
+     semantics merely because it is phrased as "a caller-selected setting"
+     rather than "a guard being bypassed."
+
+     Before classifying a concern under this pattern, trace the complete
+     source-grounded reachability chain the supplied evidence exposes for
+     THIS finding: entry, any verified default argument or configuration
+     value, any preceding guard, the order those steps actually execute
+     in, and any early return, error, or stop that occurs before the
+     concerning operation. Do this even when the finding's own wording
+     never names the guard or the gating parameter at all — describes
+     only the later, concerning operation — you must still derive the
+     guard's existence and effect from the evidence supplied for this
+     finding; do not wait for the finding to name it. This obligation
+     does not depend on first deciding the dependency is unresolved —
+     `Group: Observed` together with `Unresolved: none` is not a way to
+     bypass it: a reachability claim you are about to record as fully
+     observed and settled must have already been through this same
+     trace, exactly like one you are about to list as unresolved.
+
+     Once the trace establishes that the concerning behavior is reachable
+     only through such an explicit non-default caller choice — whether a
+     direct setting or a guard bypass — decide between exactly these three
+     outcomes:
+     - **Case A — affirmatively in scope.** Classify `proof_required`
+       (when resolving the dependency is necessary to establish
+       remediation correctness) only when the supplied Security
+       Invariant, vulnerability description, or verified evidence itself
+       affirmatively establishes that this explicit non-default execution
+       is part of the required remediation behavior.
+     - **Case B — not affirmatively established as in scope.** Otherwise,
+       classify `validation_only`. The mere fact that it remains
+       conceptually possible to ask whether the invariant could be
+       extended to this non-default execution does not, by itself, make
+       the question `proof_required` — unknown scope is not automatically
+       remediation-proof relevance once the evidence already establishes
+       that the concerning behavior requires explicit non-default
+       execution to reach.
+
+       Case B applies whenever the supplied Security Invariant,
+       vulnerability description, or verified evidence is available and
+       its meaning with respect to this non-default execution can
+       actually be established — it simply does not affirmatively extend
+       to that scenario. This is silence, not ambiguity, and silence is
+       enough for Case B on its own. Silence is different from a case
+       where the supplied text itself cannot be read with respect to this
+       scenario at all — for example it is internally contradictory, or
+       too unclear to tell whether it is meant to reach this non-default
+       execution. That is not Case B: it is a failure to establish scope,
+       and it fails closed to `proof_required` for the same reason Case
+       C's reachability uncertainty does — never to `validation_only`.
+     - **Case C — cannot establish non-default-only reachability.** If
+       the supplied evidence does not establish the relevant default, the
+       preceding guard, execution order, whether the concerning operation
+       is reachable under defaults, or whether an explicit non-default
+       choice is actually required, remain `proof_required` and declare
+       the applicable `Evidence acquirability` below — do not guess
+       either answer, and do not infer default-only reachability merely
+       from a parameter's name or from an assumption about what a flag
+       "probably" does.
+
+     This is a scope decision made only from what the supplied evidence
+     and Security Invariant actually establish. It is never a blanket
+     rule that a non-default configuration is automatically irrelevant —
+     Case A remains fully available whenever the evidence supports it,
+     exactly like any other in-scope dependency. It is never decided
+     from a keyword describing the configuration (such as "override",
+     "custom", "explicit", "disabled", or "non-default") in the finding's
+     own wording, and it is never decided from whether upstream already
+     reached, or failed to reach, the same conclusion about this path —
+     upstream's own choices are not evidence of what this advisory's
+     remediation requires.
+
+     Example 1 — direct explicit override (repository-neutral): the
+     default configuration does not enable behavior X; a caller must
+     explicitly select a non-default configuration to enable X; the
+     supplied Security Invariant does not establish X as required
+     remediation scope. Classify `validation_only` (Case B).
+
+     Example 2 — default-enabled guard bypass (repository-neutral):
+     ```
+     process(item, allow_external=False)
+
+     if external(item) and not allow_external:
+         return
+
+     perform_sensitive_operation(item)
+     ```
+     A finding here reads only: "`perform_sensitive_operation` runs on
+     `item` without further restriction; whether that is acceptable for an
+     externally-sourced item is not addressed by the supplied evidence" —
+     the finding's own wording never mentions `allow_external` or the
+     guard at all. The evidence above nonetheless shows
+     `perform_sensitive_operation` is not reached for an external item
+     under the default (`allow_external=False`); reaching it requires a
+     caller to explicitly pass `allow_external=True`. This is the SAME
+     pattern as Example 1, reached through a guard bypass rather than a
+     direct setting. Classify `validation_only` (Case B) unless the
+     supplied Security Invariant or vulnerability description itself
+     extends the required remediation to that explicit override.
+
+     Example 3 — override explicitly included in scope (repository-
+     neutral): the same control flow as Example 2, but the supplied
+     Security Invariant explicitly states that the protection must hold
+     even when a caller enables external execution
+     (`allow_external=True`). Classify `proof_required` (Case A) when
+     resolving the dependency is necessary to establish remediation
+     correctness.
 
    This axis never determines Group, and Group never determines this axis: a
    `Hypothesis` finding may be `proof_required` or `validation_only`, and a
@@ -116,6 +235,145 @@ For each finding, do five things:
    established), write `validation_only` here — there is nothing left
    unresolved for this axis to grade. Never leave this field blank, and
    never write anything other than one of these three exact words.
+
+   Every `proof_required` finding additionally requires an `Evidence
+   acquirability` declaration (see the output format below). This is
+   MANDATORY, not optional, whenever `Remediation impact` is
+   `proof_required` — never leave it blank, and never write anything
+   other than one of these three exact words:
+
+   - `actionable` — the Unresolved dependency can potentially be resolved
+     by repository evidence, and that evidence is expressible through the
+     currently supported request vocabulary (a single, exact file path,
+     or a single, exact symbol in a file you can name). Declaring
+     `actionable` REQUIRES you to also emit exactly one schema-valid
+     `Evidence request` line naming that one file or symbol (see the
+     output format below) — never more than one target, never a menu of
+     alternatives, never speculative or open-ended access ("search for
+     callers", "check related files", "look for tests", "look for other
+     configurations"). If you conclude that a `proof_required`
+     uncertainty can be resolved by inspecting one specific repository
+     file or symbol using this vocabulary, you MUST declare `actionable`
+     and emit the corresponding `Evidence request` — do not declare
+     `not_expressible` or `conceptual_scope` merely because doing so
+     would be simpler.
+   - `not_expressible` — the Unresolved dependency may still require
+     additional repository investigation to settle, but what would need
+     to be checked is not a single nameable file or symbol (e.g. it
+     depends on enumerating or searching across an open-ended set of call
+     sites, configurations, or entry points that the supported request
+     vocabulary has no way to name). Never accompanied by an `Evidence
+     request` line. The finding remains `proof_required` — declaring
+     `not_expressible` is not a way to soften or resolve it, only a
+     statement that no single supported request would.
+   - `conceptual_scope` — the remaining uncertainty is not something any
+     additional repository source could resolve at all, regardless of
+     vocabulary: it is a question of interpretation, required scope, or
+     policy (e.g. whether a given scenario is even within the advisory's
+     required remediation behavior), not a question about what the
+     repository contains. Never accompanied by an `Evidence request`
+     line. The finding remains `proof_required`.
+
+   Decide between these three only from what resolving the dependency
+   would actually require — never from how difficult, tedious, or
+   involved that would be, and never to avoid writing an `Evidence
+   request`. A secondhand description of a file or symbol's behavior —
+   including your own earlier Claims above, another finding's Reworded
+   text, or any other prose characterizing what a piece of repository
+   source does — is never automatically equivalent to that file or
+   symbol's own primary source being available to you in the evidence
+   supplied for THIS calibration pass. If the Unresolved dependency turns
+   on the exact behavior of a specific, nameable file or symbol and you
+   have only been given prose describing it (by an earlier pipeline
+   stage, by yourself, or by another finding) rather than its own
+   verified source in the evidence above, that still qualifies as
+   `actionable` with an `Evidence request` for it — not `not_expressible`
+   or `conceptual_scope`, and not `Observed` either (see step 3 below).
+
+   Work through this order when deciding: first, is the remaining
+   uncertainty fundamentally a question of interpretation, required
+   scope, or policy that no repository source of any kind could settle,
+   regardless of vocabulary? That is `conceptual_scope`. Otherwise, can
+   one specific repository file or symbol be named from evidence already
+   supplied — even if that file or symbol's own implementation has not
+   yet been shown — whose contents could materially reduce or settle the
+   dependency? That is `actionable`. Only when neither applies — genuine
+   repository investigation is relevant, but what would need to be
+   checked cannot currently be reduced to one or more supported exact
+   requests (an open-ended, not-yet-identifiable population of callers,
+   configurations, or entry points, with no concrete file or symbol
+   target nameable from the evidence you have) — is it `not_expressible`.
+   Do not treat `not_expressible` as the default merely because you do
+   not already know the answer.
+
+   A file or symbol is nameable from supplied evidence whenever its
+   identity — not necessarily its own implementation — is already
+   visible: through an import, a function or method call, a class
+   reference, an inheritance relationship, a constructor call, a helper
+   reference, or any other explicit repository identifier appearing in
+   the evidence you were given. That its own implementation has not yet
+   been shown is precisely the reason to request it, never a reason to
+   call the dependency `not_expressible`.
+
+   Reading and reasoning about the requested file or symbol once it is
+   acquired — including working out which of several branches inside it
+   applies, or how a value is transformed, normalized, wrapped, copied,
+   preserved, or replaced as it passes through it — does NOT make the
+   request `not_expressible`. The request only needs to identify which
+   repository evidence to acquire; it does not need to already encode
+   the final answer. Nor must you be certain in advance that this one
+   request will completely settle the dependency — only that the named
+   evidence is directly relevant and expected to materially reduce it. A
+   dependency that turns on which of several code paths a value actually
+   travels through is exactly this shape: `actionable`, not
+   `not_expressible`, whenever one of those paths — or the function,
+   method, or class that decides between them — can be named. The
+   evidence you acquire this way may confirm the concern rather than
+   eliminate it; `actionable` is not a prediction about the outcome, and
+   a finding may correctly remain `proof_required` after acquisition.
+
+   Two further contrastive examples (repository-neutral):
+   - Supplied evidence shows `from .transport import Transport` and
+     `self.transport = Transport(config)`, and the Unresolved dependency
+     is whether `Transport` preserves or transforms a value before
+     sending it; `Transport`'s own implementation has not been shown.
+     `Transport` is nameable directly from the import, so this is
+     `actionable` with `Evidence request: symbol_definition |
+     pkg/transport.py | Transport` — not knowing what `Transport` does
+     until it is read does not make this `not_expressible`.
+   - Supplied evidence shows a call `validator.prepare(value)`, and the
+     Unresolved dependency is whether `prepare` normalizes `value` before
+     the later validation the finding is concerned about. `prepare` is a
+     specific, nameable symbol, so this is `actionable` with `Evidence
+     request: symbol_definition | validator.py | prepare` — needing to
+     read `prepare`'s own branches to know which applies does not make
+     this `not_expressible` either.
+
+   `Evidence acquirability` is meaningless for a `validation_only` or
+   `unclear` finding — do not write it there, and do not write an
+   `Evidence request` there either. Declaring `actionable` never itself
+   makes `proof_required` non-blocking, and never substitutes for
+   actually resolving the dependency yourself from evidence already
+   shown to you — see step 1 above; only choose `actionable` after
+   checking the dependency is not already established by your own
+   Claims from evidence genuinely already supplied.
+
+   Example (repository-neutral): a finding's Unresolved dependency is
+   "whether `validate(x)` also runs when `handle(x)` is called through
+   its alternate `mode="legacy"` entry point, whose implementation was
+   not shown." The alternate entry point's own file/function IS
+   nameable, so this is `actionable` with `Evidence request: symbol_
+   definition | pkg/handler.py | handle_legacy`. Contrast: a finding's
+   Unresolved dependency is "whether any caller anywhere in the
+   application invokes `handle(x)` with sanitization disabled" — this
+   depends on an open-ended search across every call site, which the
+   supported vocabulary (one named file, or one named symbol) cannot
+   express, so it is `not_expressible`, with no `Evidence request`.
+   Contrast again: a finding's Unresolved dependency is "whether the
+   supplied Security Invariant's requirement extends to responses that
+   never reach `handle(x)` at all" — no repository source, of any kind,
+   settles what the invariant is intended to require, so this is
+   `conceptual_scope`, with no `Evidence request`.
 
 3. **Classify** it into exactly one of three groups:
    - `Observed` — the evidence shown above directly demonstrates the specific
@@ -201,7 +459,17 @@ exact format (repeat for every finding, in order):
 2. Claims:
    - <one factual dependency the conclusion requires, one per line>
    Unresolved: <the unresolved dependency, or several separated by semicolons>
-   Remediation impact: <proof_required|validation_only|unclear>
+   Remediation impact: proof_required
+   Evidence acquirability: actionable
+   Evidence request: <request_type> | <file_hint> | <symbol>
+   Group: <Observed|Hypothesis|Hardening>
+   Reworded: <the reworded finding, one paragraph, no line breaks>
+
+3. Claims:
+   - <one factual dependency the conclusion requires, one per line>
+   Unresolved: <the unresolved dependency>
+   Remediation impact: proof_required
+   Evidence acquirability: not_expressible
    Group: <Observed|Hypothesis|Hardening>
    Reworded: <the reworded finding, one paragraph, no line breaks>
 
@@ -213,8 +481,27 @@ established, separated by semicolons, on a single line. `Remediation
 impact:` always comes immediately after `Unresolved:`, on its own line,
 before `Group:`. Whenever `Unresolved: none` applies, `Remediation impact:`
 must be `validation_only` — an empty Unresolved list leaves nothing on
-this axis to block on. Do not include any other content, headers, or
-commentary outside this list.
+this axis to block on.
+
+`Evidence acquirability:` comes immediately after `Remediation impact:`,
+before `Group:`. It is MANDATORY whenever `Remediation impact:` is
+`proof_required` — exactly one of `actionable`, `not_expressible`, or
+`conceptual_scope`, never blank, never any other word. Omit the line
+entirely for `validation_only`/`unclear` — never write it there, and never
+write `not_applicable` or any other placeholder for those.
+
+`Evidence request:` comes immediately after `Evidence acquirability:`,
+before `Group:`. It is REQUIRED, exactly once, when (and only when)
+`Evidence acquirability: actionable` — omit it entirely for
+`not_expressible`/`conceptual_scope`, and never write it at all outside a
+`proof_required` finding. Exactly two forms are valid:
+
+- `Evidence request: file_source | <exact repository file path>`
+- `Evidence request: symbol_definition | <exact repository file path> | <exact qualified symbol name>`
+
+Never write a third form, never name more than one file or symbol on the
+line. Do not include any other content, headers, or commentary outside
+this list.
 
 Example input findings:
 
@@ -238,6 +525,7 @@ Example output:
    - Redirect stripping treats same-origin and cross-origin redirects identically.
    Unresolved: whether redirect stripping distinguishes same-origin from cross-origin redirects
    Remediation impact: proof_required
+   Evidence acquirability: not_expressible
    Group: Hypothesis
    Reworded: If redirect stripping does not distinguish same-origin from cross-origin redirects, same-origin redirects may also strip Cookie.
 
@@ -253,6 +541,7 @@ Example output:
      cross-origin redirect, determined by the comparison scope.
    Unresolved: whether the comparison scope considers scheme and port or host only
    Remediation impact: proof_required
+   Evidence acquirability: not_expressible
    Group: Hypothesis
    Reworded: If the comparison scope only considers host and not scheme/port, a same-host but cross-scheme or cross-port redirect may not be treated as cross-origin, and the header may not be stripped when it should be.
 
@@ -282,6 +571,8 @@ Example output:
    - The caller relies on `is_valid(x)` returning True only for well-formed input.
    Unresolved: whether `is_valid` actually returns True only for well-formed input
    Remediation impact: proof_required
+   Evidence acquirability: actionable
+   Evidence request: symbol_definition | validation.py | is_valid
    Group: Hypothesis
    Reworded: The caller relies on `is_valid` to reject malformed input; `is_valid`'s own implementation was not shown, so whether it actually does so is unconfirmed.
 
@@ -322,6 +613,8 @@ Example output:
    - The supplied Security Invariant requires sanitization for input routed through `mode="compat"` as well.
    Unresolved: whether `handle(x)` applies `sanitize(x)` when called with `mode="compat"`
    Remediation impact: proof_required
+   Evidence acquirability: actionable
+   Evidence request: symbol_definition | handler.py | handle
    Group: Hypothesis
    Reworded: `handle(x)`'s `mode="compat"` code path was not shown, so whether it applies `sanitize(x)` before use is unconfirmed; the supplied Security Invariant requires sanitization on this path, so this remains an open remediation question.
 
@@ -359,10 +652,19 @@ here does not mean the `mode="compat"` behavior is safe, false, resolved, or
 unimportant — only that resolving it is not required to establish the
 claimed remediation against Case B's supplied Security Invariant.
 
-If the supplied Security Invariant is silent or ambiguous about whether a
-scenario like `mode="compat"` is required — rather than clearly excluding
-it, as in Case B — the same dependency stays `proof_required`: scope
-ambiguity is never resolved by downgrading to `validation_only`.
+Silence and genuine ambiguity are not the same thing, and must not be
+treated interchangeably here. If the supplied Security Invariant is
+legible and its meaning with respect to `mode="compat"` can be
+established, but it simply does not mention or extend to that scenario —
+exactly as in Case B above — the dependency is `validation_only`; mere
+silence in an understandable, applicable Security Invariant is not itself
+evidence that the scenario is in scope. If, instead, the supplied
+Security Invariant's own text cannot be understood with respect to
+`mode="compat"` at all — for example it is internally contradictory, or
+its wording is too unclear to tell whether it is meant to reach that
+scenario — the dependency remains genuinely unresolved and stays
+`proof_required`: that failure to establish what the Security Invariant
+itself means is never resolved by downgrading to `validation_only`.
 
 Contrastive example — existing predicate the patch does not modify (same
 unresolved dependency and the same supplied evidence, two different supplied
@@ -405,6 +707,8 @@ Example output:
    - The Security Invariant explicitly requires the allowed-set check to reject suffix-sharing destinations, making `is_allowed_destination`'s own comparison mode part of the required remediation.
    Unresolved: whether `is_allowed_destination` performs exact-match or suffix-match comparison
    Remediation impact: proof_required
+   Evidence acquirability: actionable
+   Evidence request: symbol_definition | policy.py | is_allowed_destination
    Group: Hypothesis
    Reworded: The Security Invariant explicitly requires the allowed-set check to reject destinations sharing a suffix with a blocked entry, making `is_allowed_destination`'s own comparison mode part of the required remediation; its implementation was not shown, so this remains an open remediation question.
 
@@ -473,6 +777,8 @@ Example output:
    - The Security Invariant explicitly requires validation to still apply when `skip_validation=True` is passed.
    Unresolved: whether the required validation still applies when a caller passes `skip_validation=True`
    Remediation impact: proof_required
+   Evidence acquirability: actionable
+   Evidence request: symbol_definition | fetcher.py | fetch
    Group: Hypothesis
    Reworded: A caller can bypass `validate(url)` by explicitly passing `skip_validation=True`; the supplied Security Invariant explicitly extends the required validation to this configuration, so whether it still applies here remains an open remediation question.
 
@@ -486,7 +792,13 @@ decide this from the word "skip_validation" itself, from whether the
 parameter name sounds like a shortcut, or from any general assumption that
 a non-default configuration is automatically out of scope, or automatically
 in scope — the decision comes only from what the supplied Security
-Invariant and evidence actually establish. If the Security Invariant were
-silent or ambiguous about `skip_validation` rather than clearly excluding
-it, the same dependency would stay `proof_required`, exactly as in the
-`mode="compat"` contrastive example above.
+Invariant and evidence actually establish. Silence and genuine ambiguity
+are not the same thing here either. If the Security Invariant is legible
+and its meaning with respect to `skip_validation` can be established, but
+it simply does not address that configuration — exactly as in Case A
+above — the dependency is `validation_only`. If instead the Security
+Invariant's own text cannot be understood with respect to
+`skip_validation` at all — for example it is internally contradictory, or
+too unclear to tell whether it is meant to reach this configuration — the
+dependency remains genuinely unresolved and stays `proof_required`,
+exactly as in the `mode="compat"` contrastive example above.

@@ -16,14 +16,18 @@ a personal debugging helper; see utilities/autopatcher/tools/__init__.py
 and TRACING_AND_DEBUGGING.md in this same directory.
 
 What it does, precisely:
-  1. Parses the same --context-budget-policy / --max-context-budget-windows
-     flags as `openant patch` (openant/cli.py), reusing that CLI's own
-     validator (_positive_int) and the production
-     utilities.autopatcher.context_budget constants -- never a
-     reimplemented choice list or bound check.
+  1. Parses the same (now-deprecated) --context-budget-policy /
+     --max-context-budget-windows flags as `openant patch`
+     (openant/cli.py), reusing that CLI's own validator (_positive_int)
+     -- never a reimplemented choice list or bound check. Fix B: neither
+     flag influences the controller built in step 2 anymore; both are
+     accepted purely so an existing invocation of this script keeps
+     working (see resolve_budget_controller's own docstring).
   2. Builds ONE utilities.autopatcher.context_budget.ContextBudgetController
-     -- the real production class -- with those values, exactly the way
-     openant/cli.py's cmd_patch already does.
+     -- the real production class -- exactly the way openant/cli.py's
+     cmd_patch already does. Every acquisition stage it gates is bounded
+     by the active model's real technical context capacity (see
+     utilities.autopatcher.technical_capacity), never by the flags above.
   3. Calls core.patch.run_patch()/run_patch_cve() *in-process* (the same
      functions `openant patch` calls) with that controller. Calling
      in-process rather than shelling out to `openant patch` is what lets
@@ -58,16 +62,26 @@ What it does, precisely:
      provenance record is real, structured JSON here, never only prose
      inside the Trust Report. See utilities/autopatcher/stage_replay.py
      and run_stage.py.
+  7. Opt-in only (--blind-evaluation, --cve mode): runs the same
+     run_patch_cve() call inside a scoped
+     utilities.autopatcher.tools.blind_evaluation.BlindEvaluationSession,
+     which removes direct remediation references from the rendered
+     References section, verifies the exact blinded text at pipeline.run
+     entry, and records a `blind_evaluation` manifest block plus a
+     trace/blind_evaluation/ sidecar. Without the flag nothing about the
+     run or its manifest changes. See TRACING_AND_DEBUGGING.md §25.
+     --blind-strip-same-repo-github-references (only with
+     --blind-evaluation) additionally removes References lines under the
+     target GitHub repository, identified from --repo-root's local `origin`
+     remote (read with `git remote get-url`, never contacted).
 
 What it deliberately does NOT do:
-  - It does not implement policy=ask/always/never decisions itself --
-    that's entirely inside ContextBudgetController.request_extension().
-  - It does not do TTY handling beyond the one-line default-policy
-    expression openant/cli.py's cmd_patch already uses (isatty() check),
-    reproduced verbatim as argument-defaulting glue, not a competing
-    implementation.
-  - It does not enforce the hard window cap -- ContextBudgetController
-    does that.
+  - It does not implement any --context-budget-policy/--max-context-
+    budget-windows behavior itself -- those flags are deprecated no-ops,
+    accepted only for compatibility (see resolve_budget_controller).
+  - It does not compute technical capacity itself -- that's entirely
+    inside utilities.autopatcher.technical_capacity, via
+    ContextBudgetController.
   - It does not generate a second/competing budget-trace format -- it
     only lists the filenames the production pipeline already wrote.
   - It never reads a stdin prompt directly itself.
@@ -96,6 +110,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -113,10 +128,16 @@ from openant.cli import _positive_int  # noqa: E402
 from utilities.autopatcher.context_budget import (  # noqa: E402
     CONTEXT_BUDGET_POLICIES,
     ContextBudgetController,
-    DEFAULT_MAX_CONTEXT_BUDGET_WINDOWS,
 )
 from utilities.autopatcher.execution_recorder import ExecutionRecorder  # noqa: E402
 from utilities.autopatcher.llm_call_tracing import LLMCallCapture  # noqa: E402
+from utilities.autopatcher.tools.blind_evaluation import (  # noqa: E402
+    BlindEvaluationError,
+    BlindEvaluationSession,
+    github_repository_identity,
+    path_resolves_inside,
+    sanitize_remote_url,
+)
 
 # Basenames the production pipeline writes under ./reports/debug/ when
 # AUTOPATCHER_DEBUG is set (see utilities/autopatcher/pipeline.py and
@@ -367,27 +388,20 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(CONTEXT_BUDGET_POLICIES),
         default=None,
         help=(
-            "How to handle a repository source/context acquisition budget "
-            "exhausted purely by character capacity (never a safety/"
-            "verification failure): 'ask' prompts for another fixed-size "
-            "context window (default No; degrades to 'never' when stdin "
-            "isn't a TTY), 'always' auto-approves up to "
-            "--max-context-budget-windows, 'never' preserves the existing "
-            "fail-closed behavior. Default: 'ask' for an interactive run, "
-            "'never' otherwise. Identical flag/semantics to "
-            "`openant patch --context-budget-policy`."
+            "DEPRECATED, accepted for compatibility only -- identical to "
+            "`openant patch --context-budget-policy`: no longer controls "
+            "whether repository evidence reaches an LLM call (see that "
+            "flag's own help text)."
         ),
     )
     parser.add_argument(
         "--max-context-budget-windows",
         type=_positive_int,
-        default=DEFAULT_MAX_CONTEXT_BUDGET_WINDOWS,
+        default=None,
         help=(
-            "Hard cap on total context-budget windows (initial + approved) "
-            "per acquisition stage, even under --context-budget-policy "
-            f"always. Must be a positive integer (default: "
-            f"{DEFAULT_MAX_CONTEXT_BUDGET_WINDOWS}). Identical flag/"
-            "validation to `openant patch --max-context-budget-windows`."
+            "DEPRECATED, accepted for compatibility only -- identical to "
+            "`openant patch --max-context-budget-windows`: no longer caps "
+            "anything."
         ),
     )
     parser.add_argument(
@@ -397,6 +411,30 @@ def build_parser() -> argparse.ArgumentParser:
             "Opt-in, off by default: run Existing Test Comparison "
             "(Docker required). Identical flag/semantics to "
             "`openant patch --compare-existing-tests`."
+        ),
+    )
+
+    # --- evaluation-only, script-local (no `openant patch` equivalent) ---
+    parser.add_argument(
+        "--blind-evaluation",
+        action="store_true",
+        help=(
+            "Evaluation-only, off by default, --cve mode only: remove direct "
+            "remediation references (GitHub commit/compare URLs) from the "
+            "rendered References section before the pipeline sees it, and "
+            "fail closed on any other recognizable code-change reference. "
+            "See utilities/autopatcher/tools/blind_evaluation.py."
+        ),
+    )
+    parser.add_argument(
+        "--blind-strip-same-repo-github-references",
+        action="store_true",
+        help=(
+            "Evaluation-only, off by default, valid only with "
+            "--blind-evaluation: additionally remove References lines whose "
+            "URL is under the target GitHub repository (any route), where "
+            "the target is --repo-root's local `origin` remote. References "
+            "to other repositories keep the default behavior."
         ),
     )
 
@@ -435,16 +473,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_budget_controller(args: argparse.Namespace) -> ContextBudgetController:
-    """Argument-defaulting glue only -- mirrors openant/cli.py's cmd_patch
-    line for line (policy 'ask' for a TTY run, 'never' otherwise, when
-    --context-budget-policy is omitted), then constructs the real
-    production ContextBudgetController. No policy decision, TTY-vs-batch
-    branching for *approving* an extension, or hard-cap logic lives here
-    -- all of that is inside ContextBudgetController itself.
+    """Fix B: mirrors openant/cli.py's cmd_patch -- both legacy flags are
+    still accepted (with a one-time deprecation notice if either was
+    passed) but no longer influence the controller built here. Every
+    acquisition stage is bounded by the real per-call technical capacity
+    of the active model regardless of what these flags say -- see
+    utilities.autopatcher.technical_capacity.
     """
-    policy = args.context_budget_policy or ("ask" if sys.stdin.isatty() else "never")
-    max_windows = args.max_context_budget_windows or DEFAULT_MAX_CONTEXT_BUDGET_WINDOWS
-    return ContextBudgetController(policy=policy, max_windows=max_windows)
+    if args.context_budget_policy is not None or args.max_context_budget_windows is not None:
+        print(
+            "warning: --context-budget-policy/--max-context-budget-windows no longer "
+            "control whether repository evidence reaches an LLM call -- that is now "
+            "always bounded by the model's real technical context capacity. Both "
+            "flags are accepted for compatibility but have no further effect.",
+            file=sys.stderr,
+        )
+    return ContextBudgetController()
 
 
 def _new_debug_artifacts(debug_dir: Path, since: float) -> list[str]:
@@ -458,6 +502,40 @@ def _new_debug_artifacts(debug_dir: Path, since: float) -> list[str]:
         if entry.name.startswith(_DEBUG_ARTIFACT_PREFIXES) and entry.stat().st_mtime >= since:
             found.append(str(entry))
     return sorted(found)
+
+
+def _git_stdout(repo_root, *git_args) -> "str | None":
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), *git_args], capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = proc.stdout.strip()
+    return out if proc.returncode == 0 and out else None
+
+
+def _is_git_toplevel(repo_root) -> bool:
+    """True only when --repo-root is ITSELF the top level of a git work tree
+    -- never a subdirectory of one, and never a plain directory nested in
+    one (git would otherwise inherit the enclosing repository). Compared by
+    filesystem identity, so `..`/symlink/case spellings of the same
+    directory are equivalent."""
+    toplevel = _git_stdout(repo_root, "rev-parse", "--show-toplevel")
+    if toplevel is None:
+        return False
+    try:
+        return os.path.samefile(toplevel, repo_root)
+    except OSError:
+        return False
+
+
+def _origin_remote_url(repo_root) -> "str | None":
+    """--repo-root's configured `origin` URL (raw -- it may carry userinfo;
+    never expose it, see blind_evaluation.sanitize_remote_url), or None.
+    Local config read only (`git remote get-url` never contacts the
+    remote)."""
+    return _git_stdout(repo_root, "remote", "get-url", "origin")
 
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -482,6 +560,52 @@ def main(argv: "list[str] | None" = None) -> int:
     if finding_id and not args.pipeline_output:
         print("error: pipeline_output is required when using --finding-id", file=sys.stderr)
         return 2
+    if args.blind_strip_same_repo_github_references and not args.blind_evaluation:
+        print(
+            "error: --blind-strip-same-repo-github-references requires --blind-evaluation",
+            file=sys.stderr,
+        )
+        return 2
+    same_repo_github = None
+    same_repo_github_remote = None
+    if args.blind_evaluation:
+        if not cve:
+            print("error: --blind-evaluation is supported only with --cve", file=sys.stderr)
+            return 2
+        # The un-blinded original text is persisted under the trace dir;
+        # it must never live where repository analysis could read it --
+        # checked lexically and by filesystem identity (see
+        # blind_evaluation.path_resolves_inside).
+        planned_output = Path(args.output) if args.output else Path(tempfile.gettempdir())
+        planned_trace = Path(args.trace_dir) if args.trace_dir else planned_output / "trace"
+        for label, planned in (("--output", planned_output), ("--trace-dir", planned_trace)):
+            if path_resolves_inside(planned, args.repo_root):
+                print(
+                    f"error: --blind-evaluation requires {label} to be outside --repo-root",
+                    file=sys.stderr,
+                )
+                return 2
+        if args.blind_strip_same_repo_github_references:
+            if not _is_git_toplevel(args.repo_root):
+                print(
+                    "error: --blind-strip-same-repo-github-references requires --repo-root to be "
+                    "the top-level directory of the target git repository itself",
+                    file=sys.stderr,
+                )
+                return 2
+            _raw_origin = _origin_remote_url(args.repo_root)
+            same_repo_github = github_repository_identity(_raw_origin)
+            # Only the userinfo-free form ever leaves this block.
+            same_repo_github_remote = sanitize_remote_url(_raw_origin)
+            del _raw_origin
+            if same_repo_github is None:
+                print(
+                    "error: --blind-strip-same-repo-github-references requires --repo-root's "
+                    "`origin` remote to name a GitHub repository (https://github.com/<owner>/<repo>"
+                    f"[.git] or equivalent); found {same_repo_github_remote!r}",
+                    file=sys.stderr,
+                )
+                return 2
 
     output_dir = args.output or tempfile.mkdtemp(prefix="openant_patch_traced_")
     os.makedirs(output_dir, exist_ok=True)
@@ -507,18 +631,35 @@ def main(argv: "list[str] | None" = None) -> int:
     # near-impossible case a failure occurs before it's actually built.
     execution_recorder: "ExecutionRecorder | None" = None
 
+    # --blind-evaluation only (None otherwise -- the default path never
+    # constructs one, and no manifest ever acquires a blind_evaluation key).
+    blind_session: "BlindEvaluationSession | None" = (
+        BlindEvaluationSession(
+            same_repo_github=same_repo_github, same_repo_github_remote=same_repo_github_remote,
+        ) if args.blind_evaluation else None
+    )
+
+    def _blind_extra() -> dict:
+        # Sidecar written only here -- i.e. after run_patch_cve() returned
+        # or raised -- so the system under test can never read it.
+        if blind_session is None:
+            return {}
+        files = blind_session.write_sidecar(trace_dir)
+        return {"blind_evaluation": blind_session.to_manifest_dict(files)}
+
     def _failure_extra(exc: Exception) -> dict:
         return {
             "status": "failed",
             "error_type": type(exc).__name__,
             "error_message": str(exc),
-            "context_budget_policy": budget_controller.policy,
-            "max_context_budget_windows": budget_controller.max_windows,
+            "context_budget_policy": args.context_budget_policy,
+            "max_context_budget_windows": args.max_context_budget_windows,
             "compare_existing_tests": args.compare_existing_tests,
             **_replay_provenance(
                 args.repo_root,
                 executions=execution_recorder.executions if execution_recorder is not None else None,
             ),
+            **_blind_extra(),
         }
 
     try:
@@ -536,16 +677,26 @@ def main(argv: "list[str] | None" = None) -> int:
                 run_dir=output_dir,
                 artifacts_dir=trace_dir / "executions",
             )
+            def _run_cve():
+                return run_patch_cve(
+                    cve_id=cve,
+                    repo_root=args.repo_root,
+                    output_dir=output_dir,
+                    budget_controller=budget_controller,
+                    compare_existing_tests=args.compare_existing_tests,
+                    execution_recorder=execution_recorder,
+                )
+
             try:
-                if cve:
-                    result = run_patch_cve(
-                        cve_id=cve,
-                        repo_root=args.repo_root,
-                        output_dir=output_dir,
-                        budget_controller=budget_controller,
-                        compare_existing_tests=args.compare_existing_tests,
-                        execution_recorder=execution_recorder,
-                    )
+                if cve and blind_session is not None:
+                    # Scoped interception: cve_to_vuln_text returns the
+                    # blinded rendering and pipeline.run verifies its input
+                    # hash; both restored on exit, success or failure.
+                    with blind_session:
+                        result = _run_cve()
+                    blind_session.verify_completed(result.vulnerability_path)
+                elif cve:
+                    result = _run_cve()
                 else:
                     result = run_patch(
                         pipeline_output_path=args.pipeline_output,
@@ -573,6 +724,18 @@ def main(argv: "list[str] | None" = None) -> int:
                 )
                 print(f"Existing Test Comparison cannot start.\n\n{exc}", file=sys.stderr)
                 return 2
+            except BlindEvaluationError as exc:
+                # Fail-closed blind-evaluation condition (see
+                # blind_evaluation.py) -- expected and reportable, like the
+                # prerequisite failure above: failure manifest (with the
+                # blind_evaluation block naming what was detected), concise
+                # message, exit 2, no traceback.
+                tracer.write_manifest(
+                    extra=_failure_extra(exc),
+                    debug_artifacts=_new_debug_artifacts(debug_dir, run_started),
+                )
+                print(f"Blind evaluation aborted.\n\n{exc}", file=sys.stderr)
+                return 2
             except Exception as exc:
                 # Preserve a useful partial manifest even though this run
                 # failed: every LLM checkpoint already captured by
@@ -597,12 +760,13 @@ def main(argv: "list[str] | None" = None) -> int:
                     "input_id": result.input_id,
                     "repo_root": args.repo_root,
                     "output_dir": output_dir,
-                    "context_budget_policy": budget_controller.policy,
-                    "max_context_budget_windows": budget_controller.max_windows,
+                    "context_budget_policy": args.context_budget_policy,
+                    "max_context_budget_windows": args.max_context_budget_windows,
                     "compare_existing_tests": args.compare_existing_tests,
                     "vulnerability_path": result.vulnerability_path,
                     "trust_report_path": result.trust_report_path,
                     **_replay_provenance(args.repo_root, executions=execution_recorder.executions),
+                    **_blind_extra(),
                 },
                 debug_artifacts=_new_debug_artifacts(debug_dir, run_started),
             )

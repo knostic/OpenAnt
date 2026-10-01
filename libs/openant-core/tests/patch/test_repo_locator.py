@@ -18,6 +18,85 @@ def write(path: Path, content: str) -> Path:
     return path
 
 
+class TestGroundingTechnicalCapacity:
+    """Fix B: find_code_context()/ground_repository() no longer silently
+    slice relevant source to fit `_MAX_CONTEXT_CHARS` -- an explicit
+    `max_chars` (the real per-call technical-capacity ceiling) governs
+    whole-block-or-omit admission instead, with structured
+    `omission_reason`/`GroundingDecision.omission_reason` provenance for
+    anything that didn't fit."""
+
+    def test_no_max_chars_still_uses_a_real_ceiling(self, tmp_path):
+        """Default (no max_chars) falls back to _MAX_CONTEXT_CHARS -- still
+        a real, finite ceiling, never unbounded -- for standalone/test
+        callers that don't compute one."""
+        from utilities.autopatcher.repo_locator import find_code_context
+        write(tmp_path / "api.py", "class FileSystemProvider:\n    pass\n")
+        ctx = find_code_context("FileSystemProvider path traversal", tmp_path)
+        assert "FileSystemProvider" in ctx
+
+    def test_large_max_chars_includes_whole_secondary_file_when_small(self, tmp_path):
+        """A generous real capacity ceiling includes a secondary candidate
+        whole -- proving the ceiling (not a hardcoded 4,000) now governs
+        admission."""
+        from utilities.autopatcher.repo_locator import ground_repository
+        write(tmp_path / "api.py", "class FileSystemProvider:\n    pass\n" * 5)
+        write(
+            tmp_path / "provider.py",
+            "class FileSystemProvider:\n    def items(self, dirpath):\n"
+            "        data_path = self.data + dirpath\n" * 3,
+        )
+        result = ground_repository("FileSystemProvider path traversal", tmp_path, max_chars=1_000_000)
+        assert "provider.py" in result.rendered_context
+
+    def test_oversized_secondary_candidate_omitted_whole_with_structured_reason(self, tmp_path):
+        """A secondary candidate whose full deterministic snippet cannot
+        fit the remaining real ceiling is omitted WHOLE (never sliced),
+        and the omission is structurally recorded on GroundingDecision --
+        never prose-only."""
+        from utilities.autopatcher.repo_locator import ground_repository
+        write(tmp_path / "api.py", "class FileSystemProvider:\n    pass\n" * 5)
+        write(
+            tmp_path / "provider.py",
+            "class FileSystemProvider:\n" + "    # line\n" * 300,  # forces window-mode extraction
+        )
+        # Ceiling large enough for the small primary full-file block, but
+        # deliberately too small for the secondary's own window snippet.
+        result = ground_repository("FileSystemProvider path traversal", tmp_path, max_chars=120)
+        assert "[truncated]" not in result.rendered_context
+        provider_decision = next(d for d in result.decisions if d.path == "provider.py")
+        assert provider_decision.omission_reason == "technical_capacity"
+        assert provider_decision.outcome == "omitted_technical_capacity"
+
+    def test_primary_full_file_omitted_whole_when_it_alone_exceeds_ceiling(self, tmp_path):
+        """Even the single, highest-ranked candidate is whole-block-or-omit
+        -- an oversized primary is never sliced down to fit."""
+        from utilities.autopatcher.repo_locator import ground_repository
+        write(tmp_path / "api.py", "class FileSystemProvider:\n    pass\n" * 200)
+        result = ground_repository("FileSystemProvider path traversal", tmp_path, max_chars=10)
+        assert result.rendered_context == ""
+        assert "[truncated]" not in result.rendered_context
+        decision = next(d for d in result.decisions if d.path == "api.py")
+        assert decision.omission_reason == "technical_capacity"
+
+    def test_report_style_default_never_affects_a_caller_supplied_ceiling(self, tmp_path):
+        """The module-level fallback default (_MAX_CONTEXT_CHARS) is used
+        ONLY when a caller omits max_chars entirely -- an explicit,
+        real-capacity-derived value always wins, proving no hidden
+        report-style bound can override a caller's own technical-capacity
+        decision."""
+        from utilities.autopatcher.repo_locator import ground_repository
+        write(tmp_path / "api.py", "class FileSystemProvider:\n    pass\n" * 5)
+        write(
+            tmp_path / "provider.py",
+            "class FileSystemProvider:\n    def items(self, dirpath):\n"
+            "        data_path = self.data + dirpath\n" * 3,
+        )
+        small = ground_repository("FileSystemProvider path traversal", tmp_path, max_chars=50)
+        large = ground_repository("FileSystemProvider path traversal", tmp_path, max_chars=1_000_000)
+        assert len(small.rendered_context) < len(large.rendered_context)
+
+
 class TestExplicitFilePath:
     def test_finds_file_mentioned_by_path(self, tmp_path):
         from utilities.autopatcher.repo_locator import find_code_context
@@ -814,7 +893,7 @@ class TestExtractSnippetGrounding:
         content = (tmp_path / "retry.py").read_text()
         lines = content.splitlines()
         hit_line = next(i for i, l in enumerate(lines) if ":param int p0:" in l)
-        text, ranges = _extract_snippet(content, hit_line, 4000)
+        text, ranges = _extract_snippet(content, hit_line)
         assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in text, (
             "Code anchor must appear in snippet when hit is inside a docstring"
         )
@@ -830,27 +909,33 @@ class TestExtractSnippetGrounding:
             i for i, l in enumerate(lines)
             if "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in l
         )
-        text, ranges = _extract_snippet(content, hit_line, 4000)
+        text, ranges = _extract_snippet(content, hit_line)
         assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in text
         assert len(ranges) == 1, "Code hit should produce a single range"
 
-    def test_anchor_preserved_when_budget_tight(self, tmp_path):
-        """When budget is tight, code anchor survives even if window is cut."""
+    def test_anchor_always_included_whole_block_or_omit_is_the_callers_job(self, tmp_path):
+        """Fix B: _extract_snippet no longer takes or reasons about a
+        character budget at all -- it always proposes the deterministic
+        window+anchor combination whole; whether that whole proposal fits
+        a real technical-capacity ceiling is find_code_context's own
+        whole-block-or-omit decision, made against the caller-supplied
+        `max_chars`, never a partial slice returned from here."""
         from utilities.autopatcher.repo_locator import _extract_snippet
         _make_large_file(tmp_path, "retry.py", docstring_lines=60)
         content = (tmp_path / "retry.py").read_text()
         lines = content.splitlines()
         hit_line = next(i for i, l in enumerate(lines) if ":param int p0:" in l)
-        text, ranges = _extract_snippet(content, hit_line, 500)
+        text, ranges = _extract_snippet(content, hit_line)
         assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in text, (
-            "Code anchor must be preserved over docstring window when budget is tight"
+            "Code anchor must be preserved over docstring window unconditionally"
         )
+        assert "[truncated]" not in text
 
     def test_small_file_returns_one_range(self, tmp_path):
         """Files at or below _SMALL_FILE_THRESHOLD return a single range."""
         from utilities.autopatcher.repo_locator import _extract_snippet
         small = "def foo():\n    pass\n" * 5  # << 150 lines
-        text, ranges = _extract_snippet(small, 0, 4000)
+        text, ranges = _extract_snippet(small, 0)
         assert "def foo" in text
         assert len(ranges) == 1
 
@@ -1125,7 +1210,7 @@ class TestStructuralConstantExtraction:
         # Hit line is the docstring — triggers anchor mode
         hit_line = next(i for i, l in enumerate(lines) if ":param int p0:" in l)
 
-        text, ranges = _extract_snippet(content, hit_line, 4000)
+        text, ranges = _extract_snippet(content, hit_line)
 
         assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in text, (
             "Critical constant must appear in snippet even when preceded by "
@@ -1140,7 +1225,7 @@ class TestStructuralConstantExtraction:
         lines = content.splitlines()
         hit_line = next(i for i, l in enumerate(lines) if ":param int p0:" in l)
 
-        text, _ = _extract_snippet(content, hit_line, 4000)
+        text, _ = _extract_snippet(content, hit_line)
 
         assert "def __init__" not in text, (
             "def __init__ must not appear in the constant block snippet"
@@ -1240,29 +1325,34 @@ class TestHybridContextBudget:
         headers = _re.findall(r"^# \S+", ctx, _re.MULTILINE)
         assert len(headers) == 1, f"single candidate must produce one header, got: {headers}"
 
-    def test_secondary_budget_respected(self, tmp_path):
-        """Total secondary snippet size stays within _SECONDARY_CONTEXT_BUDGET."""
-        from utilities.autopatcher.repo_locator import find_code_context, _SECONDARY_CONTEXT_BUDGET
+    def test_secondary_snippet_is_a_bounded_window_not_the_whole_oversized_file(self, tmp_path):
+        """Fix B: there is no more separate, fixed _SECONDARY_CONTEXT_BUDGET
+        constant -- a secondary candidate too large for _SMALL_FILE_
+        THRESHOLD is extracted as its own bounded line-window (see
+        _extract_snippet: _CONTEXT_WINDOW_LINES on each side of the hit),
+        never the whole multi-thousand-line file, and that whole window is
+        included or omitted against the real per-call technical-capacity
+        ceiling -- never silently sliced."""
+        from utilities.autopatcher.repo_locator import find_code_context
         # Primary: small, triggers full-file mode
         primary_content = "class FileSystemProvider:\n    pass\n" * 5
         assert len(primary_content) < 20_000
         write(tmp_path / "api.py", primary_content)
-        # Secondary: much larger than the secondary budget
+        # Secondary: far larger than _SMALL_FILE_THRESHOLD (150 lines) --
+        # its own deterministic window extraction bounds it, not a budget.
         big_secondary = "class FileSystemProvider:\n" + "    # line\n" * 2000
-        assert len(big_secondary) > _SECONDARY_CONTEXT_BUDGET
         write(tmp_path / "provider.py", big_secondary)
 
         vuln = "FileSystemProvider path traversal"
         ctx = find_code_context(vuln, tmp_path)
 
-        # Locate the secondary section and measure its size
         sep = "\n\n# provider.py"
         assert sep in ctx, "secondary section must be present"
-        secondary_portion = ctx[ctx.index(sep) + 2:]  # from "# provider.py" onward
-        assert len(secondary_portion) <= _SECONDARY_CONTEXT_BUDGET + 200, (
-            f"secondary portion ({len(secondary_portion)} chars) exceeds budget "
-            f"{_SECONDARY_CONTEXT_BUDGET} + 200 header overhead"
+        secondary_portion = ctx[ctx.index(sep) + 2:]
+        assert len(secondary_portion) < len(big_secondary), (
+            "the bounded window must be far smaller than the whole oversized file"
         )
+        assert "[truncated]" not in secondary_portion
 
     def test_secondary_snippet_has_header(self, tmp_path):
         """Secondary snippet header shows the file path and a line range."""

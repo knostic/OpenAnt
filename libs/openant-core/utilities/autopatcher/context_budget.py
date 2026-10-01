@@ -1,322 +1,231 @@
-"""ContextBudgetController -- user-approved, fixed-size context-budget
-window extensions for Auto Patcher's repository source/context
-acquisition stages.
+"""ContextBudgetController -- Fix B: per-run cache of the ONE technical
+source-evidence capacity ceiling for each of Auto Patcher's repository
+source/context acquisition stages.
 
-Background: Auto Patcher's Final-Target Slicing / Deterministic Pre-Patch
-Acquisition (Slice 2) / Guided Pre-Patch Acquisition (Slice 3) / Post-Patch
-Recovery (Slice 4) all share ONE soft character ceiling --
-remediation_planner.FINAL_TARGET_SLICE_MAX_CHARS -- plus Slice 4's own
-additional per-round total (MAX_POST_PATCH_SOURCE_CHARS). A real research
-run can be stopped before Patch Generation purely because that character
-capacity, not any safety/verification concern, ran out. This module lets a
-caller (the CLI, or another library caller) opt in to additional, FIXED-
-SIZE windows of that same budget -- never exponential growth, never a
-silent reset, never a bypass of any non-budget gate (unsafe paths,
-ambiguous/unresolved symbols, cross-file mismatches, request/round/target
-caps, applicability, source verification, Recommendation Policy).
+--------------------------------------------------------------------------
+History (pre-Fix-B, kept for anyone reading old traces/reports/tests):
 
-Policies (exactly these three):
-  "never"  -- never extend; identical to the pre-existing fixed-budget,
-              fail-closed behavior. The default for any caller that
-              doesn't pass a controller at all (see effective_budget()/
-              request_extension() below) -- library use never prompts.
-  "always" -- automatically approve another window, up to max_windows,
-              without asking. For local research, batch validation, CI.
-  "ask"    -- ask the user interactively whenever another window is
-              needed; the default answer is No; converted to "never"
-              (recorded, not silently guessed) whenever the run is not
-              interactive (stdin is not a TTY).
+Final-Target Slicing / Deterministic Pre-Patch Acquisition (Slice 2) /
+Guided Pre-Patch Acquisition (Slice 3) / Post-Patch Recovery (Slice 4) all
+shared ONE soft character ceiling -- remediation_planner.
+FINAL_TARGET_SLICE_MAX_CHARS (10,000 chars) -- plus Slice 4's own
+additional per-round total (MAX_POST_PATCH_SOURCE_CHARS, 6,000 chars) and
+Planning's own evidence render (evidence_fusion.DEFAULT_MAX_CHARS, 4,000
+chars). This module used to let a caller (the CLI, or another library
+caller) opt in to additional, FIXED-SIZE "windows" of that same budget via
+three policies ("ask"/"always"/"never") and a `--max-context-budget-
+windows` hard cap.
 
-Deep acquisition helpers (remediation_planner.py) only ever call
-effective_budget()/request_extension() on a controller instance -- never
-input()/sys.stdin/isatty() themselves. That keeps unit tests deterministic
-and this module free of any hard coupling between repository logic and
-terminal I/O; a caller that wants "ask" supplies (or accepts the built-in
-default for) a `confirm` callback instead of this module reading stdin
-directly from inside deep helpers.
+A real regression demonstrated why that whole model was wrong: a Planning
+prompt reported requested repository evidence as successfully RESOLVED,
+while the corresponding full-file source was OMITTED because a "budget"
+of 4,000 x N characters -- an arbitrary legacy constant, never derived
+from any real model's context capacity -- ran out. The evidence existed,
+was located, and was never delivered to the LLM in usable form, purely
+because of a resource mechanic that had nothing to do with genuine
+technical capacity. Investigation (see the Fix B architecture
+investigation and its two design amendments) found no real per-call
+token/cost/call metering existed anywhere in this codebase to justify
+"windows" as a resource concept either -- it was, in effect, an arbitrary
+technical-capacity guess wearing resource-policy clothing.
+--------------------------------------------------------------------------
+
+Fix B removes the window/policy model entirely. Repository evidence is now
+bounded ONLY by:
+
+  1. `utilities.autopatcher.technical_capacity` -- the real, per-call
+     technical capacity of the LLM call this evidence will be embedded
+     in, derived from the active model's registry-documented context
+     window (or one documented conservative fallback) minus the exact,
+     already-known overhead of everything else that call's prompt
+     contains. This is a TECHNICAL ceiling, not a resource budget, and it
+     is always active -- there is no "no ceiling" mode, because a real
+     LLM call always has finite capacity.
+
+  2. Structural exploration bounds (MAX_PLANNING_ATTEMPTS,
+     MAX_EVIDENCE_REQUESTS_PER_ROUND, MAX_ACQUISITION_ROUNDS,
+     MAX_GUIDED_ACQUISITION_ROUNDS, MAX_POST_PATCH_RECOVERY_ROUNDS, etc.)
+     -- plain module constants in remediation_planner.py, untouched by
+     Fix B, and never touched by this module either.
+
+There is deliberately NO user-facing resource/cost/call budget in Fix B
+(see the Fix B design amendments for why: no pre-call token estimator or
+model-context-window metadata existed anywhere in this codebase to make
+one accurate, and inventing an inaccurate one would repeat the exact
+mistake this fix exists to correct). A future, separate workstream may
+add a genuine cost/token/call meter on top of the already-accurate,
+already-POST-hoc `utilities.llm_client.TokenTracker` -- this module is not
+that, and does not attempt to be.
+
+`ContextBudgetController` still exists, in a much smaller role: a per-run
+cache so a given acquisition stage's technical-capacity decision is
+computed once (the active model does not change mid-run) and reused
+everywhere that stage's ceiling is consulted, plus a place to collect
+trace/provenance data. `budget_controller=None` (every existing library
+caller, and any caller that never builds one) computes the exact SAME
+technical-capacity number on the fly instead -- "no controller" has never
+meant "no ceiling", and after Fix B it also never means "a smaller,
+arbitrary ceiling": the number is identical either way. This class only
+adds caching/observability on top of it.
+
+The two legacy CLI flags (`--context-budget-policy`/
+`--max-context-budget-windows`) are still ACCEPTED by `openant/cli.py`
+(so nothing that already passes them breaks), but they no longer
+construct or influence anything in this module -- see `openant/cli.py`'s
+own deprecation handling.
 """
 
 from __future__ import annotations
 
-import sys
-from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Optional
 
+from .llm_client import resolve_active_model, resolve_max_tokens
+from .technical_capacity import SourceCapacityResult, compute_source_capacity
 
+# Kept only so a stray import of the old policy vocabulary (tests, a
+# deprecation-message check) doesn't need to invent its own copy. No
+# runtime code in this module reads this value for any decision anymore.
 CONTEXT_BUDGET_POLICIES = ("ask", "always", "never")
-"""The only three supported policies -- see the module docstring for
-exactly what each means."""
-
-DEFAULT_MAX_CONTEXT_BUDGET_WINDOWS = 10
-"""Hard cap on total windows (initial + approved) per stage, applied
-regardless of policy -- even "always" stops here. Configurable via
-ContextBudgetController(max_windows=...) / the CLI's
---max-context-budget-windows; never an unbounded sentinel (validated to
-be a positive int by the constructor)."""
-
-
-@dataclass
-class _StageBudgetState:
-    """One acquisition stage's own fixed-size, additive budget-window
-    state. `window_size` must be that stage's PRE-EXISTING base
-    character budget (e.g. remediation_planner.FINAL_TARGET_SLICE_MAX_CHARS)
-    -- never a new, independently-sized constant -- so every extension
-    window this stage grants is exactly one more of the SAME size, never
-    exponential growth (10K -> 20K -> 30K, never 10K -> 20K -> 40K)."""
-
-    stage: str
-    window_size: int
-    initial_windows: int
-    max_windows: int
-    approved_windows: int = 0
-    used_chars: int = 0
-    extension_requests: "list" = field(default_factory=list)
-
-    @property
-    def total_windows(self) -> int:
-        return self.initial_windows + self.approved_windows
-
-    @property
-    def effective_budget(self) -> int:
-        return self.window_size * self.total_windows
-
-    @property
-    def remaining_chars(self) -> int:
-        return max(0, self.effective_budget - self.used_chars)
-
-    def as_dict(self) -> dict:
-        return {
-            "window_size": self.window_size,
-            "initial_windows": self.initial_windows,
-            "approved_windows": self.approved_windows,
-            "max_windows": self.max_windows,
-            "effective_budget": self.effective_budget,
-            "used_chars": self.used_chars,
-            "remaining_chars": self.remaining_chars,
-            "extension_requests": list(self.extension_requests),
-        }
-
-
-def _default_confirm(prompt_text: str) -> bool:
-    """The built-in interactive confirmation for policy="ask" -- mirrors
-    openant/cli.py's existing cmd_report Y/n gate (a stderr prompt +
-    sys.stdin.readline()), except the default on empty input/EOF/Ctrl-C
-    is explicitly No, never Yes -- a context-budget extension is opt-in,
-    never an accidental default. Only ever called by
-    ContextBudgetController.request_extension() when policy="ask" AND
-    the controller has already confirmed the run is interactive -- never
-    called on a non-interactive stdin."""
-    try:
-        sys.stderr.write(prompt_text)
-        sys.stderr.flush()
-        answer = sys.stdin.readline().strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return False
-    return answer in ("y", "yes")
-
-
-def format_extension_prompt(
-    stage: str, state: "_StageBudgetState", reason: str, affected_targets: "list | None",
-) -> str:
-    """Concise, concrete prompt text for a policy="ask" extension
-    request: stage, reason, affected target paths, window size, windows
-    already active, and the effective budget approval would produce --
-    deliberately never the rendered slice text or any other large
-    internal detail."""
-    targets = list(affected_targets or [])
-    lines = [f"Context budget exhausted during {stage} ({reason})."]
-    if targets:
-        noun = "target" if len(targets) == 1 else "targets"
-        lines.append("")
-        lines.append(f"{len(targets)} {noun} still lack{'s' if len(targets) == 1 else ''} verified source:")
-        for t in targets:
-            lines.append(f"- {t}")
-    lines.append("")
-    lines.append(
-        f"Allow another {state.window_size:,}-character context window? "
-        f"({state.total_windows}/{state.max_windows} windows active -- "
-        f"effective budget would become {state.effective_budget + state.window_size:,} chars) [y/N] "
-    )
-    return "\n".join(lines)
+"""Historical policy vocabulary -- Fix B: no longer consulted by anything
+in this module. `openant/cli.py` still validates `--context-budget-policy`
+against this (so a bad value still errors clearly), purely for a
+deprecation message; it no longer selects any runtime behavior here."""
 
 
 class ContextBudgetController:
-    """Owns fixed-size, additive budget-window state for one pipeline
-    run's soft character budgets that gate repository source/context
-    acquisition (see the module docstring). A caller constructs one
-    controller per pipeline run and passes it into
-    utilities.autopatcher.pipeline.run(budget_controller=...); no
-    controller supplied behaves exactly like policy="never" everywhere
-    it is consulted (see effective_budget()) -- a library caller that
-    never builds one gets the pre-existing fixed-budget behavior
-    unchanged, with zero interactive prompts.
+    """Owns, for one pipeline run, PROVIDER/MODEL identity plus a per-stage
+    cache of the ONE technical source-capacity ceiling `utilities.
+    autopatcher.technical_capacity.compute_source_capacity()` computes for
+    that stage. A caller constructs one controller per pipeline run and
+    passes it into `utilities.autopatcher.pipeline.run(budget_controller=
+    ...)`.
 
-    max_windows: hard cap on TOTAL windows (initial + approved) per
-      stage, validated to be a positive int -- no unbounded sentinel.
-      Even policy="always" stops here (see request_extension()).
-    interactive: whether an "ask" prompt may run at all. Defaults to
-      sys.stdin.isatty() -- a non-interactive process (CI, a pipe) never
-      blocks on input regardless of policy; "ask" degrades to "never"
-      (recorded as decision_source="non_interactive_fallback", not a
-      silent guess) whenever this is False.
-    confirm: optional callable(prompt_text: str) -> bool, used only for
-      policy="ask" while interactive. Defaults to a Y/N stdin prompt
-      matching the existing CLI convention (see _default_confirm).
+    provider/model: the active LLM binding's identity, used for the
+    model-registry capacity lookup (see `technical_capacity.compute_
+    source_capacity`). `None`/`None` (the default -- e.g. constructed
+    before the first real LLM call resolves one, or mock mode) is treated
+    identically to "no registry record for this model": routes to the one
+    documented conservative fallback, never raises. A caller that already
+    knows the resolved (provider, model) pair (see `utilities.autopatcher.
+    llm_client.resolve_active_model()`) should pass it; a caller that
+    doesn't can safely omit it -- the fallback path is exact and
+    deterministic, just less precise.
     """
 
     def __init__(
         self,
-        policy: str = "never",
-        max_windows: int = DEFAULT_MAX_CONTEXT_BUDGET_WINDOWS,
+        provider: "Optional[str]" = None,
+        model: "Optional[str]" = None,
+        *,
+        policy: "Optional[str]" = None,
+        max_windows: "Optional[int]" = None,
         interactive: "Optional[bool]" = None,
-        confirm: "Optional[Callable[[str], bool]]" = None,
+        confirm=None,
     ) -> None:
-        if policy not in CONTEXT_BUDGET_POLICIES:
-            raise ValueError(
-                f"Unknown context budget policy: {policy!r} (expected one of {CONTEXT_BUDGET_POLICIES})"
-            )
-        if isinstance(max_windows, bool) or not isinstance(max_windows, int) or max_windows < 1:
-            raise ValueError(f"max_windows must be a positive integer, got {max_windows!r}")
-        self.policy = policy
-        self.max_windows = max_windows
-        self.interactive = sys.stdin.isatty() if interactive is None else bool(interactive)
-        self._confirm = confirm or _default_confirm
-        self._stages: "dict" = {}
+        # policy/max_windows/interactive/confirm: DEPRECATED, pre-Fix-B
+        # constructor arguments -- accepted (never raise a TypeError on an
+        # existing caller) but otherwise ignored. There is no policy to
+        # choose and no window count to cap: every stage's ceiling is the
+        # real technical capacity computed by `technical_capacity.
+        # compute_source_capacity`, unconditionally. Kept as keyword-only
+        # so no positional-argument caller could have relied on them
+        # (this class's positional signature was always `(policy,
+        # max_windows, ...)` before Fix B; a caller passing them
+        # positionally today would silently bind to `provider`/`model`
+        # instead of raising, which is exactly why this class validated
+        # `policy`/`max_windows` strictly before -- Fix B accepts this
+        # narrow risk deliberately, since nothing in this class can act on
+        # an invalid value anymore either way).
+        self.provider = provider
+        self.model = model
+        self._stages: "dict[str, SourceCapacityResult]" = {}
+        self._used_chars: "dict[str, int]" = {}
 
-    def _stage(self, stage: str, window_size: int, initial_windows: int) -> _StageBudgetState:
-        state = self._stages.get(stage)
-        if state is None:
-            state = _StageBudgetState(
-                stage=stage, window_size=window_size, initial_windows=initial_windows,
-                max_windows=self.max_windows,
-            )
-            self._stages[stage] = state
-        return state
+    def effective_budget(
+        self,
+        stage: str,
+        *,
+        reserved_output_tokens: "Optional[int]" = None,
+        known_overhead_chars: int = 0,
+    ) -> int:
+        """The stage's technical source-capacity ceiling, in characters --
+        computed once (via `technical_capacity.compute_source_capacity`)
+        and cached for the rest of this run, mirroring the fact that the
+        active provider/model is fixed for the whole run. A stage already
+        cached from an earlier call returns its cached ceiling unchanged,
+        regardless of whatever `reserved_output_tokens`/
+        `known_overhead_chars` a LATER call happens to pass -- exactly one
+        real capacity decision per stage per run, never a moving target
+        mid-run, and never re-derived from a smaller/incomplete overhead
+        estimate a later caller might supply.
 
-    def effective_budget(self, stage: str, base_chars: int, initial_windows: int = 1) -> int:
-        """The stage's current effective ceiling -- `base_chars` unless
-        at least one extension has already been approved for this stage
-        this run. Auto-registers the stage on first call (callers never
-        need a separate registration step). `base_chars` must be that
-        stage's own pre-existing budget constant, read live by the
-        caller every time (never cached) -- so a test that monkeypatches
-        the underlying constant keeps working unchanged whether or not a
-        controller is given."""
-        return self._stage(stage, base_chars, initial_windows).effective_budget
+        `reserved_output_tokens=None` (the default) resolves the real,
+        currently-configured output-token reserve via `llm_client.
+        resolve_max_tokens()` -- callers that already know it may pass it
+        explicitly, but every real production call site can safely omit
+        it."""
+        cached = self._stages.get(stage)
+        if cached is not None:
+            return cached.source_capacity_chars
+        result = compute_source_capacity(
+            self.provider,
+            self.model,
+            reserved_output_tokens=(
+                resolve_max_tokens() if reserved_output_tokens is None else reserved_output_tokens
+            ),
+            known_overhead_chars=known_overhead_chars,
+        )
+        self._stages[stage] = result
+        return result.source_capacity_chars
+
+    def capacity_result(self, stage: str) -> "Optional[SourceCapacityResult]":
+        """The full structured capacity decision for `stage`, if
+        `effective_budget()` has been called for it at least once this run
+        -- else `None`. For trace/provenance only (see `to_trace_dict()`
+        and `pipeline.py`'s debug-JSON writers) -- never consulted by any
+        evidence-rendering decision itself, which reads only
+        `effective_budget()`'s plain int."""
+        return self._stages.get(stage)
 
     def record_used(self, stage: str, used_chars: int) -> None:
         """Best-effort observability only, for the structured trace --
-        records the largest `used_chars` seen for `stage` this run.
-        Never consulted by request_extension()'s own decision, and a
-        stage that was never registered (effective_budget()/
-        request_extension() not yet called for it) is simply a no-op."""
-        state = self._stages.get(stage)
-        if state is not None:
-            state.used_chars = max(state.used_chars, used_chars)
+        records the largest `used_chars` seen for `stage` this run. Never
+        consulted by `effective_budget()`'s own decision."""
+        self._used_chars[stage] = max(self._used_chars.get(stage, 0), used_chars)
 
     def request_extension(
         self,
         stage: str,
-        window_size: int,
+        window_size: "Optional[int]" = None,
         *,
-        reason: str,
-        affected_targets: "list | None" = None,
+        reason: str = "",
+        affected_targets: "Optional[list]" = None,
         initial_windows: int = 1,
     ) -> bool:
-        """Ask for exactly one more window for `stage`. Returns True
-        only if the effective budget actually increased by one window as
-        a direct result of THIS call -- the caller re-reads
-        effective_budget() (or recomputes its own remaining-chars)
-        immediately afterward; this never mutates anything else (no
-        rollback of already-committed source, no round/request counter).
-
-        Never blocks a non-interactive process, never asks more than
-        once per call, never exceeds max_windows. Every call -- approved
-        or not -- is recorded on the stage's own `extension_requests`
-        (see _StageBudgetState.as_dict()), including the specific reason
-        it was or wasn't granted (`decision_source`): "policy_never",
-        "policy_always", "non_interactive_fallback", "interactive_user",
-        or "hard_budget_window_limit_reached"."""
-        state = self._stage(stage, window_size, initial_windows)
-        record = {
-            "reason": reason,
-            "affected_targets": list(affected_targets or []),
-            "approved": False,
-            "decision_source": None,
-        }
-
-        if state.total_windows >= state.max_windows:
-            record["decision_source"] = "hard_budget_window_limit_reached"
-            state.extension_requests.append(record)
-            self._announce(stage, state, approved=False, note="hard_budget_window_limit_reached")
-            return False
-
-        if self.policy == "never":
-            record["decision_source"] = "policy_never"
-            state.extension_requests.append(record)
-            return False
-
-        if self.policy == "always":
-            state.approved_windows += 1
-            record["approved"] = True
-            record["decision_source"] = "policy_always"
-            state.extension_requests.append(record)
-            self._announce(stage, state, approved=True)
-            return True
-
-        # policy == "ask"
-        if not self.interactive:
-            record["decision_source"] = "non_interactive_fallback"
-            state.extension_requests.append(record)
-            return False
-
-        prompt_text = format_extension_prompt(stage, state, reason, affected_targets)
-        try:
-            approved = bool(self._confirm(prompt_text))
-        except Exception:
-            approved = False
-        if approved:
-            state.approved_windows += 1
-        record["approved"] = approved
-        record["decision_source"] = "interactive_user"
-        state.extension_requests.append(record)
-        if approved:
-            self._announce(stage, state, approved=True)
-        return approved
-
-    @staticmethod
-    def _announce(stage: str, state: "_StageBudgetState", approved: bool, note: "str | None" = None) -> None:
-        """A single concise stderr line on a granted extension (or on
-        hitting the hard cap) -- matches pipeline.py's own existing
-        `print(..., file=sys.stderr)` progress convention, so a
-        policy="always" run stays observable without requiring
-        AUTOPATCHER_DEBUG. Never raises: this is pure observability, no
-        different from every other "[pipeline] ..." line already
-        written elsewhere in this engine."""
-        try:
-            if approved:
-                sys.stderr.write(
-                    f"[context_budget] {stage}: window #{state.total_windows}/{state.max_windows} "
-                    f"approved -- effective budget now {state.effective_budget:,} chars.\n"
-                )
-            elif note == "hard_budget_window_limit_reached":
-                sys.stderr.write(
-                    f"[context_budget] {stage}: hard_budget_window_limit_reached "
-                    f"({state.max_windows} windows) -- failing closed.\n"
-                )
-            sys.stderr.flush()
-        except Exception:
-            pass
+        """DEPRECATED no-op, retained ONLY so every pre-existing
+        remediation_planner.py retry call site (Slices 2/3/4) needs no
+        signature changes. ALWAYS returns False: `effective_budget()`
+        already returned this stage's full technical capacity on its very
+        first call for this run -- there is no additional "window" left to
+        grant, because after Fix B there is no window mechanic at all
+        (see this module's own history section above). A caller observing
+        `False` here behaves exactly as it always has when a budget
+        extension was denied -- it proceeds with whatever capacity
+        `effective_budget()` already gave it, recording the omission
+        structurally (see `remediation_planner._SourceExcerptPlan`'s
+        `omission_reason` field)."""
+        return False
 
     def to_trace_dict(self) -> dict:
-        """The full structured trace for this run's budget-window
-        activity -- safe to embed verbatim into an existing debug
-        artifact (see pipeline.py's reports/debug/*.json writers).
-        Never raises: a stage's own as_dict() is pure attribute access
-        over plain ints/dicts."""
+        """The full structured trace for this run's technical-capacity
+        decisions -- safe to embed verbatim into an existing debug
+        artifact (see `pipeline.py`'s reports/debug/*.json writers). Never
+        raises."""
         return {
-            "policy": self.policy,
-            "interactive": self.interactive,
-            "max_windows": self.max_windows,
-            "stages": {name: state.as_dict() for name, state in self._stages.items()},
+            "provider": self.provider,
+            "model": self.model,
+            "stages": {
+                name: {**result.as_dict(), "used_chars": self._used_chars.get(name, 0)}
+                for name, result in self._stages.items()
+            },
         }

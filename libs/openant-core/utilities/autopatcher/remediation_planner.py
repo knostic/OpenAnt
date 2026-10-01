@@ -52,8 +52,9 @@ from typing import NamedTuple
 from .content_relocation import find_unique_occurrence, old_side_anchors
 from .context_budget import ContextBudgetController
 from .diff_parsing import parse_diff
-from .llm_client import ModelUnavailableError
+from .llm_client import ModelUnavailableError, resolve_active_model, resolve_max_tokens
 from .repository_grounding_models import DiscoveryEvidence, RepositoryCandidate
+from .technical_capacity import compute_source_capacity
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "remediation_planner.md"
 _STRATEGY_PROMPT_PATH = Path(__file__).parent / "prompts" / "remediation_strategy.md"
@@ -1167,6 +1168,26 @@ class _SourceExcerptPlan(NamedTuple):
     # (below, and _EMPTY_SOURCE_EXCERPT_PLAN) passes its own fresh dict
     # explicitly instead.
     omitted_sizes: "dict[str, int]"
+    # Fix B: every `symbol_omitted`/`fallback_omitted` label also gets a
+    # structured reason here -- always "technical_capacity" for anything
+    # this function itself omits (whole-block-or-omit against a real,
+    # per-call technical ceiling is the ONLY reason this function ever
+    # omits a RESOLVED candidate; `read_failed` entries are a different,
+    # separate cause -- the source could not be read at all -- and are
+    # deliberately never given a `technical_capacity` reason here). This
+    # is what lets a caller/trace tell "resolved but omitted because it
+    # didn't fit this call" apart from every other outcome without
+    # parsing the rendered prose omission notice. Same no-shared-default
+    # rationale as `omitted_sizes` above.
+    omission_reason: "dict[str, str]"
+    # Fix B: the exact SourceCapacityResult (see technical_capacity.py)
+    # that produced `budget` for this render, when known -- None for a
+    # caller that passed an explicit `max_chars` with no capacity
+    # decision behind it (e.g. a narrower re-render at a caller-chosen
+    # smaller ceiling). Purely for trace/provenance; never consulted by
+    # any admission decision above, which reads only `budget` (a plain
+    # int) exactly as before Fix B.
+    capacity: "object | None" = None
 
 
 def _compute_source_excerpt_plan(
@@ -1175,6 +1196,7 @@ def _compute_source_excerpt_plan(
     repo_root: Path,
     context,
     max_chars: "int | None" = None,
+    capacity: "object | None" = None,
 ) -> _SourceExcerptPlan:
     """
     Deterministic passes over the already-verified Planner candidates (same
@@ -1249,6 +1271,7 @@ def _compute_source_excerpt_plan(
     fallback_omitted: "list[str]" = []
     read_failed: "list[str]" = []
     omitted_sizes: "dict[str, int]" = {}
+    omission_reason: "dict[str, str]" = {}
     running = 0
     seen: set = set()
     ordered_blocks: "list[tuple[int, str]]" = []  # (original candidate index, rendered block)
@@ -1297,6 +1320,7 @@ def _compute_source_excerpt_plan(
         else:
             symbol_omitted.append(label)
             omitted_sizes[label] = len(block)
+            omission_reason[label] = "technical_capacity"
 
     # Pass 2 -- full-file fallback, only for candidates with no resolved
     # symbol at all (never for one whose symbol excerpt was itself omitted
@@ -1316,6 +1340,7 @@ def _compute_source_excerpt_plan(
         else:
             fallback_omitted.append(path)
             omitted_sizes[path] = len(block)
+            omission_reason[path] = "technical_capacity"
 
     # Restore original candidate order for the final rendered sequence --
     # see the docstring's own note on this above.
@@ -1326,6 +1351,7 @@ def _compute_source_excerpt_plan(
         blocks=blocks, included_labels=frozenset(included_labels),
         symbol_omitted=tuple(symbol_omitted), fallback_omitted=tuple(fallback_omitted),
         read_failed=tuple(read_failed), budget=_budget, omitted_sizes=omitted_sizes,
+        omission_reason=omission_reason, capacity=capacity,
     )
 
 
@@ -1525,7 +1551,7 @@ def _included_source_labels(
     ).included_labels
 
 
-def _render_planner_evidence(understanding) -> str:
+def _render_planner_evidence(understanding, max_chars: "int | None" = None) -> str:
     """Thin wrapper around the existing renderer: re-labels its fixed
     heading + preamble with Planner-specific provenance wording, without
     duplicating any of its actual rendering logic. render_repository_
@@ -1533,10 +1559,19 @@ def _render_planner_evidence(understanding) -> str:
     _PREAMBLE + "\\n"` with no blank line inside _PREAMBLE itself, so
     splitting on the first two "\\n\\n" occurrences cleanly isolates
     (heading, preamble, everything else) -- "everything else" is the only
-    part reused verbatim here."""
+    part reused verbatim here.
+
+    `max_chars` (Fix B, default None -> evidence_fusion.DEFAULT_MAX_CHARS):
+    the real per-call technical-capacity ceiling for THIS structural-facts
+    section alone -- `_build_planner_evidence_result` passes the stage's
+    real ceiling here and then subtracts this function's own actual
+    rendered length before computing the source-excerpt sub-budget, so the
+    two sections that end up concatenated into one evidence block share
+    ONE real ceiling rather than each independently claiming a full one."""
     from .evidence_fusion import render_repository_understanding
 
-    rendered = render_repository_understanding(understanding)
+    kwargs = {} if max_chars is None else {"max_chars": max_chars}
+    rendered = render_repository_understanding(understanding, **kwargs)
     if not rendered:
         return ""
     parts = rendered.split("\n\n", 2)
@@ -1548,7 +1583,7 @@ def _render_planner_evidence(understanding) -> str:
 
 _EMPTY_SOURCE_EXCERPT_PLAN = _SourceExcerptPlan(
     blocks=(), included_labels=frozenset(), symbol_omitted=(), fallback_omitted=(),
-    read_failed=(), budget=0, omitted_sizes={},
+    read_failed=(), budget=0, omitted_sizes={}, omission_reason={},
 )
 
 
@@ -1575,6 +1610,7 @@ def _build_planner_evidence_result(
     vulnerability_text: str,
     context,
     max_chars: "int | None" = None,
+    capacity: "object | None" = None,
 ) -> PlannerEvidenceResult:
     """The one real implementation behind both `build_planner_evidence`'s
     string return and `build_planner_evidence_with_budget`'s expansion
@@ -1633,13 +1669,22 @@ def _build_planner_evidence_result(
         )
         enrich_candidates(selection, root, vulnerability_text, context)
         understanding = fuse_evidence(selection, investigation_context_available=context is not None)
-        structural = _render_planner_evidence(understanding)
+        # Fix B: the structural-facts section and the source-excerpt
+        # section below are concatenated into ONE evidence block for the
+        # SAME LLM call -- they must share ONE real ceiling, never each
+        # independently claim the stage's full `max_chars` (which would
+        # let the combined block reach up to ~2x the intended capacity).
+        # Structural renders first (whole-block-or-omit per candidate,
+        # unchanged) against the full ceiling; source excerpts get
+        # whatever genuinely remains.
+        structural = _render_planner_evidence(understanding, max_chars)
         if not structural:
             return _empty
 
+        excerpt_max_chars = max_chars if max_chars is None else max(0, max_chars - len(structural))
         try:
             excerpt_plan = _compute_source_excerpt_plan(
-                candidates, symbol_locations, root, context, max_chars=max_chars,
+                candidates, symbol_locations, root, context, max_chars=excerpt_max_chars, capacity=capacity,
             )
         except Exception:
             excerpt_plan = _EMPTY_SOURCE_EXCERPT_PLAN
@@ -1686,6 +1731,41 @@ def build_planner_evidence(
     return _build_planner_evidence_result(plan, repo_root, vulnerability_text, context, max_chars=max_chars).rendered
 
 
+def _planner_evidence_known_overhead_chars(vulnerability_text: str, extra_overhead_chars: int = 0) -> int:
+    """Fix B: the exact, non-estimated overhead this stage's rendered
+    evidence must share room with in whichever prompt actually embeds it.
+    `build_planner_evidence_with_budget`'s output can end up inside EITHER
+    the Planning prompt (`_PROMPT_PATH`, when Fix A's own acquisition loop
+    renders newly-resolved evidence) OR the Strategy prompt
+    (`_STRATEGY_PROMPT_PATH`, once merged into `_planner_evidence_ctx` --
+    see pipeline.py) -- this deliberately uses the LARGER of the two
+    system-prompt sizes, a conservative choice: whichever prompt actually
+    embeds this text, the reservation is never too small, regardless of
+    which one it turns out to be. `vulnerability_text` is added exactly
+    (it is already a parameter of every real caller here) -- nothing here
+    is estimated except the token<->char ratio applied later, in
+    `technical_capacity.compute_source_capacity` (see that module's own
+    docstring).
+
+    `extra_overhead_chars` (Fix B, default 0): the exact length of any
+    OTHER mandatory content that unconditionally precedes this stage's own
+    rendered evidence in the real prompt -- e.g. `run_planning_evidence_
+    acquisition`'s own `base_evidence` (repo-grounding context + pattern
+    guidance + the initial Repository Understanding block), which is
+    concatenated ahead of every Fix A round's own newly-resolved evidence
+    and is otherwise invisible to this stage's own capacity computation.
+    Exact, not estimated -- the caller already has this string in hand."""
+    try:
+        planning_len = len(_PROMPT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        planning_len = 0
+    try:
+        strategy_len = len(_STRATEGY_PROMPT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        strategy_len = 0
+    return max(planning_len, strategy_len) + len(vulnerability_text or "") + max(0, extra_overhead_chars)
+
+
 def build_planner_evidence_with_budget(
     plan: RemediationPlanResult,
     repo_root,
@@ -1694,110 +1774,85 @@ def build_planner_evidence_with_budget(
     *,
     budget_controller=None,
     base_max_chars: "int | None" = None,
+    extra_overhead_chars: int = 0,
 ) -> PlannerEvidenceResult:
-    """Deterministic, no-LLM-call Planner-evidence construction with bounded
-    context-budget expansion -- the ONE shared implementation used by both
-    Strategy #1's own evidence construction and the evidence-gap Strategy
-    fallback (see pipeline.py's `_run_repository_analysis_and_remediation_
-    planning` and `_run_evidence_gap_strategy_fallback`). Neither caller
-    implements its own budget-growth logic; both call this.
+    """Deterministic, no-LLM-call Planner-evidence construction -- the ONE
+    shared implementation used by both Strategy #1's own evidence
+    construction and the evidence-gap Strategy fallback (see pipeline.py's
+    `_run_repository_analysis_and_remediation_planning` and
+    `_run_evidence_gap_strategy_fallback`). Neither caller implements its
+    own capacity logic; both call this.
 
-    `budget_controller=None` (the default) reproduces
-    `_build_planner_evidence_result`'s exact single-render behavior at
-    `base_max_chars` (or `evidence_fusion.DEFAULT_MAX_CHARS` if that is
-    also None) -- byte-identical to calling `build_planner_evidence` once,
-    no expansion loop entered at all. This is what makes every existing
-    caller that doesn't pass a controller unaffected.
+    Fix B: the ceiling is the real per-call technical source-capacity
+    ceiling for the "planner_evidence" stage (see `utilities.autopatcher.
+    technical_capacity`) -- never an arbitrary fixed-size "window" that
+    grows on request (see this module's own historical note in
+    `context_budget.py` for what this replaced and why: a real regression
+    showed resolved evidence silently omitted from a Planning prompt
+    purely because an arbitrary 4,000-character-per-window ceiling ran
+    out).
 
-    With a real `budget_controller`, uses the stage key "planner_evidence"
-    -- deliberately NOT "final_target_slice" (Slice 2/3/4's key): that
-    stage's own base window size (FINAL_TARGET_SLICE_MAX_CHARS) differs
-    from this one's (DEFAULT_MAX_CHARS), and ContextBudgetController locks
-    a stage's window_size in on first registration (see
-    ContextBudgetController._stage) -- sharing a key across two different
-    base sizes would silently corrupt whichever stage registered second.
-    A distinct key also keeps this evidence-construction budget from
-    competing with Guided Context's own, separate acquisition budget for
-    the same run.
+    Computed ONCE per run (cached on `budget_controller` when one is
+    given, else computed fresh here -- see `ContextBudgetController.
+    effective_budget`) using:
+      - `reserved_output_tokens`: the real output-token reserve every
+        Planning/Strategy/Patch-Generation call through `llm_client.
+        LLMClient.complete()` actually requests (`llm_client.
+        resolve_max_tokens()`).
+      - `known_overhead_chars`: this stage's own exact overhead (see
+        `_planner_evidence_known_overhead_chars`).
 
-    Expansion loop, run entirely before any LLM call:
-      1. Render at the stage's current effective budget.
-      2. If nothing is budget-omitted (`excerpt_plan.omitted_sizes` empty),
-         stop -- there is nothing more to acquire.
-      3. Deterministically check, from the exact sizes `omitted_sizes`
-         already recorded (no re-render needed), whether AT LEAST ONE
-         currently-omitted resolved candidate could fit within the
-         remaining LEGAL window allowance (`budget_controller.max_windows`
-         minus windows already used for this stage). If none could ever
-         fit, stop WITHOUT requesting an extension -- a window (and, under
-         policy="ask", an interactive prompt) is never spent on a
-         candidate that provably cannot benefit from it.
-      4. Otherwise request exactly one more window
-         (`budget_controller.request_extension`). If denied (policy
-         forbids it, or the hard `max_windows` cap is already reached),
-         stop -- existing fail-closed behavior.
-      5. Re-render deterministically at the new, larger ceiling.
-      6. If `included_labels` grew relative to the previous render, STOP
-         and return this improved result -- handing off to the LLM-calling
-         consumer with materially new evidence is the point; this does not
-         keep growing further just because some OTHER, still-omitted
-         candidate remains uncovered.
-      7. If `included_labels` did NOT grow, but step 3's reachability
-         check still holds (a known omitted candidate remains reachable
-         within what legal budget is left), loop back to step 3 and keep
-         going -- this is the corrected behavior: a symbol that needs
-         several successive windows before it fits must not be abandoned
-         after only one non-improving attempt.
-      8. If it did not grow and no omitted candidate remains reachable,
-         stop (defensive backstop; the step-3 check should already have
-         caught this).
+    `base_max_chars`, when explicitly given, is honored as an ADDITIONAL,
+    caller-chosen ceiling -- never larger than the technical capacity,
+    only ever smaller. This preserves the one legitimate remaining use of
+    an explicit smaller ceiling: the evidence-gap Strategy fallback (see
+    pipeline.py) deliberately wants a narrower, more targeted re-render,
+    never a reason to exceed real technical capacity.
 
-    No LLM call happens anywhere in this function -- every iteration is a
-    deterministic re-render of already-resolved, already-verified
-    candidates. Whole-symbol-or-omit rendering is preserved unchanged
-    (see `_compute_source_excerpt_plan`): this never truncates or windows
-    a candidate's source, it only changes how large a ceiling the SAME
-    whole-block-or-omit decision is made against.
+    `budget_controller=None` no longer means "use a smaller, arbitrary
+    ceiling" -- it computes the exact same technical-capacity number on
+    the fly, just without a controller object to cache it or record trace
+    provenance on.
+
+    `extra_overhead_chars` (Fix B, default 0): passed straight through to
+    `_planner_evidence_known_overhead_chars` -- see that function's own
+    docstring. Lets a caller whose prompt also carries OTHER mandatory
+    content ahead of this stage's own rendered evidence (e.g.
+    `run_planning_evidence_acquisition`'s `base_evidence`) account for it,
+    so this stage's ceiling reflects the REAL remaining room in the final
+    combined prompt, not just this stage's own isolated share.
+
+    No LLM call happens anywhere in this function. Whole-symbol-or-omit
+    rendering is preserved unchanged (see `_compute_source_excerpt_plan`):
+    this never truncates a candidate's source, and never runs a second
+    LLM call to synthesize across evidence that didn't fit -- a resolved
+    candidate that still doesn't fit this real ceiling is recorded
+    `omission_reason="technical_capacity"` (see `_SourceExcerptPlan`),
+    never silently dropped.
     """
-    from .evidence_fusion import DEFAULT_MAX_CHARS
-
-    base = base_max_chars if base_max_chars is not None else DEFAULT_MAX_CHARS
-    if budget_controller is None:
-        return _build_planner_evidence_result(plan, repo_root, vulnerability_text, context, max_chars=base)
-
     _STAGE = "planner_evidence"
-    ceiling = budget_controller.effective_budget(_STAGE, base)
-    result = _build_planner_evidence_result(plan, repo_root, vulnerability_text, context, max_chars=ceiling)
-    budget_controller.record_used(_STAGE, len(result.rendered))
+    known_overhead_chars = _planner_evidence_known_overhead_chars(vulnerability_text, extra_overhead_chars)
 
-    while True:
-        omitted_sizes = result.excerpt_plan.omitted_sizes
-        if not omitted_sizes:
-            return result
-
-        windows_used = ceiling // base
-        windows_left = budget_controller.max_windows - windows_used
-        max_reachable_ceiling = ceiling + windows_left * base
-        if not any(size <= max_reachable_ceiling for size in omitted_sizes.values()):
-            return result  # no remaining legal window allowance could ever include any omitted candidate
-
-        before_labels = result.excerpt_plan.included_labels
-        approved = budget_controller.request_extension(
-            _STAGE, base,
-            reason="symbol_or_fallback_omitted",
-            affected_targets=sorted(omitted_sizes),
+    if budget_controller is not None:
+        ceiling = budget_controller.effective_budget(_STAGE, known_overhead_chars=known_overhead_chars)
+        capacity = budget_controller.capacity_result(_STAGE)
+    else:
+        capacity = compute_source_capacity(
+            *resolve_active_model(),
+            reserved_output_tokens=resolve_max_tokens(),
+            known_overhead_chars=known_overhead_chars,
         )
-        if not approved:
-            return result  # policy denies expansion, or the hard max_windows cap is already reached
+        ceiling = capacity.source_capacity_chars
 
-        ceiling = budget_controller.effective_budget(_STAGE, base)
-        candidate = _build_planner_evidence_result(plan, repo_root, vulnerability_text, context, max_chars=ceiling)
-        budget_controller.record_used(_STAGE, len(candidate.rendered))
+    if base_max_chars is not None:
+        ceiling = min(ceiling, base_max_chars)
 
-        if candidate.excerpt_plan.included_labels != before_labels:
-            return candidate  # new structural coverage -- stop and hand off
-
-        result = candidate  # no new coverage yet, but still reachable -- keep expanding
+    result = _build_planner_evidence_result(
+        plan, repo_root, vulnerability_text, context, max_chars=ceiling, capacity=capacity,
+    )
+    if budget_controller is not None:
+        budget_controller.record_used(_STAGE, len(result.rendered))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1816,13 +1871,14 @@ def build_planner_evidence_with_budget(
 # docstring for the governing authority contract.
 # ---------------------------------------------------------------------------
 
-MAX_PLANNING_ATTEMPTS = 3
-"""Initial Planning attempt + at most 2 acquisition rounds. Mirrors
+MAX_PLANNING_ATTEMPTS = 5
+"""Initial Planning attempt + at most 4 acquisition rounds. Mirrors
 MAX_GUIDED_ACQUISITION_ROUNDS's own bound and rationale: one round already
-resolves the overwhelming majority of genuine evidence gaps; a second
-exists only to cover a gap the first round's own new evidence reveals. A
-third has never been shown necessary anywhere in this codebase and would
-only add cost/drift risk -- independent of any context-budget policy."""
+resolves the overwhelming majority of genuine evidence gaps; further
+rounds exist only to cover a gap each prior round's own new evidence
+reveals. This is a plain structural exploration bound -- independent of
+any context-budget policy -- not a claim that every genuine gap needs
+this many rounds."""
 
 MAX_EVIDENCE_REQUESTS_PER_ROUND = 3
 """At most this many of one attempt's own evidence_requests are even
@@ -1877,15 +1933,31 @@ class PlanningRequestResolution(NamedTuple):
     PlanningEvidenceRequest. `resolved=True` only when the request
     deterministically resolved to a real, unambiguous repository
     file/symbol -- independent of whether that content later fits inside
-    build_planner_evidence_with_budget's own (pre-existing, unmodified)
-    character ceiling; see this module's own section docstring above on
-    why resolution and rendering are kept as two separate concerns."""
+    build_planner_evidence_with_budget's own real per-call technical
+    capacity ceiling (see technical_capacity.py); see this module's own
+    section docstring above on why resolution and rendering are kept as
+    two separate concerns.
+
+    `included` (Fix B, added after resolution -- see
+    `run_planning_evidence_acquisition`'s own final pass) answers the
+    THIRD, previously-unrepresented question: did this resolved item's
+    source actually make it into the rendered evidence handed to the
+    next LLM call? `None` at construction time (resolution happens before
+    the final render is known) -- `run_planning_evidence_acquisition`
+    fills it in via `._replace(included=...)` once `final_evidence.
+    excerpt_plan.included_labels` is known, for every resolution whose
+    `resolved` is True. A request may validly end up
+    `resolved=True, included=False` -- see `_SourceExcerptPlan.
+    omission_reason` for why (always "technical_capacity" when this is
+    the cause) -- and that combination is never silently rewritten as
+    unresolved."""
 
     request: "PlanningEvidenceRequest"
     resolved: bool
     failure_reason: "str | None"
     resolved_file: "str | None"
     resolved_symbol: "str | None"
+    included: "bool | None" = None
 
 
 class PlanningAttemptRecord(NamedTuple):
@@ -2069,12 +2141,15 @@ def _merge_planner_evidence_results(
         )),
         budget=fresh.excerpt_plan.budget or baseline.excerpt_plan.budget,
         omitted_sizes={**baseline.excerpt_plan.omitted_sizes, **fresh.excerpt_plan.omitted_sizes},
+        omission_reason={**baseline.excerpt_plan.omission_reason, **fresh.excerpt_plan.omission_reason},
+        capacity=fresh.excerpt_plan.capacity or baseline.excerpt_plan.capacity,
     )
     return PlannerEvidenceResult(rendered=merged_rendered, excerpt_plan=merged_plan)
 
 
 def _render_planning_acquisition_context(
     base_evidence: str, acquired_evidence: str, prior_resolutions: "list[PlanningRequestResolution]",
+    omission_reason: "dict[str, str] | None" = None,
 ) -> str:
     """The `code_context` fed to each Planning attempt after the first --
     the SAME base evidence every attempt has always received, plus
@@ -2084,17 +2159,81 @@ def _render_planning_acquisition_context(
     request. On attempt 1 (no acquired evidence, no prior resolutions)
     this returns `base_evidence` completely unchanged -- byte-identical
     to Planning's own pre-Fix-A `code_context`, so the common "grounded on
-    attempt 1" case is entirely unaffected."""
+    attempt 1" case is entirely unaffected.
+
+    `outcome` is derived from `included`, never from `resolved` alone: a
+    request may resolve (the resolver found it) without its source ever
+    being rendered into `acquired_evidence` above (Fix B whole-block-or-
+    omit capacity fitting, or a later round's evidence not yet merged) --
+    claiming "see verified evidence above" for that case would be false.
+    `omission_reason` (keyed by the same label shape `_resolution_source_
+    label` produces) surfaces a real, already-known reason when one
+    exists; no reason is invented when none is known."""
     parts = [p for p in (base_evidence, acquired_evidence) if p and p.strip()]
     if prior_resolutions:
         lines = ["## Evidence requests already attempted this run -- do not repeat these", ""]
         for r in prior_resolutions:
             req = r.request
             label = req.file_hint or req.symbol or "(unnamed)"
-            outcome = "resolved -- see verified evidence above" if r.resolved else (r.failure_reason or "failed")
+            if not r.resolved:
+                outcome = r.failure_reason or "failed"
+            elif r.included:
+                outcome = "resolved -- see verified evidence above"
+            else:
+                source_label = _resolution_source_label(r)
+                reason = (omission_reason or {}).get(source_label) if source_label else None
+                outcome = (
+                    f"resolved but not included in the evidence above ({reason})" if reason
+                    else "resolved but not included in the evidence above"
+                )
             lines.append(f"- {req.request_type}: {label} -- {outcome}")
         parts.append("\n".join(lines) + "\n")
     return "\n\n".join(parts)
+
+
+def _resolution_source_label(resolution: "PlanningRequestResolution") -> "str | None":
+    """The exact label `final_evidence.excerpt_plan.included_labels` would
+    carry for this resolution's own resolved file/symbol, if its source
+    made it into the render -- `None` for a never-resolved request (Fix
+    B: `included` stays `None`/not-applicable for those, never `False`,
+    since "never resolved" and "resolved but omitted" are different
+    facts). Mirrors the exact two label shapes `_compute_source_excerpt_
+    plan` itself produces: `f"{file}:{symbol}"` for a symbol-resolved
+    candidate (Pass 1), the bare file path for a full-file-fallback
+    candidate (Pass 2) -- never a third, independently-invented shape."""
+    if not resolution.resolved:
+        return None
+    if resolution.resolved_symbol:
+        return f"{resolution.resolved_file}:{resolution.resolved_symbol}"
+    return resolution.resolved_file
+
+
+def _apply_planning_inclusion_provenance(
+    attempts: "list[PlanningAttemptRecord]", final_evidence: "PlannerEvidenceResult",
+) -> "list[PlanningAttemptRecord]":
+    """Fix B: fills in `PlanningRequestResolution.included` for every
+    already-recorded attempt's resolutions, now that `final_evidence` (the
+    fully merged, run-final Planner evidence) is known. A resolution whose
+    label appears in `final_evidence.excerpt_plan.included_labels` is
+    `included=True`; one that resolved but does not appear is
+    `included=False` (see `_SourceExcerptPlan.omission_reason` for why --
+    always "technical_capacity" when this function itself is the cause).
+    A never-resolved request's `included` stays `None` -- inclusion is not
+    applicable to evidence that was never located at all.
+
+    Pure post-processing over already-computed data: no new repository
+    read, no new LLM call, no change to `outcome`/`gate_state`/any other
+    field an attempt already recorded -- Fix A's own authority truth table
+    is read here, never written to."""
+    included_labels = final_evidence.excerpt_plan.included_labels
+    finalized: "list[PlanningAttemptRecord]" = []
+    for attempt in attempts:
+        new_resolutions = [
+            r._replace(included=(_resolution_source_label(r) in included_labels) if r.resolved else None)
+            for r in attempt.resolutions
+        ]
+        finalized.append(attempt._replace(resolutions=new_resolutions))
+    return finalized
 
 
 def run_planning_evidence_acquisition(
@@ -2130,7 +2269,8 @@ def run_planning_evidence_acquisition(
     new character ceiling and no new budget-related outcome. See this
     module's own section docstring above."""
     attempts: "list[PlanningAttemptRecord]" = []
-    seen_keys: set = set()
+    resolution_cache: "dict[tuple, PlanningRequestResolution]" = {}
+    included_keys: set = set()
     all_resolutions: "list[PlanningRequestResolution]" = []
     requested_evidence = PlannerEvidenceResult(rendered="", excerpt_plan=_EMPTY_SOURCE_EXCERPT_PLAN)
     plan_result = _EMPTY_PLAN_RESULT
@@ -2138,14 +2278,17 @@ def run_planning_evidence_acquisition(
     def _finalize(grounded: bool, terminal_state: str) -> PlanningAcquisitionResult:
         own_target_evidence = build_planner_evidence_with_budget(
             plan_result, repo_root, vulnerability_text, context, budget_controller=budget_controller,
+            extra_overhead_chars=len(base_evidence),
         )
         final_evidence = _merge_planner_evidence_results(requested_evidence, own_target_evidence)
-        return PlanningAcquisitionResult(plan_result, final_evidence, grounded, terminal_state, list(attempts))
+        finalized_attempts = _apply_planning_inclusion_provenance(attempts, final_evidence)
+        return PlanningAcquisitionResult(plan_result, final_evidence, grounded, terminal_state, finalized_attempts)
 
     for attempt_num in range(1, MAX_PLANNING_ATTEMPTS + 1):
         tag = "remediation_planning" if attempt_num == 1 else "remediation_planning_reattempt"
         code_context = _render_planning_acquisition_context(
             base_evidence, requested_evidence.rendered, all_resolutions,
+            requested_evidence.excerpt_plan.omission_reason,
         )
         plan_result = generate_remediation_plan(vulnerability_text, llm, code_context=code_context, stage=tag)
 
@@ -2175,26 +2318,63 @@ def run_planning_evidence_acquisition(
         round_resolutions: "list[PlanningRequestResolution]" = []
         new_files: "list[str]" = []
         new_symbols: "list[str]" = []
+
+        def _add_new_file(f: "str | None") -> None:
+            if f and f not in new_files:
+                new_files.append(f)
+
         for req in capped:
             key = _planning_request_key(req)
-            if key in seen_keys:
+            if key in included_keys:
+                # Its evidence is already present in the accumulated
+                # context the Planner has seen -- a genuine duplicate,
+                # not merely a repeated key.
                 round_resolutions.append(PlanningRequestResolution(req, False, "duplicate_request", None, None))
                 continue
-            seen_keys.add(key)
-            rf, rs, reason = _resolve_planning_evidence_request(req, repo_root, context)
-            if reason is not None:
-                round_resolutions.append(PlanningRequestResolution(req, False, reason, None, None))
-            else:
+            cached = resolution_cache.get(key)
+            if cached is not None and not cached.resolved:
+                # Resolution is a pure function of (request, repo_root,
+                # context); a previously-failed key would fail identically
+                # again, so it stays blocked without re-invoking the
+                # resolver.
+                round_resolutions.append(PlanningRequestResolution(req, False, "duplicate_request", None, None))
+                continue
+            if cached is not None:
+                # Resolved before but not yet included (Part 3): never
+                # stranded merely because its key is known -- reuse the
+                # already-known resolution (never re-call the resolver)
+                # and feed it back into this round's candidate set so the
+                # capacity-fit/merge machinery gets another chance to
+                # include it.
+                rf, rs = cached.resolved_file, cached.resolved_symbol
                 round_resolutions.append(PlanningRequestResolution(req, True, None, rf, rs))
-                if req.request_type == "file_source":
-                    new_files.append(rf)
-                else:
-                    new_symbols.append(f"{rf}:{rs}" if rf else rs)
+            else:
+                rf, rs, reason = _resolve_planning_evidence_request(req, repo_root, context)
+                if reason is not None:
+                    resolution = PlanningRequestResolution(req, False, reason, None, None)
+                    resolution_cache[key] = resolution
+                    round_resolutions.append(resolution)
+                    continue
+                resolution = PlanningRequestResolution(req, True, None, rf, rs)
+                resolution_cache[key] = resolution
+                round_resolutions.append(resolution)
+            if req.request_type == "file_source":
+                _add_new_file(rf)
+            else:
+                new_symbols.append(f"{rf}:{rs}" if rf else rs)
+                # Part 1: a resolved symbol's source lives in its
+                # resolved_file -- without also naming that file as a
+                # target_file, build_planner_candidates's own `if not
+                # plan.target_files: return []` rule (correct for its
+                # normal Planner-authored callers) produces zero
+                # candidates for a symbol-only round, silently dropping
+                # evidence that was genuinely resolved.
+                _add_new_file(rf)
 
-        all_resolutions.extend(round_resolutions)
         any_new = any(r.resolved for r in round_resolutions)
 
         if not any_new:
+            all_resolutions.extend(round_resolutions)
             attempts.append(PlanningAttemptRecord(
                 attempt_num, tag, plan_result.additional_evidence_required,
                 list(plan_result.evidence_requests), invalid_requests, round_resolutions, "ungrounded_unresolvable",
@@ -2202,6 +2382,7 @@ def run_planning_evidence_acquisition(
             return _finalize(False, "ungrounded_unresolvable")
 
         if attempt_num >= MAX_PLANNING_ATTEMPTS:
+            all_resolutions.extend(round_resolutions)
             attempts.append(PlanningAttemptRecord(
                 attempt_num, tag, plan_result.additional_evidence_required,
                 list(plan_result.evidence_requests), invalid_requests, round_resolutions, "ungrounded_max_attempts",
@@ -2211,9 +2392,27 @@ def run_planning_evidence_acquisition(
         synthetic = RemediationPlanResult(rendered="", target_files=new_files, target_symbols=new_symbols)
         fresh = build_planner_evidence_with_budget(
             synthetic, repo_root, vulnerability_text, context, budget_controller=budget_controller,
+            extra_overhead_chars=len(base_evidence),
         )
         requested_evidence = _merge_planner_evidence_results(requested_evidence, fresh)
 
+        # Part 2: determine, right now -- while this round's merge is
+        # fresh -- whether each resolved request's evidence actually made
+        # it into the accumulated context the NEXT attempt will see.
+        # Reuses the exact label/membership logic
+        # `_apply_planning_inclusion_provenance` applies at the very end;
+        # this is the same computation run early enough to matter, not a
+        # parallel system.
+        included_labels_now = requested_evidence.excerpt_plan.included_labels
+        round_resolutions = [
+            r._replace(included=(_resolution_source_label(r) in included_labels_now)) if r.resolved else r
+            for r in round_resolutions
+        ]
+        for r in round_resolutions:
+            if r.resolved and r.included:
+                included_keys.add(_planning_request_key(r.request))
+
+        all_resolutions.extend(round_resolutions)
         attempts.append(PlanningAttemptRecord(
             attempt_num, tag, plan_result.additional_evidence_required,
             list(plan_result.evidence_requests), invalid_requests, round_resolutions, "continue",
@@ -2712,7 +2911,39 @@ _VERIFIED_AUTHORITATIVE_SECTIONS = [
 ]
 
 
-def _render_verified_authoritative_semantics(plan_result: RemediationPlanResult) -> str:
+def _filter_required_edits_against_superseded_targets(
+    required_edits: "list[str]", superseded_target_files: "frozenset[str]",
+) -> "list[str]":
+    """Drop any `required_edits` bullet naming a file in
+    `superseded_target_files` -- a purely structural containment check
+    against exact file-path strings already present on
+    `RemediationPlanResult.target_files`/`RemediationStrategyResult.
+    target_files` (never a prose/semantic comparison between Planner's and
+    Strategy's own wording, and never a keyword/heuristic match on
+    anything else in the bullet's text).
+
+    Exists because the verified-narrower-authority split's own premise --
+    Strategy narrows only WHERE the Planner's independently-verified
+    mechanism applies, never WHAT files that mechanism covers -- does not
+    hold when Strategy's own, later, independently re-verified
+    `target_files` no longer includes a file the Planner's verified
+    `required_edits` names. When that happens, the bullet no longer
+    describes a remediation Strategy has authorized, and must not remain
+    an executable edit instruction in Patch Generation's prompt (a
+    superseded remediation proposal is not a current edit instruction,
+    exactly like resolved-but-not-included evidence is not the same as
+    included evidence). Returns every bullet unchanged when
+    `superseded_target_files` is empty -- the ordinary case where
+    Strategy's target set matches or is a superset of the Planner's own,
+    where nothing has actually been superseded."""
+    if not superseded_target_files:
+        return list(required_edits)
+    return [edit for edit in required_edits if not any(f in edit for f in superseded_target_files)]
+
+
+def _render_verified_authoritative_semantics(
+    plan_result: RemediationPlanResult, superseded_target_files: "frozenset[str] | None" = None,
+) -> str:
     """Deterministic rendering of ONLY the 5 verified Planner semantic
     fields (`remediation_mechanism`, `security_invariant`,
     `narrower_alternative_considered`, `required_edits`,
@@ -2725,10 +2956,22 @@ def _render_verified_authoritative_semantics(plan_result: RemediationPlanResult)
     the ordinary (already-existing) Planner call and Planner Claim
     Verifier, both unmodified by this function. Returns "" (a complete,
     correct answer, not an error) when none of the 5 fields have
-    content, mirroring `_render_strategy`'s own empty-body convention."""
+    content, mirroring `_render_strategy`'s own empty-body convention.
+
+    `superseded_target_files` (additive, default None so every existing
+    caller is unaffected): passed through `required_edits` only -- see
+    `_filter_required_edits_against_superseded_targets` -- so a bullet
+    naming a file Strategy's own later target decision has since excluded
+    is never rendered as a still-executable edit instruction. The other 4
+    fields are untouched: `remediation_mechanism`/`security_invariant`/
+    `narrower_alternative_considered` are prose descriptions, not discrete
+    per-file instructions, and `approaches_to_avoid` is advisory ("do not
+    do X"), never itself an edit instruction to filter."""
     body: "list[str]" = []
     for attr, label, is_list in _VERIFIED_AUTHORITATIVE_SECTIONS:
         value = getattr(plan_result, attr)
+        if attr == "required_edits" and superseded_target_files:
+            value = _filter_required_edits_against_superseded_targets(value, superseded_target_files)
         if is_list:
             if not value:
                 continue
@@ -2814,40 +3057,77 @@ def _render_strategy_target_block(strategy_result: RemediationStrategyResult) ->
 
 FINAL_TARGET_SLICE_MAX_CHARS = 10_000
 """
-A budget SEPARATE from evidence_fusion.DEFAULT_MAX_CHARS (never reused
-implicitly). Measured, not guessed: against a real urllib3 v2.0.5 checkout,
-the exact `Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT` definition alone is 70
-characters; padded by _DEFINITION_CONTEXT_LINES on each side (see that
-constant) it is 265 characters -- still small. A focused ~30-line consumer
-window inside `PoolManager.urlopen` (clamped to its own 409-486 line range)
-is 1,234 characters -- roughly 1,500 combined with the padded definition.
-10,000 comfortably holds this shape for up to three final targets (a
-padded exact definition + one focused consumer each, ~2,000 characters
-apiece even generously) plus headings/provenance text (roughly 1,000
-characters), while staying meaningfully bounded: it is deliberately NOT
-sized to fit a single full 14,188-character `HTTPConnectionPool.urlopen`
-or a full 18,374-character `retry.py` -- an oversized full function/file
-must never be able to consume this whole budget by itself when a focused
-window was available instead.
+Fix B: no longer the ceiling that gates whether Final-Target Slice
+evidence reaches an LLM call -- see `_effective_final_target_max`, which
+now derives that ceiling from `utilities.autopatcher.technical_capacity`
+instead. This constant survives ONLY as the base for `_PER_TARGET_
+FULL_FUNCTION_CAP` below -- a per-CANDIDATE proportional cap (never the
+whole-slice gate) that keeps one oversized candidate from consuming an
+unreasonable share of a much larger real ceiling. Retained at its
+historical value for that narrower purpose; NOT a claim about real model
+capacity (see technical_capacity.py for the real one).
 """
 
 
-def _effective_final_target_max(budget_controller: "ContextBudgetController | None") -> int:
-    """The shared Final-Target Slice ceiling actually in force right now
-    -- FINAL_TARGET_SLICE_MAX_CHARS unless `budget_controller` has
-    already had a user-approved extension for the "final_target_slice"
-    stage this run (see ContextBudgetController). `budget_controller=None`
-    (every existing caller, and any library caller that never builds
-    one) returns FINAL_TARGET_SLICE_MAX_CHARS unchanged -- reads it live
-    at call time, never cached, so a test that monkeypatches the module
-    constant keeps working identically whether or not a controller is
-    given. This is the ONE mechanism Slices 2/3/4 (run_deterministic_
-    acquisition/run_guided_acquisition/recover_post_patch_source) all
-    reuse for the shared total -- never a separate, per-stage-sized
-    ceiling for this particular budget."""
+def _final_target_slice_known_overhead_chars(vulnerability_text: str) -> int:
+    """Fix B: the exact, non-estimated overhead the Final-Target Slice's
+    rendered evidence must share room with in the Patch Generation prompt
+    that actually embeds it (`patch_generator._PROMPT_PATH`) -- plus
+    `vulnerability_text`'s own exact length, when known. `vulnerability_text=
+    ""` (the default -- every Slice 2/3/4 retry call site, which does not
+    carry vulnerability_text in scope) omits that one term: see
+    `_effective_final_target_max`'s own docstring for why this is safe --
+    the real number, including vulnerability_text, is registered ONCE by
+    pipeline.py's own initial `build_final_target_slice` call, before any
+    Slice 2/3/4 retry ever runs, and every later call reuses that cached
+    ceiling regardless of what this function computes on a later call."""
+    try:
+        from .patch_generator import _PROMPT_PATH as _PATCH_GENERATOR_PROMPT_PATH
+        overhead = len(_PATCH_GENERATOR_PROMPT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        overhead = 0
+    return overhead + len(vulnerability_text or "")
+
+
+def _effective_final_target_max(
+    budget_controller: "ContextBudgetController | None", vulnerability_text: str = "",
+) -> int:
+    """The shared Final-Target Slice ceiling actually in force right now --
+    Fix B: the real per-call technical source-capacity ceiling for the
+    "final_target_slice" stage (see `utilities.autopatcher.
+    technical_capacity`), never the pre-Fix-B `FINAL_TARGET_SLICE_MAX_CHARS`
+    constant and never an arbitrary "budget window" grown on request (see
+    this module's own historical note in `context_budget.py`).
+
+    Computed ONCE per run and cached on `budget_controller` (see
+    `ContextBudgetController.effective_budget`) -- the FIRST caller to
+    reach this function (in a real pipeline run: pipeline.py's own
+    initial `build_final_target_slice` call, which knows the real
+    `vulnerability_text`) fixes the ceiling for the rest of the run;
+    every later call from Slice 2/3/4's own retry loops (which do not
+    carry `vulnerability_text` in scope, and so pass the default `""`)
+    simply reuses that cached value -- their own `vulnerability_text`
+    argument is only ever consulted if this is somehow the FIRST call for
+    this stage this run (e.g. a caller that bypasses pipeline.py's own
+    registration entirely), in which case the ceiling is still real and
+    still bounded, just computed without that one term's own deduction --
+    an honest, documented, conservative-in-the-generous-direction
+    degradation, never a crash and never a return to the old fixed
+    10,000-character ceiling.
+
+    `budget_controller=None` (a library caller that never builds one)
+    computes the exact same technical-capacity number fresh on every
+    call instead of caching it -- still never the old constant."""
+    known_overhead_chars = _final_target_slice_known_overhead_chars(vulnerability_text)
     if budget_controller is None:
-        return FINAL_TARGET_SLICE_MAX_CHARS
-    return budget_controller.effective_budget("final_target_slice", FINAL_TARGET_SLICE_MAX_CHARS)
+        return compute_source_capacity(
+            *resolve_active_model(),
+            reserved_output_tokens=resolve_max_tokens(),
+            known_overhead_chars=known_overhead_chars,
+        ).source_capacity_chars
+    return budget_controller.effective_budget(
+        "final_target_slice", known_overhead_chars=known_overhead_chars,
+    )
 
 
 _USAGE_WINDOW_LINES = 15
@@ -3006,6 +3286,50 @@ def _extract_strategy_identifiers(strategy: RemediationStrategyResult) -> "list[
         _add(tok)
     for edit in strategy.required_edits:
         for tok in _extract_identifiers_from_text(edit):
+            _add(tok)
+
+    return ordered
+
+
+def _extract_strategy_residual_concern_identifiers(strategy: RemediationStrategyResult) -> "list[str]":
+    """Repository-looking identifiers from the Final Strategy's own
+    REJECTED/residual-concern text ONLY -- `rejected_targets` first, then
+    `insufficient_evidence`, order-preserving and first-occurrence-
+    deduplicated. Reuses the EXACT SAME shape-filtered token extraction
+    `_extract_strategy_identifiers` already uses for `extended_mechanism`/
+    `required_edits` (`_extract_identifiers_from_text`) -- no second,
+    different extraction algorithm, and no free-form NLP.
+
+    Deliberately NEVER reads `target_symbols`/`extended_mechanism`/
+    `required_edits` -- those remain `_extract_strategy_identifiers`'s own
+    domain (genuine, approved-mechanism-derived terms). This function's
+    only job is to make a REJECTED/residual concern's own identifiers
+    available as bounded LOOKUP CANDIDATES for Category 2 (supporting
+    context only -- see `_build_final_target_slice_inner`'s own residual-
+    concern loop, always populated AFTER every mechanism-derived Category
+    2 candidate so this list can never take priority over, or starve,
+    genuine target-derived evidence under a tight shared budget).
+
+    Resolution of whatever this returns still goes through the unchanged,
+    bounded `_lookup_identifier_definition` (preferred_files-scoped,
+    fail-closed exactly as it already is for every other caller) -- this
+    function only proposes candidate strings; it never resolves, verifies,
+    or renders anything itself, and it can never re-add a rejected/
+    residual identifier to `target_symbols`, `symbol_matches`, or any
+    edit-target category."""
+    ordered: "list[str]" = []
+    seen: set = set()
+
+    def _add(tok: "str | None") -> None:
+        if tok and tok not in seen:
+            seen.add(tok)
+            ordered.append(tok)
+
+    for text in strategy.rejected_targets:
+        for tok in _extract_identifiers_from_text(text):
+            _add(tok)
+    for text in strategy.insufficient_evidence:
+        for tok in _extract_identifiers_from_text(text):
             _add(tok)
 
     return ordered
@@ -3823,6 +4147,8 @@ def build_final_target_slice(
     planner_evidence_files: "list[str] | tuple" = (),
     max_chars: "int | None" = None,
     planner_excerpt_blocks: "list[str] | tuple" = (),
+    budget_controller: "ContextBudgetController | None" = None,
+    vulnerability_text: str = "",
 ) -> FinalTargetSliceResult:
     """
     Build the '## Final-Target Remediation Slice' from
@@ -3880,20 +4206,28 @@ def build_final_target_slice(
     except-branch below) -- never silently empty, never silently
     "coverage complete".
 
-    `max_chars=None` (the default) reads the module-level
-    FINAL_TARGET_SLICE_MAX_CHARS AT CALL TIME (not bound into the
-    function signature), so every existing caller is unaffected AND a
-    test that monkeypatches FINAL_TARGET_SLICE_MAX_CHARS still works
-    exactly as before. Slice 2 (Deterministic Pre-Patch Retrieval, see
+    `max_chars=None` (the default) resolves the REAL per-call technical
+    source-capacity ceiling for the "final_target_slice" stage (Fix B --
+    see `_effective_final_target_max`/`utilities.autopatcher.
+    technical_capacity`), never the historical `FINAL_TARGET_SLICE_MAX_CHARS`
+    constant. Pass `budget_controller`/`vulnerability_text` (pipeline.py's
+    own initial call always does) so this run's ceiling is cached and
+    reused by every later Slice 2/3/4 retry -- a caller that omits both
+    still gets a real, correctly-derived ceiling, just computed fresh
+    each call rather than cached, and without `vulnerability_text`'s own
+    overhead deduction (see `_effective_final_target_max`'s own
+    docstring). Slice 2 (Deterministic Pre-Patch Retrieval, see
     run_deterministic_acquisition) is the only caller that passes an
-    explicit smaller per-round budget, re-invoking this same function on
-    a narrowly-scoped strategy naming only the targets still unready,
+    explicit smaller per-round `max_chars`, re-invoking this same function
+    on a narrowly-scoped strategy naming only the targets still unready,
     rather than a second retrieval implementation.
     """
     if not strategy or not (strategy.target_files or strategy.target_symbols):
         return _EMPTY_SLICE_RESULT
 
-    resolved_max_chars = FINAL_TARGET_SLICE_MAX_CHARS if max_chars is None else max_chars
+    resolved_max_chars = (
+        _effective_final_target_max(budget_controller, vulnerability_text) if max_chars is None else max_chars
+    )
     try:
         return _build_final_target_slice_inner(
             strategy, repo_root, context, planner_evidence_files, resolved_max_chars,
@@ -4603,6 +4937,71 @@ def _build_final_target_slice_inner(
             # terms entry, folded into `target_derived_terms` below for band
             # classification -- so it does not need its own separate marker.
             category3_candidates.append((text, f, label, None))
+
+    # --- Residual-concern Category 2 candidates (SUPPORTING-context role,
+    # LOWEST priority within this tier -- appended to category2_candidates
+    # LAST, after strategy_terms' own definitions, the class-level same-
+    # file assignment scan, and the method-call one-hop expansion above,
+    # all of which have already had their turn to occupy this list ahead
+    # of these). Identifiers named ONLY in `strategy.rejected_targets`/
+    # `strategy.insufficient_evidence` -- a symbol the Final Strategy
+    # explicitly considered and did NOT select as a target, or explicitly
+    # flagged as insufficiently evidenced -- never `target_symbols`/
+    # `extended_mechanism`/`required_edits` (see
+    # _extract_strategy_residual_concern_identifiers's own docstring).
+    #
+    # Evidence continuity for exactly this case: Planning's own bounded
+    # evidence-acquisition loop may already have verified and RENDERED
+    # (not merely resolved -- see PlanningRequestResolution.included) this
+    # exact symbol's file, via pipeline.py's own widened
+    # `planner_evidence_files` (folds in the file component of every
+    # label in `PlannerEvidenceResult.excerpt_plan.included_labels`, not
+    # merely the Final Strategy's own selected `target_files`) -- so a
+    # residual concern a LATER stage (Challenger, Finding Calibration)
+    # needs to reason about again can already be found here, rather than
+    # forcing an avoidable re-request/re-resolve/re-render round trip.
+    #
+    # Uses the EXACT SAME bounded, already-fail-closed
+    # `_lookup_identifier_definition` as the strategy_terms loop above --
+    # no wider search, no new ambiguity rule, no repository-wide fallback.
+    # `used_definition_keys` (already populated by every edit-target
+    # category and every earlier Category 2 source above) means a
+    # residual-concern term can never displace, duplicate, or reclassify
+    # anything those already claimed -- it can only ever fill budget those
+    # earlier, higher-priority candidates left over. Always rendered
+    # under `_CATEGORY2_HEADING_LABEL` ("context only, not an approved
+    # edit target") -- never "Target definition": a residual/rejected
+    # concern is never an edit target, by construction. Committed through
+    # the exact same whole-block-or-omit `category2_candidates` loop
+    # directly below -- no new category, no new budget, no bypass.
+    for term in _extract_strategy_residual_concern_identifiers(strategy):
+        found = _lookup_identifier_definition(term, preferred_files, context, target_identity=target_identity)
+        if found is None:
+            continue
+        key = (found.file, found.line, found.end_line)
+        if key in used_definition_keys:
+            continue
+        if found.kind == "constant":
+            index = getattr(context, "index", None)
+            read_start, read_end = _padded_line_range(found.line, found.end_line, _DEFINITION_CONTEXT_LINES)
+            source = index.read_file_section(found.file, read_start, read_end) if index else None
+            render_start = read_start
+            render_end = _rendered_end_line(render_start, source) if source else found.end_line
+        else:
+            source = _read_symbol_source(
+                _SymbolMatch(file=found.file, label=found.label, kind="function",
+                             line=found.line, end_line=found.end_line, func_id=found.func_id),
+                context,
+            )
+            render_start, render_end = found.line, found.end_line
+        if source is None:
+            continue
+        used_definition_keys.add(key)
+        text = _render_definition_block(
+            found.file, found.label, render_start, render_end, source,
+            heading_label=_CATEGORY2_HEADING_LABEL,
+        )
+        category2_candidates.append((text, found.file))
 
     # --- Commit category 2's candidates now (SUPPORTING-context role,
     # tier 3) -- after every edit-target candidate AND the one-hop step
@@ -6245,10 +6644,36 @@ each target's retrieval call is built from a RemediationStrategy naming
 only that one file."""
 
 MAX_POST_PATCH_SOURCE_CHARS = 6_000
-"""Shared character budget for the whole recovery round, across every
-target it attempts -- always further clamped by whatever remains of
-FINAL_TARGET_SLICE_MAX_CHARS overall (the SAME hard total Slices 1-3
-already enforce, never a separate additional allowance)."""
+"""Fix B: no longer the ceiling that gates this round's evidence -- see
+`_effective_post_patch_recovery_max`, which derives the real starting
+pool from `utilities.autopatcher.technical_capacity` instead. Retained
+only as a historical reference value; always further clamped by whatever
+remains of the "final_target_slice" stage's own real ceiling overall (the
+SAME hard total Slices 1-3 already enforce, never a separate additional
+allowance)."""
+
+
+def _effective_post_patch_recovery_max(
+    budget_controller: "ContextBudgetController | None", vulnerability_text: str = "",
+) -> int:
+    """The Post-Patch Recovery round's own real per-call technical
+    source-capacity ceiling (stage "post_patch_recovery") -- Fix B's
+    replacement for the fixed `MAX_POST_PATCH_SOURCE_CHARS` starting pool.
+    Mirrors `_effective_final_target_max` exactly: computed once per run,
+    cached on `budget_controller` when one is given, using this call's
+    own known overhead (the Patch Generator system prompt this recovered
+    source will feed, plus `vulnerability_text` when the caller has it in
+    scope)."""
+    known_overhead_chars = _final_target_slice_known_overhead_chars(vulnerability_text)
+    if budget_controller is None:
+        return compute_source_capacity(
+            *resolve_active_model(),
+            reserved_output_tokens=resolve_max_tokens(),
+            known_overhead_chars=known_overhead_chars,
+        ).source_capacity_chars
+    return budget_controller.effective_budget(
+        "post_patch_recovery", known_overhead_chars=known_overhead_chars,
+    )
 
 MAX_ADDITIONAL_PATCH_GENERATOR_CALLS = 1
 """Slice 4 itself calls generate_patch() at most this many times (the
@@ -7296,6 +7721,7 @@ def recover_post_patch_source(
     patch: str,
     recovery_targets: "list[RecoveryTarget] | None" = None,
     budget_controller: "ContextBudgetController | None" = None,
+    vulnerability_text: str = "",
 ) -> PostPatchRecoveryResult:
     """
     Slice 4's deterministic, bounded post-patch source recovery. No LLM
@@ -7453,7 +7879,7 @@ def recover_post_patch_source(
 
     current_slice = slice_result
     attempts: "list[RecoveryTargetAttempt]" = []
-    budget_remaining = MAX_POST_PATCH_SOURCE_CHARS
+    budget_remaining = _effective_post_patch_recovery_max(budget_controller, vulnerability_text)
 
     def _extend_post_patch_budget(affected_file: str, needed_chars: int = 1) -> bool:
         """Try, in order, to extend whichever pool(s) are actually

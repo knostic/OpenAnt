@@ -360,21 +360,15 @@ openant patch \
 
 ### Context budget
 
-Several pipeline stages (final-target slicing, pre-patch and post-patch source acquisition) share a fixed character budget for how much repository source they can pull in — this is a cap on repository text gathered from disk, not the LLM's context-window size or a token/dollar budget, and it's entirely optional. By default each stage starts with one 10,000-character window. `--context-budget-policy` controls whether a stage can be granted additional windows once it runs out:
+Every pipeline stage that pulls repository source into an LLM call (final-target slicing, pre-patch and post-patch source acquisition) is bounded by the **real technical capacity** of the active model — the model's documented context window (when known), minus the exact overhead already reserved for output tokens, the system prompt, and other prompt content, minus a small safety margin. There is no arbitrary "budget window" ceiling, and no user-facing resource/cost limit: by default, every run acquires as much justified repository evidence as the model can technically hold. Resolved evidence that genuinely cannot fit in one call is recorded (never silently dropped) with a structured `technical_capacity` reason.
 
-- `ask` — prompt before granting another window (the default for an interactive run).
-- `always` — grant windows automatically up to the cap, with no prompting (useful for CI / batch runs).
-- `never` — never extend; the original fixed-budget behavior (the default for a non-interactive run).
-
-Each granted window adds the same fixed size as the first (10K → 20K → 30K → …, never exponential), up to `--max-context-budget-windows` (default `10`, i.e. up to 100,000 characters per stage). Extending the budget only grants more source text to work from — it never bypasses applicability, source verification, or the Recommendation Policy.
+`--context-budget-policy` and `--max-context-budget-windows` are **deprecated** — they no longer control whether evidence reaches an LLM call. They are still accepted (a passing script or CI job keeps working) but only print a one-time notice; they have no further effect.
 
 ```bash
 openant patch \
   --cve CVE-2023-43804 \
   --repo-root /tmp/urllib3-eval \
-  --output /tmp/urllib3-report \
-  --context-budget-policy always \
-  --max-context-budget-windows 10
+  --output /tmp/urllib3-report
 ```
 
 ### Remediating a finding instead

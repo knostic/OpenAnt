@@ -57,15 +57,17 @@ func init() {
 	patchCmd.Flags().StringVar(&patchCVE, "cve", "", "CVE identifier to fetch from NVD and remediate (mutually exclusive with --finding-id)")
 	patchCmd.Flags().StringVar(&patchRepoRoot, "repo-root", "", "Path to the target repository root (defaults to the active project's repo path; required for --cve)")
 	patchCmd.Flags().StringVarP(&patchOutput, "output", "o", "", "Output directory (default: active scan directory)")
-	// Both flags are forwarded verbatim to the Python `patch` CLI, which is
-	// the sole authority on valid values (openant/cli.py's argparse choices=
-	// / _positive_int, utilities.autopatcher.context_budget.
-	// ContextBudgetController). Go never validates policy or max-windows --
-	// see contextBudgetFlags/appendContextBudgetArgs below.
+	// Both flags are DEPRECATED (Fix B): repository evidence visibility is
+	// now always bounded by the active model's real technical context
+	// capacity, never by these flags. Forwarded verbatim to the Python
+	// `patch` CLI purely for compatibility -- Python still validates shape
+	// (argparse choices=/_positive_int) and emits a one-time deprecation
+	// notice; Go never validates policy or max-windows itself -- see
+	// contextBudgetFlags/appendContextBudgetArgs below.
 	patchCmd.Flags().StringVar(&patchContextBudgetPolicy, "context-budget-policy", "",
-		"Context-budget extension policy: ask, always, or never (default: Python's own -- ask if interactive, else never)")
+		"DEPRECATED, accepted for compatibility only: no longer controls whether repository evidence reaches an LLM call (see Python's own help text)")
 	patchCmd.Flags().IntVar(&patchMaxContextBudgetWindows, "max-context-budget-windows", 0,
-		"Hard cap on total context-budget windows per acquisition stage (default: Python's own, 10)")
+		"DEPRECATED, accepted for compatibility only: no longer caps anything")
 	// Forwarded to Python as a bare --verbose flag (see appendPresentationArgs
 	// below) -- Python (utilities.autopatcher.progress) is the sole authority
 	// on what verbose mode actually shows.

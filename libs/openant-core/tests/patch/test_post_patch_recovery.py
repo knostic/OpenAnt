@@ -1048,7 +1048,10 @@ class TestPostPatchRecovery:
             unexpected_files=["mod.py"], uncovered_files=[], no_match_files=[],
         )
         patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-CONST_B = 42\n+CONST_B = 43\n"
-        monkeypatch.setattr(rp, "MAX_POST_PATCH_SOURCE_CHARS", 1)
+        # Fix B: the real per-call technical-capacity ceiling replaced
+        # MAX_POST_PATCH_SOURCE_CHARS as the actual gate -- force it small
+        # via its own real indirection point instead.
+        monkeypatch.setattr(rp, "_effective_post_patch_recovery_max", lambda *a, **kw: 1)
 
         result = rp.recover_post_patch_source(
             _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
@@ -1635,7 +1638,7 @@ class TestPostPatchWindowBudgetAndTrace:
             unexpected_files=["mod.py"], uncovered_files=[], no_match_files=[],
         )
         patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-CONST_A = 1\n+CONST_A = 2\n"
-        monkeypatch.setattr(rp, "MAX_POST_PATCH_SOURCE_CHARS", 5)
+        monkeypatch.setattr(rp, "_effective_post_patch_recovery_max", lambda *a, **kw: 5)
 
         result = rp.recover_post_patch_source(
             _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
@@ -1660,7 +1663,7 @@ class TestPostPatchWindowBudgetAndTrace:
             unexpected_files=["mod.py"], uncovered_files=[], no_match_files=[],
         )
         patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-CONST_A = 1\n+CONST_A = 2\n"
-        monkeypatch.setattr(rp, "MAX_POST_PATCH_SOURCE_CHARS", 5)
+        monkeypatch.setattr(rp, "_effective_post_patch_recovery_max", lambda *a, **kw: 5)
         initial_slice = _make_slice_result()
 
         result = rp.recover_post_patch_source(
@@ -2213,9 +2216,11 @@ class TestPostPatchRecoveryEvidenceReachesChallenger:
             return good_patch
 
         captured_challenger_contexts: list = []
+        self.captured_provenance_contexts: list = []
 
-        def _capture_challenger(vulnerability_text, patch, llm, code_context=""):
+        def _capture_challenger(vulnerability_text, patch, llm, code_context="", provenance_context=None):
             captured_challenger_contexts.append(code_context)
+            self.captured_provenance_contexts.append(provenance_context)
             return {}
 
         with (
@@ -2247,6 +2252,9 @@ class TestPostPatchRecoveryEvidenceReachesChallenger:
             "accepted regenerated patch -- it fell back to the context frozen "
             "before Post-Patch Recovery ran."
         )
+        # D7: the recovery-verified slice is repository-derived evidence, so
+        # it must also be part of the citation-authority corpus.
+        assert self._MARKER in (self.captured_provenance_contexts[0] or "")
 
 
 # ---------------------------------------------------------------------------

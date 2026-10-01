@@ -930,6 +930,13 @@ class TestRenderPostPatchInvestigation:
         assert observations == snapshot
 
     def test_never_exceeds_max_chars(self):
+        """Fix B: whole-section-or-omit, never mid-section truncation. At
+        max_chars=500 (below even the fixed header/preamble's own length),
+        this fails closed to an empty, structurally-marked result rather
+        than a partially-truncated stub -- see
+        test_fails_closed_when_header_alone_exceeds_capacity and
+        test_whole_section_omitted_under_tighter_capacity below for the
+        two distinct capacity regimes this used to conflate."""
         from utilities.autopatcher.post_patch_evaluation import evaluate_anchors, render_post_patch_investigation
 
         anchors = [
@@ -941,7 +948,46 @@ class TestRenderPostPatchInvestigation:
 
         rendered = render_post_patch_investigation(observations, max_chars=500)
         assert len(rendered) <= 500
-        assert "(+" in rendered or "truncated" in rendered
+
+    def test_fails_closed_when_header_alone_exceeds_capacity(self):
+        """Fix B: the fixed header/preamble alone (>500 chars) already
+        exceeds this tiny ceiling -- fails closed to an empty result and a
+        structured `fixed_sections_exceeded` marker, never a mid-line
+        truncation of the preamble itself."""
+        from utilities.autopatcher.post_patch_evaluation import (
+            compute_post_patch_investigation_plan, evaluate_anchors,
+        )
+
+        anchors = [_resolved_function_anchor(f"a{i}.py:foo", candidate_path=f"a{i}.py") for i in range(50)]
+        observations = evaluate_anchors(anchors, _context({}))
+
+        plan = compute_post_patch_investigation_plan(observations, max_chars=500)
+        assert plan.rendered == ""
+        assert plan.fixed_sections_exceeded is True
+        assert all(reason == "technical_capacity" for reason in plan.omission_reason.values())
+
+    def test_whole_section_omitted_under_tighter_capacity(self):
+        """A ceiling large enough for the header but not for every section
+        omits whole sections (least-critical first), never truncating one
+        mid-content -- and every omission is structurally recorded."""
+        from utilities.autopatcher.post_patch_evaluation import (
+            _HEADING, _PREAMBLE, compute_post_patch_investigation_plan, evaluate_anchors,
+        )
+
+        anchors = [_resolved_function_anchor(f"a{i}.py:foo", candidate_path=f"a{i}.py") for i in range(50)]
+        observations = evaluate_anchors(anchors, _context({}))
+        header_len = len(_HEADING + "\n\n" + _PREAMBLE + "\n")
+
+        plan = compute_post_patch_investigation_plan(observations, max_chars=header_len + 50)
+        assert len(plan.rendered) <= header_len + 50
+        assert plan.fixed_sections_exceeded is False
+        assert plan.omitted_sections
+        assert all(reason == "technical_capacity" for reason in plan.omission_reason.values())
+        # Never a bare mid-section fragment -- every surviving section is
+        # either the fixed header or one this plan's own sections dict
+        # produced whole.
+        assert "[truncated]" not in plan.rendered
+        assert "*(truncated" not in plan.rendered
 
     def test_no_recommendation_or_verdict_vocabulary_in_data_sections(self):
         """The blocklist applies to the data-driven sections (Changed/
@@ -987,14 +1033,21 @@ class TestRenderPostPatchInvestigation:
         coverage_idx = rendered.index("### Anchor Coverage")
         assert coverage_idx < rendered.index("No anchors were available")
 
-        # Placed early enough to survive a tight character budget, unlike
-        # a section placed last (which _hard_clamp would drop first). The
-        # budget below is tight enough to truncate well before any of the
-        # Changed/Disappeared/Unchanged/Remaining-Unknowns sections could
-        # render, yet still fits header + preamble + Anchor Coverage.
+        # Fix B: whole-section-or-omit, never mid-line truncation. 760
+        # chars fits the fixed header/preamble alone but NOT header +
+        # Anchor Coverage together (measured: header=672, +coverage=936)
+        # -- Coverage is now correctly OMITTED WHOLE (never partially
+        # rendered) rather than sliced mid-line the way the old hard-clamp
+        # backstop used to leave a truncated fragment behind.
+        from utilities.autopatcher.post_patch_evaluation import compute_post_patch_investigation_plan
+
         tight = render_post_patch_investigation([], coverage, max_chars=760)
-        assert "Anchor Coverage" in tight
-        assert "*(truncated to fit the character budget)*" in tight
+        assert "Anchor Coverage" not in tight
+        assert tight  # the header/preamble alone still renders
+
+        plan = compute_post_patch_investigation_plan([], coverage, max_chars=760)
+        assert "coverage" in plan.omitted_sections
+        assert plan.omission_reason["coverage"] == "technical_capacity"
 
     def test_uncovered_list_capped_with_plus_n_more(self):
         from utilities.autopatcher.post_patch_evaluation import CoverageResult, render_post_patch_investigation

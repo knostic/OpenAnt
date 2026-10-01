@@ -46,6 +46,8 @@ class TestParseResponse:
             "unresolved_dependencies": [],
             "group_before_consistency_check": "observed",
             "remediation_impact": "validation_only",  # normalized: Unresolved parsed to []
+            "evidence_acquirability": None,
+            "evidence_request": None,
         }
         assert result[1]["group"] == "hypothesis"
         assert result[1]["unresolved_dependencies"] == [
@@ -71,6 +73,8 @@ class TestParseResponse:
             "unresolved_dependencies": [],
             "group_before_consistency_check": "hypothesis",
             "remediation_impact": "unclear",
+            "evidence_acquirability": None,
+            "evidence_request": None,
         }
 
     def test_invalid_group_name_falls_back_to_hypothesis(self):
@@ -153,6 +157,8 @@ class TestCalibrateFindings:
             "original": "a finding", "group": "observed", "reworded": "Reworded finding.",
             "unresolved_dependencies": [], "group_before_consistency_check": "observed",
             "remediation_impact": "validation_only",  # normalized: Unresolved parsed to []
+            "evidence_acquirability": None,
+            "evidence_request": None,
         }]
 
     def test_user_message_includes_code_context_and_findings(self):
@@ -717,6 +723,8 @@ class TestBlockLocalParsing:
             "unresolved_dependencies": [],
             "group_before_consistency_check": "hypothesis",
             "remediation_impact": "unclear",
+            "evidence_acquirability": None,
+            "evidence_request": None,
         }
 
     def test_duplicate_block_numbers_do_not_corrupt_other_findings(self):
@@ -816,6 +824,8 @@ class TestDuplicateBlockNumberFailsClosed:
             "unresolved_dependencies": [],
             "group_before_consistency_check": "hypothesis",
             "remediation_impact": "unclear",
+            "evidence_acquirability": None,
+            "evidence_request": None,
         }
 
     def test_duplicate_number_observed_vs_hypothesis_still_fails_closed(self):
@@ -924,6 +934,8 @@ class TestDuplicateBlockNumberFailsClosed:
             "unresolved_dependencies": [],
             "group_before_consistency_check": "hypothesis",
             "remediation_impact": "unclear",
+            "evidence_acquirability": None,
+            "evidence_request": None,
         }
 
 
@@ -2029,25 +2041,26 @@ class TestInvariantDeferredPredicateAndOverrideScopeRules:
             "correct" in text
         )
 
-    def test_rule_b_non_default_override_is_asymmetric(self):
-        """Rule B must both (a) instruct against automatically treating an
-        explicit non-default caller configuration as proof the default
-        remediation is incomplete, and (b) preserve the exception for an
-        invariant that explicitly extends the remediation to that
-        configuration -- never a blanket "custom configuration never
-        matters" exemption."""
+    def test_rule_b_non_default_execution_is_asymmetric(self):
+        """The unified "Explicit non-default execution" rule must both (a)
+        instruct against automatically treating explicit non-default
+        execution as proof the default remediation is incomplete, and (b)
+        preserve the exception (Case A) for an invariant that explicitly
+        extends the remediation to that execution -- never a blanket
+        "non-default is never in scope" exemption."""
         from utilities.autopatcher.finding_calibration import _PROMPT_PATH
         text = " ".join(_PROMPT_PATH.read_text(encoding="utf-8").split())
         assert (
-            "does not, by itself, make the default remediation incomplete" in text
+            "does not, by itself, make the question `proof_required`" in text
         )
         assert (
-            "Security Invariant, or verified evidence itself extends the required "
-            "remediation to that alternate configuration, override, or entry point" in text
+            "Security Invariant, vulnerability description, or verified evidence itself "
+            "affirmatively establishes that this explicit non-default execution is part "
+            "of the required remediation behavior" in text
         )
         assert (
-            "never a blanket rule that a custom configuration or non-default path can "
-            "never matter" in text
+            "It is never a blanket rule that a non-default configuration is "
+            "automatically irrelevant" in text
         )
 
     def test_new_scope_rules_forbid_keyword_heuristics(self):
@@ -2061,7 +2074,7 @@ class TestInvariantDeferredPredicateAndOverrideScopeRules:
             "codebase" in text
         )
         assert (
-            'it is never decided from a keyword describing the configuration (such as '
+            'It is never decided from a keyword describing the configuration (such as '
             '"override", "custom", "explicit", "disabled", or "non-default") in the '
             "finding's own wording" in text
         )
@@ -2176,3 +2189,1395 @@ class TestInvariantDeferredPredicateAndOverrideScopeRules:
         segment = full_text[start:end]
         impacts = re.findall(r"Remediation impact: (\w+)", segment)
         assert impacts == ["validation_only", "proof_required"]
+
+
+# ---------------------------------------------------------------------------
+# Explicit non-default execution -- unified rule (V9 forensic root cause):
+# in one Finding Calibration response, two findings sharing the exact same
+# governing scope pattern (explicit non-default caller configuration) were
+# given DIFFERENT remediation_impact dispositions -- one `proof_required`,
+# one `validation_only` -- even though the then-shipped prompt already said
+# a guard-bypass finding should be "treat[ed]... the same way as the
+# explicit non-default caller configuration pattern". Having the pattern
+# expressed as two separately-worded rules (one for a direct caller
+# setting, one for a guard bypass that merely cross-referenced the first)
+# left room for a model to route the two cases differently despite the
+# cross-reference. The fix folds both into ONE rule -- "Explicit non-default
+# execution" -- with the guard-bypass case stated as an explicit sub-case
+# of the SAME pattern, not a second rule that points at the first.
+#
+# This also PRESERVES, unchanged in substance, three things carried over
+# from the prior (V7/V8) fix to the guard-bypass case specifically: (a) the
+# obligation to derive a guard's existence even when the finding's own
+# wording never names it; (b) the "Observed + Unresolved: none is not a
+# bypass" reachability-tracing prerequisite; (c) the fail-closed default
+# when the guard/default/order/reachability cannot be established from
+# supplied evidence.
+#
+# SCOPE NOTE: same limitation as every other prompt-contract test in this
+# file -- reasoning quality remains entirely LLM-judgment based on the
+# prompt text; a mocked-LLM test cannot prove actual model compliance, only
+# that the shipped prompt states the rule and that the plumbing does not
+# fight a contract-following model's output. What IS testable: (a) the
+# unified rule and its three compact examples landed in the shipped
+# prompt, generically worded, in the right place; (b) a direct override and
+# a guard bypass are explicitly named as the SAME pattern, not two; (c) it
+# explicitly requires deriving a guard even when the finding's own text
+# never names it; (d) it never defers to any upstream stage's own
+# conclusion; (e) it preserves the fail-closed default on genuine ambiguity
+# and does not introduce a general "non-default path is irrelevant" rule;
+# and (f) calibrate_findings' own plumbing preserves whatever a
+# contract-following LLM returns for this shape, unchanged.
+# ---------------------------------------------------------------------------
+
+class TestUnifiedExplicitNonDefaultExecutionContract:
+    def _full_text(self):
+        from utilities.autopatcher.finding_calibration import _PROMPT_PATH
+        return _PROMPT_PATH.read_text(encoding="utf-8")
+
+    def _joined(self):
+        return " ".join(self._full_text().split())
+
+    def test_direct_override_and_guard_bypass_are_named_the_same_pattern(self):
+        """The crux of the V9 fix: a direct caller setting and a
+        preceding-guard bypass are stated as ONE pattern, not two rules
+        that merely cross-reference each other."""
+        joined = self._joined()
+        assert "**Explicit non-default execution.**" in joined
+        assert (
+            "a non-default value that directly changes the later behavior"
+        ) in joined
+        assert (
+            "a non-default value that disables, bypasses, or relaxes a "
+            "preceding default-enabled guard"
+        ) in joined
+        assert (
+            "These are the SAME remediation-scope pattern, not two "
+            "different ones"
+        ) in joined
+        # The obsolete two-separate-rules structure must be gone.
+        assert "Explicit non-default caller configuration.**" not in joined
+        assert "Preceding guards, verified defaults, and reachability under default" not in joined
+
+    def test_rule_requires_tracing_guards_defaults_order_and_early_stops(self):
+        joined = self._joined()
+        assert "entry, any verified default argument or configuration" in joined
+        assert "any preceding guard, the order those steps actually execute" in joined
+        assert "any early return, error, or stop that occurs before the" in joined
+
+    def test_rule_applies_even_when_finding_does_not_name_the_guard(self):
+        """Carried over from the prior fix: the model must derive the guard
+        from the evidence supplied for the finding, not wait for the
+        finding's own wording to name it."""
+        joined = self._joined()
+        assert (
+            "Do this even when the finding's own wording never names the "
+            "guard or the gating parameter at all"
+        ) in joined
+        assert (
+            "you must still derive the guard's existence and effect from "
+            "the evidence supplied for this finding; do not wait for the "
+            "finding to name it"
+        ) in joined
+
+    def test_observed_and_unresolved_none_still_cannot_bypass_the_trace(self):
+        """Carried over from the prior fix: reachability tracing is a
+        prerequisite to ANY reachability claim, not only one already
+        marked unresolved."""
+        joined = self._joined()
+        assert (
+            "This obligation does not depend on first deciding the "
+            "dependency is unresolved"
+        ) in joined
+        assert (
+            "`Group: Observed` together with `Unresolved: none` is not a "
+            "way to bypass it"
+        ) in joined
+
+    def test_case_a_affirmative_scope_may_remain_proof_required(self):
+        joined = self._joined()
+        assert "**Case A — affirmatively in scope.**" in joined
+        assert (
+            "only when the supplied Security Invariant, vulnerability "
+            "description, or verified evidence itself affirmatively "
+            "establishes that this explicit non-default execution is "
+            "part of the required remediation behavior"
+        ) in joined
+
+    def test_case_b_unestablished_scope_is_validation_only_not_automatic_proof_required(self):
+        joined = self._joined()
+        assert "**Case B — not affirmatively established as in scope.**" in joined
+        assert (
+            "The mere fact that it remains conceptually possible to ask "
+            "whether the invariant could be extended to this non-default "
+            "execution does not, by itself, make the question "
+            "`proof_required`"
+        ) in joined
+        assert (
+            "unknown scope is not automatically remediation-proof "
+            "relevance once the evidence already establishes that the "
+            "concerning behavior requires explicit non-default execution "
+            "to reach"
+        ) in joined
+
+    def test_case_c_fails_closed_when_guard_default_or_order_unestablished(self):
+        joined = self._joined()
+        assert "**Case C — cannot establish non-default-only reachability.**" in joined
+        assert (
+            "does not establish the relevant default, the preceding "
+            "guard, execution order, whether the concerning operation is "
+            "reachable under defaults, or whether an explicit non-default "
+            "choice is actually required, remain `proof_required`"
+        ) in joined
+        assert (
+            "do not infer default-only reachability merely from a "
+            "parameter's name or from an assumption about what a flag "
+            '"probably" does'
+        ) in joined
+
+    def test_rule_does_not_introduce_general_non_default_irrelevance_rule(self):
+        joined = self._joined()
+        assert (
+            "It is never a blanket rule that a non-default configuration "
+            "is automatically irrelevant"
+        ) in joined
+        assert (
+            "Case A remains fully available whenever the evidence "
+            "supports it, exactly like any other in-scope dependency"
+        ) in joined
+
+    def test_rule_never_defers_to_upstream_conclusion(self):
+        """Calibration must independently derive this from its own supplied
+        evidence -- never from whether an earlier pipeline stage already
+        reached (or failed to reach) the same conclusion."""
+        joined = self._joined()
+        assert (
+            "it is never decided from whether upstream already reached, "
+            "or failed to reach, the same conclusion about this path"
+        ) in joined
+        assert (
+            "upstream's own choices are not evidence of what this "
+            "advisory's remediation requires"
+        ) in joined
+
+    def test_never_decided_from_a_keyword_in_the_findings_own_wording(self):
+        joined = self._joined()
+        assert (
+            'It is never decided from a keyword describing the '
+            'configuration (such as "override", "custom", "explicit", '
+            '"disabled", or "non-default") in the finding\'s own wording'
+        ) in joined
+
+    def test_three_examples_present_and_demonstrate_the_unified_pattern(self):
+        text = self._full_text()
+        assert "Example 1 — direct explicit override" in text
+        assert "Example 2 — default-enabled guard bypass" in text
+        assert "Example 3 — override explicitly included in scope" in text
+        assert "process(item, allow_external=False)" in text
+        assert "if external(item) and not allow_external:" in text
+        assert "perform_sensitive_operation(item)" in text
+        joined = self._joined()
+        # Example 2's own "finding text" input explicitly does NOT mention
+        # the guard -- only the later operation -- mirroring the real defect.
+        assert (
+            "the finding's own wording never mentions `allow_external` or "
+            "the guard at all"
+        ) in joined
+        # Example 2 and Example 3 must resolve to opposite dispositions,
+        # differing only in whether the invariant covers the override.
+        assert "Classify `validation_only` (Case B) unless the" in joined
+        assert "Classify `proof_required` (Case A) when resolving the dependency" in joined
+
+    def test_rule_and_examples_are_domain_neutral(self):
+        """Must not mention urllib3, HTTPConnectionPool, redirects, Cookie,
+        hosts, assert_same_host, Retry, PoolManager, or any CVE identifier
+        -- scoped to the new unified bullet's own span only."""
+        full_text = self._full_text()
+        start = full_text.index("**Explicit non-default execution.**")
+        end = full_text.index("This axis never determines Group, and Group never determines this axis:")
+        segment = full_text[start:end].lower()
+        for forbidden in (
+            "urllib3", "httpconnectionpool", "redirect", "cookie", "hosts",
+            "assert_same_host", "retry", "poolmanager", "cve-", "cve ",
+        ):
+            assert forbidden not in segment, f"found forbidden term {forbidden!r}"
+
+    def test_unified_rule_placed_directly_after_predicate_bullet_before_group_axis_note(self):
+        """The unified rule is a sub-case of step 2's SAME remediation-
+        impact judgment, sitting after the existing "Existing predicate,
+        helper, policy, or abstraction" bullet and before the pre-existing
+        Group-independence reminder -- never after it, and never as a
+        separate numbered step."""
+        text = self._full_text()
+        predicate_bullet_pos = text.index(
+            "**Existing predicate, helper, policy, or abstraction the patch does"
+        )
+        unified_rule_pos = text.index("**Explicit non-default execution.**")
+        group_axis_pos = text.index(
+            "This axis never determines Group, and Group never determines this axis:"
+        )
+        step_3_pos = text.index("3. **Classify** it into exactly one of three groups:")
+        assert predicate_bullet_pos < unified_rule_pos < group_axis_pos < step_3_pos
+
+
+# ---------------------------------------------------------------------------
+# Silence-vs-unresolved-scope consistency fix: the shipped prompt previously
+# stated the Case A/B/C "Explicit non-default execution" policy correctly in
+# its own rule text and worked-example OUTPUTS (a Security Invariant that
+# merely never mentions a non-default scenario -> Case B -> validation_only),
+# but two of its own contrastive-example commentaries ("mode=compat" and
+# "skip_validation") asserted the opposite as general policy ("silent or
+# ambiguous... stays proof_required"), directly contradicting the very
+# outputs those same examples had just shown two paragraphs above. This
+# collapsed two materially different states -- silence (the Security
+# Invariant is legible and simply does not extend to the scenario) and
+# genuine unresolved ambiguity (the Security Invariant's own text cannot be
+# read with respect to the scenario at all) -- into one, which would have
+# reintroduced exactly the kind of scope-driven adjudication instability
+# this file's Case A/B/C rule was written to remove.
+#
+# SCOPE NOTE: same limitation as every other prompt-contract test in this
+# file -- these checks prove the shipped prompt now states the corrected,
+# internally-consistent rule (and that it no longer contains the
+# contradictory sentence), and that a contract-following mocked response
+# passes through calibrate_findings' own plumbing unchanged. None of this
+# proves an LLM will actually distinguish silence from ambiguity in a real
+# response -- only a real regression can.
+# ---------------------------------------------------------------------------
+
+class TestScopeSilenceVersusUnresolvedAmbiguity:
+    def _full_text(self):
+        from utilities.autopatcher.finding_calibration import _PROMPT_PATH
+        return _PROMPT_PATH.read_text(encoding="utf-8")
+
+    def _joined(self):
+        return " ".join(self._full_text().split())
+
+    def test_case_b_definition_distinguishes_silence_from_unresolved_scope_text(self):
+        """Case B's own definition must state, in one canonical place, that
+        silence alone is sufficient for Case B, and that a Security
+        Invariant whose own meaning cannot be established is a distinct
+        failure mode that fails closed to `proof_required` instead."""
+        joined = self._joined()
+        assert (
+            "This is silence, not ambiguity, and silence is enough for "
+            "Case B on its own."
+        ) in joined
+        assert (
+            "it fails closed to `proof_required` for the same reason "
+            "Case C's reachability uncertainty does — never to "
+            "`validation_only`"
+        ) in joined
+
+    def test_mode_compat_example_correctly_separates_silence_from_ambiguity(self):
+        """The corrected `mode="compat"` contrastive example must state
+        BOTH halves explicitly: silence (invariant legible, does not
+        extend to the scenario) -> validation_only, and genuine
+        unresolvable-invariant-text -> proof_required -- not the collapsed
+        single sentence this replaces."""
+        full_text = self._full_text()
+        start = full_text.index('Contrastive example — remediation scope')
+        end = full_text.index('Contrastive example — existing predicate the patch does not modify')
+        segment = " ".join(full_text[start:end].split())
+        assert (
+            "but it simply does not mention or extend to that scenario — "
+            "exactly as in Case B above — the dependency is "
+            "`validation_only`"
+        ) in segment
+        assert (
+            "the dependency remains genuinely unresolved and stays "
+            "`proof_required`"
+        ) in segment
+        assert "silent or ambiguous" not in segment.lower()
+
+    def test_skip_validation_example_correctly_separates_silence_from_ambiguity(self):
+        """Same fix, same shape, for the `skip_validation` contrastive
+        example."""
+        full_text = self._full_text()
+        start = full_text.index(
+            "Contrastive example — explicit non-default caller configuration"
+        )
+        segment = " ".join(full_text[start:].split())
+        assert (
+            "but it simply does not address that configuration — exactly "
+            "as in Case A above — the dependency is `validation_only`"
+        ) in segment
+        assert (
+            "the dependency remains genuinely unresolved and stays "
+            "`proof_required`, exactly as in the `mode=\"compat\"` "
+            "contrastive example above"
+        ) in segment
+        assert "silent or ambiguous" not in segment.lower()
+
+    def test_silence_and_ambiguity_are_never_treated_as_synonyms_anywhere_in_prompt(self):
+        """Regression guard: the stale conflation this fix removes must not
+        reappear anywhere in the prompt, under this or a paraphrased
+        spelling, regardless of which example or rule future editing
+        touches. This is the one check that would fail if a future edit
+        re-collapses silence and ambiguity into the same policy branch
+        again -- anywhere in the file, not only in the two examples fixed
+        here."""
+        full_text = self._full_text()
+        lowered = full_text.lower()
+        assert "silent or ambiguous" not in lowered
+        assert "silent and ambiguous" not in lowered
+        assert "ambiguous or silent" not in lowered
+        assert "rather than clearly excluding it" not in lowered
+
+    def test_explicit_scope_exclusion_falls_under_case_b_by_the_existing_binary_contract(self):
+        """Case A is the sole affirmative-inclusion carve-out; Case B's own
+        wording ("Otherwise, classify `validation_only`") is the exhaustive
+        complement of Case A, so an explicit exclusion -- which is
+        certainly not an affirmative inclusion -- falls under Case B
+        exactly like silence does. This is a pre-existing structural
+        property of the binary Case A/Case B contract, not new text added
+        by this fix."""
+        joined = self._joined()
+        case_a_pos = joined.index("**Case A — affirmatively in scope.**")
+        case_b_pos = joined.index(
+            "**Case B — not affirmatively established as in scope.** "
+            "Otherwise, classify `validation_only`."
+        )
+        case_c_pos = joined.index("**Case C — cannot establish non-default-only reachability.**")
+        assert case_a_pos < case_b_pos < case_c_pos
+
+
+class TestScopeTextUnresolvedPassthrough:
+    """Mocked-LLM tests: simulate a contract-following response for the
+    newly-distinguished "Security Invariant's own text cannot be
+    established" failure mode, and assert calibrate_findings' own plumbing
+    (never LLM reasoning) preserves `proof_required` unchanged -- the same
+    passthrough style already used by TestDefaultGuardReachabilityPassthrough
+    for the reachability-side Case C. This proves the parser does not fight
+    or reinterpret a contract-following response; it cannot prove an LLM
+    will actually recognize genuinely unresolvable invariant text."""
+
+    def test_genuinely_unresolvable_invariant_text_stays_proof_required(self):
+        """The non-default path's reachability is fully established, but
+        the Security Invariant's own text is reported as unreadable with
+        respect to that scenario -- must remain proof_required, never
+        silently downgraded to validation_only merely because the concern
+        involves a non-default path."""
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Claims:\n"
+            "   - A preceding guard, enabled by default, stops execution before the operation the finding raises a concern about.\n"
+            "   - Reaching that operation requires a caller to explicitly supply a non-default value for the guard's parameter.\n"
+            "   - The supplied Security Invariant's own wording about this non-default path is internally contradictory and cannot be established one way or the other.\n"
+            "   Unresolved: whether the required behavior still applies when a caller explicitly disables the preceding guard\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: conceptual_scope\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: A preceding, default-enabled guard stops the operation of concern under ordinary execution; the supplied Security Invariant's own text cannot be established with respect to the explicit-override path, so this remains an open remediation question.\n"
+        )
+        result = calibrate_findings(
+            "vuln text", "patch",
+            ["The operation runs on the item without further restriction under a caller-selected override; whether that is acceptable is not addressed by the supplied evidence."],
+            llm,
+            code_context=(
+                "def process(item, allow_external=False):\n"
+                "    if external(item) and not allow_external:\n"
+                "        return\n"
+                "    perform_sensitive_operation(item)\n"
+            ),
+        )
+        assert result[0]["remediation_impact"] == "proof_required"
+        assert result[0]["evidence_acquirability"] == "conceptual_scope"
+
+
+class TestDefaultGuardReachabilityPassthrough:
+    """Mocked-LLM tests: simulate an LLM that DOES follow the new rule and
+    assert calibrate_findings' own plumbing (never LLM reasoning) preserves
+    that outcome unchanged. These prove the mechanical pipeline does not
+    fight, re-elevate, or require any special-casing for a
+    contract-following response -- they cannot and do not prove an LLM will
+    actually reason this way."""
+
+    # The finding's own text deliberately never names the guard or its
+    # gating parameter -- only the later, concerning operation -- mirroring
+    # the real defect exactly (outcome F: "doesn't name the guard, but the
+    # evidence does").
+    UNNAMED_GUARD_FINDING = (
+        "The operation runs on the item without further restriction; "
+        "whether that is acceptable for an externally-sourced item is not "
+        "addressed by the supplied evidence."
+    )
+
+    def test_default_blocked_path_not_established_in_scope_becomes_validation_only(self):
+        """Outcome A / F combined: the finding never names the guard, but a
+        contract-following response derives it from the surrounding
+        evidence and correctly downgrades to validation_only."""
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Claims:\n"
+            "   - A preceding guard, enabled by default, stops execution before the operation the finding raises a concern about.\n"
+            "   - Reaching that operation requires a caller to explicitly supply a non-default value for the guard's parameter.\n"
+            "   - The supplied Security Invariant is stated only for the default path and does not extend to that explicit override.\n"
+            "   Unresolved: whether the required behavior still applies when a caller explicitly disables the preceding guard\n"
+            "   Remediation impact: validation_only\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: A preceding, default-enabled guard stops the operation the finding is concerned about under ordinary execution; reaching it requires an explicit non-default override, and the supplied Security Invariant does not extend the required remediation to that override, so resolving this does not affect whether the claimed remediation is established.\n"
+        )
+        result = calibrate_findings(
+            "vuln text", "patch", [self.UNNAMED_GUARD_FINDING], llm,
+            code_context=(
+                "def process(item, allow_external=False):\n"
+                "    if external(item) and not allow_external:\n"
+                "        return\n"
+                "    perform_sensitive_operation(item)\n"
+            ),
+        )
+        assert result[0]["remediation_impact"] == "validation_only"
+        assert result[0]["unresolved_dependencies"] == [
+            "whether the required behavior still applies when a caller "
+            "explicitly disables the preceding guard"
+        ]
+
+    def test_explicit_override_established_in_scope_remains_proof_required(self):
+        """Outcome C: the same default-blocked shape, but the supplied
+        Security Invariant itself extends the requirement to the override
+        path -- must remain proof_required, proving the new rule is not a
+        blanket "non-default is always safe" exemption."""
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Claims:\n"
+            "   - A preceding guard, enabled by default, stops execution before the operation the finding raises a concern about.\n"
+            "   - The supplied Security Invariant explicitly requires the remediation to hold even when a caller explicitly disables that guard.\n"
+            "   Unresolved: whether the required behavior still applies when a caller explicitly disables the preceding guard\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: conceptual_scope\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: The supplied Security Invariant explicitly extends the required remediation to the explicit-override path; whether it still holds there is not shown, so this remains an open remediation question.\n"
+        )
+        result = calibrate_findings(
+            "vuln text", "patch", [self.UNNAMED_GUARD_FINDING], llm,
+            code_context=(
+                "def process(item, allow_external=False):\n"
+                "    if external(item) and not allow_external:\n"
+                "        return\n"
+                "    perform_sensitive_operation(item)\n"
+            ),
+        )
+        assert result[0]["remediation_impact"] == "proof_required"
+        assert result[0]["evidence_acquirability"] == "conceptual_scope"
+
+    def test_missing_guard_evidence_stays_proof_required_not_silently_cleared(self):
+        """Outcome D: the guard's default/order cannot be established from
+        supplied evidence -- must remain proof_required (fail-closed), not
+        be silently downgraded merely because a guard COULD plausibly
+        exist."""
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Claims:\n"
+            "   - The finding's concern involves an operation whose preceding guard, if any, is not shown in the supplied evidence.\n"
+            "   Unresolved: whether a preceding guard exists, and if so, what its default value is and whether it executes before the operation\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: not_expressible\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: Whether a preceding guard exists, its default value, and its execution order relative to the operation are not established by the supplied evidence, so this remains an open remediation question.\n"
+        )
+        result = calibrate_findings(
+            "vuln text", "patch", [self.UNNAMED_GUARD_FINDING], llm,
+            code_context="only the concerning operation itself is shown; no preceding guard is shown",
+        )
+        assert result[0]["remediation_impact"] == "proof_required"
+        assert result[0]["evidence_acquirability"] == "not_expressible"
+
+    def test_default_reachable_path_may_remain_proof_required(self):
+        """Outcome B: the guard is shown, but the concerning operation
+        remains reachable under ordinary/default execution (no override
+        needed) -- the new rule must not force validation_only here."""
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Claims:\n"
+            "   - The preceding guard is shown, but its default value does not stop execution before the operation the finding raises a concern about.\n"
+            "   Unresolved: whether the operation is reachable under ordinary/default execution\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: actionable\n"
+            "   Evidence request: symbol_definition | handler.py | process\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: The preceding guard's default value does not stop execution before the operation of concern, so it remains reachable under ordinary execution; whether the remediation accounts for it is an open question.\n"
+        )
+        result = calibrate_findings(
+            "vuln text", "patch", [self.UNNAMED_GUARD_FINDING], llm,
+            code_context="def process(item, allow_external=True):\n    perform_sensitive_operation(item)\n",
+        )
+        assert result[0]["remediation_impact"] == "proof_required"
+        assert result[0]["evidence_acquirability"] == "actionable"
+        assert result[0]["evidence_request"] == {
+            "request_type": "symbol_definition", "file_hint": "handler.py", "symbol": "process",
+        }
+
+    def test_existing_named_override_validation_only_case_still_passes_through(self):
+        """Outcome E: the PRE-EXISTING "explicit non-default caller
+        configuration" behavior (the finding's OWN wording already names
+        the override) must remain unaffected by this addition."""
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Claims:\n"
+            "   - `fetch(url, skip_validation=True)` bypasses the call to `validate(url)`.\n"
+            "   - `skip_validation=True` is an explicit, non-default argument a caller must deliberately supply.\n"
+            "   - The Security Invariant is stated only for the default path (no `skip_validation` argument).\n"
+            "   Unresolved: whether the required validation still applies when a caller passes `skip_validation=True`\n"
+            "   Remediation impact: validation_only\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: A caller can bypass `validate(url)` by explicitly passing `skip_validation=True`; the supplied Security Invariant is stated only for the default path and does not address this explicit, non-default configuration, so resolving this does not affect whether the claimed remediation is established.\n"
+        )
+        result = calibrate_findings(
+            "vuln text", "patch",
+            ["A caller can invoke `fetch(url, skip_validation=True)`, bypassing `validate(url)`."],
+            llm, code_context="fetch(url, skip_validation=True) skips validate(url); default path calls it",
+        )
+        assert result[0]["remediation_impact"] == "validation_only"
+
+
+class TestUnifiedPatternConsistencyPassthrough:
+    """Direct regression test for the V9 defect: two findings sharing the
+    exact same governing scope pattern (explicit non-default execution) --
+    one reached via a direct caller-selected setting, one reached via
+    disabling a preceding default-enabled guard -- received DIFFERENT
+    remediation_impact dispositions in the same real Calibration response,
+    even though the prompt already intended them to be treated identically.
+    This class proves the orchestration/parser layer imposes no obstacle
+    to a contract-following model giving both findings the SAME
+    disposition; it cannot prove an LLM will actually do so -- only a real
+    regression can."""
+
+    def test_direct_override_and_guard_bypass_findings_both_become_validation_only(self):
+        """Mirrors the real V9 shape with generic identifiers: Finding 1 is
+        a guard-bypass case, Finding 2 is a direct-configuration-override
+        case. Neither the supplied Security Invariant nor the evidence
+        affirmatively places either in scope, so a contract-following
+        response gives BOTH `validation_only` -- proving the parser does
+        not force, prefer, or otherwise treat these two shapes
+        differently."""
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Claims:\n"
+            "   - A preceding guard, enabled by default, stops execution before the operation the finding raises a concern about.\n"
+            "   - Reaching that operation requires a caller to explicitly supply a non-default value for the guard's parameter.\n"
+            "   - The supplied Security Invariant is stated only for the default path.\n"
+            "   Unresolved: whether the required behavior still applies when a caller explicitly disables the preceding guard\n"
+            "   Remediation impact: validation_only\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: A preceding, default-enabled guard stops the operation the finding is concerned about under ordinary execution; reaching it requires an explicit non-default override not established as in scope by the supplied invariant.\n"
+            "\n"
+            "2. Claims:\n"
+            "   - A caller can supply an explicit, non-default configuration value that directly enables the operation the finding raises a concern about.\n"
+            "   - The supplied Security Invariant is stated only for the default configuration.\n"
+            "   Unresolved: whether the required behavior still applies when a caller explicitly selects that non-default configuration value\n"
+            "   Remediation impact: validation_only\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: A caller can directly enable the operation of concern by explicitly selecting a non-default configuration value; the supplied Security Invariant is stated only for the default configuration and does not extend to this explicit, non-default value, so resolving this does not affect whether the claimed remediation is established.\n"
+        )
+        result = calibrate_findings(
+            "vuln text", "patch",
+            [
+                "The operation runs without further restriction when a caller explicitly disables the preceding guard; whether that is acceptable is not addressed by the supplied evidence.",
+                "The operation runs without further restriction when a caller explicitly selects a non-default configuration value; whether that is acceptable is not addressed by the supplied evidence.",
+            ],
+            llm,
+            code_context=(
+                "def process(item, allow_external=False):\n"
+                "    if external(item) and not allow_external:\n"
+                "        return\n"
+                "    perform_sensitive_operation(item)\n"
+                "\n"
+                "def configure(mode='default'):\n"
+                "    if mode == 'default':\n"
+                "        return\n"
+                "    perform_sensitive_operation(item)\n"
+            ),
+        )
+        assert result[0]["remediation_impact"] == "validation_only"
+        assert result[1]["remediation_impact"] == "validation_only"
+
+    def test_direct_override_and_guard_bypass_findings_both_become_proof_required_when_in_scope(self):
+        """Same two shapes, but this time the supplied Security Invariant
+        affirmatively extends the required remediation to BOTH explicit
+        non-default cases -- both must remain `proof_required` (Case A),
+        proving the fix does not turn the pattern into a blanket
+        `validation_only` exemption."""
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Claims:\n"
+            "   - A preceding guard, enabled by default, stops execution before the operation the finding raises a concern about.\n"
+            "   - The supplied Security Invariant explicitly requires the remediation to hold even when a caller explicitly disables that guard.\n"
+            "   Unresolved: whether the required behavior still applies when a caller explicitly disables the preceding guard\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: conceptual_scope\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: The supplied Security Invariant explicitly extends the required remediation to the explicit-override path; whether it still holds there is not shown, so this remains an open remediation question.\n"
+            "\n"
+            "2. Claims:\n"
+            "   - A caller can supply an explicit, non-default configuration value that directly enables the operation the finding raises a concern about.\n"
+            "   - The supplied Security Invariant explicitly requires the remediation to hold even when a caller selects that non-default configuration value.\n"
+            "   Unresolved: whether the required behavior still applies when a caller explicitly selects that non-default configuration value\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: conceptual_scope\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: The supplied Security Invariant explicitly extends the required remediation to this explicit, non-default configuration value; whether it still holds there is not shown, so this remains an open remediation question.\n"
+        )
+        result = calibrate_findings(
+            "vuln text", "patch",
+            [
+                "The operation runs without further restriction when a caller explicitly disables the preceding guard.",
+                "The operation runs without further restriction when a caller explicitly selects a non-default configuration value.",
+            ],
+            llm,
+            code_context="def process(item, allow_external=False): ...\ndef configure(mode='default'): ...\n",
+        )
+        assert result[0]["remediation_impact"] == "proof_required"
+        assert result[1]["remediation_impact"] == "proof_required"
+
+
+class TestReachabilityPrerequisiteBeforeClaimsFinalized:
+    """V8 fix: the reachability rule previously read "Before classifying an
+    UNRESOLVED dependency... as proof_required" -- a condition an
+    overconfident model can skip entirely by declaring `Group: Observed` /
+    `Unresolved: none` directly, embedding an untraced reachability
+    conclusion into a claim the rule never gets a chance to examine. This
+    class protects the correction: the trace is now a prerequisite for
+    finalizing ANY reachability claim, anchored in step 1 (where Claims/
+    Unresolved are actually decided), not only when step 2 grades an
+    already-unresolved item.
+
+    Structural/prompt-content tests only -- they prove the rule's text
+    landed and is generic. They cannot prove an LLM will actually perform
+    the trace before writing Observed/Unresolved: none; only a real
+    regression can."""
+
+    def _full_text(self):
+        from utilities.autopatcher.finding_calibration import _PROMPT_PATH
+        return _PROMPT_PATH.read_text(encoding="utf-8")
+
+    def _joined(self):
+        return " ".join(self._full_text().split())
+
+    def test_step_1_anchors_reachability_claims_to_the_complete_trace(self):
+        """Outcome H: the obligation is stated where Claims/Unresolved are
+        actually decided (step 1), not only inside step 2's grading rule."""
+        joined = self._joined()
+        assert (
+            "A Claim that an additional execution path reaches a "
+            "concerning operation is a reachability claim"
+        ) in joined
+        assert (
+            "A Claim that names only the later operation itself, without "
+            "accounting for a guard the supplied evidence also shows, does "
+            "not establish the answer"
+        ) in joined
+        assert (
+            "it must not be used to mark that dependency already-resolved, "
+            "and must not be omitted from Unresolved, merely because you "
+            "intend to record the finding as fully `Observed`"
+        ) in joined
+
+    def test_step_1_cross_references_the_step_2_reachability_rule(self):
+        joined = self._joined()
+        assert (
+            "See the reachability rule under step 2 below — it governs "
+            "this determination directly, not only when grading a "
+            "dependency you have already decided is unresolved"
+        ) in joined
+
+    def test_step_2_rule_no_longer_conditioned_on_already_unresolved(self):
+        """Outcome I: the rule's own opening no longer presupposes the
+        dependency is already on the Unresolved list."""
+        joined = self._joined()
+        assert (
+            "Before classifying a concern under this pattern, trace the "
+            "complete source-grounded reachability chain"
+        ) in joined
+        assert "Before classifying an unresolved dependency about an" not in joined
+
+    def test_observed_and_unresolved_none_explicitly_forbidden_as_a_bypass(self):
+        """Outcome I, exact wording: the rule names the precise shortcut
+        V8 took and forbids it explicitly."""
+        joined = self._joined()
+        assert (
+            "This obligation does not depend on first deciding the "
+            "dependency is unresolved"
+        ) in joined
+        assert (
+            "`Group: Observed` together with `Unresolved: none` is not a "
+            "way to bypass it"
+        ) in joined
+        assert (
+            "a reachability claim you are about to record as fully "
+            "observed and settled must have already been through this "
+            "same trace, exactly like one you are about to list as "
+            "unresolved"
+        ) in joined
+
+    def test_step_1_addition_is_domain_neutral(self):
+        text = self._full_text()
+        start = text.index("A Claim that an additional execution path reaches a")
+        end = text.index("2. **Rate the remediation impact of any unresolved dependency**")
+        segment = text[start:end].lower()
+        for forbidden in (
+            "urllib3", "httpconnectionpool", "redirect", "cookie", "hosts",
+            "assert_same_host", "retry", "poolmanager", "cve-", "cve ",
+        ):
+            assert forbidden not in segment, f"found forbidden term {forbidden!r}"
+
+    def test_step_1_addition_placed_before_step_2_heading(self):
+        text = self._full_text()
+        step1_marker_pos = text.index(
+            "because a Claim above already establishes the specific answer from"
+        )
+        new_para_pos = text.index("A Claim that an additional execution path reaches a")
+        step2_pos = text.index("2. **Rate the remediation impact of any unresolved dependency**")
+        assert step1_marker_pos < new_para_pos < step2_pos
+
+
+class TestObservedUnresolvedNoneBypassPassthrough:
+    """Mocked-LLM regression tests for the exact V8-shaped raw model
+    output: `Group: Observed`, `Unresolved: none`, and a model-written
+    `Remediation impact: proof_required` for a finding whose own claim
+    embeds an untraced reachability conclusion. Confirms the PRE-EXISTING,
+    unrelated structural parser gate in _parse_response (empty Unresolved
+    -> validation_only, regardless of what the model wrote) still applies
+    unchanged -- this is the safety net that made V8's Calibration mistake
+    non-outcome-causal, and it must keep working exactly as before,
+    independent of whether the prompt fix above changes model behavior."""
+
+    def test_v8_shaped_raw_response_is_still_normalized_to_validation_only(self):
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Claims:\n"
+            "   - The shown branch forwards the item verbatim to the next call with no restriction logic present.\n"
+            "   Unresolved: none\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: conceptual_scope\n"
+            "   Group: Observed\n"
+            "   Reworded: The shown branch forwards the item verbatim with no restriction logic present, so this path is within the invariant's scope and is not remediated.\n"
+        )
+        result = calibrate_findings(
+            "vuln text", "patch",
+            ["The shown branch forwards the item verbatim with no restriction logic present."],
+            llm, code_context="the shown branch has no restriction logic before forwarding the item",
+        )
+        # The empty Unresolved list forces validation_only regardless of
+        # what the model wrote for Remediation impact -- unchanged by this
+        # fix, and still the reason a V8-shaped mistake cannot block.
+        assert result[0]["unresolved_dependencies"] == []
+        assert result[0]["remediation_impact"] == "validation_only"
+        assert result[0]["group"] == "observed"
+
+    def test_a_corrected_response_names_the_real_unresolved_scope_question(self):
+        """Outcome I, positive case: a model that DOES perform the trace
+        before finalizing Observed/Unresolved surfaces the genuine scope
+        question as Unresolved (non-empty) instead of skipping straight to
+        Unresolved: none -- proving the parser accepts this corrected shape
+        exactly like any other genuinely-unresolved dependency."""
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Claims:\n"
+            "   - A preceding guard, enabled by default, stops execution before the operation the finding raises a concern about.\n"
+            "   - Reaching that operation requires a caller to explicitly supply a non-default value for the guard's parameter.\n"
+            "   - The supplied Security Invariant is stated only for the default path.\n"
+            "   Unresolved: whether the required behavior still applies when a caller explicitly disables the preceding guard\n"
+            "   Remediation impact: validation_only\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: A preceding, default-enabled guard stops the operation under ordinary execution; reaching it requires an explicit non-default override not established as in scope by the supplied invariant.\n"
+        )
+        result = calibrate_findings(
+            "vuln text", "patch",
+            ["The shown branch forwards the item verbatim with no restriction logic present."],
+            llm, code_context="a preceding guard stops the branch under default arguments",
+        )
+        assert result[0]["unresolved_dependencies"] == [
+            "whether the required behavior still applies when a caller "
+            "explicitly disables the preceding guard"
+        ]
+        assert result[0]["remediation_impact"] == "validation_only"
+
+
+# ---------------------------------------------------------------------------
+# "Evidence request:" field parsing (bounded post-Finding-Calibration
+# evidence-acquisition loop). See pipeline.py's own
+# _calibrate_findings_with_evidence_acquisition -- the only consumer;
+# _parse_response/_parse_evidence_request here never act on the field
+# themselves, only expose it structurally.
+# ---------------------------------------------------------------------------
+
+class TestEvidenceRequestParsing:
+    def _block(
+        self, unresolved, impact, evidence_request_line,
+        acquirability_line=None, group="Hypothesis", reworded="Reworded text.",
+    ):
+        lines = [
+            "1. Claims:",
+            "   - a claim",
+            f"   Unresolved: {unresolved}",
+            f"   Remediation impact: {impact}",
+        ]
+        if acquirability_line is not None:
+            lines.append(f"   Evidence acquirability: {acquirability_line}")
+        if evidence_request_line is not None:
+            lines.append(f"   Evidence request: {evidence_request_line}")
+        lines.append(f"   Group: {group}")
+        lines.append(f"   Reworded: {reworded}")
+        return "\n".join(lines) + "\n"
+
+    def test_valid_file_source_request_parses(self):
+        resp = self._block(
+            "whether the file is safe", "proof_required", "file_source | src/a.py",
+            acquirability_line="actionable",
+        )
+        result = _parse_response(resp, ["finding"])
+        assert result[0]["remediation_impact"] == "proof_required"
+        assert result[0]["evidence_acquirability"] == "actionable"
+        assert result[0]["evidence_request"] == {
+            "request_type": "file_source", "file_hint": "src/a.py", "symbol": None,
+        }
+
+    def test_valid_symbol_definition_request_parses(self):
+        resp = self._block(
+            "whether Foo.bar is safe", "proof_required",
+            "symbol_definition | src/a.py | Foo.bar",
+            acquirability_line="actionable",
+        )
+        result = _parse_response(resp, ["finding"])
+        assert result[0]["evidence_acquirability"] == "actionable"
+        assert result[0]["evidence_request"] == {
+            "request_type": "symbol_definition", "file_hint": "src/a.py", "symbol": "Foo.bar",
+        }
+
+    def test_missing_optional_field_parses_as_none(self):
+        """No 'Evidence request:' line at all (and, correspondingly, no
+        'Evidence acquirability:' declaration either) -- the overwhelming
+        majority of responses, including every pre-existing test fixture
+        in this file -- must still parse every other field exactly as
+        before, with both new fields simply absent/unclear."""
+        resp = self._block("whether X holds", "proof_required", None)
+        result = _parse_response(resp, ["finding"])
+        assert result[0]["remediation_impact"] == "proof_required"
+        assert result[0]["evidence_acquirability"] == "unclear"
+        assert result[0]["evidence_request"] is None
+
+    def test_malformed_request_type_fails_closed(self):
+        resp = self._block(
+            "whether X holds", "proof_required", "directory_listing | src/",
+            acquirability_line="actionable",
+        )
+        result = _parse_response(resp, ["finding"])
+        assert result[0]["evidence_acquirability"] == "unclear"
+        assert result[0]["evidence_request"] is None
+
+    def test_file_source_missing_file_fails_closed(self):
+        resp = self._block(
+            "whether X holds", "proof_required", "file_source | ", acquirability_line="actionable",
+        )
+        result = _parse_response(resp, ["finding"])
+        assert result[0]["evidence_request"] is None
+
+    def test_symbol_definition_missing_symbol_fails_closed(self):
+        resp = self._block(
+            "whether X holds", "proof_required", "symbol_definition | src/a.py",
+            acquirability_line="actionable",
+        )
+        result = _parse_response(resp, ["finding"])
+        assert result[0]["evidence_request"] is None
+
+    def test_symbol_definition_missing_symbol_with_trailing_pipe_fails_closed(self):
+        resp = self._block(
+            "whether X holds", "proof_required", "symbol_definition | src/a.py | ",
+            acquirability_line="actionable",
+        )
+        result = _parse_response(resp, ["finding"])
+        assert result[0]["evidence_request"] is None
+
+    def test_file_source_with_extra_symbol_part_fails_closed(self):
+        """A file_source request never carries a third part -- never
+        silently discard the extra part and accept the file anyway."""
+        resp = self._block(
+            "whether X holds", "proof_required", "file_source | src/a.py | Extra",
+            acquirability_line="actionable",
+        )
+        result = _parse_response(resp, ["finding"])
+        assert result[0]["evidence_request"] is None
+
+    def test_evidence_request_attached_to_validation_only_is_structurally_dropped(self):
+        """Only a proof_required finding may carry an Evidence request --
+        enforced structurally here regardless of what the model wrote, not
+        left to the prompt's own instruction alone. This must not initiate
+        acquisition (see pipeline.py's own orchestration, which filters on
+        remediation_impact == "proof_required" before ever reading this
+        field -- this test proves the SAME guarantee already holds one
+        layer earlier, at parse time)."""
+        resp = self._block(
+            "whether X holds", "validation_only", "file_source | src/a.py",
+            acquirability_line="actionable",
+        )
+        result = _parse_response(resp, ["finding"])
+        assert result[0]["remediation_impact"] == "validation_only"
+        assert result[0]["evidence_acquirability"] is None
+        assert result[0]["evidence_request"] is None
+
+    def test_evidence_request_attached_to_unclear_is_structurally_dropped(self):
+        resp = self._block(
+            "whether X holds", "unclear", "file_source | src/a.py", acquirability_line="actionable",
+        )
+        result = _parse_response(resp, ["finding"])
+        assert result[0]["remediation_impact"] == "unclear"
+        assert result[0]["evidence_acquirability"] is None
+        assert result[0]["evidence_request"] is None
+
+    def test_evidence_request_dropped_when_impact_normalized_to_validation_only(self):
+        """A finding whose Unresolved successfully parses to 'none' has its
+        remediation_impact deterministically normalized to validation_only
+        REGARDLESS of what the model wrote for that field (existing gate) --
+        an Evidence acquirability declaration and Evidence request attached
+        anyway must both be dropped too, since they are now attached to a
+        finding that is, in its FINAL form, not proof_required."""
+        resp = self._block(
+            "none", "proof_required", "file_source | src/a.py", acquirability_line="actionable",
+        )
+        result = _parse_response(resp, ["finding"])
+        assert result[0]["remediation_impact"] == "validation_only"
+        assert result[0]["evidence_acquirability"] is None
+        assert result[0]["evidence_request"] is None
+
+    def test_unrecognized_request_type_case_insensitive_match_still_works(self):
+        resp = self._block(
+            "whether X holds", "proof_required", "FILE_SOURCE | src/a.py",
+            acquirability_line="actionable",
+        )
+        result = _parse_response(resp, ["finding"])
+        assert result[0]["evidence_request"] == {
+            "request_type": "file_source", "file_hint": "src/a.py", "symbol": None,
+        }
+
+
+class TestEvidenceAcquirabilityConsistencyContract:
+    """Tests 1-9 of the acquirability-contract fix: the mandatory
+    declaration for proof_required findings, and the deterministic
+    consistency gate between it and Evidence request."""
+
+    def _block(self, impact, acquirability_line, evidence_request_line, unresolved="whether X holds"):
+        lines = [
+            "1. Claims:",
+            "   - a claim",
+            f"   Unresolved: {unresolved}",
+            f"   Remediation impact: {impact}",
+        ]
+        if acquirability_line is not None:
+            lines.append(f"   Evidence acquirability: {acquirability_line}")
+        if evidence_request_line is not None:
+            lines.append(f"   Evidence request: {evidence_request_line}")
+        lines.append("   Group: Hypothesis")
+        lines.append("   Reworded: Reworded text.")
+        return "\n".join(lines) + "\n"
+
+    def test_actionable_with_valid_request_is_authoritative(self):
+        resp = self._block("proof_required", "actionable", "file_source | src/a.py")
+        result = _parse_response(resp, ["finding"])[0]
+        assert result["remediation_impact"] == "proof_required"
+        assert result["evidence_acquirability"] == "actionable"
+        assert result["evidence_request"] == {"request_type": "file_source", "file_hint": "src/a.py", "symbol": None}
+
+    def test_actionable_with_missing_request_fails_closed(self):
+        resp = self._block("proof_required", "actionable", None)
+        result = _parse_response(resp, ["finding"])[0]
+        assert result["remediation_impact"] == "proof_required"  # still blocking
+        assert result["evidence_acquirability"] == "unclear"
+        assert result["evidence_request"] is None
+
+    def test_actionable_with_malformed_request_fails_closed(self):
+        resp = self._block("proof_required", "actionable", "not_a_valid_request")
+        result = _parse_response(resp, ["finding"])[0]
+        assert result["remediation_impact"] == "proof_required"
+        assert result["evidence_acquirability"] == "unclear"
+        assert result["evidence_request"] is None
+
+    def test_not_expressible_with_no_request_is_authoritative_and_blocking(self):
+        resp = self._block("proof_required", "not_expressible", None)
+        result = _parse_response(resp, ["finding"])[0]
+        assert result["remediation_impact"] == "proof_required"
+        assert result["evidence_acquirability"] == "not_expressible"
+        assert result["evidence_request"] is None
+
+    def test_conceptual_scope_with_no_request_is_authoritative_and_blocking(self):
+        resp = self._block("proof_required", "conceptual_scope", None)
+        result = _parse_response(resp, ["finding"])[0]
+        assert result["remediation_impact"] == "proof_required"
+        assert result["evidence_acquirability"] == "conceptual_scope"
+        assert result["evidence_request"] is None
+
+    def test_not_expressible_with_a_request_fails_closed(self):
+        resp = self._block("proof_required", "not_expressible", "file_source | src/a.py")
+        result = _parse_response(resp, ["finding"])[0]
+        assert result["remediation_impact"] == "proof_required"
+        assert result["evidence_acquirability"] == "unclear"
+        assert result["evidence_request"] is None
+
+    def test_conceptual_scope_with_a_request_fails_closed(self):
+        resp = self._block("proof_required", "conceptual_scope", "file_source | src/a.py")
+        result = _parse_response(resp, ["finding"])[0]
+        assert result["remediation_impact"] == "proof_required"
+        assert result["evidence_acquirability"] == "unclear"
+        assert result["evidence_request"] is None
+
+    def test_missing_declaration_fails_closed(self):
+        resp = self._block("proof_required", None, None)
+        result = _parse_response(resp, ["finding"])[0]
+        assert result["remediation_impact"] == "proof_required"
+        assert result["evidence_acquirability"] == "unclear"
+        assert result["evidence_request"] is None
+
+    def test_missing_declaration_with_a_request_anyway_fails_closed(self):
+        """A request without its mandatory declaration is never trusted
+        merely because the request itself looks well-formed."""
+        resp = self._block("proof_required", None, "file_source | src/a.py")
+        result = _parse_response(resp, ["finding"])[0]
+        assert result["remediation_impact"] == "proof_required"
+        assert result["evidence_acquirability"] == "unclear"
+        assert result["evidence_request"] is None
+
+    def test_malformed_declaration_fails_closed(self):
+        resp = self._block("proof_required", "maybe_actionable", None)
+        result = _parse_response(resp, ["finding"])[0]
+        assert result["remediation_impact"] == "proof_required"
+        assert result["evidence_acquirability"] == "unclear"
+        assert result["evidence_request"] is None
+
+    def test_validation_only_never_carries_acquirability_and_does_not_spuriously_acquire(self):
+        resp = self._block("validation_only", "actionable", "file_source | src/a.py", unresolved="none")
+        result = _parse_response(resp, ["finding"])[0]
+        assert result["remediation_impact"] == "validation_only"
+        assert result["evidence_acquirability"] is None
+        assert result["evidence_request"] is None
+
+    def test_fallback_entry_for_missing_block_never_acquires_authoritative_state(self):
+        """A completely missing/unparseable block falls back to Hypothesis/
+        unclear (existing behavior) -- it must never accidentally acquire
+        an authoritative acquirability state."""
+        resp = ""  # no blocks at all
+        result = _parse_response(resp, ["finding"])[0]
+        assert result["remediation_impact"] == "unclear"
+        assert result["evidence_acquirability"] is None
+        assert result["evidence_request"] is None
+
+
+# ---------------------------------------------------------------------------
+# Actionable-via-reference (V10 forensic root cause): Calibration correctly
+# identified a genuine, factual unresolved dependency about which of two
+# code paths a value travels through, but declared `not_expressible` even
+# though one specific file was directly nameable from an import statement
+# already present in the supplied evidence -- and the existing acquisition
+# machinery/vocabulary was already sufficient to resolve it. The prompt
+# never previously stated that (a) nameability survives even when the
+# implementation itself has not been shown, (b) needing to read and reason
+# about a file's own branches once acquired does not make the request
+# not_expressible, or (c) a request only needs to be expected to materially
+# reduce the dependency, not to guarantee complete settlement.
+#
+# SCOPE NOTE: same limitation as every other prompt-contract test in this
+# file -- a mocked-LLM test cannot prove actual model compliance, only that
+# the shipped prompt states the corrected boundary and that the plumbing
+# does not fight a contract-following model's output.
+# ---------------------------------------------------------------------------
+
+class TestActionableViaReferenceContract:
+    def _full_text(self):
+        from utilities.autopatcher.finding_calibration import _PROMPT_PATH
+        return _PROMPT_PATH.read_text(encoding="utf-8")
+
+    def _joined(self):
+        return " ".join(self._full_text().split())
+
+    def test_classification_sequence_checks_conceptual_scope_then_actionable_then_not_expressible(self):
+        joined = self._joined()
+        assert (
+            "Work through this order when deciding: first, is the "
+            "remaining uncertainty fundamentally a question of "
+            "interpretation, required scope, or policy that no repository "
+            "source of any kind could settle, regardless of vocabulary? "
+            "That is `conceptual_scope`."
+        ) in joined
+        assert (
+            "Otherwise, can one specific repository file or symbol be "
+            "named from evidence already supplied — even if that file or "
+            "symbol's own implementation has not yet been shown — whose "
+            "contents could materially reduce or settle the dependency? "
+            "That is `actionable`."
+        ) in joined
+        assert (
+            "Only when neither applies — genuine repository investigation "
+            "is relevant, but what would need to be checked cannot "
+            "currently be reduced to one or more supported exact requests"
+        ) in joined
+        assert (
+            "Do not treat `not_expressible` as the default merely because "
+            "you do not already know the answer."
+        ) in joined
+
+    def test_nameable_via_reference_forms_are_enumerated(self):
+        joined = self._joined()
+        assert (
+            "through an import, a function or method call, a class "
+            "reference, an inheritance relationship, a constructor call, "
+            "a helper reference, or any other explicit repository "
+            "identifier appearing in the evidence you were given"
+        ) in joined
+        assert (
+            "That its own implementation has not yet been shown is "
+            "precisely the reason to request it, never a reason to call "
+            "the dependency `not_expressible`."
+        ) in joined
+
+    def test_reading_and_reasoning_about_acquired_source_does_not_disqualify_it(self):
+        joined = self._joined()
+        assert (
+            "Reading and reasoning about the requested file or symbol "
+            "once it is acquired — including working out which of several "
+            "branches inside it applies, or how a value is transformed, "
+            "normalized, wrapped, copied, preserved, or replaced as it "
+            "passes through it — does NOT make the request "
+            "`not_expressible`"
+        ) in joined
+        assert (
+            "The request only needs to identify which repository evidence "
+            "to acquire; it does not need to already encode the final "
+            "answer."
+        ) in joined
+
+    def test_materially_reduce_suffices_certainty_of_complete_settlement_not_required(self):
+        joined = self._joined()
+        assert (
+            "Nor must you be certain in advance that this one request "
+            "will completely settle the dependency — only that the named "
+            "evidence is directly relevant and expected to materially "
+            "reduce it."
+        ) in joined
+
+    def test_actionable_is_not_a_prediction_that_the_finding_becomes_non_blocking(self):
+        joined = self._joined()
+        assert (
+            "The evidence you acquire this way may confirm the concern "
+            "rather than eliminate it; `actionable` is not a prediction "
+            "about the outcome, and a finding may correctly remain "
+            "`proof_required` after acquisition."
+        ) in joined
+
+    def test_data_flow_through_one_path_is_named_as_the_actionable_shape(self):
+        joined = self._joined()
+        assert (
+            "A dependency that turns on which of several code paths a "
+            "value actually travels through is exactly this shape: "
+            "`actionable`, not `not_expressible`, whenever one of those "
+            "paths — or the function, method, or class that decides "
+            "between them — can be named."
+        ) in joined
+
+    def test_transport_and_validator_examples_present(self):
+        text = self._full_text()
+        assert "from .transport import Transport" in text
+        assert "self.transport = Transport(config)" in text
+        assert "Evidence request: symbol_definition |\n     pkg/transport.py | Transport" in text
+        assert "validator.prepare(value)" in text
+        assert "Evidence\n     request: symbol_definition | validator.py | prepare" in text
+
+    def test_new_content_is_domain_neutral(self):
+        """Must not mention urllib3, HTTPConnectionPool, redirects, Cookie,
+        hosts, assert_same_host, Retry, PoolManager, bytes, headers, or any
+        CVE identifier -- scoped to the new span only."""
+        full_text = self._full_text()
+        start = full_text.index("Work through this order when deciding")
+        end = full_text.index("`Evidence acquirability` is meaningless for a `validation_only`")
+        segment = full_text[start:end].lower()
+        for forbidden in (
+            "urllib3", "httpconnectionpool", "redirect", "cookie", "hosts",
+            "assert_same_host", "retry", "poolmanager", "cve-", "cve ",
+            "bytes", "header",
+        ):
+            assert forbidden not in segment, f"found forbidden term {forbidden!r}"
+
+    def test_new_content_placed_after_existing_secondhand_description_paragraph_before_meaningless_note(self):
+        text = self._full_text()
+        secondhand_pos = text.index(
+            "A secondhand description of a file or symbol's behavior"
+        )
+        sequence_pos = text.index("Work through this order when deciding")
+        meaningless_pos = text.index(
+            "`Evidence acquirability` is meaningless for a `validation_only`"
+        )
+        step_3_pos = text.index("3. **Classify** it into exactly one of three groups:")
+        assert secondhand_pos < sequence_pos < meaningless_pos < step_3_pos
+
+    def test_existing_not_expressible_and_conceptual_scope_bullets_unchanged(self):
+        """Purely additive: the three-way bullet definitions themselves
+        must remain byte-for-byte present."""
+        text = self._full_text()
+        assert (
+            "`not_expressible` — the Unresolved dependency may still require\n"
+            "     additional repository investigation to settle, but what would need\n"
+            "     to be checked is not a single nameable file or symbol"
+        ) in text
+        assert (
+            "`conceptual_scope` — the remaining uncertainty is not something any\n"
+            "     additional repository source could resolve at all, regardless of"
+        ) in text
+        assert "Contrast: a finding's" in text
+        assert "Contrast again: a finding's" in text
+
+
+class TestActionableViaReferencePassthrough:
+    """Mocked-LLM tests: simulate a Calibration response that DOES follow
+    the corrected boundary, for the shapes the V10 defect specifically
+    targeted, and assert the parser preserves that outcome unchanged. These
+    prove the mechanical pipeline does not fight, second-guess, or require
+    any special-casing for a contract-following response -- they cannot and
+    do not prove an LLM will actually classify this way; only a real
+    regression can."""
+
+    def test_data_flow_through_one_nameable_file_parses_actionable(self):
+        """Item 1: a proof-required dependency about data flow through one
+        specific nameable file is actionable."""
+        resp = (
+            "1. Claims:\n"
+            "   - `self.transport = Transport(config)` is shown, imported via `from .transport import Transport`.\n"
+            "   - Whether `Transport` preserves or transforms a value before sending it is not shown.\n"
+            "   Unresolved: whether `Transport` preserves or transforms the value before it reaches the later operation\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: actionable\n"
+            "   Evidence request: symbol_definition | pkg/transport.py | Transport\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: `Transport` is constructed and used, but its own implementation is not shown, so whether it preserves or transforms the value before the concerning operation remains open.\n"
+        )
+        result = calibrate_findings("vuln text", "patch", ["finding"], mock.MagicMock(complete=mock.Mock(return_value=resp)), code_context="ctx")
+        assert result[0]["remediation_impact"] == "proof_required"
+        assert result[0]["evidence_acquirability"] == "actionable"
+        assert result[0]["evidence_request"] == {
+            "request_type": "symbol_definition", "file_hint": "pkg/transport.py", "symbol": "Transport",
+        }
+
+    def test_data_flow_through_one_nameable_symbol_parses_actionable(self):
+        """Item 2: a proof-required dependency about one specific nameable
+        symbol is actionable."""
+        resp = (
+            "1. Claims:\n"
+            "   - `validator.prepare(value)` is called, shown in the supplied evidence.\n"
+            "   - Whether `prepare` normalizes `value` before the later validation is not shown.\n"
+            "   Unresolved: whether `prepare` normalizes the value before the later validation the finding is concerned about\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: actionable\n"
+            "   Evidence request: symbol_definition | validator.py | prepare\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: `prepare` is called but its own implementation is not shown, so whether it normalizes the value first remains open.\n"
+        )
+        result = calibrate_findings("vuln text", "patch", ["finding"], mock.MagicMock(complete=mock.Mock(return_value=resp)), code_context="ctx")
+        assert result[0]["remediation_impact"] == "proof_required"
+        assert result[0]["evidence_acquirability"] == "actionable"
+        assert result[0]["evidence_request"] == {
+            "request_type": "symbol_definition", "file_hint": "validator.py", "symbol": "prepare",
+        }
+
+    def test_multiple_branches_inside_requested_file_does_not_prevent_actionable(self):
+        """Item 4: needing to reason about multiple branches inside the one
+        requested file does not make the dependency not_expressible."""
+        resp = (
+            "1. Claims:\n"
+            "   - The requested file contains several branches; which one applies is not yet known.\n"
+            "   Unresolved: which of several branches in the requested file handles the value before the concerning operation\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: actionable\n"
+            "   Evidence request: file_source | pkg/dispatcher.py\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: The requested file contains multiple branches; which one applies to this value is not yet known and remains open.\n"
+        )
+        result = calibrate_findings("vuln text", "patch", ["finding"], mock.MagicMock(complete=mock.Mock(return_value=resp)), code_context="ctx")
+        assert result[0]["evidence_acquirability"] == "actionable"
+        assert result[0]["evidence_request"] == {
+            "request_type": "file_source", "file_hint": "pkg/dispatcher.py", "symbol": None,
+        }
+
+    def test_genuinely_open_ended_dependency_remains_not_expressible(self):
+        """Item 6: a genuinely open-ended repository-wide question with no
+        concrete target remains not_expressible."""
+        resp = (
+            "1. Claims:\n"
+            "   - The concern depends on whether any caller anywhere in the application invokes the operation with the relevant guard disabled.\n"
+            "   Unresolved: whether any such caller exists anywhere in the application\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: not_expressible\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: Whether any caller anywhere in the application invokes the operation with the guard disabled cannot be settled by naming one file or symbol; no concrete target is nameable from the supplied evidence.\n"
+        )
+        result = calibrate_findings("vuln text", "patch", ["finding"], mock.MagicMock(complete=mock.Mock(return_value=resp)), code_context="ctx")
+        assert result[0]["remediation_impact"] == "proof_required"
+        assert result[0]["evidence_acquirability"] == "not_expressible"
+        assert result[0]["evidence_request"] is None
+
+    def test_genuinely_conceptual_scope_question_remains_conceptual_scope(self):
+        """Item 7: a genuinely conceptual scope question remains
+        conceptual_scope."""
+        resp = (
+            "1. Claims:\n"
+            "   - The repository behavior is already established from the supplied evidence.\n"
+            "   - The remaining question is whether the supplied Security Invariant is intended to cover a separate behavior it does not itself resolve.\n"
+            "   Unresolved: whether the supplied Security Invariant is intended to extend to the separate behavior\n"
+            "   Remediation impact: proof_required\n"
+            "   Evidence acquirability: conceptual_scope\n"
+            "   Group: Hypothesis\n"
+            "   Reworded: The behavior itself is established; whether the invariant is intended to cover it is a scope question no repository source could answer.\n"
+        )
+        result = calibrate_findings("vuln text", "patch", ["finding"], mock.MagicMock(complete=mock.Mock(return_value=resp)), code_context="ctx")
+        assert result[0]["remediation_impact"] == "proof_required"
+        assert result[0]["evidence_acquirability"] == "conceptual_scope"
+        assert result[0]["evidence_request"] is None
+
+
+class TestFindingCalibrationCapacityContract:
+    def test_capacity_accounts_for_system_prompt_vuln_patch_and_findings(self):
+        from utilities.autopatcher.finding_calibration import compute_finding_calibration_capacity, _PROMPT_PATH
+
+        findings = ["finding one", "finding two"]
+        cap_small = compute_finding_calibration_capacity("v", "p", findings)
+        cap_bigger_vuln = compute_finding_calibration_capacity("v" * 5000, "p", findings)
+        assert cap_bigger_vuln.source_capacity_chars < cap_small.source_capacity_chars
+        assert (
+            cap_small.source_capacity_chars - cap_bigger_vuln.source_capacity_chars >= 4999
+        )
+
+    def test_capacity_never_counts_code_context_itself(self):
+        """code_context is the one variable this contract sizes -- it must
+        never appear in known_overhead_chars (unlike vulnerability_text/
+        patch/findings, which are always-present fixed overhead)."""
+        from utilities.autopatcher.finding_calibration import compute_finding_calibration_capacity
+
+        cap = compute_finding_calibration_capacity("v", "p", ["f"])
+        # A capacity computed with a nonsense huge code_context isn't even
+        # accepted as a parameter -- this just documents that the function
+        # signature has no such parameter to begin with.
+        import inspect
+        assert "code_context" not in inspect.signature(compute_finding_calibration_capacity).parameters
+
+    def test_fit_calibration_evidence_reserves_existing_context_first(self):
+        from utilities.autopatcher.finding_calibration import fit_calibration_evidence
+
+        existing = "EXISTING" * 10
+        new_blocks = [("label_a", "A" * 1000)]
+        plan = fit_calibration_evidence(existing, new_blocks, max_chars=len(existing) + 5)
+        assert plan.required_missing is False
+        assert existing in plan.rendered
+        assert "label_a" not in plan.included_labels  # too big to fit alongside existing
+
+    def test_fit_calibration_evidence_required_missing_when_existing_alone_exceeds_capacity(self):
+        from utilities.autopatcher.finding_calibration import fit_calibration_evidence
+
+        plan = fit_calibration_evidence("X" * 1000, [("label_a", "small")], max_chars=10)
+        assert plan.required_missing is True
+        assert plan.rendered == ""
+
+    def test_fit_calibration_evidence_includes_new_block_when_it_fits(self):
+        from utilities.autopatcher.finding_calibration import fit_calibration_evidence
+
+        existing = "EXISTING"
+        new_blocks = [("label_a", "NEWDATA")]
+        plan = fit_calibration_evidence(existing, new_blocks, max_chars=1000)
+        assert plan.required_missing is False
+        assert "NEWDATA" in plan.rendered
+        assert "label_a" in plan.included_labels
