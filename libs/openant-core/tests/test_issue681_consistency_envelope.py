@@ -137,7 +137,9 @@ def test_e2e_consistency_rewrite_threads_to_every_surface(tmp_path, monkeypatch)
         "consistent_verdict": "safe",
         "findings_to_update": [
             {"route_key": "s.py:errorMsg", "should_be": "safe",
-             "reason": "both routes validated at the boundary"}],
+             "reason": "both routes validated at the boundary"},
+            {"route_key": "s.py:warnMsg", "should_be": "safe",
+             "reason": "the wave catch: the guard holds here too"}],
         "explanation": "the pair shares the guard"})
 
     import utilities.llm as llm_mod
@@ -173,12 +175,18 @@ def test_e2e_consistency_rewrite_threads_to_every_surface(tmp_path, monkeypatch)
         "results": [
             {"unit_id": "u1", "route_key": "s.py:errorMsg",
              "finding": "vulnerable", "file": "s.py", "function": "errorMsg"},
-            {"unit_id": "u2", "route_key": "s.py:infoMsg",
+            {"unit_id": "u2", "route_key": "s.py:warnMsg",
+             "finding": "vulnerable", "file": "s.py", "function": "warnMsg"},
+            {"unit_id": "u3", "route_key": "s.py:infoMsg",
              "finding": "vulnerable", "file": "s.py", "function": "infoMsg"},
+            {"unit_id": "u4", "route_key": "s.py:failMsg",
+             "finding": "vulnerable", "file": "s.py", "function": "failMsg"},
         ],
         "code_by_route": {"s.py:errorMsg": "def errorMsg(): pass",
-                          "s.py:infoMsg": "def infoMsg(): pass"},
-        "metrics": {"total": 2, "vulnerable": 2},
+                          "s.py:warnMsg": "def warnMsg(): pass",
+                          "s.py:infoMsg": "def infoMsg(): pass",
+                          "s.py:failMsg": "def failMsg(): pass"},
+        "metrics": {"total": 4, "vulnerable": 4},
     }
     results_path = tmp_path / "results.json"
     write_json(results_path, payload)
@@ -192,22 +200,33 @@ def test_e2e_consistency_rewrite_threads_to_every_surface(tmp_path, monkeypatch)
         registry=_OfflineRegistry(_Scripted([
             {"agree": True, "correct_finding": "vulnerable",
              "explanation": "confirmed exploitable"},
+            {"agree": True, "correct_finding": "vulnerable",
+             "explanation": "confirmed exploitable too"},
+            {"agree": True, "correct_finding": "vulnerable",
+             "explanation": "confirmed exploitable as well"},
             {"agree": False, "correct_finding": "safe",
              "explanation": "input validated; controls hold"},
         ])))
-    # THE FIELD (the threading): the rewrite reached its VerifyResult bucket
-    assert vr.consistency_safe == 1, (
-        f"the consistency-rewritten-to-safe row must reach the FIELD "
-        f"(got consistency_safe={vr.consistency_safe}) — the scanner "
-        "envelope's safe fold threads from here (the e2e wiring)")
-    assert vr.agreed == 1, "the rewritten row agreed (the rewrite class)"
+    # THE FIELD (the threading): the DISTINCT tuple — agreed=3, rewritten=2,
+    # disagreed=1, confirmed=1 — so a cross-wire (threading the wrong
+    # count) is visible at every surface, not just the zero/nonzero (the
+    # T1's F1: the degenerate 1/1/1 let wrong-field mutants survive)
+    assert (vr.consistency_safe, vr.agreed, vr.disagreed,
+            vr.confirmed_vulnerabilities) == (2, 3, 1, 1), (
+        f"the distinct counts must reach the FIELDS (got "
+        f"consistency_safe={vr.consistency_safe}, agreed={vr.agreed}, "
+        f"disagreed={vr.disagreed}, "
+        f"confirmed={vr.confirmed_vulnerabilities}) — the e2e wiring")
     # THE SUMMARY (the display): the step summary threads it beside #622
     summary = verify_step_summary(vr)
-    assert summary.get("consistency_safe") == 1, (
-        f"the step SUMMARY must thread consistency_safe "
-        f"(got {summary.get('consistency_safe')}) — the display surface")
+    assert (summary.get("consistency_safe"),
+            summary.get("agreed")) == (2, 3), (
+        f"the step SUMMARY must thread the distinct counts "
+        f"(got consistency_safe={summary.get('consistency_safe')}, "
+        f"agreed={summary.get('agreed')}) — the display surface")
     # THE DICT (the consumers' source)
     d = vr.to_dict()
-    assert d.get("consistency_safe") == 1, (
-        f"the DICT must thread consistency_safe "
-        f"(got {d.get('consistency_safe')}) — the Go/CSV consumers' source")
+    assert (d.get("consistency_safe"), d.get("agreed")) == (2, 3), (
+        f"the DICT must thread the distinct counts "
+        f"(got consistency_safe={d.get('consistency_safe')}, "
+        f"agreed={d.get('agreed')}) — the Go/CSV consumers' source")
