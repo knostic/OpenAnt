@@ -245,6 +245,45 @@ def same_model_verification_note(analyze_binding, verify_binding) -> str | None:
     return None
 
 
+def _post_verify_metrics(analyze_metrics, verify_result) -> "AnalysisMetrics":
+    """#681: the post-verify envelope, extracted — ONE authority the tests
+    can drive. The folds (previously inline in scan_repository):
+
+    - ``inconclusive`` += disagreed_inconclusive (#509: an explicitly
+      unconfirmable finding threads to inconclusive, never into safe).
+    - ``protected`` += disagreed_protected (#622: protected-by-controls,
+      not inherently-safe) AND #681: += consistency_protected (an agreed
+      row the consistency pass rewrote — the destination previously
+      reached NO envelope column: the analysis metrics counted the
+      Stage-1 verdict and disagreed_* counts only agree=False rows, so
+      the envelope was the outlier surface against its own recount).
+    - ``safe`` += disagreed (#622: only genuine downgrades to safe) AND
+      #681: += consistency_safe (the same sum-to-total property).
+    - #679: an unrecognised verdict never reaches the disagreed arm — it
+      counts as error_count upstream.
+    """
+    return AnalysisMetrics(
+        total=analyze_metrics.total,
+        vulnerable=verify_result.confirmed_vulnerabilities,
+        bypassable=0,
+        inconclusive=analyze_metrics.inconclusive
+        + getattr(verify_result, "disagreed_inconclusive", 0)
+        + getattr(verify_result, "consistency_inconclusive", 0),
+        protected=analyze_metrics.protected
+        + getattr(verify_result, "disagreed_protected", 0)
+        + getattr(verify_result, "consistency_protected", 0),
+        safe=analyze_metrics.safe
+        + getattr(verify_result, "disagreed", 0)
+        + getattr(verify_result, "consistency_safe", 0),
+        errors=analyze_metrics.errors + verify_result.error_count,
+        verified=verify_result.findings_verified,
+        stage2_agreed=verify_result.agreed,
+        stage2_disagreed=verify_result.disagreed,
+        stage2_disagreed_protected=verify_result.disagreed_protected,
+        needs_review=verify_result.needs_review,
+    )
+
+
 def scan_repository(
     repo_path: str,
     output_dir: str,
@@ -1267,33 +1306,8 @@ def scan_repository(
                 # (``needs_review``) or that errored (``error_count``) must NOT inflate
                 # ``safe`` — they are preserved Stage-1 potential vulnerabilities
                 # awaiting manual review. Errors stay in the ``errors`` bucket.
-                result.metrics = AnalysisMetrics(
-                    total=analyze_result.metrics.total,
-                    vulnerable=verify_result.confirmed_vulnerabilities,
-                    bypassable=0,
-                    # #509: a Stage-2 disagreement corrected to
-                    # ``inconclusive`` is an explicitly-unconfirmable finding —
-                    # it threads into inconclusive, NEVER into safe (the
-                    # plain-disagreement fold below covers only genuine
-                    # downgrades to safe).
-                    inconclusive=analyze_result.metrics.inconclusive
-                    + verify_result.disagreed_inconclusive,
-                    # #622: a disagreement corrected to ``protected`` is
-                    # protected-by-controls — the destination category
-                    # reaches the scan metrics (the recount always counted
-                    # it here; the scanner fold was the only divergence).
-                    protected=analyze_result.metrics.protected
-                    + verify_result.disagreed_protected,
-                    # #622: the residual ``disagreed`` (corrected to safe or
-                    # an unrecognised verdict) is ALL that folds into safe.
-                    safe=analyze_result.metrics.safe + verify_result.disagreed,
-                    errors=analyze_result.metrics.errors + verify_result.error_count,
-                    verified=verify_result.findings_verified,
-                    stage2_agreed=verify_result.agreed,
-                    stage2_disagreed=verify_result.disagreed,
-                    stage2_disagreed_protected=verify_result.disagreed_protected,
-                    needs_review=verify_result.needs_review,
-                )
+                result.metrics = _post_verify_metrics(
+                    analyze_result.metrics, verify_result)
             except Exception as e:
                 print(f"  WARNING: Verification failed: {e}", file=sys.stderr)
                 print("  Continuing with unverified Stage 1 results.", file=sys.stderr)
