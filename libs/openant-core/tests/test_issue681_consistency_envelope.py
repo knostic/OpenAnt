@@ -114,3 +114,100 @@ def test_the_envelope_folds_the_consistency_buckets():
     )
     assert m.safe == 1
     assert m.inconclusive == 1
+
+
+def test_e2e_consistency_rewrite_threads_to_every_surface(tmp_path, monkeypatch):
+    """THE #681 E2E (the three wiring gaps the P3 cycle's surviving mutants
+    proved): an agreed row the consistency pass rewrites must thread from
+    ONE real run_verification drive to EVERY surface — the VerifyResult
+    FIELD (the scanner envelope's fold source), the step SUMMARY (the
+    display), and the DICT (the Go/CSV consumers' source). The unit tests
+    drive _count and _post_verify_metrics directly; this is the wiring
+    between them."""
+    import json as _json
+
+    import core.verifier as verifier_mod
+    from core.schemas import verify_step_summary
+    from utilities.file_io import write_json
+    from utilities.llm import ToolUseBlock, CompletionResult
+
+    CONSISTENCY_JSON = _json.dumps({
+        "should_be_consistent": "true",
+        "pattern_identified": "the shared validated sink",
+        "consistent_verdict": "safe",
+        "findings_to_update": [
+            {"route_key": "s.py:errorMsg", "should_be": "safe",
+             "reason": "both routes validated at the boundary"}],
+        "explanation": "the pair shares the guard"})
+
+    import utilities.llm as llm_mod
+    monkeypatch.setattr(
+        llm_mod, "simple_text",
+        lambda binding, prompt, **kw: CONSISTENCY_JSON, raising=True)
+
+    class _Scripted:
+        supports_tools = True
+
+        def __init__(self, responses):
+            self._responses = responses
+            self._n = 0
+
+        def complete(self, *, model, system, messages, max_tokens, tools=None):
+            self._n += 1
+            resp = self._responses[min(self._n, len(self._responses)) - 1]
+            return CompletionResult(
+                content=[ToolUseBlock(id=f"finish-{self._n}", name="finish",
+                                      input=resp)],
+                input_tokens=1, output_tokens=1, stop_reason="tool_use")
+
+    class _OfflineRegistry:
+        def __init__(self, adapter):
+            self._adapter = adapter
+
+        def get(self, phase):
+            from types import SimpleNamespace
+            return SimpleNamespace(phase=phase, adapter=self._adapter,
+                                   model="fake-model", provider_name="fake")
+
+    payload = {
+        "results": [
+            {"unit_id": "u1", "route_key": "s.py:errorMsg",
+             "finding": "vulnerable", "file": "s.py", "function": "errorMsg"},
+            {"unit_id": "u2", "route_key": "s.py:infoMsg",
+             "finding": "vulnerable", "file": "s.py", "function": "infoMsg"},
+        ],
+        "code_by_route": {"s.py:errorMsg": "def errorMsg(): pass",
+                          "s.py:infoMsg": "def infoMsg(): pass"},
+        "metrics": {"total": 2, "vulnerable": 2},
+    }
+    results_path = tmp_path / "results.json"
+    write_json(results_path, payload)
+    analyzer_path = tmp_path / "analyzer_output.json"
+    write_json(analyzer_path, {"functions": {}})
+    vr = verifier_mod.run_verification(
+        results_path=str(results_path),
+        output_dir=str(tmp_path),
+        analyzer_output_path=str(analyzer_path),
+        workers=1,
+        registry=_OfflineRegistry(_Scripted([
+            {"agree": True, "correct_finding": "vulnerable",
+             "explanation": "confirmed exploitable"},
+            {"agree": False, "correct_finding": "safe",
+             "explanation": "input validated; controls hold"},
+        ])))
+    # THE FIELD (the threading): the rewrite reached its VerifyResult bucket
+    assert vr.consistency_safe == 1, (
+        f"the consistency-rewritten-to-safe row must reach the FIELD "
+        f"(got consistency_safe={vr.consistency_safe}) — the scanner "
+        "envelope's safe fold threads from here (the e2e wiring)")
+    assert vr.agreed == 1, "the rewritten row agreed (the rewrite class)"
+    # THE SUMMARY (the display): the step summary threads it beside #622
+    summary = verify_step_summary(vr)
+    assert summary.get("consistency_safe") == 1, (
+        f"the step SUMMARY must thread consistency_safe "
+        f"(got {summary.get('consistency_safe')}) — the display surface")
+    # THE DICT (the consumers' source)
+    d = vr.to_dict()
+    assert d.get("consistency_safe") == 1, (
+        f"the DICT must thread consistency_safe "
+        f"(got {d.get('consistency_safe')}) — the Go/CSV consumers' source")
