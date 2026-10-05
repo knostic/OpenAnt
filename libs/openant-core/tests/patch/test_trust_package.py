@@ -5,7 +5,6 @@ Tests cover the four building blocks:
   _classify_challenger     — classifies all findings + produces summary counts
   _compute_trust_signals   — derives the six trust signals deterministically
   _build_recommendation_v1 — produces a V1 deployment decision from signals
-  _extract_security_gain   — extracts the benefit sentence from reviewer text
   _build_known_findings    — groups classified findings into the Known
                              Findings section's epistemic categories
 
@@ -25,7 +24,6 @@ from utilities.autopatcher.pipeline import (
     _classify_challenger,
     _compute_trust_signals,
     _build_recommendation_v1,
-    _extract_security_gain,
     _build_known_findings,
     _render_known_findings,
     _check_recommendation_consistency,
@@ -845,11 +843,11 @@ def _signals_full(**overrides):
     though neither is yet read by _build_recommendation_v1."""
     base = {
         "patch_integrity":       {"value": "Clean", "label": "Clean", "notes": "Applies cleanly · no hygiene issues"},
-        "security_improvement":  {"value": "High", "label": "High", "notes": "Adversarial review found no remaining exploit path"},
-        "remediation_alignment": {"value": "Aligned", "label": "Aligned", "notes": "Adversarial review confirms fix approach"},
+        "security_improvement":  {"value": "High", "label": "High", "notes": "No blocking or unresolved adversarial concern (heuristic review; not independent verification)"},
+        "remediation_alignment": {"value": "Aligned", "label": "Aligned", "notes": "No blocking or unresolved adversarial concern (heuristic review; not independent verification)"},
         "coverage_confidence":   {"value": "High", "label": "High", "notes": "No gaps identified by adversarial analysis"},
-        "test_availability":     {"value": "Tests Available", "label": "Tests Available", "notes": "Good — test files cover this module"},
-        "deployment_safety":     {"value": "Low Risk", "label": "Low Risk", "notes": "Localized change · low regression risk"},
+        "test_availability":     {"value": "Tests Available", "label": "Tests Available", "notes": "Good — related test files found by file name (not run; coverage not measured)"},
+        "deployment_safety":     {"value": "Low Risk", "label": "Low Risk", "notes": "Localized change · small static impact surface"},
         "source_verification":   {"value": "Confirmed", "label": "✓ Confirmed", "notes": "1 hunk(s) matched the repository uniquely"},
         "existing_test_comparison": {"value": "PASS", "label": "✅ Pass", "notes": "No failures in either the baseline or the patched run."},
     }
@@ -917,7 +915,9 @@ class TestTrustSignalsV2Table:
             "Aligned": "✅ Good",
             "Likely Aligned": "⚠️ Needs review",
             "Partial": "⚠️ Needs review",
-            "Misaligned": "❌ Blocked",
+            # Release polish: Misaligned lands at Manual Review Required (I5),
+            # never Do Not Apply -- a concern, not a block.
+            "Misaligned": "❌ Concern",
         }
         for value, status in expected.items():
             table = _render_trust_signals_table(_signals_full(
@@ -928,7 +928,7 @@ class TestTrustSignalsV2Table:
 
     def test_coverage_confidence_status_mapping(self):
         from utilities.autopatcher.pipeline import _render_trust_signals_table
-        expected = {"High": "✅ Good", "Medium": "⚠️ Needs review", "Low": "❌ Blocked"}
+        expected = {"High": "✅ Good", "Medium": "⚠️ Needs review", "Low": "❌ Concern"}
         for value, status in expected.items():
             table = _render_trust_signals_table(_signals_full(
                 coverage_confidence={"value": value, "label": value, "notes": ""}
@@ -955,7 +955,7 @@ class TestTrustSignalsV2Table:
         expected = {
             "Low Risk": "✅ Good",
             "Medium Risk": "⚠️ Needs review",
-            "High Risk": "❌ Blocked",
+            "High Risk": "❌ Concern",  # Manual Review Required (I5), not a block
             "Not Verified": "? Not verified",
         }
         for value, status in expected.items():
@@ -1012,10 +1012,10 @@ class TestTrustSignalsV2Table:
         from utilities.autopatcher.pipeline import _render_trust_signals_table
         table = _render_trust_signals_table(_signals_full())
         assert "Applies cleanly · no hygiene issues" in table
-        assert "Adversarial review confirms fix approach" in table
+        assert "No blocking or unresolved adversarial concern (heuristic review; not independent verification)" in table
         assert "No gaps identified by adversarial analysis" in table
-        assert "Good — test files cover this module" in table
-        assert "Localized change · low regression risk" in table
+        assert "Good — related test files found by file name (not run; coverage not measured)" in table
+        assert "Localized change · small static impact surface" in table
 
     def test_good_rows_get_no_forward_pointer(self):
         """A row that's already ✅ Good has nothing to send the reader to —
@@ -1054,7 +1054,7 @@ class TestTrustSignalsV2Table:
     def test_non_good_test_availability_points_to_test_support(self):
         from utilities.autopatcher.pipeline import _render_trust_signals_table
         table = _render_trust_signals_table(_signals_full(
-            test_availability={"value": "No Tests Found", "label": "No Tests Found", "notes": "No test files cover this module"}
+            test_availability={"value": "No Tests Found", "label": "No Tests Found", "notes": "No related test files found by file name"}
         ))
         assert "see Test Support section below" in table
 
@@ -1261,8 +1261,20 @@ class TestDescribeUnmetGates:
             security_improvement={"value": "Low", "label": "Low", "notes": "1 review finding(s) flagged"},
         )
         result = _describe_unmet_gates(signals)
-        assert "Patch integrity could not be verified because" in result
-        assert "Security improvement could not be verified because" in result
+        # Release polish: both axes were assessed (adversely), not left
+        # unverified -- "could not be verified" is reserved for Not
+        # Verified/Unknown values.
+        assert "Patch integrity has minor hygiene issues (MEDIUM: unused import)." in result
+        assert "Security improvement was assessed as low (1 review finding(s) flagged)." in result
+        assert "could not be verified" not in result
+
+    def test_high_impact_is_assessed_high_not_unverified(self):
+        from utilities.autopatcher.pipeline import _describe_unmet_gates
+        signals = _signals_full(
+            deployment_safety={"value": "High Risk", "label": "High Risk", "notes": "HIGH impact surface"},
+        )
+        result = _describe_unmet_gates(signals)
+        assert result == "Deployment risk was assessed as high (HIGH impact surface)."
 
     def test_empty_notes_falls_back_to_terse_sentence(self):
         from utilities.autopatcher.pipeline import _describe_unmet_gates
@@ -1304,7 +1316,11 @@ class TestRecommendationReasonNamesActualSignal:
         assert rec["decision"] == "Do Not Apply"
         assert "rejected by git apply" in rec["reason"]
 
-    def test_misaligned_reason_cites_remediation_alignment_notes(self):
+    # Release polish: the alignment-driven branches name their gate (the
+    # adversarial review) in reason/why, but no longer re-quote
+    # remediation_alignment's notes -- the Trust Signals table shows them,
+    # and repeating them made one sentence appear 3-4 times.
+    def test_misaligned_reason_names_gate_without_repeating_notes(self):
         signals = _signals_full(
             remediation_alignment={
                 "value": "Misaligned", "label": "✗ Misaligned",
@@ -1313,9 +1329,11 @@ class TestRecommendationReasonNamesActualSignal:
         )
         rec = _build_recommendation_v1(signals)
         assert rec["decision"] == "Manual Review Required"
-        assert "Confirmed alternate exploit path identified" in rec["reason"]
+        assert rec["reason"].startswith("Adversarial review flagged findings")
+        assert "Confirmed alternate exploit path identified" not in rec["reason"]
+        assert "Confirmed alternate exploit path identified" not in rec["why"]
 
-    def test_still_vulnerable_reason_cites_remediation_alignment_notes(self):
+    def test_still_vulnerable_reason_names_gate_without_repeating_notes(self):
         signals = _signals_full(
             remediation_alignment={
                 "value": "Likely Aligned", "label": "Likely Aligned",
@@ -1324,7 +1342,9 @@ class TestRecommendationReasonNamesActualSignal:
         )
         rec = _build_recommendation_v1(signals, still_vulnerable=True, defect_count=0)
         assert rec["decision"] == "Manual Review Required"
-        assert "Correct mechanism" in rec["reason"]
+        assert "Challenger's verification status" in rec["reason"]
+        assert "Correct mechanism" not in rec["reason"]
+        assert "Correct mechanism" not in rec["why"]
 
     def test_high_risk_reason_cites_deployment_safety_notes(self):
         signals = _signals_full(
@@ -1538,42 +1558,6 @@ class TestRecommendationV1EvaluationCases:
         )
         rec = _build_recommendation_v1(signals, still_vulnerable=True, defect_count=0)
         assert rec["decision"] == "Manual Review Required"
-
-
-# ---------------------------------------------------------------------------
-# _extract_security_gain
-# ---------------------------------------------------------------------------
-
-class TestExtractSecurityGain:
-    def test_extracts_sentence_with_fix_verb(self):
-        explanation = "The vulnerability exists because the header is not stripped. The patch fixes this by adding Cookie to the removal list."
-        gain = _extract_security_gain(explanation)
-        assert "patch" in gain.lower() or "fix" in gain.lower()
-        assert len(gain) >= 40
-
-    def test_extracts_sentence_with_prevent_verb(self):
-        explanation = "Sensitive tokens were logged. This patch prevents token values from appearing in log output."
-        gain = _extract_security_gain(explanation)
-        assert "prevent" in gain.lower()
-
-    def test_extracts_sentence_with_add_verb(self):
-        explanation = "Cookie was not stripped. The fix adds Cookie to DEFAULT_REMOVE_HEADERS_ON_REDIRECT alongside Authorization."
-        gain = _extract_security_gain(explanation)
-        assert "add" in gain.lower() or "Cookie" in gain
-
-    def test_skips_short_sentences(self):
-        # A sentence with a verb but too short should be skipped
-        explanation = "Bug found. The patch fixes it. Here is why the fix adds significant protection against cross-origin leakage of credentials."
-        gain = _extract_security_gain(explanation)
-        assert len(gain) >= 40
-
-    def test_fallback_to_first_paragraph(self):
-        explanation = "This change modifies the retry behavior."
-        gain = _extract_security_gain(explanation)
-        assert len(gain) > 0
-
-    def test_empty_explanation_returns_empty(self):
-        assert _extract_security_gain("") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1881,7 +1865,7 @@ class TestRecommendationConsistency:
         return {
             "test_availability": {
                 "value": test_availability, "label": test_availability,
-                "notes": "No test files cover this module" if test_availability == "No Tests Found" else "some notes",
+                "notes": "No related test files found by file name" if test_availability == "No Tests Found" else "some notes",
             },
             # coverage_confidence is realistic fixture data only — this
             # function no longer reads it at all.
@@ -1919,7 +1903,9 @@ class TestRecommendationConsistency:
         findings = self._known_findings()
         caveats = _check_recommendation_consistency(signals, "Deploy After Validation", findings)
         assert len(caveats) == 1
-        assert "test coverage" in caveats[0].lower()
+        # Release polish: filename discovery is never described as coverage.
+        assert "not backed by any discovered existing test" in caveats[0]
+        assert "coverage" not in caveats[0].lower()
 
     def test_no_caveat_when_tests_available_at_top_tier(self):
         signals = self._signals(test_availability="Tests Available")
@@ -2009,7 +1995,7 @@ class TestRecommendationConsistency:
         signals = self._signals(test_availability="No Tests Found")
         findings = self._known_findings()
         caveats = _check_recommendation_consistency(signals, "Deploy After Validation", findings)
-        assert "No test files cover this module" in caveats[0]
+        assert "No related test files found by file name" in caveats[0]
 
     # --- Defensive: missing keys never raise ---
 

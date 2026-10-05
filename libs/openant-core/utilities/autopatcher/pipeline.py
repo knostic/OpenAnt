@@ -275,8 +275,41 @@ def _extract_score(score_text: str) -> str:
     return match.group(1) if match else "N/A"
 
 
+_VULN_DESCRIPTION_HEADING_RE = re.compile(r"^##[ \t]+Vulnerability description[ \t]*$", re.MULTILINE)
+_NEXT_HEADING_RE = re.compile(r"^#{1,6}[ \t]", re.MULTILINE)
+# "**Advisory:** X" / "- **Finding ID:** X" metadata lines (cve_converter /
+# core.patch.render_vulnerability_markdown), not description prose.
+_VULN_METADATA_LINE_RE = re.compile(r"^(?:[-*][ \t]+)?\*\*[^*\n]+:\*\*")
+_SUMMARY_MAX_CHARS = 1000
+
+
 def _extract_summary(vulnerability_text: str) -> str:
-    """Return the first non-empty line of the vulnerability file as a summary."""
+    """Return the report's Vulnerability summary (display only -- the
+    vulnerability text itself, the LLM input, is never modified).
+
+    Release polish: prefers the first prose paragraph under
+    "## Vulnerability description", skipping metadata lines. The title line
+    (the former summary) is only the description's first sentence, cut off
+    by the converter -- for many advisories just a product blurb such as
+    "urllib3 is a user-friendly HTTP client library for Python." Falls back
+    to that first non-empty line when there is no such paragraph (e.g. a
+    hand-written vulnerability file).
+    """
+    heading = _VULN_DESCRIPTION_HEADING_RE.search(vulnerability_text)
+    if heading:
+        body = vulnerability_text[heading.end():]
+        next_heading = _NEXT_HEADING_RE.search(body)
+        if next_heading:
+            body = body[:next_heading.start()]
+        for paragraph in re.split(r"\n[ \t]*\n", body):
+            prose = " ".join(
+                line.strip() for line in paragraph.splitlines()
+                if line.strip() and not _VULN_METADATA_LINE_RE.match(line.strip())
+            )
+            if prose:
+                if len(prose) <= _SUMMARY_MAX_CHARS:
+                    return prose
+                return _truncate_reason(prose, _SUMMARY_MAX_CHARS, ellipsis="…")
     for line in vulnerability_text.splitlines():
         line = line.strip().lstrip("#").strip()
         if line:
@@ -477,10 +510,8 @@ _TITLE_GENERIC_FALLBACK = "Add targeted validation for the identified behavior"
 def _build_generic_sentence_title(raw: str) -> str:
     """Build a concise imperative validation title directly from `raw`'s own
     human-readable sentence (via `short_reason`), with no domain keyword
-    classification -- the shared tail end of `normalize_title_from_text`
-    (used after its keyword groups miss) and the whole of
-    `normalize_security_invariant_title` (which never runs those keyword
-    checks at all; see that function's own docstring for why).
+    classification -- the tail end of `normalize_title_from_text` (used
+    after its keyword groups miss).
 
     A slug-shaped or otherwise unusable input falls back to
     `_TITLE_GENERIC_FALLBACK` rather than ever surfacing that identifier
@@ -534,26 +565,15 @@ def normalize_title_from_text(t: str) -> str:
     return _build_generic_sentence_title(raw)
 
 
-def normalize_security_invariant_title(t: str) -> str:
-    """Build a title for a security-invariant-derived Validation Action
-    (see build_validation_plan's behavior-driven action block) WITHOUT
-    running `normalize_title_from_text`'s domain keyword classification.
-
-    A concrete security_invariant already carries the semantic meaning a
-    title needs -- classifying it into a generic domain bucket can only
-    lose information, and worse, can silently mismatch it: the auth
-    keyword group's `access`/`permission`/`token` are common, generic
-    words in a path-containment or prototype-integrity invariant (e.g.
-    "...must remain strictly within the configured provider root...
-    preventing unauthorized *access*..."), not evidence the invariant is
-    actually about authentication. That false match previously turned a
-    filesystem-containment invariant's title into "Review authentication
-    flow" -- a real regression this function exists to prevent. Reuses the
-    exact same generic-sentence construction `normalize_title_from_text`
-    already falls back to (`_build_generic_sentence_title`) -- no new
-    truncation/cleanup logic, no LLM call, no new classifier.
-    """
-    return _build_generic_sentence_title((t or "").strip())
+# Fixed title for the security-invariant-derived Validation Action (see
+# build_validation_plan's behavior-driven action block). The invariant text
+# itself is rendered once, in full, beneath it (action["security_property"]).
+# Never derived from the invariant: normalize_title_from_text's domain
+# keyword classification turned a filesystem-containment invariant into
+# "Review authentication flow" (its auth keywords include the generic
+# "access"/"permission"/"token"), and a sentence-derived title could only
+# repeat the property truncated.
+_SECURITY_PROPERTY_ACTION_TITLE = "Verify the security property this patch must restore"
 
 
 def _legacy_action_bucket_for_finding(text: str) -> str:
@@ -863,11 +883,10 @@ _BEHAVIORAL_DEFECT_OBJECT_RE = re.compile(
 )
 # Clause boundaries -- punctuation and contrast conjunctions a human would
 # read as separating one claim from another. Deterministic string
-# splitting only, never NLP/sentiment analysis -- mirrors this module's own
-# existing `_extract_security_gain` sentence-splitting idiom, one level
-# finer-grained (clauses, not sentences), since Challenger findings are
-# short, often single-sentence bullet points where a clause boundary is the
-# only structural signal available to separate independent claims.
+# splitting only, never NLP/sentiment analysis -- clauses, not sentences,
+# since Challenger findings are short, often single-sentence bullet points
+# where a clause boundary is the only structural signal available to
+# separate independent claims.
 _CLAUSE_SPLIT_RE = re.compile(
     r"[,;()]|\b(?:but|and|while|though|although|however|whereas)\b",
     re.IGNORECASE,
@@ -894,13 +913,6 @@ def _has_behavioral_defect_signal(text: str) -> bool:
         if _BEHAVIORAL_DEFECT_VERB_RE.search(clause) and _BEHAVIORAL_DEFECT_OBJECT_RE.search(clause):
             return True
     return False
-
-_BENEFIT_VERB_RE = re.compile(
-    r"\b(fix(es)?|prevent(s)?|add(s)?|block(s)?|strip(s)?|remov(es)?|"
-    r"resolve(s)?|ensure(s)?|protect(s)?|mitigat(es)?|eliminat(es)?|"
-    r"address(es)?|patch(es)?|close(s)?)\b",
-    re.IGNORECASE,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -1558,27 +1570,6 @@ def _finding_directness_tier(text: str, calibration_by_original: dict) -> int:
     return _DIRECTNESS_BY_CLASSIFIER_CATEGORY.get(_classify_finding(text), 1)
 
 
-def _extract_security_gain(explanation: str) -> str:
-    """Extract the concrete security benefit statement from the reviewer explanation.
-
-    Looks for the first sentence containing a security action verb (fix, prevent,
-    add, strip, etc.) that is long enough to be meaningful.  Falls back to the
-    first 250 characters of the explanation.
-    """
-    if not explanation:
-        return ""
-    sentences = re.split(r"(?<=[.!?])\s+", explanation.strip())
-    for sentence in sentences:
-        if _BENEFIT_VERB_RE.search(sentence) and len(sentence.strip()) >= 40:
-            return sentence.strip()
-    # Fallback: first paragraph, truncated
-    first_para = explanation.split("\n\n", 1)[0].strip()
-    first_para = re.sub(r"\s+", " ", first_para)
-    if len(first_para) > 250:
-        first_para = first_para[:250].rsplit(" ", 1)[0] + "…"
-    return first_para
-
-
 # ---------------------------------------------------------------------------
 # Primary Vulnerability References
 #
@@ -1734,7 +1725,9 @@ def _selected_reason_kind(candidate: "RepositoryCandidate | None") -> "str | Non
     return candidate.evidence[0].pass_name
 
 
-def _render_repository_context_section(grounding: "RepositoryGroundingResult | None") -> str:
+def _render_repository_context_section(
+    grounding: "RepositoryGroundingResult | None", *, no_patch: bool = False,
+) -> str:
     """Render the Repository Context section (own leading rule).
 
     Shows only the repository locations find_code_context() actually
@@ -1742,6 +1735,10 @@ def _render_repository_context_section(grounding: "RepositoryGroundingResult | N
     rejected locations. None-safe: renders the zero-selection sentence when
     grounding is None or nothing was selected. Preserves the order
     grounding.decisions already comes in — no additional sorting.
+
+    `no_patch` (display only) swaps the intro sentence, which otherwise
+    refers to "the patch" and Post-Patch Investigation, for a NO PATCH
+    PRODUCED report.
     """
     lines: list[str] = ["---\n", "## Repository Context\n"]
 
@@ -1753,12 +1750,18 @@ def _render_repository_context_section(grounding: "RepositoryGroundingResult | N
         )
         return "\n".join(lines) + "\n"
 
-    lines.append(
-        "The following repository locations were selected to provide context "
-        "for patch generation and review. These locations were selected "
-        "**before** the patch was generated — for evidence gathered from the "
-        "final patch diff itself, see Post-Patch Investigation.\n"
-    )
+    if no_patch:
+        lines.append(
+            "The following repository locations were selected to provide context "
+            "for remediation planning. No patch was produced from them.\n"
+        )
+    else:
+        lines.append(
+            "The following repository locations were selected to provide context "
+            "for patch generation and review. These locations were selected "
+            "**before** the patch was generated — for evidence gathered from the "
+            "final patch diff itself, see Post-Patch Investigation.\n"
+        )
 
     candidates_by_path = {c.path: c for c in grounding.candidates}
 
@@ -2230,6 +2233,17 @@ def _describe_structured_concern_counts(counts: dict) -> str:
     )
 
 
+# Notes text (display only) for the "adversarial review did not leave the
+# vulnerability open" branch of security_improvement/remediation_alignment.
+# Release polish: an LLM adversarial review can fail to find a problem; it
+# cannot confirm a fix, so this states what was observed and its epistemic
+# status rather than "confirms fix approach".
+_NO_OPEN_ADVERSARIAL_CONCERN_NOTES = (
+    "No blocking or unresolved adversarial concern "
+    "(heuristic review; not independent verification)"
+)
+
+
 def _compute_trust_signals(
     hygiene: list | None,
     applicability: dict | None,
@@ -2309,7 +2323,7 @@ def _compute_trust_signals(
         imp_notes = f"{defect_count} review finding(s) flagged as high-confidence heuristic risk"
     elif not still_vulnerable:
         imp_val = "High"
-        imp_notes = "Adversarial review found no remaining exploit path"
+        imp_notes = _NO_OPEN_ADVERSARIAL_CONCERN_NOTES
     elif still_vulnerable and risk_count == 0:
         # still_vulnerable=True but only due to validation gaps, not high-confidence findings
         imp_val = "High"
@@ -2332,7 +2346,7 @@ def _compute_trust_signals(
         aln_notes = "Confirmed alternate exploit path identified"
     elif not still_vulnerable:
         aln_val = "Aligned"
-        aln_notes = "Adversarial review confirms fix approach"
+        aln_notes = _NO_OPEN_ADVERSARIAL_CONCERN_NOTES
     elif still_vulnerable and risk_count == 0:
         aln_val = "Likely Aligned"
         if verification_status == "RESIDUAL_VULNERABILITY" and structured:
@@ -2403,7 +2417,7 @@ def _compute_trust_signals(
     # --- Test Availability (replaces Validation Evidence) ---
     if testing_rating in ("Good", "Some"):
         tst_val = "Tests Available"
-        tst_notes = f"{testing_rating} — test files cover this module"
+        tst_notes = f"{testing_rating} — related test files found by file name (not run; coverage not measured)"
     elif testing_rating == "Not Applicable":
         tst_val = "Not Verified"
         tst_notes = "Test discovery is not supported for this language yet"
@@ -2412,7 +2426,7 @@ def _compute_trust_signals(
         tst_notes = "No repository root was provided"
     else:
         tst_val = "No Tests Found"
-        tst_notes = "No test files cover this module"
+        tst_notes = "No related test files found by file name"
 
     # --- Deployment Safety ---
     # I2: "Low Risk" is only reached for the explicit, genuine "low" value.
@@ -2430,7 +2444,7 @@ def _compute_trust_signals(
         saf_notes = "Moderate impact surface"
     elif impact_level == "low":
         saf_val = "Low Risk"
-        saf_notes = "Localized change · low regression risk"
+        saf_notes = "Localized change · small static impact surface"
     elif impact_level == "not_applicable":
         saf_val = "Not Verified"  # I2
         saf_notes = "Impact analysis is not supported for this language yet"
@@ -2492,6 +2506,15 @@ _POSITIVE_SETS_BY_AXIS = {
     "security_improvement": _POSITIVE_IMPROVEMENT,
     "deployment_safety": _POSITIVE_SAFETY,
 }
+# Presentation only: (axis, value) pairs that mean the pipeline assessed the
+# axis and the result was adverse, as opposed to not establishing it at all
+# (Not Verified/Unknown keep the "could not be verified" wording).
+_GATE_ASSESSED_ADVERSE_PHRASES = {
+    ("patch_integrity", "Minor Issues"): "Patch integrity has minor hygiene issues",
+    ("security_improvement", "Low"): "Security improvement was assessed as low",
+    ("security_improvement", "None"): "No security improvement was established",
+    ("deployment_safety", "High Risk"): "Deployment risk was assessed as high",
+}
 
 
 def _describe_unmet_gates(signals: dict) -> str:
@@ -2512,7 +2535,14 @@ def _describe_unmet_gates(signals: dict) -> str:
             continue
         label = _GATE_AXIS_LABELS[axis]
         notes = (signals[axis].get("notes") or "").strip().rstrip(".")
-        if notes:
+        # Release polish: a value the pipeline actually assessed as adverse
+        # (e.g. deployment_safety="High Risk" from a HIGH impact surface)
+        # was verified, just not favorably -- "could not be verified" is
+        # reserved for values that genuinely were not established.
+        assessed = _GATE_ASSESSED_ADVERSE_PHRASES.get((axis, value))
+        if assessed:
+            sentences.append(f"{assessed} ({notes})." if notes else f"{assessed}.")
+        elif notes:
             # Lowercase only a genuine sentence-initial capital, not an
             # acronym/all-caps lead word (e.g. "HIGH impact surface" or
             # "MEDIUM: unused_import" must stay as-is).
@@ -2572,12 +2602,11 @@ def _build_recommendation_v1(
     wording, since a caller that has no richer signal to offer must not be
     read as implying one.
 
-    Release-polish (report explainability): every branch's `reason` may
-    append one sentence naming the specific Trust Signal(s) that gated it —
-    the Misaligned/still_vulnerable branches cite `remediation_alignment`'s
-    own notes directly (that is the signal that triggered them); every
-    branch reached after the I3 check cites whichever of I3's three axes
-    were not positive, via `_describe_unmet_gates`. This only changes
+    Release-polish (report explainability): every branch reached after the
+    I3 check appends one sentence naming whichever of I3's three axes were
+    not positive, via `_describe_unmet_gates`. The Misaligned/
+    still_vulnerable branches do NOT re-quote `remediation_alignment`'s
+    notes: the Trust Signals table already shows them. This only changes
     `reason` text — `decision` is computed identically to before this note.
 
     Report Polish Batch B: every branch that returns "Manual Review
@@ -2619,12 +2648,10 @@ def _build_recommendation_v1(
             "indicators; this is unresolved heuristic evidence, not a verified exploit — "
             "manual review is required before deployment."
         )
-        notes = (signals["remediation_alignment"].get("notes") or "").strip().rstrip(".")
-        if notes:
-            reason += f" Remediation alignment: {notes}."
+        # Release polish: remediation_alignment's own notes are not appended
+        # here -- the Trust Signals table already shows them, and repeating
+        # them in reason AND why made the same sentence appear 3-4 times.
         why = "adversarial review flagged high-confidence risk indicators that remain unresolved"
-        if notes:
-            why += f" ({notes})"
         return {"decision": "Manual Review Required", "reason": reason, "why": why}
     if still_vulnerable and defect_count == 0:  # I5
         detail_section = "Challenger concerns" if structured_challenger else "Review Results"
@@ -2658,22 +2685,27 @@ def _build_recommendation_v1(
                 "deploying."
             )
             why = "the Challenger's verification status could not be established for this patch"
-        notes = (signals["remediation_alignment"].get("notes") or "").strip().rstrip(".")
-        if notes:
-            reason += f" Remediation alignment: {notes}."
-        if notes:
-            why += f" ({notes})"
+        # Release polish: remediation_alignment's notes are already in the
+        # Trust Signals table -- not repeated in reason/why (see the
+        # Misaligned branch above).
         return {"decision": "Manual Review Required", "reason": reason, "why": why}
     if (
         integrity in _POSITIVE_INTEGRITY
         and improvement in _POSITIVE_IMPROVEMENT
         and safety in _POSITIVE_SAFETY
     ):  # I3
+        # Release polish: states the evidence I3 actually checked, never that
+        # the vulnerability is fixed. Reaching I3 requires still_vulnerable
+        # to be False (both still_vulnerable branches above return first), a
+        # Clean patch_integrity, and a Low/Medium Risk deployment_safety.
         return {
             "decision": "Deploy After Validation",
             "reason": (
-                "Patch addresses the attack vector described by the advisory and applies cleanly. "
-                "Run the listed validation actions before deployment."
+                "The patch applies cleanly with no hygiene issues, the available adversarial "
+                "review raised no blocking or unresolved concern, and static analysis found a "
+                "low or moderate impact surface. This is an evidence-based recommendation, not "
+                "proof that the vulnerability is fixed: complete any validation actions listed "
+                "below before deployment."
             ),
         }
     # Every branch below is reached only because the I3 whitelist above
@@ -2829,7 +2861,7 @@ def _check_recommendation_consistency(signals: dict, decision: str, known_findin
     if test_sig.get("value") == "No Tests Found":
         caveats.append(
             _build_consistency_caveat(
-                "This recommendation currently has no automated test coverage",
+                "This recommendation is not backed by any discovered existing test",
                 test_sig.get("notes", ""),
             )
         )
@@ -3142,12 +3174,15 @@ _TRUST_SIGNALS_V2_ROWS = [
         "Aligned": "✅ Good",
         "Likely Aligned": "⚠️ Needs review",
         "Partial": "⚠️ Needs review",
-        "Misaligned": "❌ Blocked",
+        # Release polish: "❌ Concern", not "❌ Blocked" -- Misaligned lands
+        # at Manual Review Required (I5), never Do Not Apply. Only
+        # patch_integrity's ❌ values actually block (I4).
+        "Misaligned": "❌ Concern",
     }, "Review Results"),
     ("Are there unresolved concerns?", "coverage_confidence", {
         "High": "✅ Good",
         "Medium": "⚠️ Needs review",
-        "Low": "❌ Blocked",
+        "Low": "❌ Concern",
     }, "Review Results"),
     ("Do relevant tests already exist?", "test_availability", {
         "Tests Available": "✅ Good",
@@ -3157,7 +3192,7 @@ _TRUST_SIGNALS_V2_ROWS = [
     ("Is deployment risk low?", "deployment_safety", {
         "Low Risk": "✅ Good",
         "Medium Risk": "⚠️ Needs review",
-        "High Risk": "❌ Blocked",
+        "High Risk": "❌ Concern",  # Manual Review Required (I5), not a block
         "Not Verified": "? Not verified",
     }, "Impact Surface"),
     # Evidence Sufficiency Gate (Phase 1, source_verification.py). Display
@@ -3252,10 +3287,32 @@ def _render_trust_signals_table(
     lines: list[str] = []
     lines.append("---\n")
     lines.append("## Trust Signals\n")
+    # Release polish: the legend names the rows exactly as rendered below
+    # and states how each one is established -- deterministic check, static
+    # heuristic (nothing executed), heuristic LLM review, or an opt-in test
+    # run -- plus what the ❌/? statuses mean.
+    lines.append("*How each row is established:*\n")
     lines.append(
-        "*Patch Integrity, Test Availability, and Deployment Risk are deterministic "
-        "checks. Remediation Alignment and Coverage Confidence are derived from "
-        "heuristic adversarial review, not independent verification.*\n"
+        "- *Deterministic checks against the repository:* \"Does the patch apply?\", "
+        "\"Was the edited content verified against the repository?\""
+    )
+    lines.append(
+        "- *Adversarial review (Challenger) — a heuristic LLM review whose citations are "
+        "checked by code, not independent verification:* \"Does it address the "
+        "vulnerability?\", \"Are there unresolved concerns?\""
+    )
+    lines.append(
+        "- *Static heuristics, nothing executed:* \"Do relevant tests already exist?\" "
+        "(test-file name matching), \"Is deployment risk low?\" (symbol-name usage analysis)"
+    )
+    lines.append(
+        "- *Existing tests run only when Existing Test Comparison was requested:* \"Were "
+        "there new test failures after the patch?\"\n"
+    )
+    lines.append(
+        "*❌ Blocked: the check blocks this patch · ❌ Concern: an adverse finding that "
+        "requires review · ? Not verified: the check did not run or is unsupported — never "
+        "positive evidence.*\n"
     )
     lines.append("| Question | Status | Notes |")
     lines.append("|---|---|---|")
@@ -3291,9 +3348,9 @@ def _render_trust_signals_table(
                 if challenger_concerns_rendered and not known_findings_rendered
                 else "Review Results"
             )
-            bridge = f"existing repository coverage only — new-behavior validation is tracked separately, see {review_section} below"
+            bridge = f"existing repository tests only — new-behavior validation is tracked separately, see {review_section} below"
             if status != "✅ Good" and effective_target:
-                bridge += f"; see {effective_target} section below for existing coverage detail"
+                bridge += f"; see {effective_target} section below for existing test detail"
             notes = f"{notes} ({bridge})" if notes else bridge.capitalize()
         elif status != "✅ Good" and effective_target:
             notes = f"{notes} — see {effective_target} section below" if notes else \
@@ -3335,7 +3392,10 @@ def _render_validation_actions_section(validation_actions: list[dict], decision:
         title = action.get("title", "")
         reason = action.get("reason", "")
         next_step = action.get("next_step", "")
+        security_property = (action.get("security_property") or "").strip()
         lines.append(f"{i}. **[{priority}]** {title}  ")
+        if security_property:
+            lines.append(f"   Security property: {security_property}  ")
         if reason:
             lines.append(f"   Reason: {reason}  ")
         if next_step:
@@ -3446,7 +3506,136 @@ def _render_decision_card(
     return "\n".join(lines)
 
 
-def _render_no_patch_card(files_changed: list[str]) -> str:
+_NOT_APPLICABLE_NO_PATCH = "*Not applicable — no patch was produced.*"
+
+# Terminal closing block (release polish). Each entry restates what the
+# decision already means -- the same meaning _render_decision_card states in
+# the report -- never a new judgment.
+_TERMINAL_NEXT_STEP = {
+    "Deploy After Validation": "Complete the validation actions in the Trust Report before deploying.",
+    "Deploy With Caution": (
+        "Complete a manual security review and the validation actions in the Trust Report "
+        "before deploying."
+    ),
+    "Manual Review Required": (
+        "A human reviewer must resolve the open questions in the Trust Report before any "
+        "deployment."
+    ),
+    "Do Not Apply": "Do not deploy this patch; see the Trust Report for the failed check.",
+}
+# Deploy After Validation has no `why`; this restates exactly what I3
+# required (see _build_recommendation_v1's I3 branch).
+_TERMINAL_GREEN_REASON = (
+    "The patch applies cleanly, adversarial review raised no blocking or unresolved concern, "
+    "and the static impact surface is low or moderate. Not proof that the vulnerability is fixed."
+)
+
+
+def _as_sentence(text: str) -> str:
+    text = (text or "").strip().rstrip(".")
+    return f"{text[:1].upper()}{text[1:]}." if text else ""
+
+
+def _terminal_decision_summary(
+    no_patch: bool,
+    trust_rec: dict,
+    classified_challenger: "dict | None",
+    no_patch_reason: "str | None",
+) -> list[str]:
+    """Lines printed under the terminal's closing decision line: the
+    reason, the structured Challenger concern counts (when any), and the
+    next step. Presentation only -- every value is one the report already
+    renders (trust_rec's why/reason, the Challenger concerns table's counts,
+    the no-patch card's reason); nothing here is recomputed or new.
+    """
+    if no_patch:
+        lines = ["Run completed without a final candidate patch."]
+        if no_patch_reason:
+            lines.append(f"Reason    {no_patch_reason}")
+        lines.append("Next      No patch to review or deploy; see the Trust Report for details.")
+        return lines
+
+    decision = trust_rec["decision"]
+    if decision == "Deploy After Validation":
+        reason = _TERMINAL_GREEN_REASON
+    else:
+        reason = _as_sentence(trust_rec.get("why") or trust_rec.get("reason") or "")
+    lines = [f"Reason    {reason}"] if reason else []
+    if _is_structured_challenger(classified_challenger):
+        counts = _structured_concern_counts(classified_challenger)
+        if sum(counts.values()):
+            lines.append(
+                f"Concerns  {counts['BLOCKING']} blocking · {counts['UNRESOLVED']} unresolved · "
+                f"{counts['NON_BLOCKING']} non-blocking Challenger concern(s)"
+            )
+    next_step = _TERMINAL_NEXT_STEP.get(decision)
+    if next_step:
+        lines.append(f"Next      {next_step}")
+    return lines
+
+
+# Applicability skip reasons that, when the FINAL patch is empty, only mean
+# "the applicability check found nothing to check" -- never why there is no
+# patch. A real skipped-generation reason reaches applicability verbatim
+# instead (see _patch_validation_skip_reason); these three arise only when
+# patch generation ran and the final candidate ended up empty.
+_EMPTY_FINAL_PATCH_SKIP_REASONS = frozenset({
+    "empty diff after stripping fences",
+    "not a git repository",
+    "no repo_root provided",
+})
+_CAPACITY_NUMBERS_RE = re.compile(r"\((\d+) chars needed, (\d+) chars available\)")
+
+
+def _describe_no_patch_reason(raw_reason: "str | None") -> "str | None":
+    """Plain-language reason for NO PATCH PRODUCED, from the reason the run
+    already recorded (the applicability skip reason). Presentation only:
+    each phrase restates what its source string already says; an
+    unrecognized reason is shown verbatim rather than guessed at.
+
+    The empty-final-patch case is deliberately a disjunction: the pipeline
+    does not record which of the two happened (the model returned no diff,
+    or the conformance-recovery block withdrew a candidate that did not
+    conform to the approved edit targets), so the report must not pick one.
+    """
+    raw = (raw_reason or "").strip().rstrip(".")
+    if not raw:
+        return None
+    if raw in _EMPTY_FINAL_PATCH_SKIP_REASONS:
+        return (
+            "No usable candidate patch remained after patch generation: either the "
+            "model's output contained no diff, or the generated patch was withdrawn "
+            "because it did not conform to the approved edit targets."
+        )
+    if raw.startswith("planning_ungrounded"):
+        return "The remediation plan could not be grounded in repository evidence."
+    if raw.startswith("Planner Claim Verifier"):
+        return (
+            "A verification check found a contradiction in the remediation plan's claims "
+            "that was not resolved."
+        )
+    if "target_authority_unresolved" in raw:
+        return (
+            "The remediation strategy named a target, but repository evidence was not "
+            "sufficient to justify editing it."
+        )
+    if "omission_reason=technical_capacity" in raw:
+        numbers = _CAPACITY_NUMBERS_RE.search(raw)
+        detail = (
+            f" ({numbers.group(1)} chars needed, {numbers.group(2)} available)" if numbers else ""
+        )
+        return (
+            "The verified target source needed for patch generation does not fit within "
+            f"the model's context capacity{detail}."
+        )
+    if raw == "no verified final-target source":
+        return "The run did not establish verified, patch-ready source for the remediation target."
+    if raw.startswith("Patch Generator response invalid"):
+        return "The patch generator's response was still invalid after one bounded regeneration."
+    return f"Reason recorded by the run: {raw}."
+
+
+def _render_no_patch_card(files_changed: list[str], reason: "str | None" = None) -> str:
     """First-screen execution-outcome card for a run that produced no
     final candidate patch. Deliberately NOT a Recommendation Policy
     decision (see _build_recommendation_v1, left untouched) -- a report
@@ -3454,10 +3643,19 @@ def _render_no_patch_card(files_changed: list[str]) -> str:
     reuse _render_decision_card's signals-driven wording, which would
     otherwise render a misleading "Patch was not verified." line for a
     patch that does not exist.
+
+    `reason` is `_describe_no_patch_reason`'s plain-language text, or None
+    when the run recorded no reason. The opening line is deliberately
+    neutral: the no-patch causes differ (ungrounded plan, context capacity,
+    a withdrawn candidate, ...), so it asserts only what is true of all.
     """
     lines = [
         "## ⚫ NO PATCH PRODUCED\n",
-        "The pipeline did not produce a final candidate patch.  ",
+        "Run completed without a final candidate patch.  ",
+    ]
+    if reason:
+        lines.append(f"Reason: {reason}  ")
+    lines += [
         "No patch is available for deployment or review.  ",
         f"Files changed: {len(files_changed)}",
         "",
@@ -3658,6 +3856,9 @@ def _build_report(result: PipelineResult) -> str:
             detail = f.get("detail", "")
             hygiene_lines.append(f"- [{sev}] {detail}")
         hygiene_section = "\n".join(hygiene_lines)
+    elif no_patch:
+        # Release polish: never call a nonexistent patch clean.
+        hygiene_section = _NOT_APPLICABLE_NO_PATCH
     else:
         hygiene_section = "No obvious hygiene issues detected."
 
@@ -3677,6 +3878,13 @@ def _build_report(result: PipelineResult) -> str:
             applicability_section += f"\n\n```\n{stderr}\n```"
     else:
         applicability_section = "*(Applicability unknown.)*"
+
+    # Plain-language NO PATCH PRODUCED reason for the decision card and the
+    # terminal summary -- the same recorded reason the Patch Applicability
+    # section shows verbatim (left unchanged: run_cve_batch.py parses it).
+    no_patch_reason = (
+        _describe_no_patch_reason(app.get("skipped_reason")) if no_patch and app.get("skipped") else None
+    )
 
     # -----------------------
     # Hoist: Suggested Tests + Test Support + Validation Actions
@@ -3936,7 +4144,11 @@ def _build_report(result: PipelineResult) -> str:
             if no_suggestions and no_adversarial and rating == "Good":
                 final = [{
                     "priority": "LOW", "title": "Perform quick manual review",
-                    "reason": "No automated anchors available; brief manual inspection advised.",
+                    # Release polish: not "No automated anchors available" --
+                    # "anchor" means something else in Post-Patch
+                    # Investigation, and this fallback fires whenever no
+                    # specific validation item was generated.
+                    "reason": "No specific validation items were generated; brief manual inspection advised.",
                     "next_step": "Manually review the changed logic and adjacent call sites.",
                     "cap_bucket": "review",
                 }]
@@ -4015,15 +4227,22 @@ def _build_report(result: PipelineResult) -> str:
         if _security_invariant or (behavior and not behavior.get("is_generic")):
             try:
                 if _security_invariant:
-                    # normalize_security_invariant_title, NOT
-                    # normalize_title_from_text: a security invariant
-                    # already carries its own semantic meaning and must
-                    # not be run through domain keyword classification
-                    # (see that function's own docstring for the exact
-                    # false-match regression this avoids).
-                    title = normalize_security_invariant_title(_security_invariant)
-                    beh_reason = short_reason(_security_invariant)
-                    next_step = f"Verify: {short_reason(_security_invariant)}"
+                    # Release polish: the invariant is shown ONCE, in full,
+                    # under a fixed title (rendered by
+                    # _render_validation_actions_section) -- previously the
+                    # title, Reason and Next step each carried the same
+                    # sentence truncated mid-clause, and the full property
+                    # appeared nowhere in the report. A fixed title also
+                    # never runs the invariant through
+                    # normalize_title_from_text's domain keyword
+                    # classification (the "Review authentication flow"
+                    # false match).
+                    title = _SECURITY_PROPERTY_ACTION_TITLE
+                    beh_reason = ""
+                    next_step = (
+                        "Confirm the patched code upholds this property, with a targeted "
+                        "test or a manual review."
+                    )
                 else:
                     pbs = behavior.get("primary_behaviors") or []
                     # comma-separated first 4 primary behaviors
@@ -4056,6 +4275,8 @@ def _build_report(result: PipelineResult) -> str:
                     # selection only, never ranking, membership, cap
                     # behavior, reason, or next_step.
                     beh_action["is_security_invariant_action"] = True
+                    # Display only: the full, untruncated invariant text.
+                    beh_action["security_property"] = _security_invariant
                 # Prepend but keep final limited to 3 actions by trimming the end
                 final = [beh_action] + final
                 if len(final) > 3:
@@ -4137,7 +4358,12 @@ def _build_report(result: PipelineResult) -> str:
     signals["existing_test_comparison"] = classify_existing_test_comparison_signal(
         result.existing_test_comparison
     )
-    progress.success("Trust signals evaluated")
+    if no_patch:
+        # The report omits Trust Signals for this outcome (see below), so
+        # the terminal must not claim they were evaluated for it.
+        progress.skipped("Trust signals not applicable", reason="no candidate patch was produced")
+    else:
+        progress.success("Trust signals evaluated")
     trust_rec = _build_recommendation_v1(
         signals,
         still_vulnerable=classified_challenger.get("still_vulnerable", False),
@@ -4169,12 +4395,16 @@ def _build_report(result: PipelineResult) -> str:
         _decision_line = "⚫ NO PATCH PRODUCED"
     else:
         _decision_line = f"{_DECISION_CARD_EMOJI.get(trust_rec['decision'], '⚪')} {trust_rec['decision'].upper()}"
-    progress.banner([_decision_line])
+    # Release polish: the decision line stays first and unchanged; the lines
+    # after it only restate already-computed results (see
+    # _terminal_decision_summary).
+    progress.banner([_decision_line] + _terminal_decision_summary(
+        no_patch, trust_rec, classified_challenger, no_patch_reason,
+    ))
     progress.verbose(
         f"[pipeline] Recommendation:\n"
         f"{'⚫ NO PATCH PRODUCED' if no_patch else _DECISION_CARD_EMOJI.get(trust_rec['decision'], '⚪') + ' ' + trust_rec['decision']}"
     )
-    security_gain = _extract_security_gain(review_sections.get("explanation", ""))
     # known_findings already computed above (calibration-aware, feeds signals/trust_rec).
     # Gate the Trust Signals table's forward pointer on the same finding
     # categories that back remediation_alignment/coverage_confidence
@@ -4196,7 +4426,7 @@ def _build_report(result: PipelineResult) -> str:
         # intentionally not read here; the normal Manual Review Required /
         # Deploy / Do Not Apply bottom line must never appear for an empty
         # final patch.
-        decision_card = _render_no_patch_card(files_changed)
+        decision_card = _render_no_patch_card(files_changed, reason=no_patch_reason)
         recommendation_block = ""
     else:
         decision_card = _render_decision_card(trust_rec, signals, validation_actions, files_changed)
@@ -4215,7 +4445,7 @@ def _build_report(result: PipelineResult) -> str:
         # therefore derived from that empty state, not from genuine
         # adversarial review. Rendering them would show a misleadingly
         # confident Trust Signals table (e.g. remediation_alignment=
-        # "Aligned" / "Adversarial review confirms fix approach") and an
+        # "Aligned" rendered as "✅ Good") and an
         # empty "## Review Results" section that never ran. Neither
         # section is meaningful without a patch to have reviewed.
         trust_signals_block = ""
@@ -4328,13 +4558,11 @@ def _build_report(result: PipelineResult) -> str:
     # §6: Recommendation
     report += recommendation_block
 
-    # §7: Explanation — absorbs Known Security Gain as a lead-in. security_gain
-    # is itself an extracted sentence from this same explanation text (or, on
-    # the fallback path, a truncated first paragraph of it) — kept as a
-    # callout rather than dropped. When it's a verbatim match (the common
-    # case), that one copy is stripped from the body below so the sentence
-    # isn't shown twice; the fallback (truncated, non-verbatim) copy is left
-    # in place since it isn't a duplicate of the full text. A standing
+    # §7: Explanation — the reviewer text verbatim. (Release polish: the
+    # former "Security gain:" callout is gone -- it labeled whichever sentence
+    # matched an action verb as a gain, and on real runs that was often
+    # background, a heading, or a stated limitation such as "the fix is only
+    # partial".) A standing
     # disclaimer states the epistemic status of this whole section once,
     # rather than requiring per-sentence hedging of LLM-generated prose this
     # pipeline cannot rewrite without a new semantic classifier.
@@ -4355,21 +4583,6 @@ def _build_report(result: PipelineResult) -> str:
             "upstream comparison.*\n\n"
         )
         explanation_text = review_sections["explanation"]
-        if security_gain:
-            report += f"**Security gain:** {security_gain}\n\n"
-            # security_gain is extracted verbatim from this same explanation
-            # text (see _extract_security_gain) — drop that one copy from the
-            # body so the sentence isn't shown twice.
-            if security_gain in explanation_text:
-                explanation_text = explanation_text.replace(security_gain, "", 1)
-                explanation_text = re.sub(r"^[ \t]+", "", explanation_text, flags=re.MULTILINE)
-                # Rendering-only fix: when the stripped sentence was the entire
-                # body of a numbered/bulleted list item, removing it leaves a
-                # bare marker behind (e.g. a dangling "1." with nothing after
-                # it). Drop such now-empty marker lines — a list marker with no
-                # body is never meaningful output, regardless of why it emptied.
-                explanation_text = re.sub(r"^[ \t]*(?:\d+\.|[-*])[ \t]*\n", "", explanation_text, flags=re.MULTILINE)
-                explanation_text = re.sub(r"\n{3,}", "\n\n", explanation_text).strip()
         report += f"""{explanation_text}
 
 """
@@ -4393,10 +4606,12 @@ def _build_report(result: PipelineResult) -> str:
             "*Not evaluated — no repository root was provided.*\n\n"
         )
     else:
-        report += _render_repository_context_section(result.grounding)
+        report += _render_repository_context_section(result.grounding, no_patch=no_patch)
 
     # §9c: Post-Patch Investigation
-    if result.post_patch_observations is None:
+    if no_patch:
+        report += f"---\n\n## Post-Patch Investigation\n\n{_NOT_APPLICABLE_NO_PATCH}\n\n"
+    elif result.post_patch_observations is None:
         # Distinct wording from the "no repository root was provided" guard
         # above (F-01, §9b/§10/Test Support) -- reusing that exact string
         # here would inflate its count in tests that assert on it, and it
@@ -4429,7 +4644,13 @@ def _build_report(result: PipelineResult) -> str:
     report += render_existing_test_comparison(result.existing_test_comparison)
 
     # §10: Impact Surface
-    if result.impact:
+    if no_patch:
+        # Release polish: impact analysis of an empty diff ("Change appears
+        # localized to (local) — low operational risk") describes a patch
+        # that does not exist.
+        report += "---\n\n## Impact Surface\n\n"
+        report += f"{_NOT_APPLICABLE_NO_PATCH}\n\n"
+    elif result.impact:
         try:
             imp = result.impact
             report += "---\n\n## Impact Surface\n\n"
@@ -4498,7 +4719,11 @@ def _build_report(result: PipelineResult) -> str:
             pass
 
     # Test Support
-    if result.repo_root is None:
+    if no_patch:
+        # Release polish: this section is keyed to the patched file
+        # ("Target file: unknown", "Rating: None" without a patch).
+        test_support_md = f"\n### Test Support\n\n{_NOT_APPLICABLE_NO_PATCH}\n\n"
+    elif result.repo_root is None:
         # F-01: state the gap explicitly rather than silently omitting the
         # section — a reader must not mistake "not shown" for "clean".
         test_support_md = (
@@ -4562,8 +4787,10 @@ def _build_report(result: PipelineResult) -> str:
             test_support_md += "- No matching tests found.\n"
     report += test_support_md
 
-    # Behavior Summary
-    if behavior:
+    # Behavior Summary -- omitted for no_patch, like Affected areas/Reviewer
+    # Notes below: it describes the diff ("This patch likely affects
+    # application logic in unknown.").
+    if behavior and not no_patch:
         try:
             report += "\n### Behavior Summary\n\n"
             # behavior["function"] is a regex-based `def` scan over the diff
@@ -4647,7 +4874,20 @@ prior knowledge, not evidence this pipeline fetched or verified.*
     # only how much of each one is printed).
     suggested_md = "\n### Suggested Tests\n\n"
     suggested_md += "Generated from adversarial findings. Not automatically written to the repo.\n\n"
-    if not suggestions:
+    if no_patch:
+        # Release polish: no Challenger ran for this outcome -- omitted like
+        # Affected areas/Reviewer Notes, rather than "no findings found".
+        suggested_md = ""
+    elif not suggestions and challenger_concerns_block:
+        # Release polish: suggestions are derived only from the legacy
+        # free-text Challenger findings, which a structured response never
+        # populates -- "No actionable adversarial findings found" sat beside
+        # BLOCKING/UNRESOLVED concerns on real runs.
+        suggested_md += (
+            "- None generated: test suggestions are not derived from structured Challenger "
+            "concerns — see the Challenger concerns section above.\n"
+        )
+    elif not suggestions:
         suggested_md += "- No actionable adversarial findings found.\n"
     else:
         for s in suggestions:
@@ -5808,7 +6048,15 @@ def _run_patch_generation_and_investigation(
     progress.stage(3, 5, "Generate")
     if _skip_patch_generation:
         _skip_reason_text = _skip_patch_generation_reason or "no verified final-target source"
-        progress.skipped("Patch generation skipped", reason=_skip_reason_text)
+        # Release polish: the same plain-language reason the report's NO
+        # PATCH PRODUCED card shows; the raw recorded reason stays available
+        # under --verbose and verbatim in the report's Patch Applicability.
+        _skip_reason_display = (_describe_no_patch_reason(_skip_reason_text) or _skip_reason_text).rstrip(".")
+        progress.skipped(
+            "Patch generation skipped",
+            reason=_skip_reason_display[:1].lower() + _skip_reason_display[1:],
+        )
+        progress.verbose(f"[pipeline] Patch generation skipped: {_skip_reason_text}")
         patch = ""
         _patch_validation_skip_reason = _skip_reason_text
     else:
@@ -9286,7 +9534,17 @@ def run(
             vulnerability_text, patch, llm, code_context=challenger_context,
             provenance_context=_challenger_provenance_context(_challenger_provenance_parts, challenger_context),
         )
-        progress.success("Patch evaluated")
+        # Release polish: completing the adversarial review is not passing
+        # it. Reads only flags/consequences challenge_patch already set.
+        _review_counts = (
+            _structured_concern_counts(challenger) if _is_structured_challenger(challenger) else None
+        )
+        if _review_counts and (_review_counts["BLOCKING"] or _review_counts["UNRESOLVED"]):
+            progress.warning("Adversarial review completed — concerns remain")
+        elif (challenger or {}).get("still_vulnerable"):
+            progress.warning("Adversarial review completed — fix not verified")
+        else:
+            progress.success("Adversarial review completed")
     else:
         progress.skipped("Challenger skipped", reason="no candidate patch was produced")
         challenger = {}

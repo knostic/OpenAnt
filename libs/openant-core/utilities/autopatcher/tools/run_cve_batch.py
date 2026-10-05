@@ -2127,7 +2127,7 @@ def render_markdown(summary: dict) -> str:
         meta.append(("Manifest", f"`{inp['path']}` — {inp['case_count']} case(s), sha256 `{inp['sha256'][:16]}…`, copy `{inp['copy']}`"))
     openant_by_session = {o["session"]: o for o in oa["sessions"]}
     for s in summary["sessions"]:
-        jobs = f"jobs {s.get('jobs')}" + ("" if s.get("jobs_validated", True) else " (above the validated maximum of 2)")
+        jobs = f"jobs {s.get('jobs')}" + ("" if s.get("jobs_validated", True) else f" (above the validated maximum of {VALIDATED_MAX_JOBS})")
         timeout = fmt_duration(s["case_timeout_seconds"]) if s.get("case_timeout_seconds") else "none"
         o = openant_by_session.get(s["session"], {})
         code = (f"OpenAnt `{(o.get('start_head') or '?')[:12]}`{' dirty' if o.get('start_dirty') else ''}"

@@ -339,8 +339,13 @@ class TestF2StructuredResidualWording:
                                             verification_status="RESIDUAL_VULNERABILITY",
                                             structured_challenger=False)
         assert default == explicit
-        assert default["reason"] == f"{LEGACY_RESIDUAL_REASON} Remediation alignment: {LEGACY_RESIDUAL_NOTES}."
-        assert default["why"] == f"{LEGACY_RESIDUAL_WHY} ({LEGACY_RESIDUAL_NOTES})"
+        assert default["decision"] == "Manual Review Required"
+        # Release polish: remediation_alignment's notes (still the legacy
+        # text, see the signal itself) are no longer re-quoted in reason/why
+        # -- the Trust Signals table already shows them.
+        assert signals["remediation_alignment"]["notes"] == LEGACY_RESIDUAL_NOTES
+        assert default["reason"] == LEGACY_RESIDUAL_REASON
+        assert default["why"] == LEGACY_RESIDUAL_WHY
 
     @pytest.mark.parametrize("status", ["INSUFFICIENT_EVIDENCE", None])
     def test_legacy_non_residual_reasons_unchanged(self, status):

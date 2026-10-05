@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -1080,17 +1081,38 @@ def _parse_via_subprocess(
     if library_mode:
         cmd.append("--library-mode")
 
-    result = subprocess.run(
-        cmd,
-        stdout=sys.stderr,
-        stderr=sys.stderr,
-        cwd=str(_CORE_ROOT),
-        timeout=1800,  # 30 min — large repos, tree-sitter/Node/Go toolchains
-        # #303: the child resolves THIS checkout by construction — the shared
-        # venv's editable .pth (re-pointable mid-scan by a concurrent session)
-        # cannot win over an explicit PYTHONPATH entry.
-        env=child_interpreter_env(),
-    )
+    # Under AUTOPATCHER_PARSER_QUIET (Auto Patcher's default/quiet modes
+    # only), the child's stdout -- its full "PARSER PIPELINE TEST" progress
+    # report -- goes to a temporary file instead of the terminal and is
+    # replayed only if the parser fails. A file, not a pipe: a grandchild
+    # that inherits the descriptor can never block us on a pipe. The
+    # child's stderr is untouched. Unset (every other command), output is
+    # exactly as before.
+    with (contextlib.nullcontext(None) if _verbose_parser_output()
+          else tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")) as quiet_stdout:
+
+        def _replay_quiet_stdout() -> None:
+            if quiet_stdout is not None:
+                quiet_stdout.seek(0)
+                sys.stderr.write(quiet_stdout.read())
+
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=quiet_stdout if quiet_stdout is not None else sys.stderr,
+                stderr=sys.stderr,
+                cwd=str(_CORE_ROOT),
+                timeout=1800,  # 30 min — large repos, tree-sitter/Node/Go toolchains
+                # #303: the child resolves THIS checkout by construction — the shared
+                # venv's editable .pth (re-pointable mid-scan by a concurrent session)
+                # cannot win over an explicit PYTHONPATH entry.
+                env=child_interpreter_env(),
+            )
+        except subprocess.TimeoutExpired:
+            _replay_quiet_stdout()
+            raise
+        if result.returncode != 0:
+            _replay_quiet_stdout()
 
     if result.returncode != 0:
         raise RuntimeError(f"{language} parser failed with exit code {result.returncode}")

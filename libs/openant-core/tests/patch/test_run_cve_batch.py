@@ -734,9 +734,15 @@ def test_timeout_kills_the_case(env):
 
 def test_jobs_above_validated_maximum_warns(env, capsys):
     m = env.manifest("m.yaml", [env.case("one", "CVE-2024-0001")])
-    assert env.run("--manifest", str(m), "--batch-id", "b", "--jobs", "3", "--no-zip") == 0
-    assert "above the experimentally validated maximum of 4" in capsys.readouterr().out
-    assert env.batch("b")[1]["sessions"][0]["jobs_validated"] is False
+    warning = f"above the experimentally validated maximum of {rcb.VALIDATED_MAX_JOBS}"
+    at_max = str(rcb.VALIDATED_MAX_JOBS)
+    assert env.run("--manifest", str(m), "--batch-id", "at", "--jobs", at_max, "--no-zip") == 0
+    assert warning not in capsys.readouterr().out
+    assert env.batch("at")[1]["sessions"][0]["jobs_validated"] is True
+    above_max = str(rcb.VALIDATED_MAX_JOBS + 1)
+    assert env.run("--manifest", str(m), "--batch-id", "above", "--jobs", above_max, "--no-zip") == 0
+    assert warning in capsys.readouterr().out
+    assert env.batch("above")[1]["sessions"][0]["jobs_validated"] is False
 
 
 def test_existing_batch_dir_and_held_lock_are_refused(env, capsys):

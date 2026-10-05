@@ -245,7 +245,25 @@ class TestRecommendationBannerCases:
         err = capsys.readouterr().err
 
         assert "[5/5] Decide" in err
+        # Release polish: the report omits Trust Signals for NO PATCH
+        # PRODUCED, so the terminal must not claim they were evaluated.
+        assert "– Trust signals not applicable: no candidate patch was produced" in err
+        assert "Trust signals evaluated" not in err
+
+    def test_decide_stage_trust_signals_line_with_patch(self, tmp_path, capsys):
+        from utilities.autopatcher.pipeline import _build_report
+
+        progress.configure()
+        patch = "--- a/f.py\n+++ b/f.py\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+        result = _minimal_pipeline_result(
+            tmp_path, patch=patch,
+            applicability={"applicable": True, "skipped": False, "skipped_reason": None, "error": None, "stderr": ""},
+        )
+        _build_report(result)
+        err = capsys.readouterr().err
+
         assert "✓ Trust signals evaluated" in err
+        assert "Trust signals not applicable" not in err
 
     @pytest.fixture(autouse=True)
     def _reset(self):

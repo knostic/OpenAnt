@@ -212,9 +212,10 @@ def render_metadata_section(meta: RunMetadata) -> str:
             f"public advisory ({source_label}), not an OpenAnt-detected Finding. Advisory "
             "claims (description, CWE, CVSS, affected products) are contextual evidence "
             "only and have not been verified against this repository's actual code or "
-            "dependency versions. The Recommendation and Trust Signals in this report are "
-            "based only on the evidence this pipeline run actually collected against the "
-            "given repository — not on the advisory's own severity or CVSS score.\n\n"
+            "dependency versions. This report's outcome — and its Recommendation and Trust "
+            "Signals, when present — is based only on the evidence this pipeline run actually "
+            "collected against the given repository, not on the advisory's own severity or "
+            "CVSS score.\n\n"
         )
 
     max_tokens_display = (

@@ -742,13 +742,12 @@ class TestDecisionCardInReport:
         idx_rec = report.find("## Recommendation")
         assert idx_vuln < idx_patch < idx_trust < idx_rec
 
-    def test_security_gain_appears_within_explanation(self):
-        """Known Security Gain was merged into Explanation rather than kept
-        as its own heading — it was always an extracted sentence from (or,
-        on the fallback path, a truncated paragraph of) the same explanation
-        text, so it's now a labeled lead-in inside that section instead of a
-        separate one repeating the same information. "Impact Summary" no
-        longer exists at all (removed as duplicated storytelling)."""
+    def test_explanation_has_no_security_gain_label(self):
+        """Release polish: the "Security gain:" callout is gone -- it labeled
+        whichever explanation sentence matched an action verb as a gain, and
+        on real runs that was often background or a stated limitation ("the
+        fix is only partial"). The Explanation renders the reviewer text
+        verbatim; "Impact Summary"/"Known Security Gain" stay absent."""
         from utilities.autopatcher.pipeline import run
         report = run(vulnerability_text=self._vuln_text(), api_key="")
         idx_patch = report.find("## Proposed patch")
@@ -758,8 +757,7 @@ class TestDecisionCardInReport:
         assert idx_patch < idx_rec < idx_expl < idx_val_actions
         assert "## Impact Summary" not in report
         assert "## Known Security Gain" not in report
-        explanation_block = report[idx_expl:idx_val_actions]
-        assert "**Security gain:**" in explanation_block
+        assert "Security gain" not in report
 
 
 class TestReportTerminologyCleanup:
@@ -834,13 +832,11 @@ class TestReportTerminologyCleanup:
 # Explanation rendering fix — dangling list-marker regression
 # ---------------------------------------------------------------------------
 
-class TestExplanationDanglingListMarkerFix:
-    """Reviewer-experience fix: when the extracted security_gain sentence is
-    the entire body of a numbered/bulleted list item in the reviewer LLM's
-    explanation text, stripping it used to leave a bare marker behind (e.g.
-    a dangling "1." with nothing after it). This only touches how the
-    already-generated explanation text is rendered — _extract_security_gain
-    and the reviewer LLM's own output are untouched."""
+class TestExplanationRenderedVerbatim:
+    """Release polish: with the "Security gain:" callout removed, the
+    reviewer's explanation renders verbatim -- no sentence is extracted,
+    relabeled, or stripped from the body (stripping it previously needed a
+    dangling-list-marker cleanup)."""
 
     @staticmethod
     def _build(tmp_path, review):
@@ -877,15 +873,16 @@ class TestExplanationDanglingListMarkerFix:
             "- Test with payload Y.\n"
         )
         report = self._build(tmp_path, review)
-        # The extracted sentence still appears once, as the Security gain callout.
-        assert "**Security gain:** This patch does not fix the vulnerability at all." in report
+        # A limitation is never relabeled as a gain; the list item stays intact.
+        assert "Security gain" not in report
+        assert "1. This patch does not fix the vulnerability at all." in report
         # No line consisting solely of a bare numbered/bulleted marker.
         assert not re.search(r"^[ \t]*(?:\d+\.|[-*])[ \t]*$", report, re.MULTILINE)
         # The rest of the explanation body is preserved.
         assert "The underlying issue remains because the check was never added." in report
 
     def test_ordinary_explanation_unaffected(self, tmp_path):
-        """No list markers involved — behavior is unchanged from before this fix."""
+        """No list markers involved — the body is rendered unchanged."""
         review = (
             "**Explanation:**\n"
             "This patch fixes the vulnerability by validating input.\n\n"
@@ -896,8 +893,11 @@ class TestExplanationDanglingListMarkerFix:
             "- Test with payload Y.\n"
         )
         report = self._build(tmp_path, review)
-        assert "**Security gain:** This patch fixes the vulnerability by validating input." in report
-        assert "Additional context about the fix follows here." in report
+        assert "Security gain" not in report
+        assert (
+            "This patch fixes the vulnerability by validating input.\n\n"
+            "Additional context about the fix follows here."
+        ) in report
 
 
 # ---------------------------------------------------------------------------
@@ -957,7 +957,10 @@ class TestRecommendationConsistencyReport:
         report = _build_report(result)
 
         assert "**Deploy After Validation**" in report
-        assert "test coverage" in report
+        # Release polish: filename discovery is never described as coverage.
+        assert "not backed by any discovered existing test" in report
+        assert "No related test files found by file name" in report
+        assert "no automated test coverage" not in report
         assert "adversarial coverage" not in report
         # Correction: never say "0 confirmed" / imply the patch is broken.
         assert "0 confirmed" not in report.lower()
@@ -1312,9 +1315,11 @@ class TestReleasePolishReportBehaviors:
         report = _build_report(result)
         assert "NO PATCH PRODUCED" in report
 
-    def test_green_decision_reason_unaffected(self, tmp_path):
-        """Deploy After Validation's reason text must stay byte-identical —
-        the I3 whitelist branch is never enriched (nothing is unmet)."""
+    def test_green_decision_reason_states_evidence_not_a_fix(self, tmp_path):
+        """Deploy After Validation's reason states exactly what the I3
+        whitelist checked and is never enriched with unmet-gate text
+        (nothing is unmet). Release polish: it must not claim the
+        vulnerability or attack vector is fixed."""
         from utilities.autopatcher.pipeline import _build_report, PipelineResult
         (tmp_path / "tests").mkdir()
         (tmp_path / "tests" / "test_mod.py").write_text("def test_foo(): pass\n", encoding="utf-8")
@@ -1323,9 +1328,14 @@ class TestReleasePolishReportBehaviors:
         report = _build_report(result)
         assert "**Deploy After Validation**" in report
         assert (
-            "Patch addresses the attack vector described by the advisory and applies cleanly. "
-            "Run the listed validation actions before deployment."
+            "The patch applies cleanly with no hygiene issues, the available adversarial "
+            "review raised no blocking or unresolved concern, and static analysis found a "
+            "low or moderate impact surface. This is an evidence-based recommendation, not "
+            "proof that the vulnerability is fixed: complete any validation actions listed "
+            "below before deployment."
         ) in report
+        assert "addresses the attack vector" not in report
+        assert "could not be verified" not in report
 
 
 class TestSuggestedTestsAndTestSupportLanguageAware:
@@ -4419,7 +4429,8 @@ class TestNoPatchProducedOutcome:
         report = _build_report(result)
 
         assert "NO PATCH PRODUCED" in report
-        assert "The pipeline did not produce a final candidate patch." in report
+        # Release polish: neutral wording true of every no-patch path.
+        assert "Run completed without a final candidate patch." in report
         assert "No patch is available for deployment or review." in report
 
     def test_no_manual_review_or_deploy_bottom_line(self, tmp_path):
@@ -4703,79 +4714,55 @@ class TestSecurityInvariantTitleNormalization:
     normalize_title_from_text's domain keyword classification (auth/db/
     encoding). Root cause: `_TITLE_AUTH_KEYWORDS_RE` includes the generic
     words "access"/"permission"/"token" -- common vocabulary in a path-
-    containment or prototype-integrity invariant (e.g. "...preventing
-    unauthorized access to files outside the collection scope"), not
-    evidence the invariant is actually about authentication. That false
-    match previously turned a filesystem-containment invariant's title
-    into "Review authentication flow".
+    containment or prototype-integrity invariant, not evidence the
+    invariant is about authentication. That false match previously turned a
+    filesystem-containment invariant's title into "Review authentication
+    flow".
 
-    normalize_title_from_text itself is intentionally NOT touched here --
-    its keyword groups remain exactly as before for every other caller
-    (Suggested Tests, adversarial findings); see
-    TestHumanReadableActionTitles above, still green. Only
-    normalize_security_invariant_title (a new, narrow entry point used
-    solely for security_invariant) skips that classification.
+    Release polish: the title is now fixed and the invariant is rendered
+    once, in full, as "Security property:" -- previously a sentence-derived
+    title, Reason and Next step each repeated it truncated.
+    normalize_title_from_text itself is untouched for every other caller.
     """
 
+    INVARIANT_ACTION_TITLE = "Verify the security property this patch must restore"
+
+    def _validation_actions(self, invariant):
+        from utilities.autopatcher.pipeline import PipelineResult, _build_report
+        report = _build_report(PipelineResult(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch="--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 2\n",
+            review="**Explanation:**\nok\n",
+            score_text="",
+            challenger={"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""},
+            impact={"impact_level": "low", "changed_files": [], "affected_files": [],
+                    "impact_summary": "", "recommendations": [], "usage_matches": []},
+            hygiene=[],
+            applicability={"applicable": True, "skipped": False, "skipped_reason": None,
+                           "error": None, "stderr": ""},
+            security_invariant=invariant,
+            repo_root=None,
+        ))
+        start = report.find("## Validation Actions")
+        return report[start:report.find("\n## ", start + 1)]
+
     def test_1_filesystem_containment_invariant_not_classified_as_auth(self):
-        from utilities.autopatcher.pipeline import normalize_title_from_text, normalize_security_invariant_title
+        from utilities.autopatcher.pipeline import normalize_title_from_text
 
         invariant = (
             "The absolute resolved filesystem path derived from the untrusted "
             "dirpath/urlpath must remain strictly within the configured provider "
             "root, preventing unauthorized access to files outside the collection scope."
         )
-
-        # Proves the exact false match this fix corrects: the generic
-        # normalizer really does mis-fire on this text (via the "access"
-        # keyword), which is exactly why the security-invariant path must
-        # not reuse it.
+        # The generic normalizer really does mis-fire on this text (via the
+        # "access" keyword) -- why the invariant action never uses it.
         assert normalize_title_from_text(invariant) == "Review authentication flow"
 
-        title = normalize_security_invariant_title(invariant)
-        assert "authentication" not in title.lower(), title
-        assert any(word in title.lower() for word in ("path", "filesystem", "root")), title
+        block = self._validation_actions(invariant)
+        assert f"**[MEDIUM]** {self.INVARIANT_ACTION_TITLE}" in block, block
+        assert "authentication" not in block.lower(), block
 
-    def test_2_cookie_redirect_invariant_keeps_its_own_semantics(self):
-        from utilities.autopatcher.pipeline import normalize_security_invariant_title
-
-        invariant = "A caller-supplied Cookie must not be forwarded on a cross-origin redirect"
-        title = normalize_security_invariant_title(invariant)
-
-        assert "cookie" in title.lower(), title
-        assert "redirect" in title.lower(), title
-        assert "authentication" not in title.lower(), title
-
-    def test_3_prototype_pollution_invariant_keeps_its_own_semantics(self):
-        from utilities.autopatcher.pipeline import normalize_security_invariant_title
-
-        invariant = "Attacker-controlled argv must not modify Object.prototype via constructor or prototype keys"
-        title = normalize_security_invariant_title(invariant)
-
-        assert "prototype" in title.lower(), title
-        assert "authentication" not in title.lower(), title
-        assert "database" not in title.lower(), title
-
-    def test_4_generic_words_do_not_trigger_unrelated_domain_remap(self):
-        """Invariants containing "untrusted"/"trusted"/"token"/"tokens" in
-        an ordinary, non-authentication sense must not be remapped to the
-        auth domain merely by substring/keyword presence."""
-        from utilities.autopatcher.pipeline import normalize_security_invariant_title
-
-        cases = [
-            "Input derived from an untrusted client must not traverse outside the configured root",
-            "A value supplied by a trusted internal caller must still be re-validated before use",
-            "Version tokens embedded in the query string must not alter the resolved file path",
-            "Path tokens containing '..' must be rejected before path resolution",
-        ]
-        for invariant in cases:
-            title = normalize_security_invariant_title(invariant)
-            assert "authentication" not in title.lower(), (invariant, title)
-            assert "database" not in title.lower(), (invariant, title)
-
-    def test_5_long_invariant_truncates_cleanly(self):
-        from utilities.autopatcher.pipeline import normalize_security_invariant_title
-
+    def test_2_long_invariant_rendered_once_in_full(self):
         long_invariant = (
             "The absolute resolved filesystem path derived from a combination of "
             "the configured provider root and the untrusted, request-supplied "
@@ -4784,16 +4771,16 @@ class TestSecurityInvariantTitleNormalization:
             "how many levels of parent-directory traversal or symlink indirection "
             "an attacker attempts to use to escape that boundary"
         )
-        title = normalize_security_invariant_title(long_invariant)
-
-        assert len(title) <= 90
-        assert title.count("`") % 2 == 0
-        assert not title.endswith(" ")
+        block = self._validation_actions(long_invariant)
+        assert f"Security property: {long_invariant}" in block, block
+        assert block.count("configured provider root and the untrusted") == 1, block
+        assert "Reason:" not in block.split("2.")[0], block
+        assert "..." not in block.split("2.")[0], block
 
     def test_6_existing_keyword_title_tests_untouched(self):
         """Sanity: normalize_title_from_text's own keyword groups (used by
         every non-security-invariant caller) are completely unaffected by
-        the new normalize_security_invariant_title entry point."""
+        the security-invariant action's fixed title."""
         from utilities.autopatcher.pipeline import normalize_title_from_text
         assert normalize_title_from_text("The db driver placeholder style differs across dialects") == \
             "Verify database driver compatibility"
@@ -5712,6 +5699,22 @@ class TestSecurityInvariantTopAction:
         idx = report.find("**Top action:**")
         return report[idx: report.find("\n", idx)]
 
+    # Release polish: the security-invariant action has a fixed title and
+    # carries the invariant ONCE, in full, as "Security property:" in
+    # Validation Actions -- never truncated into title/Reason/Next step.
+    INVARIANT_ACTION_TITLE = "Verify the security property this patch must restore"
+
+    def _assert_invariant_is_top_action(self, report, invariant):
+        top_action_line = self._top_action_line(report)
+        va_block = self._validation_actions_block(report)
+        assert self.INVARIANT_ACTION_TITLE in top_action_line, top_action_line
+        first_bullet_idx = va_block.find("1.")
+        second_bullet_idx = va_block.find("2.")
+        first_bullet = va_block[first_bullet_idx:second_bullet_idx]
+        assert self.INVARIANT_ACTION_TITLE in first_bullet, va_block
+        assert f"Security property: {invariant}" in first_bullet, va_block
+        return top_action_line
+
     def test_1_core_behavior_beats_casing_edge_case(self, tmp_path, monkeypatch):
         """urllib3-representative: a header-casing edge case must not
         outrank the core cross-origin-stripping invariant."""
@@ -5724,14 +5727,8 @@ class TestSecurityInvariantTopAction:
         result = pl.PipelineResult(**kwargs)
         report = pl._build_report(result)
 
-        top_action_line = self._top_action_line(report)
-        va_block = self._validation_actions_block(report)
-
-        assert "cross-origin" in top_action_line.lower(), top_action_line
+        top_action_line = self._assert_invariant_is_top_action(report, invariant)
         assert "case variations" not in top_action_line.lower(), top_action_line
-        first_bullet_idx = va_block.find("1.")
-        second_bullet_idx = va_block.find("2.")
-        assert "cross-origin" in va_block[first_bullet_idx:second_bullet_idx].lower(), va_block
 
     def test_2_core_behavior_beats_legitimate_key_compatibility_concern(self, tmp_path, monkeypatch):
         """minimist-representative: a legitimate-key compatibility/
@@ -5746,14 +5743,8 @@ class TestSecurityInvariantTopAction:
         result = pl.PipelineResult(**kwargs)
         report = pl._build_report(result)
 
-        top_action_line = self._top_action_line(report)
-        va_block = self._validation_actions_block(report)
-
-        assert "constructor and prototype" in top_action_line.lower(), top_action_line
+        top_action_line = self._assert_invariant_is_top_action(report, invariant)
         assert "compatibility" not in top_action_line.lower(), top_action_line
-        first_bullet_idx = va_block.find("1.")
-        second_bullet_idx = va_block.find("2.")
-        assert "constructor and prototype" in va_block[first_bullet_idx:second_bullet_idx].lower(), va_block
 
     def test_3_core_containment_beats_secondary_path_format_concern(self, tmp_path, monkeypatch):
         """pygeoapi-representative: a secondary path-formatting concern
@@ -5767,14 +5758,8 @@ class TestSecurityInvariantTopAction:
         result = pl.PipelineResult(**kwargs)
         report = pl._build_report(result)
 
-        top_action_line = self._top_action_line(report)
-        va_block = self._validation_actions_block(report)
-
-        assert "data root" in top_action_line.lower(), top_action_line
+        top_action_line = self._assert_invariant_is_top_action(report, invariant)
         assert "trailing separator" not in top_action_line.lower(), top_action_line
-        first_bullet_idx = va_block.find("1.")
-        second_bullet_idx = va_block.find("2.")
-        assert "data root" in va_block[first_bullet_idx:second_bullet_idx].lower(), va_block
 
     def test_3b_security_invariant_beats_single_high_secondary_action(self, tmp_path, monkeypatch):
         """Post-review fix (real-CVE regression, pygeoapi-representative):
@@ -5795,10 +5780,8 @@ class TestSecurityInvariantTopAction:
         result = pl.PipelineResult(**kwargs)
         report = pl._build_report(result)
 
-        top_action_line = self._top_action_line(report)
+        top_action_line = self._assert_invariant_is_top_action(report, invariant)
         va_block = self._validation_actions_block(report)
-
-        assert "data root" in top_action_line.lower(), top_action_line
         assert "symlink" not in top_action_line.lower(), top_action_line
         # The HIGH action's own priority and membership are untouched.
         assert "**[MEDIUM]**" in va_block, va_block
@@ -5822,10 +5805,8 @@ class TestSecurityInvariantTopAction:
         result = pl.PipelineResult(**kwargs)
         report = pl._build_report(result)
 
-        top_action_line = self._top_action_line(report)
+        top_action_line = self._assert_invariant_is_top_action(report, invariant)
         va_block = self._validation_actions_block(report)
-
-        assert "data root" in top_action_line.lower(), top_action_line
         assert "symlink" not in top_action_line.lower(), top_action_line
         assert "trailing slash" not in top_action_line.lower(), top_action_line
         assert va_block.count("**[HIGH]**") == 2, va_block
@@ -5868,7 +5849,7 @@ class TestSecurityInvariantTopAction:
         assert "Next step: Validate the finding via focused unit tests or manual review." in va_without
 
         # Top Action differs precisely because the marker exists in one case.
-        assert "data root" in self._top_action_line(report_with).lower()
+        self._assert_invariant_is_top_action(report_with, invariant)
         assert "symlink" in self._top_action_line(report_without).lower()
 
     def test_4_secondary_observed_hypothesis_ordering_preserves_pre_existing_semantics(self, tmp_path, monkeypatch):

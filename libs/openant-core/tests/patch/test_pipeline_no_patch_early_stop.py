@@ -229,7 +229,12 @@ class TestNoPatchReportSemantics:
         spies: dict = {}
         report = _run_no_patch(tmp_path, spies)
         assert "NO PATCH PRODUCED" in report
-        assert "The pipeline did not produce a final candidate patch." in report
+        assert "Run completed without a final candidate patch." in report
+        # Release polish: the recorded reason, in plain language, on the card.
+        assert (
+            "Reason: The patch generator's response was still invalid after one bounded "
+            "regeneration."
+        ) in report
 
 
 class TestValidPatchPathUnaffected:
