@@ -47,6 +47,7 @@ machine.
 | `apps/openant-cli` | Go CLI (`openant`). Thin transport layer: parses flags, resolves the active project, and shells out to the Python engine via `python.Invoke`. Does **no** LLM resolution, patch logic, or trace capture of its own. |
 | `libs/openant-core` | The Python engine. Contains `openant/cli.py` (the actual `patch` subcommand argparse + entry point), `core/patch.py` (`run_patch`/`run_patch_cve`, artifact writing), and `utilities/autopatcher/` (the pipeline itself). |
 | `libs/openant-core/utilities/autopatcher/tools/run_traced.py` | In-process tracing wrapper, tracked normally as part of the Auto Patcher subsystem. Calls the same `core.patch.run_patch`/`run_patch_cve` functions the CLI calls, but intercepts every LLM call to record prompt/response to disk, and wires an `ExecutionRecorder` (see below) into `pipeline.run()`. The **canonical producer of replay-capable source traces** (see §19-§22) — every trace it writes carries a schema-v3 `run_manifest.json` with real, structured `StageExecution` records, not just prose. |
+| `libs/openant-core/utilities/autopatcher/tools/run_cve_batch.py` | The standard real-CVE regression/evaluation batch runner (see §26 and `RUN_CVE_BATCH.md`, same directory). Runs every case of one or more YAML manifests through `run_traced.py` with bounded parallelism (default `--jobs 2`), an isolated checkout/output/CWD per case attempt, canonical evaluation flags, aggregate summaries, a results ZIP and `--resume`. `run_patcheval_python_37.py` is a thin wrapper around it. |
 | `libs/openant-core/utilities/autopatcher/tools/run_stage.py` | Single-stage debug replay tool (see §19), same directory. A thin CLI wrapper around `replay_engine.replay_stage()` — consumes a source run/replay directory and reruns exactly ONE canonical pipeline stage's CURRENT implementation against upstream state resolved from that source's lineage. Accepts any of the 13 canonical stage names; **12 of the 13 currently have a working replay implementation** (every stage except `trust_signals_and_recommendation`, which has no independent execution to replay — see the architecture document's [Terminal reporting architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#terminal-reporting-architecture)). |
 | `libs/openant-core/utilities/autopatcher/replay_engine.py` | The current, stage-registry-driven replay engine `run_stage.py` calls. Owns dependency resolution, capability-aware preflight, stage invocation, and manifest persistence for every replayable stage. Each stage's replay handler calls the *same* production stage-implementation function `pipeline.run()` calls — see the architecture document's [Shared production/replay architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#shared-productionreplay-architecture). |
 | `libs/openant-core/utilities/autopatcher/stage_replay.py` | The Phase-1 predecessor to `replay_engine.py`. No longer the entry point `run_stage.py` calls, but still supplies reused helpers (`SourceProvenance`, `resolve_source_provenance`, `validate_target_repository`, output-directory safety checks) that `replay_engine.py` imports directly. |
@@ -1698,3 +1699,30 @@ in short:
   the same-repo target when `--blind-strip-same-repo-github-references` is
   given, otherwise `--repo-root`'s GitHub `origin` if there is one; with no
   identity, pinned links are removed rather than path-reduced.
+
+---
+
+## Section 26 — Batch Real-CVE Evaluation (`run_cve_batch.py`)
+
+Real-CVE regression suites are run with `run_cve_batch.py` (this directory);
+the complete guide — options, manifest rules, output layout, statistics
+semantics, ZIP contents, resume and exit codes — is
+[`RUN_CVE_BATCH.md`](RUN_CVE_BATCH.md).
+
+```bash
+cd /Users/goddess/dev/OpenAnt/libs/openant-core
+python3.12 utilities/autopatcher/tools/run_cve_batch.py \
+    --manifest utilities/autopatcher/tools/cfp_evaluation_cases.yaml --jobs 2
+python3.12 utilities/autopatcher/tools/run_cve_batch.py --resume /tmp/openant-cve-batches/<batch-id>
+```
+
+Each case attempt gets a fresh clone at the exact manifest SHA (verified
+HEAD, origin and clean tree), its own `--output`, and its own working
+directory — mandatory, because the `AUTOPATCHER_DEBUG` writers of §10
+resolve `./reports/debug/` against the process CWD. `run_traced.py` is
+invoked unchanged with the canonical flags (`--context-budget-policy always
+--max-context-budget-windows 10 --blind-evaluation
+--blind-strip-same-repo-github-references`). The case outcome is read from
+the Trust Report decision card (§9) only when the run manifest proves
+success, identity and verified blind evaluation; a valid
+`NO PATCH PRODUCED` result is counted as Gray, never as a failure.
