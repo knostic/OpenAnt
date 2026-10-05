@@ -74,6 +74,10 @@ What it does, precisely:
      --blind-evaluation) additionally removes References lines under the
      target GitHub repository, identified from --repo-root's local `origin`
      remote (read with `git remote get-url`, never contacted).
+     --blind-filter-policy {v1,v2} (only with --blind-evaluation; default
+     v1) selects the filter contract; v2 is blind-evaluation-filter/v2
+     (TRACING_AND_DEBUGGING.md §25). The manifest's blind_evaluation.rule_id
+     records the contract actually applied.
 
 What it deliberately does NOT do:
   - It does not implement any --context-budget-policy/--max-context-
@@ -132,6 +136,8 @@ from utilities.autopatcher.context_budget import (  # noqa: E402
 from utilities.autopatcher.execution_recorder import ExecutionRecorder  # noqa: E402
 from utilities.autopatcher.llm_call_tracing import LLMCallCapture  # noqa: E402
 from utilities.autopatcher.tools.blind_evaluation import (  # noqa: E402
+    BLIND_FILTER_POLICIES,
+    DEFAULT_BLIND_FILTER_POLICY,
     BlindEvaluationError,
     BlindEvaluationSession,
     github_repository_identity,
@@ -438,6 +444,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--blind-filter-policy",
+        choices=list(BLIND_FILTER_POLICIES),
+        default=None,
+        help=(
+            "Evaluation-only, valid only with --blind-evaluation: the blind "
+            f"filter contract to apply (default {DEFAULT_BLIND_FILTER_POLICY}). "
+            "v2 (blind-evaluation-filter/v2) also removes or normalizes "
+            "code-change URLs outside References and revision-pinned links "
+            "at remediation revisions; see blind_evaluation.py."
+        ),
+    )
+
     # --- presentation flags -- identical semantics/precedence to
     # `openant patch`'s own --verbose/--quiet (see
     # utilities/autopatcher/progress.py); --json is specific to this
@@ -566,8 +585,13 @@ def main(argv: "list[str] | None" = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.blind_filter_policy is not None and not args.blind_evaluation:
+        print("error: --blind-filter-policy requires --blind-evaluation", file=sys.stderr)
+        return 2
+    blind_filter_policy = args.blind_filter_policy or DEFAULT_BLIND_FILTER_POLICY
     same_repo_github = None
     same_repo_github_remote = None
+    path_retention_target = None
     if args.blind_evaluation:
         if not cve:
             print("error: --blind-evaluation is supported only with --cve", file=sys.stderr)
@@ -606,6 +630,14 @@ def main(argv: "list[str] | None" = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
+        if blind_filter_policy == "v2":
+            # V2 path retention only: the target repository whose checkout
+            # may supply repository-relative paths. Never required -- with no
+            # identity, sanitized links are simply removed, not path-reduced.
+            if same_repo_github is not None:
+                path_retention_target = same_repo_github
+            elif _is_git_toplevel(args.repo_root):
+                path_retention_target = github_repository_identity(_origin_remote_url(args.repo_root))
 
     output_dir = args.output or tempfile.mkdtemp(prefix="openant_patch_traced_")
     os.makedirs(output_dir, exist_ok=True)
@@ -636,6 +668,8 @@ def main(argv: "list[str] | None" = None) -> int:
     blind_session: "BlindEvaluationSession | None" = (
         BlindEvaluationSession(
             same_repo_github=same_repo_github, same_repo_github_remote=same_repo_github_remote,
+            policy=blind_filter_policy, target_repository=path_retention_target,
+            repo_root=(args.repo_root if blind_filter_policy == "v2" else None),
         ) if args.blind_evaluation else None
     )
 

@@ -89,6 +89,89 @@ aborting; unsupported references to any other repository, other hosts, and
 every URL outside the References section keep the V1 behavior exactly.
 Without the option, nothing in this module behaves differently.
 
+V2 (RULE_ID_V2 = "blind-evaluation-filter/v2"; run_traced.py
+--blind-filter-policy v2, valid only with --blind-evaluation; V1 stays the
+default and is unchanged). V2 keeps CLASSIFICATION (what a URL is:
+classify_url_v2) separate from TRANSFORMATION (what may be done to the text
+around it, decided only by structural context):
+
+  Classification (syntax only, never fetched):
+    code_change -- github.com/www.github.com http(s) URLs whose route is
+      commit, commits, compare, pull or pulls (any query/fragment/suffix/
+      route case), any GitHub repository path ending in .patch/.diff, and
+      every non-GitHub form V1 already recognizes as a code change.
+    revision_pinned_content -- blob/tree/blame/raw/<hex 7-40>/<path> on
+      github.com, and raw.githubusercontent.com/<o>/<r>/<hex 7-40>/<path>.
+    malformed_code_change_url -- a code-change or pinned route without a
+      valid http(s) /<owner>/<repo> prefix (fails closed).
+    ordinary -- everything else (issues, advisories, named-ref blobs, ...).
+
+  Pass 1 collects remediation revisions: the hex revisions named by
+  code_change URLs anywhere in the rendered text and in the advisory
+  record's raw reference URLs (including those past the converter's
+  five-reference cap). Nothing is fetched; no repository history is read.
+  Pass 2: a revision_pinned_content URL is treated as remediation leakage
+  ONLY if its revision prefix-matches (7-40 hex, either direction) a pass-1
+  revision; any other pinned link (e.g. to vulnerable code) is ordinary.
+
+  Transformation, by context:
+    - References entry (`- <url>`), code_change or remediation-pinned:
+      whole line deleted (the V1 operation). The same-repository policy
+      still applies to other References lines exactly as before.
+    - Standalone line outside References whose only content is code_change
+      link(s) -- optional `-`/`*`/`+` bullet, optional `(...)` or `<...>`
+      wrapping, links separated only by whitespace/`,`/`;`, optional
+      trailing `.,;:` -- deleted; a whole Markdown link on its own line
+      counts as a link.
+    - Structural remediation-pointer line: exactly
+        [bullet] (Resolved|Fixed|Patched|Fix|Patch) [in|by|via] [:] <links>[.]
+      (case-insensitive), where every link is code_change or
+      remediation-pinned and nothing else is on the line -- deleted. This
+      is the ONLY phrase-level rule; no other wording is recognized.
+    - A deleted paragraph between two blank lines also deletes the blank
+      line before it (no double blank line is left).
+    - Anywhere else (embedded prose, headings): only the unsafe span is
+      replaced -- a bare or <angle> URL by LINK_REMOVED_TOKEN; a Markdown
+      link `[text](url)` by its text when the text holds no URL, bracket or
+      7+ hex run, otherwise by the token; a remediation-pinned link by its
+      repository-relative path when the link is under the target
+      repository and the normalized path (no `..`, `.git`, encoded `/`,
+      symlink escape) exists in the target checkout, otherwise by the
+      token. Revision, query and line anchor are always dropped (an anchor
+      indexes the remediation revision's file, not the target's).
+    - Bare remediation revision: a standalone 7-40 hex token (case-
+      insensitive) that prefix-matches, or is prefix-matched by, a pass-1
+      revision is replaced -- token only -- by REVISION_REMOVED_TOKEN.
+      Standalone means: preceded by line start, whitespace or ( [ { ` ' ";
+      followed by line end, whitespace, ) ] } ` ' " , ; : ! ? or a
+      sentence-final ".". A token inside a URL, inside a span already being
+      replaced, adjacent to any other character (letters, digits, _ - / @ =
+      + # % ~ &, a continuing "."), or in fenced code is never rewritten; in
+      inline code it is redacted only when the code span is exactly the
+      token (`` `<token>` ``, backticks kept). Hex strings never named by a
+      pass-1 code-change URL are never touched.
+    - Fail closed (nothing rewritten): malformed code-change URLs; an
+      eligible URL inside fenced or inline code; a URL truncated with
+      `...` in the summary heading; Markdown links with a title, images,
+      a URL as link text, or unbalanced angle brackets.
+
+  Invariants over the COMPLETE blinded text, else abort: zero code_change,
+  malformed or remediation-pinned URLs; zero known remediation revisions
+  (as any 7+ hex run -- so a revision the token rule may not redact, e.g.
+  one inside an identifier, a larger code span, fenced code or an
+  unrecognized URL, aborts); and replay_transformations(original, record)
+  must reproduce the blinded text exactly. Every change is recorded
+  (action, context, line, original line/span, URL, replacement, category,
+  reason, matched revision, path retention) in the manifest and in the
+  sidecar's transformations.json. The pipeline-boundary hash guard is the
+  same as V1's.
+
+  Known V2 limitations: revisions are discovered only from URLs the
+  advisory itself names (a fix revision that appears ONLY inside a blob
+  link, a merge commit never named, or `blob/main/...` at a post-fix HEAD
+  are not detected); non-GitHub forges get no revision extraction; the
+  forge families V1 does not recognize remain unrecognized.
+
 This module contains no benchmark-specific identifiers, repository names,
 fix hashes, expected patches, or expected outcomes, and must never acquire
 any.
@@ -286,6 +369,13 @@ class BlindingResult:
     removed_by_v1: tuple = ()
     removed_same_repo_github: tuple = ()
     same_repo_github_target: "GitHubRepository | None" = None
+    # RULE_ID_V2 only (empty under V1): ordered transformation record,
+    # remediation revisions found by pass 1, References lines removed by the
+    # V2 filter itself, and the repository used for path retention.
+    transformations: tuple = ()
+    remediation_revisions: tuple = ()
+    removed_by_v2: tuple = ()
+    path_retention_target: "GitHubRepository | None" = None
 
 
 def sha256_text(text: str) -> str:
@@ -514,6 +604,745 @@ def _check_invariants(lines, body_start, body_end, remove_indices, result: Blind
         raise BlindEvaluationError("internal invariant violated: nothing removed but text changed")
 
 
+# ---------------------------------------------------------------------------
+# blind-evaluation-filter/v2 (opt-in; see the module docstring's V2 section)
+# ---------------------------------------------------------------------------
+
+RULE_ID_V2 = "blind-evaluation-filter/v2"
+BLIND_FILTER_POLICIES = {"v1": RULE_ID, "v2": RULE_ID_V2}
+DEFAULT_BLIND_FILTER_POLICY = "v1"
+LINK_REMOVED_TOKEN = "[link removed]"
+REVISION_REMOVED_TOKEN = "[revision removed]"
+
+# Classification -- what a URL IS (independent of where it appears).
+KIND_CODE_CHANGE = "code_change"
+KIND_PINNED_CONTENT = "revision_pinned_content"
+KIND_MALFORMED = "malformed_code_change_url"
+KIND_ORDINARY = "ordinary"
+
+V2_GITHUB_COMMIT = "code_change:github_commit"
+V2_GITHUB_COMMITS = "code_change:github_commits"
+V2_GITHUB_COMPARE = "code_change:github_compare"
+V2_GITHUB_PULL = "code_change:github_pull"
+V2_GITHUB_PATCH_FILE = "code_change:github_patch_file"
+V2_OTHER_HOST = "code_change:other_host"
+V2_PINNED = "revision_pinned_content:github"
+V2_REVISION_TOKEN = "remediation_revision_token"
+V2_MALFORMED = "malformed_github_code_change_url"
+
+# Fail-closed categories -- conditions under which no transformation is safe.
+V2_ABORT_MALFORMED = V2_MALFORMED
+V2_ABORT_CODE = "code_change_url_in_code"
+V2_ABORT_TRUNCATED = "truncated_url_in_heading"
+V2_ABORT_MARKDOWN = "ambiguous_markdown_link"
+V2_ABORT_REVISION = "remediation_revision_in_text"
+V2_ABORT_INVARIANT = "post_transform_invariant_violation"
+
+_GITHUB_PINNED_ROUTES = frozenset({"blob", "tree", "blame", "raw"})
+_RAW_GITHUB_HOST = "raw.githubusercontent.com"
+_HEX_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_HEX_RUN_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{7,}(?![0-9A-Za-z])")
+_V2_TRAILING_PUNCT = ".,;:!?*"
+_FENCE_RE = re.compile(r"^ {0,3}(?:`{3,}|~{3,})")
+# A standalone 7-40 hex token in prose: preceded by start-of-line, whitespace
+# or an opening ( [ { ` ' " ; followed by end-of-line, whitespace, a closing
+# ) ] } ` ' " , ; : ! ? or a sentence-final "." (one followed by whitespace
+# or end-of-line). Anything else adjacent -- letters, digits, _ - / @ = + #
+# % ~ & or a "." continuing a token -- means it is part of a larger
+# identifier, path or URL and is never redacted (if it still names a known
+# remediation revision, the post-transform scan fails closed instead).
+_BARE_REVISION_RE = re.compile(
+    r"(?:^|(?<=[\s(\[{`'\"]))([0-9a-fA-F]{7,40})(?=$|[\s)\]}`'\",;:!?]|\.(?:$|\s))"
+)
+
+# Structural line forms (see the module docstring, "V2 text contexts").
+_STANDALONE_PREFIX_RE = re.compile(r"^[ \t]*(?:[-*+][ \t]+)?\(?$")
+_STANDALONE_SUFFIX_RE = re.compile(r"^\)?[.,;:]?[ \t]*$")
+_UNIT_SEPARATOR_RE = re.compile(r"^(?:[ \t]*[,;][ \t]*|[ \t]+)$")
+_POINTER_PREFIX_RE = re.compile(
+    # Same language as "<word>[ in|by|via][ ][:] " but without adjacent
+    # overlapping whitespace quantifiers (linear-time on long whitespace runs).
+    r"^[ \t]*(?:[-*+][ \t]+)?(?:resolved|fixed|patched|fix|patch)(?:[ \t]+(?:in|by|via))?(?:[ \t]*:)?[ \t]+$",
+    re.IGNORECASE,
+)
+_POINTER_SUFFIX_RE = re.compile(r"^\.?[ \t]*$")
+
+
+@dataclass(frozen=True)
+class UrlClassification:
+    """V2 classification of one URL by its syntax alone (never fetched)."""
+
+    url: str
+    kind: str
+    category: str
+    reason: str
+    repository: "GitHubRepository | None" = None
+    revisions: tuple = ()
+    pinned_revision: "str | None" = None
+    pinned_path: tuple = ()
+
+    def to_dict(self) -> dict:
+        d = {"url": self.url, "kind": self.kind, "category": self.category, "reason": self.reason}
+        if self.repository is not None:
+            d["repository"] = self.repository.slug
+        if self.revisions:
+            d["revisions"] = list(self.revisions)
+        if self.pinned_revision is not None:
+            d["pinned_revision"] = self.pinned_revision
+        return d
+
+
+def _strip_diff_suffix(token: str) -> str:
+    low = token.lower()
+    for suffix in _DIFF_SUFFIXES:
+        if low.endswith(suffix):
+            return token[: -len(suffix)]
+    return token
+
+
+def _hex_revision(token: str) -> "str | None":
+    return token.lower() if _HEX_REVISION_RE.match(token) else None
+
+
+def _range_revisions(spec: str) -> tuple:
+    """Hex revisions named by a `<a>...<b>` / `<a>..<b>` / `<a>` spec
+    (fork prefixes `owner:` dropped; named refs ignored)."""
+    spec = _strip_diff_suffix(spec)
+    sides = spec.split("...") if "..." in spec else spec.split("..")
+    return tuple(r for r in (_hex_revision(s.rpartition(":")[2]) for s in sides) if r)
+
+
+def _dedupe(items) -> tuple:
+    return tuple(dict.fromkeys(items))
+
+
+def _valid_github_repository(scheme: str, owner: str, repo: str) -> "GitHubRepository | None":
+    if scheme.lower() not in ("http", "https"):
+        return None
+    if not re.fullmatch(_GITHUB_OWNER, owner) or not re.fullmatch(_GITHUB_REPO, repo) or repo in (".", ".."):
+        return None
+    return GitHubRepository(owner.lower(), repo.lower())
+
+
+def _malformed(url: str, reason: str) -> UrlClassification:
+    return UrlClassification(url, KIND_MALFORMED, V2_MALFORMED, reason)
+
+
+def _ordinary(url: str) -> UrlClassification:
+    return UrlClassification(url, KIND_ORDINARY, ORDINARY, "ordinary vulnerability/context reference")
+
+
+def _classify_github_v2(url: str, parts) -> UrlClassification:
+    segs = parts.path.split("/")[1:]
+    route = segs[2].lower() if len(segs) >= 3 else None
+    is_change = route in _GITHUB_CODE_CHANGE_ROUTES
+    is_pinned = route in _GITHUB_PINNED_ROUTES
+    is_patch_file = len(segs) >= 3 and segs[-1].lower().endswith(_DIFF_SUFFIXES)
+    if not (is_change or is_pinned or is_patch_file):
+        return _ordinary(url)
+    repository = _valid_github_repository(parts.scheme, segs[0], segs[1])
+    if repository is None:
+        return _malformed(url, f"GitHub '{route}' URL without a valid http(s) /<owner>/<repo> prefix")
+    rest = segs[3:]
+    if is_change:
+        if route in ("commit", "commits"):
+            revs = _range_revisions(rest[0]) if rest else ()
+            category = V2_GITHUB_COMMIT if route == "commit" else V2_GITHUB_COMMITS
+        elif route == "compare":
+            revs, category = _range_revisions("/".join(rest)), V2_GITHUB_COMPARE
+        else:  # pull / pulls: the PR number is never treated as a revision
+            revs = tuple(r for seg in rest[1:] for r in _range_revisions(seg))
+            category = V2_GITHUB_PULL
+        return UrlClassification(
+            url, KIND_CODE_CHANGE, category, f"GitHub '{route}' route (direct code change)",
+            repository, _dedupe(revs),
+        )
+    if is_patch_file:
+        return UrlClassification(
+            url, KIND_CODE_CHANGE, V2_GITHUB_PATCH_FILE, "GitHub path names a .patch/.diff file", repository,
+        )
+    rev = _hex_revision(rest[0]) if rest else None
+    if rev is None:
+        return _ordinary(url)  # named ref (branch/tag) or no revision
+    return UrlClassification(
+        url, KIND_PINNED_CONTENT, V2_PINNED, f"GitHub '{route}' URL pinned to a hexadecimal revision",
+        repository, (), rev, tuple(rest[1:]),
+    )
+
+
+def _classify_raw_github_v2(url: str, parts) -> UrlClassification:
+    segs = parts.path.split("/")[1:]
+    if len(segs) < 3:
+        return _ordinary(url)
+    repository = _valid_github_repository(parts.scheme, segs[0], segs[1])
+    if repository is None:
+        return _malformed(url, "raw GitHub content URL without a valid http(s) /<owner>/<repo> prefix")
+    if segs[-1].lower().endswith(_DIFF_SUFFIXES):
+        return UrlClassification(
+            url, KIND_CODE_CHANGE, V2_GITHUB_PATCH_FILE, "GitHub path names a .patch/.diff file", repository,
+        )
+    rev = _hex_revision(segs[2])
+    if rev is None:
+        return _ordinary(url)
+    return UrlClassification(
+        url, KIND_PINNED_CONTENT, V2_PINNED, "raw GitHub content URL pinned to a hexadecimal revision",
+        repository, (), rev, tuple(segs[3:]),
+    )
+
+
+def classify_url_v2(url: str) -> UrlClassification:
+    """Classify one URL under RULE_ID_V2 by syntax alone. Classification
+    only says what the URL is; what may be done to the surrounding text is
+    decided separately, by context (blind_vulnerability_text_v2)."""
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return _malformed(url, "URL cannot be parsed")
+    if host in _GITHUB_HOSTS:
+        return _classify_github_v2(url, parts)
+    if host == _RAW_GITHUB_HOST:
+        return _classify_raw_github_v2(url, parts)
+    if classify_reference_url(url).category == UNSUPPORTED_CODE_CHANGE:
+        return UrlClassification(
+            url, KIND_CODE_CHANGE, V2_OTHER_HOST,
+            "recognized non-GitHub code-change form (no revision extraction for this host)",
+        )
+    return _ordinary(url)
+
+
+def _split_newline(line: str) -> tuple[str, str]:
+    for nl in ("\r\n", "\n"):
+        if line.endswith(nl):
+            return line[: -len(nl)], nl
+    return line, ""
+
+
+@dataclass
+class _Occurrence:
+    line_index: int
+    start: int
+    end: int
+    raw: str
+    classification: UrlClassification
+    matched_revision: "str | None" = None
+
+    @property
+    def url(self) -> str:
+        return self.classification.url
+
+    @property
+    def eligible(self) -> bool:
+        c = self.classification
+        return c.kind == KIND_CODE_CHANGE or (c.kind == KIND_PINNED_CONTENT and self.matched_revision is not None)
+
+
+@dataclass
+class _Unit:
+    """One replaceable span: a bare/angle-bracketed URL or a whole Markdown link."""
+
+    start: int
+    end: int
+    kind: str  # "url" | "markdown"
+    occurrence: _Occurrence
+    link_text: "str | None" = None
+
+
+def _url_occurrences(line_index: int, content: str) -> list[_Occurrence]:
+    found = []
+    for m in _URL_IN_TEXT_RE.finditer(content):
+        raw = m.group(0)
+        url = raw.rstrip(_V2_TRAILING_PUNCT)
+        found.append(_Occurrence(line_index, m.start(), m.start() + len(url), raw, classify_url_v2(url)))
+    return found
+
+
+def _inline_code_spans(content: str) -> list[tuple[int, int]]:
+    ticks = [i for i, ch in enumerate(content) if ch == "`"]
+    return [(ticks[k], ticks[k + 1]) for k in range(0, len(ticks) - 1, 2)]
+
+
+def _match_revision(rev: "str | None", revisions) -> "str | None":
+    if rev is None:
+        return None
+    for known in revisions:
+        if known.startswith(rev) or rev.startswith(known):
+            return known
+    return None
+
+
+def _text_revision_hits(text: str, revisions) -> list[tuple[str, str]]:
+    hits = []
+    for m in _HEX_RUN_RE.finditer(text):
+        known = _match_revision(m.group(0).lower(), revisions)
+        if known is not None:
+            hits.append((m.group(0), known))
+    return hits
+
+
+def _safe_link_text(text: "str | None", url: str) -> bool:
+    """Link text may replace a code-change link only if it restates nothing
+    identifying: no URL, bracket or 7+ hex run, no `#<number>`, and no digit
+    run that is itself a path segment of the link (e.g. its PR number)."""
+    if text is None or not text.strip():
+        return False
+    if "://" in text or "[" in text or "]" in text or re.search(r"#\s*\d", text):
+        return False
+    path_numbers = {seg for seg in urlsplit(url).path.split("/") if seg.isdigit()}
+    if path_numbers & set(re.findall(r"\d+", text)):
+        return False
+    return not _HEX_RUN_RE.search(text)
+
+
+def _retained_path(c: UrlClassification, target, repo_root, revisions) -> tuple:
+    """(path or None, path_exists_at_target or None, reason)."""
+    from urllib.parse import unquote
+
+    if target is None or repo_root is None:
+        return None, None, "no target repository checkout available for path retention"
+    if c.repository != target:
+        return None, None, "pinned URL is not under the target repository"
+    segs = [unquote(s) for s in c.pinned_path]
+    if not segs or any(
+        s in ("", ".", "..") or s.lower() == ".git" or "/" in s or "\\" in s or "\x00" in s for s in segs
+    ):
+        return None, None, "pinned path is not a safely normalizable repository-relative path"
+    rel = "/".join(segs)
+    if _text_revision_hits(rel, revisions):
+        return None, None, "pinned path itself contains a remediation revision"
+    root = Path(repo_root)
+    candidate = root / rel
+    exists = os.path.lexists(candidate) and path_resolves_inside(candidate, root)
+    if not exists:
+        return None, False, "pinned path does not exist in the target checkout"
+    return rel, True, "path exists in the target checkout; revision, query and anchor dropped"
+
+
+def _bare_revision_tokens(content: str, revisions, line_occurrences, line_replacements) -> list:
+    """(start, end, token, matched revision, context) for each standalone hex
+    token on a prose line that names a pass-1 remediation revision. Tokens
+    inside a URL or inside a span already being replaced are skipped (URL
+    sanitization owns them); a token in inline code is redacted only when the
+    code span is exactly that token (`` `<token>` ``)."""
+    protected = [(o.start, o.start + len(o.raw)) for o in line_occurrences]
+    protected += [(s, e) for s, e, _ in line_replacements]
+    code_spans = _inline_code_spans(content)
+    found = []
+    for m in _BARE_REVISION_RE.finditer(content):
+        s, e = m.span(1)
+        known = _match_revision(m.group(1).lower(), revisions)
+        if known is None or any(a < e and s < b for a, b in protected):
+            continue
+        enclosing = [(a, b) for a, b in code_spans if a < s and e <= b]
+        if enclosing and enclosing[0] != (s - 1, e):
+            continue  # part of a larger code span: never rewritten (scan fails closed)
+        context = "heading" if content.startswith("#") else ("inline_code_token" if enclosing else "embedded_prose")
+        found.append((s, e, m.group(1), known, context))
+    return found
+
+
+def _raw_reference_urls(cve) -> tuple:
+    if not isinstance(cve, dict):
+        return ()
+    entries = cve.get("references") or []
+    return tuple(
+        e["url"] for e in entries if isinstance(e, dict) and isinstance(e.get("url"), str) and e["url"]
+    )
+
+
+def replay_transformations(original_text: str, transformations) -> str:
+    """Apply a recorded v2 transformation list to `original_text`.
+
+    Independent of the code path that produced the record: it uses only the
+    serialized records, checks each one against the original bytes, and
+    raises BlindEvaluationError on any inconsistency."""
+    lines = original_text.splitlines(keepends=True)
+    deleted: set = set()
+    replacements: dict = {}
+    for t in transformations:
+        i = t["line_no"] - 1
+        if not 0 <= i < len(lines):
+            raise BlindEvaluationError(f"transformation record names line {t['line_no']}, outside the original")
+        content, _ = _split_newline(lines[i])
+        if content != t["original_line"]:
+            raise BlindEvaluationError(f"transformation record does not match original line {t['line_no']}")
+        if t["action"] == "delete_line":
+            if i in deleted or i in replacements:
+                raise BlindEvaluationError(f"conflicting transformation records for line {t['line_no']}")
+            deleted.add(i)
+        elif t["action"] in ("replace_span", "redact_revision"):
+            if i in deleted or content[t["start"]:t["end"]] != t["original_span"]:
+                raise BlindEvaluationError(f"replacement record does not match original line {t['line_no']}")
+            if t["action"] == "redact_revision" and (
+                t["replacement"] != REVISION_REMOVED_TOKEN
+                or not _HEX_REVISION_RE.match(t["original_span"])
+                or _match_revision(t["original_span"].lower(), (t["matched_revision"] or "",)) is None
+            ):
+                raise BlindEvaluationError(f"revision redaction record is inconsistent on line {t['line_no']}")
+            replacements.setdefault(i, []).append(t)
+        else:
+            raise BlindEvaluationError(f"unknown transformation action {t['action']!r}")
+    out = []
+    for i, line in enumerate(lines):
+        if i in deleted:
+            continue
+        if i in replacements:
+            content, nl = _split_newline(line)
+            limit = len(content)
+            for t in sorted(replacements[i], key=lambda r: r["start"], reverse=True):
+                if t["end"] > limit:
+                    raise BlindEvaluationError(f"overlapping replacement records on line {t['line_no']}")
+                content = content[: t["start"]] + t["replacement"] + content[t["end"]:]
+                limit = t["start"]
+            line = content + nl
+        out.append(line)
+    return "".join(out)
+
+
+def _problem(category: str, line_no: int, line: str, reason: str, url: "str | None" = None,
+             context: "str | None" = None) -> dict:
+    return {"line": line, "url": url, "category": category, "reason": reason,
+            "line_no": line_no, "context": context}
+
+
+def _raise_problems(problems: list) -> None:
+    listed = "; ".join(f"line {p['line_no']}: {p['category']} ({p['url'] or p['reason']})" for p in problems)
+    raise BlindEvaluationError(
+        f"blind evaluation aborted: {len(problems)} condition(s) cannot be transformed safely by "
+        f"{RULE_ID_V2}: {listed}. Nothing was rewritten.",
+        unsupported_references=problems,
+    )
+
+
+def _markdown_or_url_unit(content: str, o: _Occurrence) -> "_Unit | str":
+    """The replaceable span for an eligible occurrence, or a fail-closed reason."""
+    s, e = o.start, o.end
+    if s >= 1 and content[s - 1] == "[" and content[e:e + 2] == "](":
+        return "URL is the text of a Markdown link"
+    if content[max(0, s - 2):s] == "](":
+        if e >= len(content) or content[e] != ")":
+            return "Markdown link with a title or trailing characters inside the parentheses"
+        lb = content.rfind("[", 0, s - 2)
+        if lb == -1 or "]" in content[lb + 1:s - 2]:
+            return "Markdown link text could not be delimited"
+        if lb >= 1 and content[lb - 1] == "!":
+            return "Markdown image pointing at a code-change URL"
+        return _Unit(lb, e + 1, "markdown", o, content[lb + 1:s - 2])
+    if s >= 1 and content[s - 1] == "<":
+        if e < len(content) and content[e] == ">":
+            if content[max(0, s - 3):s - 1] == "](":
+                return "angle-bracketed Markdown link destination"
+            return _Unit(s - 1, e + 1, "url", o)
+        return "unbalanced angle bracket around URL"
+    return _Unit(s, e, "url", o)
+
+
+def blind_vulnerability_text_v2(
+    text: str,
+    *,
+    same_repo_github: "GitHubRepository | None" = None,
+    raw_reference_urls=(),
+    target_repository: "GitHubRepository | None" = None,
+    repo_root=None,
+) -> BlindingResult:
+    """Apply RULE_ID_V2 (and, when `same_repo_github` is given,
+    SAME_REPO_GITHUB_POLICY_ID inside References) to rendered
+    vulnerability_text. See the module docstring's V2 section.
+
+    `raw_reference_urls` are the advisory record's own reference URLs (used
+    only to discover remediation revisions -- never fetched).
+    `target_repository` + `repo_root` enable path retention for sanitized
+    revision-pinned links. Raises BlindEvaluationError on any fail-closed
+    condition or post-transform invariant violation."""
+    if not isinstance(text, str):
+        raise BlindEvaluationError(f"vulnerability_text must be str, got {type(text).__name__}")
+    lines = text.splitlines(keepends=True)
+    body_start, body_end = _locate_references_section(lines)
+    split = [_split_newline(line) for line in lines]
+    problems: list = []
+
+    # References entries: identical structural rules to V1.
+    ref_entries = []
+    for i in range(body_start, body_end):
+        content = lines[i].rstrip("\n")
+        if content == "" or content == _NONE_PLACEHOLDER:
+            continue
+        m = _REFERENCE_LINE_RE.match(content)
+        if not m or not lines[i].endswith("\n"):
+            raise BlindEvaluationError(f"malformed reference line in References section: {content!r}")
+        ref_entries.append((i, content, classify_url_v2(m.group("url"))))
+
+    # Text outside References: URL occurrences, code context, heading region.
+    first_h2 = next((i for i, (c, _) in enumerate(split) if c.startswith("## ")), len(lines))
+    in_references = range(body_start - 1, body_end)
+    occurrences: dict = {}
+    in_code_line: dict = {}
+    fence = False
+    for i, (content, _) in enumerate(split):
+        if content.startswith("## "):
+            fence = False
+        if i in in_references:
+            continue
+        if _FENCE_RE.match(content):
+            fence = not fence
+            in_code_line[i] = True
+        else:
+            in_code_line[i] = fence
+        found = _url_occurrences(i, content)
+        if found:
+            occurrences[i] = found
+
+    # Pass 1: remediation revisions named by direct code-change URLs.
+    revisions: dict = {}
+
+    def _collect(c: UrlClassification, source: str) -> None:
+        if c.kind == KIND_CODE_CHANGE:
+            for r in c.revisions:
+                revisions.setdefault(r, {"revision": r, "source_url": c.url, "source": source})
+
+    for _, _, c in ref_entries:
+        _collect(c, "rendered_references")
+    for found in occurrences.values():
+        for o in found:
+            _collect(o.classification, "rendered_text")
+    for url in raw_reference_urls:
+        _collect(classify_url_v2(url), "raw_advisory_references")
+
+    for found in occurrences.values():
+        for o in found:
+            if o.classification.kind == KIND_PINNED_CONTENT:
+                o.matched_revision = _match_revision(o.classification.pinned_revision, revisions)
+
+    transformations: list = []
+    deleted: set = set()
+    replacements: dict = {}
+    removed_ref = []  # (line content, url, attribution)
+
+    # References decisions.
+    for i, content, c in ref_entries:
+        matched = _match_revision(c.pinned_revision, revisions) if c.kind == KIND_PINNED_CONTENT else None
+        if c.kind == KIND_CODE_CHANGE or matched is not None:
+            attribution, reason = "v2", c.reason
+        elif same_repo_github is not None and _belongs_to_github_repository(c.url, same_repo_github):
+            attribution, reason = "same_repo_github", f"under the target repository ({SAME_REPO_GITHUB_POLICY_ID})"
+        else:
+            if c.kind == KIND_MALFORMED:
+                problems.append(_problem(V2_ABORT_MALFORMED, i + 1, content, c.reason, c.url, "references_entry"))
+            continue
+        deleted.add(i)
+        removed_ref.append((content, c.url, attribution))
+        transformations.append({
+            "action": "delete_line", "context": "references_entry", "line_no": i + 1,
+            "original_line": content, "urls": [c.url], "categories": [c.category],
+            "attribution": attribution, "reason": reason, "matched_revision": matched,
+        })
+
+    # Outside-References decisions, line by line.
+    outside_deleted = []
+    for i in sorted(occurrences):
+        content, _ = split[i]
+        found = occurrences[i]
+        line_problems = []
+        for o in found:
+            if o.classification.kind == KIND_MALFORMED:
+                line_problems.append(_problem(V2_ABORT_MALFORMED, i + 1, content, o.classification.reason, o.url))
+        if i < first_h2 and any(o.raw.endswith("...") for o in found):
+            line_problems.append(_problem(
+                V2_ABORT_TRUNCATED, i + 1, content, "URL truncated in the summary heading cannot be classified",
+                next(o.url for o in found if o.raw.endswith("...")), "heading",
+            ))
+        eligible = [o for o in found if o.eligible]
+        if not eligible or line_problems:
+            problems.extend(line_problems)
+            continue
+        if in_code_line.get(i):
+            problems.extend(_problem(V2_ABORT_CODE, i + 1, content, "code-change URL inside fenced code; code is "
+                                     "never rewritten", o.url, "fenced_code") for o in eligible)
+            continue
+        spans = _inline_code_spans(content)
+        in_inline = [o for o in eligible if any(a < o.start and o.end <= b for a, b in spans)]
+        if in_inline:
+            problems.extend(_problem(V2_ABORT_CODE, i + 1, content, "code-change URL inside inline code; code is "
+                                     "never rewritten", o.url, "inline_code") for o in in_inline)
+            continue
+
+        units: list = []
+        for o in eligible:
+            unit = _markdown_or_url_unit(content, o)
+            if isinstance(unit, str):
+                line_problems.append(_problem(V2_ABORT_MARKDOWN, i + 1, content, unit, o.url, "markdown_link"))
+            else:
+                units.append(unit)
+        units.sort(key=lambda u: u.start)
+        if any(a.end > b.start for a, b in zip(units, units[1:])):
+            line_problems.append(_problem(V2_ABORT_MARKDOWN, i + 1, content, "overlapping link spans", None,
+                                          "markdown_link"))
+        if line_problems:
+            problems.extend(line_problems)
+            continue
+
+        prefix, suffix = content[:units[0].start], content[units[-1].end:]
+        separators = [content[a.end:b.start] for a, b in zip(units, units[1:])]
+        seps_ok = all(_UNIT_SEPARATOR_RE.match(s) for s in separators)
+        heading = content.startswith("#")
+        standalone = (not heading and seps_ok and bool(_STANDALONE_PREFIX_RE.match(prefix))
+                      and bool(_STANDALONE_SUFFIX_RE.match(suffix)) and (("(" in prefix) == (")" in suffix)))
+        pointer = (not heading and seps_ok and all(u.kind == "url" for u in units)
+                   and bool(_POINTER_PREFIX_RE.match(prefix)) and bool(_POINTER_SUFFIX_RE.match(suffix)))
+        all_change = all(u.occurrence.classification.kind == KIND_CODE_CHANGE for u in units)
+
+        if (standalone and all_change) or pointer:
+            context = "remediation_pointer_line" if pointer and not standalone else (
+                "standalone_link_line" if any(u.kind == "markdown" for u in units) else "standalone_url_line")
+            deleted.add(i)
+            outside_deleted.append(i)
+            transformations.append({
+                "action": "delete_line", "context": context, "line_no": i + 1, "original_line": content,
+                "urls": [u.occurrence.url for u in units],
+                "categories": [u.occurrence.classification.category for u in units],
+                "reason": ("line consists only of direct code-change link(s)" if context != "remediation_pointer_line"
+                           else "line is a structural remediation pointer: '<Resolved|Fixed|Patched|Fix|Patch>"
+                                "[ in|by|via][:] <link(s)>[.]'"),
+                "matched_revision": next((u.occurrence.matched_revision for u in units
+                                          if u.occurrence.matched_revision), None),
+            })
+            continue
+
+        for u in units:
+            o = u.occurrence
+            path, exists, path_reason = None, None, None
+            if u.kind == "markdown" and _safe_link_text(u.link_text, o.url):
+                replacement, reason = u.link_text, "Markdown link reduced to its text"
+            elif o.classification.kind == KIND_PINNED_CONTENT:
+                path, exists, path_reason = _retained_path(o.classification, target_repository, repo_root, revisions)
+                replacement = path if path is not None else LINK_REMOVED_TOKEN
+                reason = "revision-pinned link at a remediation revision: " + path_reason
+            else:
+                replacement, reason = LINK_REMOVED_TOKEN, "direct code-change URL span replaced"
+            if heading:
+                context = "heading"
+            elif standalone:
+                context = "standalone_url_line"
+            else:
+                context = "markdown_link" if u.kind == "markdown" else "embedded_prose"
+            replacements.setdefault(i, []).append((u.start, u.end, replacement))
+            transformations.append({
+                "action": "replace_span", "context": context, "line_no": i + 1, "original_line": content,
+                "start": u.start, "end": u.end, "original_span": content[u.start:u.end], "url": o.url,
+                "replacement": replacement, "category": o.classification.category, "reason": reason,
+                "matched_revision": o.matched_revision, "path_retained": path is not None,
+                "path_exists_at_target": exists,
+            })
+
+    # Bare remediation revisions in prose: replace only the token.
+    for i, (content, _) in enumerate(split):
+        if i in in_references or i in deleted or in_code_line.get(i):
+            continue
+        for s, e, token, known, context in _bare_revision_tokens(
+            content, revisions, occurrences.get(i, ()), replacements.get(i, ()),
+        ):
+            replacements.setdefault(i, []).append((s, e, REVISION_REMOVED_TOKEN))
+            transformations.append({
+                "action": "redact_revision", "context": context, "line_no": i + 1, "original_line": content,
+                "start": s, "end": e, "original_span": token, "replacement": REVISION_REMOVED_TOKEN,
+                "category": V2_REVISION_TOKEN, "matched_revision": known,
+                "reason": "standalone hexadecimal token prefix-matching a remediation revision established by "
+                          "pass 1 (case-insensitive); only the token is replaced",
+            })
+
+    if problems:
+        _raise_problems(problems)
+
+    # Blank-line collapse: a deleted paragraph between two blank lines also
+    # takes the blank line before it, so no double blank line is left.
+    runs = []
+    for i in sorted(outside_deleted):
+        if runs and runs[-1][1] == i - 1:
+            runs[-1][1] = i
+        else:
+            runs.append([i, i])
+    for a, b in runs:
+        before, after = a - 1, b + 1
+        if (before >= 0 and after < len(lines) and before not in deleted and not split[before][0].strip()
+                and not split[after][0].strip()):
+            deleted.add(before)
+            transformations.append({
+                "action": "delete_line", "context": "blank_line_collapse", "line_no": before + 1,
+                "original_line": split[before][0], "urls": [], "categories": [],
+                "reason": "blank line preceding a deleted paragraph", "matched_revision": None,
+            })
+
+    # Produce the blinded text (forward construction from internal state).
+    out_lines, out_map = [], []
+    for i, line in enumerate(lines):
+        if i in deleted:
+            continue
+        if i in replacements:
+            content, nl = split[i]
+            pieces, pos = [], 0
+            for s, e, r in sorted(replacements[i]):
+                pieces += [content[pos:s], r]
+                pos = e
+            line = "".join(pieces) + content[pos:] + nl
+        out_lines.append(line)
+        out_map.append(i)
+    blinded = "".join(out_lines)
+    transformations.sort(key=lambda t: (t["line_no"], t.get("start", -1)))
+
+    _check_v2_invariants(text, blinded, out_lines, out_map, transformations, revisions)
+
+    removed_urls = tuple(u for _, u, _ in removed_ref)
+    return BlindingResult(
+        rule_id=RULE_ID_V2,
+        original_text=text,
+        blinded_text=blinded,
+        original_sha256=sha256_text(text),
+        blinded_sha256=sha256_text(blinded),
+        removed_reference_lines=tuple(line for line, _, _ in removed_ref),
+        removed_references=removed_urls,
+        classifications=tuple(c for _, _, c in ref_entries),
+        removed_by_v1=(),
+        removed_same_repo_github=tuple(u for _, u, a in removed_ref if a == "same_repo_github"),
+        same_repo_github_target=same_repo_github,
+        transformations=tuple(transformations),
+        remediation_revisions=tuple(revisions.values()),
+        removed_by_v2=tuple(u for _, u, a in removed_ref if a == "v2"),
+        path_retention_target=target_repository,
+    )
+
+
+def _check_v2_invariants(original, blinded, out_lines, out_map, transformations, revisions) -> None:
+    """Defense in depth over the COMPLETE blinded text: no recognized
+    code-change URL, no revision-pinned link at a remediation revision, no
+    known remediation revision anywhere, and the recorded transformations
+    replay to exactly this text."""
+    for k, line in enumerate(out_lines):
+        content, _ = _split_newline(line)
+        for o in _url_occurrences(k, content):
+            c = o.classification
+            leaked = c.kind in (KIND_CODE_CHANGE, KIND_MALFORMED) or (
+                c.kind == KIND_PINNED_CONTENT and _match_revision(c.pinned_revision, revisions))
+            if leaked:
+                _raise_problems([_problem(V2_ABORT_INVARIANT, out_map[k] + 1, content,
+                                          f"{c.category} URL survives transformation", c.url)])
+    for k, line in enumerate(out_lines):
+        hits = _text_revision_hits(line, revisions)
+        if hits:
+            content, _ = _split_newline(line)
+            _raise_problems([_problem(
+                V2_ABORT_REVISION, out_map[k] + 1, content,
+                f"known remediation revision {hits[0][1]} appears outside any removable code-change URL "
+                f"(as {hits[0][0]!r}); it cannot be removed without rewriting text",
+            )])
+    try:
+        replayed = replay_transformations(original, json.loads(json.dumps(transformations)))
+    except BlindEvaluationError as exc:
+        _raise_problems([_problem(V2_ABORT_INVARIANT, 0, "", f"transformation record does not replay: {exc}")])
+    if replayed != blinded:
+        _raise_problems([_problem(V2_ABORT_INVARIANT, 0, "", "replaying the transformation record does not "
+                                                            "reproduce the blinded text")])
+
+
 @dataclass
 class BlindEvaluationSession:
     """Scoped, opt-in interception for ONE CVE-mode run.
@@ -542,7 +1371,18 @@ class BlindEvaluationSession:
     # exposed through sanitize_remote_url (no userinfo).
     same_repo_github: "GitHubRepository | None" = None
     same_repo_github_remote: "str | None" = None
+    # Filter policy ("v1" default, or "v2"). V2 only: the repository and
+    # checkout used for path retention, and how many raw advisory reference
+    # URLs pass 1 inspected.
+    policy: str = DEFAULT_BLIND_FILTER_POLICY
+    target_repository: "GitHubRepository | None" = None
+    repo_root: "str | None" = None
+    raw_reference_url_count: "int | None" = None
     _saved: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def rule_id(self) -> str:
+        return BLIND_FILTER_POLICIES[self.policy]
 
     def __enter__(self) -> "BlindEvaluationSession":
         from utilities.autopatcher import cve_converter as _converter
@@ -550,6 +1390,8 @@ class BlindEvaluationSession:
 
         if self._saved:
             raise BlindEvaluationError("BlindEvaluationSession is not re-entrant")
+        if self.policy not in BLIND_FILTER_POLICIES:
+            raise BlindEvaluationError(f"unknown blind filter policy {self.policy!r}")
         self._saved = {
             "converter_module": _converter,
             "converter": _converter.cve_to_vuln_text,
@@ -584,7 +1426,15 @@ class BlindEvaluationSession:
             text = original(cve)
             self.original_text = text
             try:
-                self.result = blind_vulnerability_text(text, same_repo_github=self.same_repo_github)
+                if self.policy == "v2":
+                    raw_urls = _raw_reference_urls(cve)
+                    self.raw_reference_url_count = len(raw_urls)
+                    self.result = blind_vulnerability_text_v2(
+                        text, same_repo_github=self.same_repo_github, raw_reference_urls=raw_urls,
+                        target_repository=self.target_repository, repo_root=self.repo_root,
+                    )
+                else:
+                    self.result = blind_vulnerability_text(text, same_repo_github=self.same_repo_github)
             except BlindEvaluationError as exc:
                 self.unsupported_references = list(exc.unsupported_references)
                 self.error = str(exc)
@@ -671,6 +1521,13 @@ class BlindEvaluationSession:
                 "".join(line + "\n" for line in self.result.removed_reference_lines), encoding="utf-8"
             )
             files["removed_reference_lines"] = "removed_reference_lines.txt"
+            if self.policy == "v2":
+                (sidecar / "transformations.json").write_text(json.dumps({
+                    "rule_id": self.rule_id,
+                    "transformations": list(self.result.transformations),
+                    "remediation_revisions": list(self.result.remediation_revisions),
+                }, indent=2), encoding="utf-8")
+                files["transformations"] = "transformations.json"
         (sidecar / "blind_evaluation.json").write_text(json.dumps(self.to_manifest_dict(files), indent=2), encoding="utf-8")
         files["metadata"] = "blind_evaluation.json"
         return files
@@ -679,7 +1536,7 @@ class BlindEvaluationSession:
         r = self.result
         manifest = {
             "enabled": True,
-            "rule_id": RULE_ID,
+            "rule_id": self.rule_id,
             "status": self.status(),
             "original_sha256": r.original_sha256 if r else (sha256_text(self.original_text) if self.original_text is not None else None),
             "blinded_sha256": r.blinded_sha256 if r else None,
@@ -700,8 +1557,11 @@ class BlindEvaluationSession:
         }
         if self.same_repo_github is not None:
             # Additive keys, present only when the opt-in policy is enabled --
-            # default-mode manifests are byte-identical to before.
-            manifest["removed_by_v1"] = list(r.removed_by_v1) if r else []
+            # default-mode manifests are byte-identical to before. Under V2
+            # the filter's own removals are reported as removed_by_v2 (below),
+            # never under the V1 key.
+            if self.policy != "v2":
+                manifest["removed_by_v1"] = list(r.removed_by_v1) if r else []
             manifest["removed_same_repo_github"] = list(r.removed_same_repo_github) if r else []
             manifest["same_repo_github_policy"] = {
                 "enabled": True,
@@ -710,4 +1570,19 @@ class BlindEvaluationSession:
                 "target_source": "origin remote of --repo-root",
                 "target_remote_url": sanitize_remote_url(self.same_repo_github_remote),
             }
+        if self.policy == "v2":
+            # Additive, V2-only keys; V1 manifests never carry them.
+            manifest["removed_by_v2"] = list(r.removed_by_v2) if r else []
+            manifest["transformations"] = list(r.transformations) if r else []
+            manifest["transformation_count"] = len(r.transformations) if r else 0
+            manifest["remediation_revisions"] = list(r.remediation_revisions) if r else []
+            manifest["raw_reference_url_count"] = self.raw_reference_url_count
+            manifest["path_retention"] = {
+                "target_repository": self.target_repository.slug if self.target_repository else None,
+                "target_checkout_checked": self.target_repository is not None and self.repo_root is not None,
+            }
+            manifest["post_transform_checks"] = (
+                {"code_change_rescan_clean": True, "remediation_revision_scan_clean": True,
+                 "transformation_replay_verified": True} if r else None
+            )
         return manifest

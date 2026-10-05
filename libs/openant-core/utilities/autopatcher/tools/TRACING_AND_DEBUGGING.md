@@ -1651,3 +1651,50 @@ anything. Without it, blind evaluation is exactly the V1 contract above.
   `original_sha256` / `blinded_sha256` hash the exact original and final text;
   `rule_id` stays `blind-evaluation-filter/v1`. Default-mode manifests are
   unchanged.
+
+**Opt-in contract `blind-evaluation-filter/v2` (`--blind-filter-policy v2`).**
+Valid only with `--blind-evaluation` (alone, `run_traced.py` exits 2 before
+doing anything); the default stays `v1`, whose behavior and manifests are
+unchanged. `blind_evaluation.rule_id` records the contract actually applied.
+The full contract is in `blind_evaluation.py`'s module docstring (V2 section);
+in short:
+
+- **Classification is separate from transformation.** `classify_url_v2` says
+  what a URL is (`code_change`, `revision_pinned_content`,
+  `malformed_code_change_url`, `ordinary`); what may be done to the text is
+  decided by structural context only.
+- **Two passes.** Pass 1 collects hex revisions named by code-change URLs in
+  the rendered text and in the advisory record's raw reference URLs (including
+  those past the five-reference rendering cap) -- never fetched, no git
+  history. Pass 2 treats a `blob`/`tree`/`blame`/`raw` (or
+  `raw.githubusercontent.com`) link as leakage only when its revision
+  prefix-matches a pass-1 revision; other pinned links are kept.
+- **Contexts.** Code-change References entries and standalone link-only lines
+  are deleted; a line of exactly
+  `[bullet] Resolved|Fixed|Patched|Fix|Patch [in|by|via][:] <links>[.]` is
+  deleted (the only phrase-level rule); elsewhere only the unsafe span is
+  replaced (`[link removed]`, a Markdown link's own text, or -- for a pinned
+  link under the target repository whose normalized path exists in the
+  checkout -- the repository-relative path, with revision, query and line
+  anchor dropped). A deleted paragraph also takes the blank line before it.
+- **Bare remediation revisions.** A standalone 7-40 hex token in prose that
+  prefix-matches (either direction, case-insensitive) a pass-1 revision is
+  replaced -- token only -- by `[revision removed]` (action
+  `redact_revision`); inside inline code only when the code span is exactly
+  that token (backticks kept). Tokens inside URLs, identifiers, larger code
+  spans or fenced code are never rewritten.
+- **Fail closed** on malformed code-change URLs, eligible URLs in fenced or
+  inline code, URLs truncated in the summary heading, ambiguous Markdown, and
+  any known remediation revision the token rule may not redact.
+- **Invariants.** The complete blinded text is rescanned (no code-change,
+  malformed or remediation-pinned URL; no remediation revision), and the
+  recorded transformations must replay to it exactly; otherwise abort.
+- **Audit.** V2-only keys: `removed_by_v2` (References lines removed by the
+  filter itself; `removed_by_v1` never appears under v2), `transformations`
+  (action, context, line, original line/span, URL, replacement, category,
+  reason, matched revision, path retention), `transformation_count`,
+  `remediation_revisions`, `raw_reference_url_count`, `path_retention`,
+  `post_transform_checks`; sidecar `transformations.json`. Path retention uses
+  the same-repo target when `--blind-strip-same-repo-github-references` is
+  given, otherwise `--repo-root`'s GitHub `origin` if there is one; with no
+  identity, pinned links are removed rather than path-reduced.

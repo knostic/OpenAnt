@@ -79,3 +79,262 @@ cases:
       Sensitive-information-exposure case chosen to diversify the evaluation
       beyond injection and path-validation vulnerabilities and exercise
       reasoning about intended data flow.
+  
+  - id: opendiamond-cve-2022-31506
+    display_name: OpenDiamond
+    repo: https://github.com/cmusatyalab/opendiamond.git
+    cve: CVE-2022-31506
+    language: Python
+    sha: d2f20ffff793f88335f2c0244679d7193295abe2
+
+  - id: products-genericsetup-cve-2021-21360
+    display_name: Products.GenericSetup
+    repo: https://github.com/zopefoundation/Products.GenericSetup.git
+    cve: CVE-2021-21360
+    language: Python
+    sha: 835c1ac23e18b7b6f8b7facd5caebe0e997d3500
+
+  - id: rdiffweb-cve-2022-4724
+    display_name: rdiffweb
+    repo: https://github.com/ikus060/rdiffweb.git
+    cve: CVE-2022-4724
+    language: Python
+    sha: d1aaa96b665a39fba9e98d6054a9de511ba0a837
+
+  - id: luigi-cve-2024-21542
+    display_name: Luigi
+    repo: https://github.com/spotify/luigi.git
+    cve: CVE-2024-21542
+    language: Python
+    sha: c9a0d2074be5bc03008485aeeef90678f1567231
+
+  - id: airflow-cve-2022-41672
+    display_name: Apache Airflow
+    repo: https://github.com/apache/airflow.git
+    cve: CVE-2022-41672
+    language: Python
+    sha: d81b2971bc4384775deff49522458d434255ca46
+
+  - id: celery-cve-2021-23727
+    display_name: Celery
+    repo: https://github.com/celery/celery.git
+    cve: CVE-2021-23727
+    language: Python
+    sha: 2d8dbc2a8087bbb60590465031ebd5138b8eb359
+
+  - id: django-cve-2018-14574
+    display_name: Django
+    repo: https://github.com/django/django.git
+    cve: CVE-2018-14574
+    language: Python
+    sha: af344691114e4a68334c30543bfb838996328212
+
+  - id: jupyter-notebook-cve-2019-10856
+    display_name: Jupyter Notebook
+    repo: https://github.com/jupyter/notebook.git
+    cve: CVE-2019-10856
+    language: Python
+    sha: 16cf97cf3cc7bd3bacf939ecd86f2c1cc6944935
+
+  - id: python-dbusmock-cve-2015-1326
+    display_name: python-dbusmock
+    repo: https://github.com/martinpitt/python-dbusmock.git
+    cve: CVE-2015-1326
+    language: Python
+    sha: a4bd39f63ffd8213218bfafd6f0f4e1ca50cb6d4
+
+  - id: django-cve-2024-39330
+    display_name: Django
+    repo: https://github.com/django/django.git
+    cve: CVE-2024-39330
+    language: Python
+    sha: 156d3186c96e3ec2ca73b8b25dc2ef366e38df14
+
+  - id: twisted-cve-2022-21712
+    display_name: Twisted
+    repo: https://github.com/twisted/twisted.git
+    cve: CVE-2022-21712
+    language: Python
+    sha: 7039a20e8a56c000cb95262ac02b3195349759d1
+
+  - id: opencanary-cve-2024-48911
+    display_name: OpenCanary
+    repo: https://github.com/thinkst/opencanary.git
+    cve: CVE-2024-48911
+    language: Python
+    sha: d3956bc602f95d2bec55eebc96d5e3a2cb35bf47
+
+  - id: starlette-cve-2023-29159
+    display_name: Starlette
+    repo: https://github.com/encode/starlette.git
+    cve: CVE-2023-29159
+    language: Python
+    sha: 24c1fac62a80bb153c6548145334fc643991e35a
+
+  - id: waitress-cve-2019-16789
+    display_name: Waitress
+    repo: https://github.com/Pylons/waitress.git
+    cve: CVE-2019-16789
+    language: Python
+    sha: f11093a6b3240fc26830b6111e826128af7771c3
+
+  - id: restrictedpython-cve-2023-41039
+    display_name: RestrictedPython
+    repo: https://github.com/zopefoundation/RestrictedPython.git
+    cve: CVE-2023-41039
+    language: Python
+    sha: 41a183d59a0224e86cb3e8c5eab9b75f5bfe2d62
+
+  - id: django-cve-2021-31542
+    display_name: Django
+    repo: https://github.com/django/django.git
+    cve: CVE-2021-31542
+    language: Python
+    sha: 7f1b088ab4a4342a87a11496096471703994a006
+
+  - id: mechanicalsoup-cve-2023-34457
+    display_name: MechanicalSoup
+    repo: https://github.com/MechanicalSoup/MechanicalSoup.git
+    cve: CVE-2023-34457
+    language: Python
+    sha: b9c8a0c48e44d70b9128a8e0befa3a50df0e4b58
+
+  - id: mlflow-cve-2024-3848
+    display_name: MLflow
+    repo: https://github.com/mlflow/mlflow.git
+    cve: CVE-2024-3848
+    language: Python
+    sha: c01c02a315431fddd40f6b18f1d8791d4cdd20da
+
+  - id: django-cve-2015-8213
+    display_name: Django
+    repo: https://github.com/django/django.git
+    cve: CVE-2015-8213
+    language: Python
+    sha: 710e11d076b9e5ef3e3b486dfb70bb55b788691c
+
+  - id: bleach-cve-2018-7753
+    display_name: Bleach
+    repo: https://github.com/mozilla/bleach.git
+    cve: CVE-2018-7753
+    language: Python
+    sha: e7f83b82b023e4956f99e9316fc7a621f6f507af
+
+  - id: planet-client-python-cve-2023-32303
+    display_name: Planet Client Python
+    repo: https://github.com/planetlabs/planet-client-python.git
+    cve: CVE-2023-32303
+    language: Python
+    sha: 9783607b2d79496f912f2da9ec60084fa43438ed
+
+  - id: aiohttp-cve-2024-23334
+    display_name: aiohttp
+    repo: https://github.com/aio-libs/aiohttp.git
+    cve: CVE-2024-23334
+    language: Python
+    sha: 33ccdfb0a12690af5bb49bda2319ec0907fa7827
+
+  - id: chuanhuchatgpt-cve-2024-5823
+    display_name: ChuanhuChatGPT
+    repo: https://github.com/gaizhenbiao/chuanhuchatgpt.git
+    cve: CVE-2024-5823
+    language: Python
+    sha: ffea5e9419ed517e8b80208567f4f70404047cbe
+
+  - id: scrapy-cve-2021-41125
+    display_name: Scrapy
+    repo: https://github.com/scrapy/scrapy.git
+    cve: CVE-2021-41125
+    language: Python
+    sha: 4183925b4b7114f772883c04e7cef44d766f0f80
+
+  - id: pyjwt-cve-2022-29217
+    display_name: PyJWT
+    repo: https://github.com/jpadilla/pyjwt.git
+    cve: CVE-2022-29217
+    language: Python
+    sha: 24b29adfebcb4f057a3cef5aaf35653bc0c1c8cc
+
+  - id: airflow-cve-2024-39877
+    display_name: Apache Airflow
+    repo: https://github.com/apache/airflow.git
+    cve: CVE-2024-39877
+    language: Python
+    sha: 09bbc9c62f04fd730d3a531dd1f271ac7e9c54ff
+
+  - id: rdiffweb-cve-2022-3298
+    display_name: rdiffweb
+    repo: https://github.com/ikus060/rdiffweb.git
+    cve: CVE-2022-3298
+    language: Python
+    sha: 667657c6fe2b336c90be37f37fb92f65df4feee3
+
+  - id: snowflake-connector-python-cve-2023-34233
+    display_name: Snowflake Connector for Python
+    repo: https://github.com/snowflakedb/snowflake-connector-python.git
+    cve: CVE-2023-34233
+    language: Python
+    sha: 4b1d4741eb6e902dd415ad7cd91fc04c231bcca4
+
+  - id: numexpr-cve-2023-39631
+    display_name: NumExpr
+    repo: https://github.com/pydata/numexpr.git
+    cve: CVE-2023-39631
+    language: Python
+    sha: 74d597398ba3c379c196e469d40f516de110eaa5
+
+  - id: jupyter-core-cve-2022-39286
+    display_name: Jupyter Core
+    repo: https://github.com/jupyter/jupyter_core.git
+    cve: CVE-2022-39286
+    language: Python
+    sha: d3f61f336bfe5c6c63e1af0d8c9fb0dea59f8793
+
+  - id: h11-cve-2025-43859
+    display_name: h11
+    repo: https://github.com/python-hyper/h11.git
+    cve: CVE-2025-43859
+    language: Python
+    sha: 9462006f6ce4941661888228cbd4ac1ea80689b0
+
+  - id: ansible-cve-2021-3583
+    display_name: Ansible
+    repo: https://github.com/ansible/ansible.git
+    cve: CVE-2021-3583
+    language: Python
+    sha: c49092fd2929e85276bfe60fc63d3f47f8aa4646
+
+  - id: ansible-cve-2020-10691
+    display_name: Ansible
+    repo: https://github.com/ansible/ansible.git
+    cve: CVE-2020-10691
+    language: Python
+    sha: cef6296735a0baebcd2f25d967c7bdb770ed6b08
+
+  - id: kiwi-tcms-cve-2023-33977
+    display_name: Kiwi TCMS
+    repo: https://github.com/kiwitcms/Kiwi.git
+    cve: CVE-2023-33977
+    language: Python
+    sha: ce5b83ef9745f90e24b34a08147e898a52d4c0f3
+
+  - id: mlflow-cve-2023-30172
+    display_name: MLflow
+    repo: https://github.com/mlflow/mlflow.git
+    cve: CVE-2023-30172
+    language: Python
+    sha: d1c7621940fabb7fd3895699f5d16d0799f5d121
+
+  - id: langchain-cve-2024-0243
+    display_name: LangChain
+    repo: https://github.com/langchain-ai/langchain.git
+    cve: CVE-2024-0243
+    language: Python
+    sha: 817b84de9e2cd9f2e16a11004caea6fa53aefed8
+
+  - id: mlflow-cve-2023-6831
+    display_name: MLflow
+    repo: https://github.com/mlflow/mlflow.git
+    cve: CVE-2023-6831
+    language: Python
+    sha: 9612ef043d7fe88f3ee899657a1d0fc2faf8ae0f
