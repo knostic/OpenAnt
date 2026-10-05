@@ -12,18 +12,8 @@ next to the Auto Patcher subsystem, not a gitignored scratch directory —
 because a debugging session usually starts by opening these files side by
 side.
 
-Everything below was verified against the current working tree of this repo
-(`/Users/goddess/dev/OpenAnt`) on 2026-08-31, including the stage-replay
-execution-graph work landed since this document was last refreshed (see
-§9 and §19-§22 in particular — single-stage replay now covers 12 of the
-13 canonical pipeline stages, generalized well beyond the original
-`test_plan_discovery`-only capability). Where behavior recently changed
-(see the LLM-configuration refactor in §3, and the replay generalization
-in §19), this document describes **only** the current state — not any
-superseded one. If a section number or a specific file:line reference
-below looks wrong, re-verify against source rather than trusting this
-document; it is the kind of thing that goes stale fast in an actively
-developed subsystem.
+This document describes the current tooling only. If a statement below
+disagrees with the source, the source is authoritative.
 
 For the pipeline's overall architecture — every canonical stage, execution
 recording, and how replay shares implementation with production — see
@@ -34,9 +24,9 @@ assumes the architecture document's vocabulary (canonical stage,
 *how to run and inspect the system*, not on explaining that vocabulary
 from scratch.
 
-Generic placeholder: `<OPENANT_REPO_ROOT>` stands in for
-`/Users/goddess/dev/OpenAnt` wherever a path is otherwise specific to this
-machine.
+`<OPENANT_REPO_ROOT>` stands for your OpenAnt checkout. Commands use
+`python3` for any Python ≥ 3.11 that has OpenAnt's dependencies installed
+(for example the managed venv, `~/.openant/venv/bin/python`).
 
 ---
 
@@ -50,7 +40,9 @@ machine.
 | `libs/openant-core/utilities/autopatcher/tools/run_cve_batch.py` | The standard real-CVE regression/evaluation batch runner (see §26 and `RUN_CVE_BATCH.md`, same directory). Runs every case of one or more YAML manifests through `run_traced.py` with bounded parallelism (default `--jobs 2`), an isolated checkout/output/CWD per case attempt, canonical evaluation flags, aggregate summaries, a results ZIP and `--resume`. `run_patcheval_python_37.py` is a thin wrapper around it. |
 | `libs/openant-core/utilities/autopatcher/tools/run_stage.py` | Single-stage debug replay tool (see §19), same directory. A thin CLI wrapper around `replay_engine.replay_stage()` — consumes a source run/replay directory and reruns exactly ONE canonical pipeline stage's CURRENT implementation against upstream state resolved from that source's lineage. Accepts any of the 13 canonical stage names; **12 of the 13 currently have a working replay implementation** (every stage except `trust_signals_and_recommendation`, which has no independent execution to replay — see the architecture document's [Terminal reporting architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#terminal-reporting-architecture)). |
 | `libs/openant-core/utilities/autopatcher/replay_engine.py` | The current, stage-registry-driven replay engine `run_stage.py` calls. Owns dependency resolution, capability-aware preflight, stage invocation, and manifest persistence for every replayable stage. Each stage's replay handler calls the *same* production stage-implementation function `pipeline.run()` calls — see the architecture document's [Shared production/replay architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#shared-productionreplay-architecture). |
-| `libs/openant-core/utilities/autopatcher/stage_replay.py` | The Phase-1 predecessor to `replay_engine.py`. No longer the entry point `run_stage.py` calls, but still supplies reused helpers (`SourceProvenance`, `resolve_source_provenance`, `validate_target_repository`, output-directory safety checks) that `replay_engine.py` imports directly. |
+| `libs/openant-core/utilities/autopatcher/stage_replay.py` | Helpers that `replay_engine.py` imports: `SourceProvenance`, `resolve_source_provenance`, `validate_target_repository`, and output-directory safety checks. |
+| `libs/openant-core/utilities/autopatcher/tools/replay_challenger_reparse.py` | Zero-LLM reparse of an archived `challenger` execution's raw response through the *current* `patch_challenger.py` parser and verdict derivation (`--source-run`, `--output`; writes `challenger_reparse.json`). Useful after a parser change. |
+| `tools/concern_tree_harness.py`, `simple_concern_harness.py`, `concrete_trace_harness.py` | Research harnesses for experimental Challenger designs (`concern_tree.py`, `simple_concern_resolver.py`, `concrete_trace.py`). Not used by `openant patch` or the production pipeline. |
 | `libs/openant-core/utilities/autopatcher/stage_registry.py` | The static, side-effect-free catalog of all 13 canonical stages: names, approved dependency graph, capability flags (repo access / Docker / LLM provider), and which `stage=` LLM tags each canonical stage owns. Answers "what IS this stage," never "is it replayable today" (that's `replay_engine.REPLAY_HANDLERS`). |
 | `libs/openant-core/utilities/autopatcher/execution_recorder.py` | `ExecutionRecorder` — passive recording of real `StageExecution` entries during a production run. Strictly opt-in: `pipeline.run()`'s `execution_recorder` parameter defaults to `None`, and only `run_traced.py` constructs one. A plain `openant patch` run records nothing. |
 | `libs/openant-core/utilities/autopatcher/lineage.py` | The manifest schema (v3, `executions: [...]`) and the lineage/dependency-resolution logic (`resolve_effective`, `build_chain`) both production recording and replay share. |
@@ -59,7 +51,7 @@ machine.
 | Trace output (`<output>/trace/`) | Written only when running via `run_traced.py`. Per-call prompt/response text files, `checkpoints.jsonl`, `run_manifest.json`, and an `executions/` directory of per-`StageExecution` JSON artifacts. |
 | Replay output (`<output>/` from `run_stage.py`) | Written only when running via `run_stage.py`. One new `StageExecution`, its own `run_manifest.json` (`kind: "replay"`, `parent` pointing at the source run), and that stage's own artifact file(s). |
 | Debug artifacts (`./reports/debug/*.json`) | Written by the *production* pipeline itself whenever `AUTOPATCHER_DEBUG=1` is set (by hand, or automatically by `run_traced.py`). Observability-only — never fed back into pipeline decisions. |
-| Trust Report (`<patch_dir>/<label>-trust-report.md`) | The final, user-facing artifact. Produced by every run (traced or not). Downstream of everything else — treat it as a claim to verify, not a starting fact. |
+| Trust Report (`<output>/patch/<label>-trust-report.md`) | The final, user-facing artifact, produced by every completed run (traced or not). It is downstream of everything else, so treat it as a claim to verify, not a starting fact. |
 
 Scope of this document: **build → run → trace → debug → regression
 validation** for Auto Patcher specifically. It does not attempt to document
@@ -90,7 +82,7 @@ the binary — the symlink resolves to the new file automatically, with no
 copy step:
 
 ```bash
-cd /Users/goddess/dev/OpenAnt/apps/openant-cli
+cd <OPENANT_REPO_ROOT>/apps/openant-cli
 go build -o bin/openant .
 ```
 
@@ -99,7 +91,7 @@ go build -o bin/openant .
 Run once, from the repo root:
 
 ```bash
-ln -sf "/Users/goddess/dev/OpenAnt/apps/openant-cli/bin/openant" /usr/local/bin/openant
+ln -sf "<OPENANT_REPO_ROOT>/apps/openant-cli/bin/openant" /usr/local/bin/openant
 ```
 
 After this, every `go build -o bin/openant .` is picked up immediately with
@@ -107,11 +99,10 @@ no further steps.
 
 ### 2.3 If you use `sudo cp` instead
 
-The task that produced this document was framed around `sudo cp
-bin/openant /usr/local/bin/openant`. That command still *works* — but if
-`/usr/local/bin/openant` is the symlink from §2.2, `cp` follows the symlink
-and writes through it to the same underlying file (`bin/openant`) that is
-already the source. That's exactly why you may see:
+`sudo cp bin/openant /usr/local/bin/openant` still *works*. If
+`/usr/local/bin/openant` is the symlink from §2.2, however, `cp` follows the
+symlink and writes through it to the same file (`bin/openant`) that is
+already the source. That is why you may see:
 
 ```
 cp: bin/openant and /usr/local/bin/openant are identical (not copied).
@@ -137,12 +128,9 @@ type -a openant
 ```
 
 Both matter because **more than one `openant` executable can be on PATH**.
-This has been observed concretely on this machine:
-
-- `/usr/local/bin/openant` — the Go CLI binary this document is about.
-- `/Library/Frameworks/Python.framework/Versions/3.12/bin/openant` — an
-  unrelated Python package's console-script entry point that happens to
-  share the name `openant`.
+For example, a Python environment that has `libs/openant-core` installed
+also has an `openant` console script, alongside the Go CLI binary this
+document is about.
 
 `which openant` shows only the first match your shell will actually invoke.
 `type -a openant` (zsh/bash) lists **every** match on PATH in resolution
@@ -159,12 +147,13 @@ openant patch --help
 ```
 
 `openant version` prints the Go build version, the Go runtime version, and
-(if detectable) the resolved Python interpreter version — a quick way to
-notice if you're accidentally running a stale or wrong binary. `openant
-patch --help` should show, at minimum, `--finding-id`, `--cve`,
-`--repo-root`, `--output`/`-o`, `--context-budget-policy`, and
-`--max-context-budget-windows`, plus the global `--json`, `--quiet`/`-q`,
-`--api-key`, and `--project`/`-p` flags.
+(if detectable) the resolved Python interpreter version. It is a quick way
+to notice that you are running a stale or wrong binary. `openant patch
+--help` should show `--finding-id`, `--cve`, `--repo-root`, `--output`/`-o`,
+`--verbose` and the two deprecated context-budget flags, plus the global
+`--json`, `--quiet`/`-q`, `--api-key` and `--project`/`-p` flags. The Go CLI
+has no `--compare-existing-tests` flag; that flag exists only on the Python
+`patch` command and on `run_traced.py`.
 
 ### 2.6 When a Go rebuild is (and isn't) actually necessary
 
@@ -192,12 +181,6 @@ diff touches anything under `apps/openant-cli/` — if not, skip the rebuild.
 ---
 
 ## Section 3 — LLM Configuration (current behavior)
-
-**This section describes only the current, post-refactor behavior** (commit
-`7b59b1a`, "refactor(auto-patcher): align LLM configuration with OpenAnt",
-which deleted the previous Auto-Patcher-specific `patch_llm.go` and
-`llm_config.py`). Earlier commits on this branch (`d214bae`, `6753e22`)
-represent a superseded intermediate design — do not treat them as current.
 
 ### 3.1 Where provider/model selection comes from
 
@@ -240,10 +223,11 @@ unset LLM_PROVIDER
 unset LLM_MODEL
 ```
 
-`LLM_PROVIDER` and `LLM_MODEL` are read in exactly one module
-(`utilities/autopatcher/llm_client.py`) and **are no longer a way to select a
-real provider/model**. If either is set to anything other than the one
-exception below, Auto Patcher raises immediately:
+`LLM_PROVIDER` and `LLM_MODEL` **are not a way to select a real provider or
+model** (`utilities/autopatcher/llm_client.py`; the batch runner also refuses
+to start when they are set). A non-mock `LLM_PROVIDER` fails in the preflight,
+before any repository work. A set `LLM_MODEL` fails at the first live LLM
+call:
 
 ```python
 # llm_client.py — _resolve_active_provider()
@@ -290,13 +274,11 @@ The module docstring is explicit:
 > Auto-Patcher-specific test/research escape hatch... It is never an
 > implicit fallback — there is no "unset → mock" default.
 
-No failure mode (missing config, missing credentials, auth error, rate
-limit, malformed response, model-not-found) degrades into mock. All of
-those re-raise a real error. There is one vestigial, display-only code path
-(`LLMClient.__init__`/`is_mock` falling back to `not bool(OPENAI_API_KEY)`
-when nothing else has set `_cached_provider` yet) — per its own test suite's
-comment, "it never selects anything itself." Don't rely on it; it's legacy
-plumbing kept only for a label, not a selection mechanism.
+No failure mode degrades into mock: missing config, missing credentials,
+an auth error, a rate limit, a malformed response, a model the provider
+does not know. All of them raise a real error. A configured model the
+provider rejects raises `ModelUnavailableError`; there is never a fallback
+to another model.
 
 ### 3.5 How a run tells you which provider/model actually ran
 
@@ -316,19 +298,29 @@ places report the real answer:
 
    with a `⚠️ **MOCK MODE**` banner when `llm_mode == "MOCK"`.
 
-2. **Live stderr during the run**, from `llm_client.call_llm()`:
+2. **The run header on stderr** (`core/patch.py`), printed once before the
+   pipeline starts:
 
    ```
-   Using Anthropic (model: claude-...)
-   ```
-   or, in mock mode:
-   ```
-   Using mock LLM
+   OpenAnt Auto Patcher
+   ────────────────────────────────────────────────────────────
+   CVE         CVE-2023-43804
+   Repository  /tmp/urllib3-eval
+   Model       Anthropic · claude-...
    ```
 
-The CLI's own stdout summary (`PrintPatchSummary`) does **not** print
-provider/model — only the finding/CVE id and the Trust Report path. Always
-check the Trust Report's metadata table or the stderr log, never assume.
+   In mock mode the model line reads `Mock`. `--quiet`/`--json` suppress the
+   header. A caller that bypasses `core/patch.py` gets a single `Model  …`
+   line on its first live call instead.
+
+The CLI's own stdout summary (`PrintPatchSummary`) does **not** print the
+provider or model, only the finding/CVE id and the Trust Report path. Check
+the Trust Report's metadata table or the stderr log; never assume.
+
+Other environment variables that affect a run: `LLM_MAX_TOKENS` (output
+tokens per call, default 4096; this also reduces the source-evidence capacity,
+see §5), `NVD_API_KEY` (optional; raises NVD rate limits for `--cve`), and
+`AUTOPATCHER_DEBUG` (debug artifacts, §10).
 
 ---
 
@@ -385,70 +377,67 @@ Why each step matters:
 
 ---
 
-## Section 5 — Baseline Run Flags (historical; Fix B)
+## Section 5 — Context-Budget Flags (deprecated) and Technical Capacity
+
+`--context-budget-policy` and `--max-context-budget-windows` are **deprecated
+no-ops**. `openant patch`, the Python `patch` command, and `run_traced.py`
+still accept them, with the same validation, so existing scripts keep
+working. When either flag is passed, a deprecation warning is printed
+straight to stderr, bypassing the progress layer, so Python-side
+`--quiet`/`--json` do not hide it. (The Go CLI's own `--quiet` drops the
+Python stderr stream entirely.) Neither flag changes anything else. `run_traced.py` records the raw values (or `null`)
+in `run_manifest.json`.
+
+Repository evidence in every LLM call is bounded instead by a per-call
+technical capacity (`technical_capacity.compute_source_capacity`):
 
 ```
---context-budget-policy always
---max-context-budget-windows 10
+source_capacity_chars = (context_window_tokens − LLM_MAX_TOKENS − 2,000) × 3 − known_overhead_chars
 ```
 
-**Fix B (release hardening) retired the mechanism these flags used to
-control.** They are still accepted (both by the Go CLI and `run_traced.py`,
-forwarded verbatim to Python) so an existing script keeps working, but
-Python now only prints a one-time deprecation notice and otherwise ignores
-them — see `openant/cli.py`'s `cmd_patch`/`utilities.autopatcher.
-context_budget.ContextBudgetController`.
+`context_window_tokens` comes from `config/models.json` when the active model
+has a `context_window_tokens` entry. **No model has one today**, so every run
+uses the documented fallback of 60,000 tokens (`capacity_source:
+"conservative_fallback"`). Fixed structural limits (attempts, rounds,
+requests per round, 5,000 new characters per acquisition round) apply on top;
+see the architecture document's
+[Context capacity](../../../../../docs/auto-patcher/auto-patcher-architecture.md#context-capacity)
+section.
 
-What governs repository-evidence visibility now, instead: every
-acquisition stage's rendering ceiling is the **real per-call technical
-source capacity** of the active model — see `utilities.autopatcher.
-technical_capacity.compute_source_capacity()`. This is derived from
-`core.model_registry.context_window_tokens()` (or one documented,
-provider-independent conservative fallback when the registry has no entry
-for the active model) minus the exact, already-known overhead of that
-call's own system prompt/vulnerability text/other non-source content,
-converted to a character ceiling via one fixed, deliberately conservative
-`CONSERVATIVE_CHARS_PER_TOKEN` ratio. There is no "window" concept left to
-extend, and no policy to choose — this ceiling applies identically whether
-or not these two flags are passed.
+`ContextBudgetController.to_trace_dict()` is embedded as `budget_trace` in
+`edit_readiness_*.json` and `post_patch_recovery_*.json` (§10). It has the
+shape `{provider, model, stages: {<stage>: {source_capacity_chars,
+capacity_source, context_window_tokens, reserved_output_tokens,
+safety_margin_tokens, chars_per_token_ratio, known_overhead_chars,
+capacity_is_approximate, used_chars}}}`. The controller is built without a
+provider or model, so `provider`/`model` are `null` there.
 
-The old per-stage `"budget_trace"` field (`ContextBudgetController.
-to_trace_dict()`, embedded in `edit_readiness_*.json`/
-`post_patch_recovery_*.json`, see §10) still exists, but now reports the
-technical-capacity decision for each stage — `capacity_source`
-(`"model_registry"` or `"conservative_fallback"`), `context_window_tokens`,
-`chars_per_token_ratio`, `known_overhead_chars`, and the resulting
-`source_capacity_chars` — never a window/policy state.
-
-**These two flags are no longer needed in a real-CVE regression command.**
-Passing them is harmless (a deprecation notice fires, nothing else
-changes); omitting them is now the recommended default, since the default
-path already uses the real technical capacity rather than a small fixed
-ceiling.
+Omit both flags in new commands. The batch runner (§26) still passes them,
+only so that its command line stays identical across batches.
 
 ---
 
 ## Section 6 — Normal Auto Patcher Run
 
 ```bash
-openant patch --cve CVE-2023-43804 \
-  --repo-root /tmp/urllib3-eval \
-  --context-budget-policy always \
-  --max-context-budget-windows 10
+openant patch --cve CVE-2023-43804 --repo-root /tmp/urllib3-eval -o /tmp/urllib3-report
 ```
 
 or, for a Finding produced by a prior OpenAnt scan (instead of a CVE):
 
 ```bash
-openant patch --finding-id <finding-id> \
-  --context-budget-policy always \
-  --max-context-budget-windows 10
+openant patch --finding-id <finding-id>
 ```
 
-`--output` defaults to the active project's scan directory; pass `-o
-<dir>` to redirect it. `--repo-root` defaults to the active project's repo
-path for `--finding-id` mode, but is **required** for `--cve` mode unless a
-project is active.
+`--output` defaults to the active project's scan directory, or to a new
+temporary directory when no project is active; pass `-o <dir>` to redirect
+it. `--repo-root` defaults to the active project's repository path, and is
+**required** for `--cve` mode unless a project is active. `--verbose` adds
+per-stage diagnostics (hunk repair, relocation, retries, evidence-acquisition
+rounds) and full tracebacks; Go's `--quiet`/`--json` also quiet the Python
+side. A normal run writes `<output>/patch/` plus `<output>/patch.report.json`
+(OpenAnt's step report). It exits 0 when a Trust Report was written, and 2
+on failure.
 
 ### Normal run vs. traced run — when to use which
 
@@ -457,7 +446,7 @@ project is active.
 | Purpose | Product/regression behavior — "does this CVE end up Deploy After Validation / Do Not Apply as expected?" | Deep investigation — "why did each stage decide what it decided?" |
 | Invocation | Go CLI → Python subprocess | In-process Python, no subprocess |
 | LLM call visibility | None beyond stderr logging and the final Trust Report | Every prompt + raw response saved to disk, per call |
-| Extra artifacts | None beyond the standard `patch/` output | `trace/` directory: prompts, responses, `checkpoints.jsonl`, `run_manifest.json` |
+| Extra artifacts | None beyond `patch/` and `patch.report.json` | `trace/` directory: prompts, responses, `checkpoints.jsonl`, `run_manifest.json`, `executions/` |
 | Use when | Confirming end-to-end product behavior, running the regression suite | Root-causing a specific failure, comparing two runs stage-by-stage |
 
 Use `openant patch` first to confirm *whether* something is wrong; reach for
@@ -468,73 +457,87 @@ Use `openant patch` first to confirm *whether* something is wrong; reach for
 ## Section 7 — Traced Run
 
 ```bash
-cd /Users/goddess/dev/OpenAnt/libs/openant-core
-python3.12 utilities/autopatcher/tools/run_traced.py \
+cd <OPENANT_REPO_ROOT>/libs/openant-core
+python3 utilities/autopatcher/tools/run_traced.py \
   --cve CVE-2023-43804 \
   --repo-root /tmp/urllib3-eval \
-  --output /tmp/urllib3-trace \
-  --context-budget-policy always \
-  --max-context-budget-windows 10
+  --output /tmp/urllib3-trace
 ```
 
 `run_traced.py` requires Python 3.11+ (`libs/openant-core/pyproject.toml`
-pins `requires-python = ">=3.11"`); any interpreter satisfying that with the
-project's dependencies installed works — `python3.12` above is this
-machine's convention, not a hard requirement. Run it with the working
-directory at `libs/openant-core` (as shown): the script inserts that
-directory onto `sys.path` itself for imports, but the debug-artifact writers
-it triggers (§10) resolve `./reports/debug/` relative to the process's
-current working directory, not `--output`.
+pins `requires-python = ">=3.11"`) with the project's dependencies
+installed. Run it from `libs/openant-core`, as shown. The script adds that
+directory to `sys.path` itself, but the debug-artifact writers it triggers
+(§10) resolve `./reports/debug/` against the process's working directory,
+not `--output`.
+
+| Flag | Meaning |
+|---|---|
+| `--cve ID --repo-root PATH` | CVE mode (NVD fetch). `--repo-root` is required. |
+| `<pipeline_output.json> --finding-id ID [--repo-root PATH]` | Finding mode. |
+| `--output`, `-o DIR` | Output root (default: a new `openant_patch_traced_*` temp dir). |
+| `--trace-dir DIR` | Where `trace/` content goes, including `run_manifest.json` and `executions/` (default `<output>/trace`). |
+| `--compare-existing-tests` | Opt-in Existing Test Comparison (Docker required; the run aborts first if Docker is not ready). |
+| `--blind-evaluation`, `--blind-strip-same-repo-github-references`, `--blind-filter-policy {v1,v2}` | Evaluation-only blind mode (§25). |
+| `--verbose`, `--quiet`, `--json` | Verbosity. `--quiet` beats `--verbose`. `--json` implies quiet and prints a JSON summary: paths, trace manifest, LLM call count, usage. |
+| `--context-budget-policy`, `--max-context-budget-windows` | Deprecated no-ops (§5). |
+
+At the end, `run_traced.py` prints a "Trace Summary" block to stderr with the
+paths, LLM-call count, tokens and cost. It exits 0 on success. It exits 2 for
+argument errors, `TestComparisonEnvironmentError`, and `BlindEvaluationError`.
+Any other exception writes a failure manifest and is re-raised, so the
+process ends with a traceback and exit 1.
 
 ### What `run_traced.py` does differently from `openant patch`
 
 Per its own module docstring, it is a "thin tracing ADAPTER" — it does not
 reimplement or duplicate any Auto Patcher logic:
 
-1. Parses the *same* `--context-budget-policy`/`--max-context-budget-windows`
-   flags, reusing `openant/cli.py`'s own validator and
-   `utilities.autopatcher.context_budget` constants.
-2. Builds one real `ContextBudgetController`, exactly as `openant patch`
-   does.
-3. Calls `core.patch.run_patch()` / `run_patch_cve()` **in-process** (not via
-   subprocess) — the same functions the CLI calls — so it can observe every
-   LLM call made during that call.
-4. Monkeypatches `utilities.autopatcher.llm_client.call_llm` — the single
-   choke point every stage's `LLMClient.complete()` goes through — purely
-   to record each call's prompt and raw response before/after delegating to
-   the real, unmodified `call_llm()`. This changes nothing about provider
-   resolution, mock fallback, retries, or content.
-5. Sets `AUTOPATCHER_DEBUG=1` for the run's duration (restoring whatever was
-   there before), so the pipeline's own existing debug-artifact writers fire
-   exactly as they would for any other `AUTOPATCHER_DEBUG=1` run.
+1. Builds one `ContextBudgetController`, exactly as `openant patch` does,
+   and an `ExecutionRecorder`.
+2. Calls `core.patch.run_patch()` / `run_patch_cve()` **in-process** (not via
+   subprocess). These are the same functions the CLI calls, so it can
+   observe every LLM call made during that call.
+3. Replaces `utilities.autopatcher.llm_client.call_llm`, the single choke
+   point every stage's `LLMClient.complete()` goes through, with a wrapper
+   (`llm_call_tracing.LLMCallCapture`). The wrapper records each call's
+   prompt and raw response **after the real call returns**, so a call that
+   raises leaves no prompt file, response file or checkpoint. The wrapper
+   changes nothing about provider resolution, retries, or content.
+4. Sets `AUTOPATCHER_DEBUG=1` for the run's duration (restoring whatever was
+   there before), so the pipeline's debug-artifact writers fire exactly as
+   they would for any other `AUTOPATCHER_DEBUG=1` run.
 
 ### What it captures vs. does not
 
 | Captured? | Item |
 |---|---|
-| ✅ | Every rendered prompt sent to an LLM stage (`NNN_<stage>.prompt.txt`) |
-| ✅ | Every raw LLM response (`NNN_<stage>.response.txt`) |
-| ✅ | Per-call metadata: sequence, stage, timestamps, char counts, filenames (`checkpoints.jsonl`) |
-| ✅ | Run-level metadata: status, input type/id, repo root, output dir, budget policy/windows, artifact paths, LLM call count (`run_manifest.json`) |
-| ✅ (as pointers, not copies) | Filenames of any `reports/debug/*.json` artifacts that appeared during the run |
-| ✅ | The same production `patch/<label>-vulnerability.md` and `<label>-trust-report.md` that a normal run also produces |
-| ✅ | The same production investigation artifacts (`<label>-investigation/*.json`) that a normal run also produces |
-| ❌ | It does **not** copy `reports/debug/*.json` into the trace directory — those stay at `./reports/debug/` relative to CWD |
-| ❌ | It does **not** implement its own budget-policy decisions, TTY handling, or window-cap enforcement — all of that is the real `ContextBudgetController` |
+| Captured? | Item |
+|---|---|
+| ✅ | Every rendered prompt sent to an LLM (`NNN_<llm_tag>.prompt.txt`) |
+| ✅ | Every raw LLM response (`NNN_<llm_tag>.response.txt`) |
+| ✅ | Per-call metadata: sequence, tag, timestamps, char counts, filenames (`checkpoints.jsonl`) |
+| ✅ | Run-level metadata and one `StageExecution` record per recorded stage (`run_manifest.json`, `executions/`) |
+| ✅ (as absolute-path pointers, not copies) | `reports/debug/` files with the prefixes `context_selection_`, `edit_readiness_`, `relocation_telemetry_`, `post_patch_recovery_` that appeared during the run |
+| ✅ | The same `patch/<label>-vulnerability.md`, `<label>-trust-report.md` and `<label>-investigation/` a normal run produces |
+| ❌ | It does **not** copy `reports/debug/*` into the trace directory. They stay at `./reports/debug/` relative to the working directory |
+| ❌ | It does **not** list `patch_generation_context_*.json` or `prompt_*.txt` debug files in the manifest (§10) |
+| ❌ | It does **not** capture a call that raised (see step 3 above) |
 | ❌ | It does **not** reformat, re-derive, or reinterpret anything it captures |
 
 ---
 
 ## Section 8 — Trace Directory Structure
 
-A representative run produces:
+An illustrative run produces the following. Which LLM calls appear depends
+on which conditional paths fired.
 
 ```
 /tmp/urllib3-trace/
   patch/
     CVE-2023-43804-vulnerability.md
     CVE-2023-43804-trust-report.md
-    CVE-2023-43804-investigation/
+    CVE-2023-43804-investigation/     # pre-patch repository parse only
       analyzer_output.json
       call_graph.json
       dataset.json
@@ -550,12 +553,10 @@ A representative run produces:
     003_patch_generation.response.txt
     004_challenger.prompt.txt
     004_challenger.response.txt
-    005_finding_calibration.prompt.txt
-    005_finding_calibration.response.txt
-    006_patch_review.prompt.txt
-    006_patch_review.response.txt
-    007_confidence_scorer.prompt.txt
-    007_confidence_scorer.response.txt
+    005_patch_review.prompt.txt
+    005_patch_review.response.txt
+    006_confidence_scorer.prompt.txt
+    006_confidence_scorer.response.txt
     checkpoints.jsonl
     run_manifest.json
     executions/
@@ -564,41 +565,58 @@ A representative run produces:
       003_guided_context_acquisition.json
       004_patch_generation_and_post_patch_investigation.json
       005_challenger.json
-      ...                        # one file per recorded StageExecution --
-                                  # see §9's run_manifest.json subsection
+      006_patch_repair_and_calibration.json
+      007_patch_review.json
+      008_confidence_scoring.json
+      009_impact_and_behavior_analysis.json
+    blind_evaluation/                 # only with --blind-evaluation (§25)
 ```
 
-(`reports/debug/*.json`, if `AUTOPATCHER_DEBUG=1` fired any writers, land
-separately at `libs/openant-core/reports/debug/` — see §10 — and are only
-*referenced* from `run_manifest.json`, not present under `/tmp/urllib3-trace/`.)
+The post-patch repository parse runs inside a temporary repository copy and
+is deleted with it. `reports/debug/*`, if `AUTOPATCHER_DEBUG=1` fired any
+writers, lands in `./reports/debug/` under the working directory (§10) and is
+only *referenced* from `run_manifest.json`.
 
 ### Call numbering is NOT semantically fixed
 
 The prefix number (`NNN`) is just `seq`, a 1-based counter over *however
-many LLM calls this particular run happened to make*, generated at
-`run_traced.py`'s `_traced_call_llm`:
+many LLM calls this particular run happened to make*. The file names are
+generated by `LLMCallTracer._write_call` in `run_traced.py`:
 
 ```python
 prompt_path = self.trace_dir / f"{seq:03d}_{stage}.prompt.txt"
 response_path = self.trace_dir / f"{seq:03d}_{stage}.response.txt"
 ```
 
-Real pipeline `stage=` tags, in normal execution order (from
-`remediation_planner.py`, `patch_generator.py`, `patch_challenger.py`,
-`finding_calibration.py`, `patch_reviewer.py`, `confidence_scorer.py`):
-`remediation_planning`, `remediation_strategy`, optionally
-`guided_context_request`, `patch_generation` (possibly followed by
-`patch_generation_contract_retry`), `challenger`, optionally
-`finding_calibration` (and, only if the repair loop fires,
-`patch_repair_regeneration` then a second `challenger` then a second
-`finding_calibration`), `patch_review`, `confidence_scorer` — see the
-[architecture document's per-stage detail](../../../../../docs/auto-patcher/auto-patcher-architecture.md#per-stage-detail)
-for exactly which canonical stage owns each tag and when each one is
-conditional.
+The `stage=` tags, in execution order (optional calls in brackets):
 
-A run that triggers the applicability-aware retry (§9's `patch_generation`
-discussion, §12) inserts a **second** `patch_generation` call, shifting
-every later position by one:
+1. `remediation_planning`, then
+   [`remediation_planning_reattempt` …] when the Planner asks for more
+   evidence (up to 5 attempts in total).
+2. [`remediation_plan_verification`, `remediation_plan_revision`,
+   `remediation_plan_reverification`]: the Planner Claim Verifier.
+3. `remediation_strategy`, then [a second `remediation_strategy`] for the
+   evidence-gap fallback.
+4. [`guided_context_request` ×≤2].
+5. `patch_generation`, then [`patch_generation_contract_retry`], then
+   [`patch_generation` again, for Post-Patch Recovery or the applicability
+   retry].
+6. `challenger`.
+7. [`finding_calibration` …, `patch_repair_regeneration`, a second
+   `challenger`]: Finding Calibration and the repair loop.
+8. With `--compare-existing-tests`: [`test_plan_discovery`,
+   `test_plan_discovery_contract_retry`, `test_failure_distillation`,
+   `existing_test_amendment`].
+9. `patch_review`.
+10. `confidence_scorer`.
+
+See the
+[architecture document's stage table](../../../../../docs/auto-patcher/auto-patcher-architecture.md#pipeline-stages)
+for which canonical stage owns each tag.
+
+A run that triggers a regeneration (Post-Patch Recovery or the
+applicability-aware retry, §14 Example A) inserts a **second**
+`patch_generation` call, shifting every later position by one:
 
 ```
 without retry:              with retry:
@@ -648,8 +666,8 @@ output), or calibration rewording. Use it to separate:
 
 ### `checkpoints.jsonl`
 
-One JSON object per LLM call, in call order. Exact schema (from
-`LLMCallTracer._traced_call_llm`):
+One JSON object per LLM call, in call order (written by `run_traced.py`'s
+`write_manifest`):
 
 ```json
 {"seq": 3, "stage": "patch_generation", "started_at": "...", "finished_at": "...",
@@ -666,16 +684,17 @@ relying on filename position (§8).
 Run-level summary, written once at the end. Two layers of content live in
 the same file:
 
-**The pre-existing flat fields** (unchanged by the execution-recording
-work below):
+**Flat run-level fields:**
 - Always: `llm_call_count`, `checkpoints_file`, `autopatcher_debug_artifacts`
-  (absolute paths to any `reports/debug/*.json` files that appeared during
-  this run — pointers only, not copies).
+  (absolute paths of the listed `reports/debug/` files that appeared during
+  this run; pointers only, not copies), `compare_existing_tests`, and the raw
+  values of the two deprecated budget flags (`context_budget_policy`,
+  `max_context_budget_windows`, `null` when not passed).
 - On success: `status: "success"`, `input_type`, `input_id`, `repo_root`,
-  `output_dir`, `context_budget_policy`, `max_context_budget_windows`,
-  `vulnerability_path`, `trust_report_path`.
-- On failure: `status: "failed"`, `error_type`, `error_message`,
-  `context_budget_policy`, `max_context_budget_windows`.
+  `output_dir`, `vulnerability_path`, `trust_report_path`.
+- On failure: `status: "failed"`, `error_type`, `error_message`, plus every
+  execution recorded before the failure.
+- In blind mode: `blind_evaluation` (§25).
 
 Note: **no provider/model field lives in the flat layer** — that's carried
 in the structured `llm` block below instead (or read from the Trust
@@ -699,36 +718,40 @@ Report's Run Metadata table, §3.5, or `stderr` captured during the run).
       "sequence": 1,
       "invocation_kind": "initial",
       "consumed": {},
-      "outcome": "settled",
+      "outcome": "generated",
       "replay_of": null,
       "invoked_by": null,
       "artifact_path": "<output>/trace/executions/001_repository_analysis_and_remediation_planning.json",
-      "llm_calls": [{"seq": 1, "stage": "remediation_planning", "prompt_file": "...", "response_file": "..."}],
+      "llm_calls": [{"seq": 1, "stage": "remediation_planning", "started_at": "...", "finished_at": "...",
+                     "prompt_chars": 4821, "response_chars": 1390, "prompt_file": "...", "response_file": "..."}],
       "external_calls": [],
-      "timing": {"started_at": "...", "finished_at": "..."}
+      "timing": null
     }
-    // ... one entry per canonical stage the run actually instrumented
+    // ... one entry per recorded execution
   ]
 }
 ```
 
-`executions` is **honest and partial by design** — a full run's manifest
-only ever lists the canonical stages `pipeline.run()` was actually asked to
-record (today: S1-S11; S12/S13 are never separately recorded in
-production — see the architecture document's
-[Terminal reporting architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#terminal-reporting-architecture)).
-Absence of a stage from `executions` means "not instrumented in this run,"
-never "did not happen." This is what makes a trace produced by
-`run_traced.py` **replay-capable by design** — see §19-§22. See the
-architecture document's [Execution recording](../../../../../docs/auto-patcher/auto-patcher-architecture.md#execution-recording)
-section for the full field-by-field meaning of each key in an execution
-record — in particular, **do not read `sequence` or the `NNN` prefix of
-`execution_id` as the stage's canonical position**; it is a directory-local
-call-completion counter, unrelated to `CANONICAL_STAGE_ORDER`.
+A full run records **S1–S9 on every completed run**. S10 and S11 are
+recorded only with `--compare-existing-tests`, a repository root, and a
+non-empty patch that applies. S12/S13 are never separately recorded, because
+they run together inside `_build_report` (see the architecture document's
+[Canonical order vs. runtime order](../../../../../docs/auto-patcher/auto-patcher-architecture.md#canonical-order-vs-runtime-order)).
+Executions are numbered in the order they *finish*. When S10/S11 run, they
+are `007`/`008`, and S7–S9 become `009`–`011`.
 
-A trace with no `schema_version` key at all is a legacy trace (produced
-before this feature existed); `run_stage.py` still accepts it via a
-bounded compatibility fallback (§19.6), but a legacy trace has no
+Other fields: full-run `timing` is always `null` (replays set it).
+`invocation_kind` is `"initial"` in full runs and `"replay"` in replays.
+`invoked_by` is never set, and `external_calls` is always `[]`. Some records
+carry extra keys, for example `canonical_contract_scope: "full"` on S4. See
+the architecture document's
+[Recording, provenance, and replay](../../../../../docs/auto-patcher/auto-patcher-architecture.md#recording-provenance-and-replay)
+section. **Do not read `sequence` or the `NNN` prefix of `execution_id` as
+the stage's canonical position.**
+
+A trace with no `schema_version` key at all is a legacy trace, produced
+before execution recording existed. `run_stage.py` still accepts it via a
+bounded compatibility fallback (§19.8), but a legacy trace has no
 structured `executions` list to resolve dependencies from — only the
 Trust Report's prose Run Metadata table (§3.5) has any provenance for a
 legacy run. `checkpoints.jsonl` is unaffected by any of this — it remains
@@ -736,7 +759,7 @@ exactly what §9's own description above says: a per-LLM-call index/
 history, never a source of reconstructable stage state.
 
 Each finished execution's own artifact (e.g.
-`trace/executions/003_patch_generation_and_post_patch_investigation.json`)
+`trace/executions/004_patch_generation_and_post_patch_investigation.json`)
 holds that stage's actual output, serialized losslessly
 (`execution_recorder.to_jsonable`) — this is what a replay handler reads
 back and reconstructs into a typed Python object when that stage becomes a
@@ -771,11 +794,12 @@ report claim
 
 ### Investigation artifacts (`<label>-investigation/*.json`)
 
-Produced by OpenAnt's general repo-parsing pipeline
-(`parsers/python/parse_repository.py`), reused by Auto Patcher for its own
-candidate enrichment (`candidate_enrichment.py:build_investigation_context`).
-Written **twice** per run: once pre-patch, once post-patch against an
-isolated patched copy of the repo.
+Produced by OpenAnt's repository parser (`core.parser_adapter.parse_repository`;
+the file names below are the Python parser's), which Auto Patcher reuses for
+candidate enrichment (`candidate_enrichment.build_investigation_context`).
+`<label>-investigation/` holds the **pre-patch** parse only, and only when a
+repository root was given. Post-Patch Investigation re-parses an isolated,
+patched copy in a temporary directory that is deleted afterwards.
 
 | File | Useful for asking |
 |---|---|
@@ -795,16 +819,21 @@ first — before assuming an LLM stage reasoned incorrectly.
 These exist only when `AUTOPATCHER_DEBUG=1` is set (automatically, by
 `run_traced.py`; or manually, for a plain `openant patch` run). They are
 written under `./reports/debug/` **relative to the process's current
-working directory** — not `--output`, and not the trace directory.
-`run_traced.py` never copies them; it only records their filenames as
-pointers inside `run_manifest.json`'s `autopatcher_debug_artifacts` list.
+working directory**, not `--output` and not the trace directory.
+`run_traced.py` never copies them. It records the absolute paths of the
+first four kinds below, if they appeared during the run, in
+`run_manifest.json`'s `autopatcher_debug_artifacts` list.
 
-| File | Writer | What it contains | Can it influence the patch? |
+| File | Writer | What it contains | Listed in the manifest? |
 |---|---|---|---|
-| `context_selection_{ts}.json` | `repo_locator.py:_write_debug_artifact` | Which candidate source-context selection happened and why | **No** — observability only |
-| `edit_readiness_{ts}.json` | `pipeline.py` (inline, after Slices 1–3) | Edit-readiness gate decision + embedded `budget_trace` | **No** — observability only |
-| `relocation_telemetry_{ts}.json` | `pipeline.py` (inline) | Content-relocation decisions made while repairing hunk headers (§12 Example A) | **No** — observability only |
-| `post_patch_recovery_{ts}.json` | `pipeline.py` (inline, after Slice 4) | Post-patch recovery attempt details + embedded `budget_trace` | **No** — observability only |
+| `context_selection_{ts}.json` | `repo_locator.py` | Which candidate source-context selection happened and why | Yes |
+| `edit_readiness_{ts}.json` | `pipeline.py` (S3) | Edit Readiness Gate decision, acquisition attempts, embedded `budget_trace` | Yes |
+| `relocation_telemetry_{ts}.json` | `pipeline.py` (S4) | Content-relocation decisions made while repairing hunk headers (§14 Example A) | Yes |
+| `post_patch_recovery_{ts}.json` | `pipeline.py` (S4) | Patch Target Conformance and Post-Patch Recovery details, embedded `budget_trace` | Yes |
+| `patch_generation_context_{ts}.json` | `pipeline.py` (before S4) | Patch Generation context fit: `max_chars`, included sections, omissions and their reasons, `required_missing` | No |
+| `prompt_{ts}.txt` | `patch_generator.py` | The full Patch Generation user message | No |
+
+None of these can influence the patch: they are observability only.
 
 **Explicitly: none of these is the mechanism that mutated the patch.** They
 are logs *of* what the deterministic repair code (`diff_hunk_repair.py`,
@@ -855,10 +884,11 @@ misclassified.**
 | Correct evidence, wrong remediation plan | Remediation reasoning | `001_remediation_planning.*`, `002_remediation_strategy.*` | The prompt contained the evidence the plan should have used |
 | Correct semantic fix, malformed diff | Patch mechanics / deterministic repair | `NNN_patch_generation.response.txt`, `relocation_telemetry_*.json` | Whether `repair_hunk_headers`/`reconstruct_hunk_context` ran and what they changed (see §14 Example A) |
 | Patch fails `git apply` | Applicability / diff reconstruction / retry | `checkpoints.jsonl` (look for a second `patch_generation`), `relocation_telemetry_*.json` | Whether deterministic repair alone was tried and failed before any retry |
-| Unexpected second `patch_generation` call | Applicability-aware retry (or Challenger-driven repair loop) | `checkpoints.jsonl` stage sequence, both `patch_generation.response.txt` files | Which of the two distinct retry mechanisms fired (`pipeline.py`'s applicability retry vs. its defect-driven Challenger repair loop) and why |
-| Correct patch, Challenger says still vulnerable | Challenger prompt + evidence completeness | `NNN_challenger.prompt.txt`, `NNN_challenger.response.txt` | Whether the Challenger's prompt actually contained the patched code, or stale/partial evidence |
-| Unsupported inference becomes "Confirmed" | Finding Calibration | `NNN_finding_calibration.*`, the paired `NNN_challenger.*` it was calibrating | Whether Calibration only reclassifies `plausible_risk`/`generic` findings (by design it never touches `confirmed_defect`/`validation_gap`) |
-| Correct findings but wrong final color | Trust Signals / Recommendation Policy | Trust Report's Trust Signals table, `pipeline.py`'s `_compute_trust_signals`/`_build_recommendation_v1` | Which signal drove the mapping — the six `_compute_trust_signals` computes directly (patch_integrity, security_improvement, remediation_alignment, coverage_confidence, test_availability, deployment_safety), plus the two merged in separately (source_verification, existing_test_comparison) that are also shown in the Trust Signals table |
+| Unexpected second `patch_generation` call | Post-Patch Recovery regeneration or applicability-aware retry (the Challenger-driven repair uses `patch_repair_regeneration`) | `checkpoints.jsonl` stage sequence, both `patch_generation.response.txt` files, `post_patch_recovery_*.json` | Which mechanism fired and why |
+| NO PATCH PRODUCED | A fail-closed gate in S1–S4 | Terminal output (`--verbose` gives the reason); `executions/001`–`004` outcomes (`planning_ungrounded`, `skipped_target_authority_unresolved`, `no_candidate_patch`, …); `edit_readiness_*.json`, `patch_generation_context_*.json`, `post_patch_recovery_*.json` | Which gate fired, and whether its input evidence was genuinely missing or merely not acquired |
+| Correct patch, Challenger verdict not `VERIFIED_FIXED` | Challenger facts, citations, evidence completeness | `NNN_challenger.prompt.txt`/`.response.txt`; the S5 artifact (`classified_challenger.concerns[*]`: consequence, malformed reason) | Whether a concern is BLOCKING on its cited facts, UNRESOLVED because a quote was not in the repository-derived evidence the Challenger was shown, or fail-closed for structure (not exactly one primary concern, or prose in the legacy sections). `replay_challenger_reparse.py` re-derives this with zero LLM calls |
+| Unsupported inference becomes "Observed" | Finding Calibration | `NNN_finding_calibration.*`, the paired `NNN_challenger.*`, S6 artifact (`finding_calibration`, `finding_calibration_evidence_acquisition`) | Which findings calibration received (it depends on whether the repair path ran), and whether a rerun with acquired evidence happened |
+| Correct findings but wrong final color | Trust Signals / Recommendation Policy | Trust Report's Trust Signals table, `pipeline.py`'s `_compute_trust_signals`/`_build_recommendation_v1` | Which signal drove the decision, and whether `_reconcile_verification_status_with_calibration` narrowed `VERIFIED_FIXED` or calibration changed the defect count (see the [recommendation policy](../../../../../docs/auto-patcher/recommendation-policy.md)) |
 | Different result on identical case | Non-determinism / first-divergence analysis | Two full trace directories, compared stage by stage | See §13 — find the *first* differing stage, not just the final report |
 | Report contains a factual statement contradicted by source | Trace backward | Report → calibrated finding → Challenger/Reviewer response → prompt evidence → repository ground truth | Every hop in that chain, in order — don't skip straight from report to source |
 
@@ -866,10 +896,7 @@ misclassified.**
 
 ## Section 13 — First-Divergence Analysis
 
-**`compare_traces.py` does not currently exist anywhere in this repository**
-(verified by both filename and full-text search across the whole repo).
-Don't invent a command for it — the correct current approach is a manual
-methodology, described here, until such a script is committed.
+There is no trace-comparison tool; this is a manual method.
 
 We have observed the same real-CVE input produce different recommendations
 across runs (non-determinism inherent to LLM calls). The correct approach is
@@ -884,7 +911,7 @@ Instead:
    name (not numeric position — see §8) and sequence within that stage.
 3. For each matched stage, diff the `.prompt.txt` pair first. If prompts
    differ, that's expected only if upstream evidence genuinely differs
-   (e.g. a different budget-extension decision, a different earlier LLM
+   (e.g. a different evidence-acquisition result, a different earlier LLM
    output feeding this prompt) — anything else is a bug.
 4. If prompts are identical, diff the `.response.txt` pair — this isolates
    pure LLM non-determinism at that stage.
@@ -899,15 +926,9 @@ Instead:
    normalize (e.g. `sed` both files' repo-root prefix to a placeholder)
    before comparing.
 
-If you build tooling to automate this, name it and document it here — but do
-not claim `compare_traces.py` exists until it's actually committed.
-
 ---
 
 ## Section 14 — Real Examples of Trace Reasoning
-
-These are generalized methodology lessons, not a historical diary — don't
-extend this list into a running log of every bug ever found.
 
 ### Example A — malformed diff, mechanically starved
 
@@ -964,8 +985,10 @@ from, say, 8 calls to 7 could mean:
 - the initial `patch_generation` call simply happened to produce an
   applicable patch this time (LLM non-determinism), with no repair
   mechanism exercised at all, **or**
-- a context-budget extension request (`guided_context_request`) did or
-  didn't fire, independent of any repair/retry logic.
+- an evidence-acquisition call did or didn't fire, independent of any
+  repair/retry logic: a Planner reattempt, a Planner Claim Verifier call, the
+  evidence-gap Strategy rerun, a `guided_context_request`, or a calibration
+  rerun.
 
 Before claiming a specific mechanism ran (or was newly avoided), always
 cross-check:
@@ -989,40 +1012,26 @@ description or a bug report.
 
 1. Run the directly affected deterministic unit/integration tests, e.g.:
    ```bash
-   cd /Users/goddess/dev/OpenAnt/libs/openant-core
-   python3.12 -m pytest tests/patch/test_diff_parsing.py tests/patch/test_pipeline_retry.py tests/patch/test_context_reconstruction.py -v
+   cd <OPENANT_REPO_ROOT>/libs/openant-core
+   python3 -m pytest tests/patch/test_diff_parsing.py tests/patch/test_pipeline_retry.py tests/patch/test_context_reconstruction.py -v
    ```
 2. Run the relevant broader test suite (e.g. all of `tests/patch/`).
 3. Pick the real CVE that originally exposed the problem being fixed.
 4. Always start that CVE from a fresh clone, exact vulnerable version,
    verified SHA, and clean output directories (§4) — never re-run against a
    dirty checkout from a previous experiment.
-5. Use the standard `--context-budget-policy always
-   --max-context-budget-windows 10` flags, unless the change specifically
-   concerns context-budget behavior.
-6. Inspect actual behavior via the trace, not just the final Trust Report
+5. Inspect actual behavior via the trace, not just the final Trust Report
    color.
-7. For trace-related fixes, prove the intended *internal* behavior changed —
+6. For trace-related fixes, prove the intended *internal* behavior changed —
    e.g. if the goal is removing an unnecessary `patch_generation` retry,
    don't stop at "the report is green now." Prove: what the first generated
    patch looked like, whether deterministic recovery ran, and whether a
    second `patch_generation` call happened at all (§15).
-8. Run the remaining real-CVE regression cases you have available to check
-   for regressions elsewhere.
-9. **Experiment Registry:** a repo-wide search (code, docs, `CLAUDE.md`
-   files) for "Experiment Registry" found no matches — this concept does
-   not currently exist as a named, documented location in this project.
-   (There is an unrelated `experiment.py` benchmarking script for the SAST
-   scan pipeline, referenced in `libs/openant-core/CLAUDE.md` — it is not an
-   "Experiment Registry" and is unrelated to Auto Patcher.) If a future
-   version of this project introduces one, update this section with its
-   real name and location rather than assuming this description still
-   applies.
-10. Only after the above should the change be considered ready for commit.
-
-**AI coding agents must NOT commit automatically as part of this workflow.**
-Commit remains a deliberate, human-controlled step — regardless of how
-confident validation looks.
+7. Run the remaining real-CVE regression cases (§26) to check for
+   regressions elsewhere.
+8. Only after the above should the change be considered ready for commit.
+   Committing remains a deliberate, human-controlled step; automated agents
+   must not commit as part of this workflow.
 
 ---
 
@@ -1031,7 +1040,7 @@ confident validation looks.
 ### A. Build CLI
 
 ```bash
-cd /Users/goddess/dev/OpenAnt/apps/openant-cli
+cd <OPENANT_REPO_ROOT>/apps/openant-cli
 go build -o bin/openant .
 ```
 
@@ -1067,10 +1076,10 @@ Expected SHA for this worked example: `d9f85a749488188c286cd50606d159874db94d5f`
 ### E. Run traced CVE
 
 ```bash
-cd /Users/goddess/dev/OpenAnt/libs/openant-core
+cd <OPENANT_REPO_ROOT>/libs/openant-core
 unset LLM_PROVIDER
 unset LLM_MODEL
-python3.12 utilities/autopatcher/tools/run_traced.py --cve CVE-2023-43804 --repo-root /tmp/urllib3-eval --output /tmp/urllib3-trace --context-budget-policy always --max-context-budget-windows 10
+python3 utilities/autopatcher/tools/run_traced.py --cve CVE-2023-43804 --repo-root /tmp/urllib3-eval --output /tmp/urllib3-trace
 ```
 
 ### F. List trace artifacts
@@ -1095,7 +1104,7 @@ Supply this context at the start of any new session (human or AI) picking
 up an investigation:
 
 ```
-Repository:        /Users/goddess/dev/OpenAnt
+Repository:        <OPENANT_REPO_ROOT>
 Branch:
 Case (CVE/finding):
 Version:
@@ -1124,8 +1133,9 @@ This is a second, distinct workflow from everything above. Sections 1–18
 describe **one full traced run**; this section describes **rerunning
 exactly one canonical pipeline stage's CURRENT code**, against upstream
 state resolved from a prior run's lineage, without paying for (or waiting
-on) the rest of the pipeline. §20-§22 build on this for chained replay,
-failed-stage debugging, and comparing full vs. replay executions.
+on) the rest of the pipeline. §20–§23 build on this for chained replay,
+failed-stage debugging, prompt inspection, and comparing full vs. replay
+executions.
 
 ### 19.1 The two workflows
 
@@ -1177,7 +1187,7 @@ for exactly why. Requesting it (or any genuinely unknown stage name) fails
 immediately, before any file I/O or LLM call:
 
 ```
-$ python3.12 utilities/autopatcher/tools/run_stage.py \
+$ python3 utilities/autopatcher/tools/run_stage.py \
     --source-run /tmp/minimist-trace --stage trust_signals_and_recommendation --output /tmp/out
 Stage 'trust_signals_and_recommendation' is registered but not replayable yet.
 Currently replayable: repository_analysis_and_remediation_planning, remediation_strategy,
@@ -1186,30 +1196,42 @@ patch_repair_and_calibration, patch_review, confidence_scoring, impact_and_behav
 test_analysis_and_plan, existing_test_comparison, report_generation.
 ```
 
-To replay "the report," pass `--stage report_generation` — its handler
-reconstructs a full `PipelineResult` from every other stage's persisted
-artifact and calls the real, unmodified `_build_report()`, which computes
-both Trust Signals/Recommendation and the report markdown in one call (see
-the architecture document). It never silently falls back to running the
-full pipeline instead of replaying.
+To replay "the report," pass `--stage report_generation`. Its handler
+rebuilds a `PipelineResult` from the persisted S1, S2, S4, S6, S7, S8 and S9
+artifacts (plus S11 when present) and calls the real `_build_report()`,
+which computes Trust Signals, the Recommendation and the report Markdown in
+one call. It also writes `report.md`. Some fields have no persisted source,
+for example relocation telemetry, source verification, and edit
+readiness/acquisition. These are left empty, so a replayed report always
+shows Source Verification as "Not Verified". The manifest's
+`replay_limitations` field lists such gaps. Replay never falls back to
+running the full pipeline.
 
-`test_analysis_and_plan`'s handler is worth calling out specifically: it is
-still **transitional**. Its full approved contract depends on
-`patch_repair_and_calibration` (S6) and `impact_and_behavior_analysis`
-(S9) — both of which are independently replayable in their own right —
-but this particular handler was never wired to reconstruct either of
-their artifacts as its own inputs, so it declares a narrower dependency
-set and computes only the `TestExecutionPlan` sub-artifact — its manifest
-entry is tagged `"transitional": true` so this is visible, not silently
-understated. See the architecture document's
-[Replay architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#replay-architecture)
-section for the full explanation.
+Two handlers declare fewer dependencies than the stage's approved contract.
+
+- `test_analysis_and_plan` is **transitional**. It declares no
+  dependencies, calls `test_plan_discovery.discover_test_plan` directly, and
+  produces only the `TestExecutionPlan`. Its manifest entry is tagged
+  `"transitional": true`.
+- `report_generation` declares 7 of its 12 approved dependencies.
+
+Other prerequisites:
+
+- `existing_test_comparison` needs a resolvable S10 execution. That exists
+  only if the source ran with `--compare-existing-tests`, or if S10 was
+  replayed first.
+- Stages with `requires_repo_access` need the recorded checkout (§19.5). This
+  includes `report_generation`.
+
+See the architecture document's
+[Recording, provenance, and replay](../../../../../docs/auto-patcher/auto-patcher-architecture.md#recording-provenance-and-replay)
+section.
 
 ### 19.4 Usage
 
 ```bash
-cd /Users/goddess/dev/OpenAnt/libs/openant-core
-python3.12 utilities/autopatcher/tools/run_stage.py \
+cd <OPENANT_REPO_ROOT>/libs/openant-core
+python3 utilities/autopatcher/tools/run_stage.py \
   --source-run /tmp/minimist-trace \
   --stage patch_review \
   --output /tmp/minimist-patch-review-debug
@@ -1217,10 +1239,14 @@ python3.12 utilities/autopatcher/tools/run_stage.py \
 
 Current arguments (`run_stage.py`'s `argparse` setup):
 
-- **`--source-run`** (required) — path to a `run_traced.py` output
-  directory, OR a prior replay's `--output` directory — either the run
-  root or its `trace/` subdirectory directly. Resolution is exact-name
-  only, never a recursive/fuzzy search. Never modified by this tool.
+- **`--source-run`** (required): the path to a `run_traced.py` output
+  directory, or to a prior replay's `--output` directory. Resolution is
+  exact-name only, never a recursive or fuzzy search. This tool never
+  modifies the source run. **Spell the path exactly as it was given to
+  `run_traced.py --output`** (or to the earlier replay's `--output`). Each
+  recorded `consumed` edge stores that path string, and dependency
+  resolution compares identities as exact strings. A different spelling of
+  the same directory may therefore resolve dependencies as `STALE`.
   **`--source-trace` is still accepted as a deprecated alias** (same
   destination) — use `--source-run` in new commands; `--source-trace` is
   kept only for backward compatibility with older invocations/scripts.
@@ -1237,10 +1263,18 @@ Current arguments (`run_stage.py`'s `argparse` setup):
   source recorded.
 
 On success, `run_stage.py` prints a small JSON summary (`stage`,
-`execution_id`, `outcome`, `output_dir`, `run_manifest`) and exits 0. On a
-handled failure (unknown/not-yet-replayable stage, unsafe output
-directory, unresolved dependency, failed target-repo safety gate) it
-prints the reason to stderr and exits 2.
+`execution_id`, `outcome`, `output_dir`, `run_manifest`) and exits 0. Exits
+are as follows:
+
+- **Exit 2** with the reason on stderr: an engine or stage-replay error, such
+  as an unknown or not-yet-replayable stage, an unsafe output directory, an
+  unresolved or stale dependency, or a failed target-repository gate.
+- **Traceback, exit 1**: other failures. These include a missing, invalid,
+  or unsupported-schema manifest at `--source-run` (`LineageError`) and an
+  unusable LLM configuration.
+
+LLM-owning stages use the **current** OpenAnt LLM configuration (or
+`LLM_PROVIDER=mock`), not the source run's provider.
 
 ### 19.5 The target-repository safety gate
 
@@ -1249,8 +1283,9 @@ for every replayable stage that touches the repository:
 
 1. The target repository (from the source run, or `--repo-root`) must
    exist and be a git repository.
-2. Its current `HEAD` (full SHA) must **exactly match** the full SHA the
-   source recorded.
+2. Its current `HEAD` must **exactly match** the full SHA the source
+   recorded. A legacy trace that recorded only a short SHA is matched by
+   prefix.
 3. Its working tree must be **clean** (`git status --porcelain` empty).
 
 Any failure stops replay immediately, before any LLM call, with a
@@ -1295,24 +1330,34 @@ a current code change against historical target-repo state:
 | OpenAnt implementation commit (`patcher_commit`) | **No** — recorded on both sides only |
 | LLM provider/model | **No** — recorded on both sides only |
 
-A successful replay makes LLM calls **only** tagged with a `stage=` value
-the replayed canonical stage owns (`stage_registry.STAGE_OWNED_LLM_TAGS`)
-— any other tag captured during the replay aborts it before any manifest
-is written (an "LLM ownership violation"), so a replay cannot silently
-call into another stage's logic.
+A successful replay makes LLM calls **only** with a `stage=` tag that the
+replayed canonical stage owns (`stage_registry.STAGE_OWNED_LLM_TAGS`). Any
+other captured tag aborts the replay as an "LLM ownership violation", so a
+replay cannot silently call into another stage's logic. The prompt and
+response files may already be on disk when this happens, but the stage
+artifact and `run_manifest.json` are not written.
+
+The replay manifest records both sides. Its `openant` block holds
+`source_patcher_commit`, `replay_patcher_commit` and `replay_openant_dirty`.
+Its `llm` block holds `source_provider`, `source_model`, `replay_provider`
+and `replay_model`.
 
 ### 19.7 Output
 
 ```
 /tmp/minimist-patch-review-debug/
   run_manifest.json                 # kind: "replay", parent: <source_run>
-  001_patch_review.prompt.txt       # only if this stage made an LLM call
+  001_patch_review.prompt.txt       # named NNN_<llm tag>, only if the stage made LLM calls
   001_patch_review.response.txt
-  patch_review.json                 # this stage's own artifact — name/shape
-                                     # varies by stage (e.g. test_execution_plan.json
-                                     # for test_analysis_and_plan, report_generation.json
-                                     # for report_generation)
+  patch_review.json                 # <canonical_stage>.json; test_analysis_and_plan writes
+                                    # test_execution_plan.json or rejection_reason.json;
+                                    # report_generation also writes report.md
 ```
+
+Prompt and response files are named after the LLM tag, not the canonical
+stage. For example, a `challenger` replay writes `001_challenger.*`, and a
+contract retry writes `002_patch_generation_contract_retry.*`. Replay output
+is not write-once: reuse an empty `--output` directory per replay.
 
 A directory always contains exactly one new execution
 (`execution_id` sequence is always `1` within a replay directory — see
@@ -1321,21 +1366,20 @@ A rejected/negative outcome (e.g. `test_analysis_and_plan` rejecting a
 plan) is still a **valid, completed replay** (exit code 0) — the current
 implementation ran, produced a result, and that result happened to be
 negative for a specific, recorded reason. This is exactly what you inspect
-to tell whether a prompt/code change fixed the problem. Only an
-infrastructure failure (§19.3/§19.5's gates, an unresolvable LLM config, a
-malformed/incompatible source) exits non-zero, and does so **before**
-writing anything to `--output` at all.
+to tell whether a prompt/code change fixed the problem. The preflight gates
+(§19.3, §19.5, unresolved dependencies) fail before anything is written to
+`--output`. A failure inside the stage itself can leave partial files behind.
 
-See the architecture document's
-[Execution recording](../../../../../docs/auto-patcher/auto-patcher-architecture.md#execution-recording)
-section for the exact `run_manifest.json` field shape — it is the same v3
-schema a full run's manifest uses, just with exactly one entry in
-`executions` and `kind: "replay"`.
+The replay `run_manifest.json` uses the same v3 schema as a full run, with
+`kind: "replay"` and exactly one execution. That execution has `sequence` 1,
+`invocation_kind: "replay"`, and `timing` set (`started_at`, `finished_at`,
+`duration_seconds`). It may also carry `transitional`, `replay_limitations`
+and `canonical_contract_scope`.
 
 ### 19.8 Legacy traces
 
-A trace produced before the execution-graph work existed (no
-`schema_version` key in its `run_manifest.json`) is still usable:
+A legacy trace (no `schema_version` key in its `run_manifest.json`) is
+still usable:
 `run_stage.py` falls back to a **bounded** read of that Trust Report's own
 `## Run Metadata` table (§9's `trust-report.md` section) — ONLY the `Repo
 commit`, `Auto-patcher`, `LLM provider`, and `LLM model` table rows, via
@@ -1380,24 +1424,24 @@ full run                                     (produces S4, S5, S6, S7, ...)
 ```
 
 ```bash
-cd /Users/goddess/dev/OpenAnt/libs/openant-core
+cd <OPENANT_REPO_ROOT>/libs/openant-core
 
-python3.12 utilities/autopatcher/tools/run_stage.py \
+python3 utilities/autopatcher/tools/run_stage.py \
   --source-run /tmp/minimist-trace \
   --stage patch_generation_and_post_patch_investigation \
   --output /tmp/replay-s4
 
-python3.12 utilities/autopatcher/tools/run_stage.py \
+python3 utilities/autopatcher/tools/run_stage.py \
   --source-run /tmp/replay-s4 \
   --stage challenger \
   --output /tmp/replay-s5
 
-python3.12 utilities/autopatcher/tools/run_stage.py \
+python3 utilities/autopatcher/tools/run_stage.py \
   --source-run /tmp/replay-s5 \
   --stage patch_repair_and_calibration \
   --output /tmp/replay-s6
 
-python3.12 utilities/autopatcher/tools/run_stage.py \
+python3 utilities/autopatcher/tools/run_stage.py \
   --source-run /tmp/replay-s6 \
   --stage patch_review \
   --output /tmp/replay-s7
@@ -1446,10 +1490,9 @@ A practical, end-to-end workflow combining everything above:
 
 1. **Run a full trace.**
    ```bash
-   cd /Users/goddess/dev/OpenAnt/libs/openant-core
-   python3.12 utilities/autopatcher/tools/run_traced.py \
-     --cve CVE-2023-43804 --repo-root /tmp/urllib3-eval --output /tmp/urllib3-trace \
-     --context-budget-policy always --max-context-budget-windows 10
+   cd <OPENANT_REPO_ROOT>/libs/openant-core
+   python3 utilities/autopatcher/tools/run_traced.py \
+     --cve CVE-2023-43804 --repo-root /tmp/urllib3-eval --output /tmp/urllib3-trace
    ```
 2. **Inspect the failing execution/artifacts.** Open
    `/tmp/urllib3-trace/trace/run_manifest.json`, find the suspect stage's
@@ -1462,7 +1505,7 @@ A practical, end-to-end workflow combining everything above:
    prompt (e.g. `patch_reviewer.py`).
 4. **Replay only that stage**, from the original full run:
    ```bash
-   python3.12 utilities/autopatcher/tools/run_stage.py \
+   python3 utilities/autopatcher/tools/run_stage.py \
      --source-run /tmp/urllib3-trace \
      --stage patch_review \
      --output /tmp/urllib3-replay-review-v2
@@ -1479,12 +1522,19 @@ A practical, end-to-end workflow combining everything above:
    — to see the full downstream effect of your change without rerunning
    remediation planning, patch generation, or the Challenger again.
 
-This is strictly cheaper than re-running the full pipeline for every
-iteration of a code/prompt fix, and — because replay calls the exact same
-stage implementation production does (see the architecture document's
-[Shared production/replay architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#shared-productionreplay-architecture))
-— what you observe in a replay is what production would do with the same
-upstream state, not an approximation of it.
+This is cheaper than re-running the full pipeline for every iteration of a
+code or prompt fix. Replay calls the same stage implementation production
+does. Some handlers, however, cannot reconstruct every production input:
+
+- S1–S4 run without the parsed investigation context;
+- S2 skips the evidence-gap fallback;
+- S7/S8 run without the calibration summary;
+- S8 also runs without the Challenger context.
+
+Most of these gaps are recorded in the replay manifest's
+`replay_limitations`; the S7/S8 calibration summary gap is not. Treat a
+replay as production behavior given the reconstructed inputs, and confirm
+important conclusions with a full traced run.
 
 ---
 
@@ -1498,11 +1548,11 @@ within its own output directory, regardless of what stage or how many
 calls the source run made — never assume the numbering carries over from
 the source.
 
-To relate a replay's LLM call back to its execution record: read the
-replay's one `executions` entry's `llm_calls` list — it holds the same
-`seq`/`stage`/`prompt_file`/`response_file` shape a full run's manifest
-does, with the full prompt/response text stripped (that text is the
-`.prompt.txt`/`.response.txt` files sitting right next to the manifest).
+To relate a replay's LLM call back to its execution record, read the
+replay's one `executions` entry's `llm_calls` list. Replay entries carry
+`seq`, `stage`, `prompt_file` and `response_file`. Full-run entries also
+carry timestamps and character counts. The prompt and response text itself
+is in the `.prompt.txt`/`.response.txt` files next to the manifest.
 
 ---
 
@@ -1515,7 +1565,7 @@ matter:
 | Field | What it tells you |
 |---|---|
 | `kind` | `"full_run"` vs `"replay"` — which directory produced this manifest. |
-| `invocation_kind` | `"initial"` (production's first pass at this stage), `"retry"`, or `"replay"` — why this specific execution exists. |
+| `invocation_kind` | `"initial"` (a full run's execution) or `"replay"`. (`"retry"` is defined in the schema but no code path produces it today.) |
 | `replay_of` | For a replay execution: the closest prior execution of the same canonical stage found anywhere in the source lineage — a provenance pointer, not a data dependency (never used by dependency resolution itself). |
 | `consumed` | The exact `{run, execution_id}` this execution actually read for each dependency — compare this between the full run's execution and the replay's execution to see whether the replay picked up a newer (replayed) upstream input or inherited the same original one (§20.2). |
 | `parent` (manifest-level, not per-execution) | Which directory this replay was invoked against — walk it manually, or via `lineage.build_chain`, to reconstruct the full lineage a given replay sits in. |
@@ -1710,10 +1760,10 @@ semantics, ZIP contents, resume and exit codes — is
 [`RUN_CVE_BATCH.md`](RUN_CVE_BATCH.md).
 
 ```bash
-cd /Users/goddess/dev/OpenAnt/libs/openant-core
-python3.12 utilities/autopatcher/tools/run_cve_batch.py \
+cd <OPENANT_REPO_ROOT>/libs/openant-core
+python3 utilities/autopatcher/tools/run_cve_batch.py \
     --manifest utilities/autopatcher/tools/cfp_evaluation_cases.yaml --jobs 2
-python3.12 utilities/autopatcher/tools/run_cve_batch.py --resume /tmp/openant-cve-batches/<batch-id>
+python3 utilities/autopatcher/tools/run_cve_batch.py --resume /tmp/openant-cve-batches/<batch-id>
 ```
 
 Each case attempt gets a fresh clone at the exact manifest SHA (verified
@@ -1722,7 +1772,12 @@ directory — mandatory, because the `AUTOPATCHER_DEBUG` writers of §10
 resolve `./reports/debug/` against the process CWD. `run_traced.py` is
 invoked unchanged with the canonical flags (`--context-budget-policy always
 --max-context-budget-windows 10 --blind-evaluation
---blind-strip-same-repo-github-references`). The case outcome is read from
-the Trust Report decision card (§9) only when the run manifest proves
-success, identity and verified blind evaluation; a valid
-`NO PATCH PRODUCED` result is counted as Gray, never as a failure.
+--blind-strip-same-repo-github-references`). The two budget flags are
+deprecated no-ops (§5), kept so batch command lines stay identical.
+
+The case outcome is read from the Trust Report's decision card (its first
+`##` heading). It counts only when the run manifest proves success, identity
+and verified blind evaluation. A valid `NO PATCH PRODUCED` result is counted
+as Gray, a legitimate outcome, never as a failure. Default concurrency is
+`--jobs 2`; above 4 the runner warns. See `RUN_CVE_BATCH.md` §6 for the
+outcome and failure vocabulary.

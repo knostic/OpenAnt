@@ -7,14 +7,26 @@ going when individual cases fail, and leaves one self-contained batch
 directory with summaries, per-case artifacts and a results ZIP. Interrupted
 batches resume without rerunning finished cases.
 
-It is evaluation tooling only: it never changes Auto Patcher behavior and
-reads nothing but `run_traced.py`'s own artifacts.
+It is evaluation tooling only. Normal use of Auto Patcher (`openant patch`)
+never needs it. It never changes Auto Patcher behavior, and it reads nothing
+but `run_traced.py`'s own artifacts.
 
-All commands below assume:
+All commands below are run from `libs/openant-core` in the OpenAnt checkout:
 
 ```bash
-cd /Users/goddess/dev/OpenAnt/libs/openant-core
+cd libs/openant-core
 ```
+
+**Requirements:** POSIX, `git` on `PATH`, and Python ≥ 3.11 with PyYAML and
+OpenAnt's Python dependencies installed. Network access to GitHub, NVD and
+the LLM provider is needed. A real LLM provider must be configured with
+`openant setup llm` (Auto Patcher's normal configuration). `NVD_API_KEY` is
+optional, but it raises NVD's rate limits, which matters at higher
+concurrency: NVD 429 responses fail a case as `advisory_fetch_failed`. Each
+case inherits the runner's environment.
+
+Shipped manifests: `cfp_evaluation_cases.yaml` (43 cases) and
+`smoke_cases.yaml` (7 cases).
 
 ---
 
@@ -22,43 +34,43 @@ cd /Users/goddess/dev/OpenAnt/libs/openant-core
 
 ```bash
 # Validate manifests and print the plan (no checkout, no LLM calls, no batch dir)
-python3.12 utilities/autopatcher/tools/run_cve_batch.py \
+python3 utilities/autopatcher/tools/run_cve_batch.py \
     --manifest utilities/autopatcher/tools/cfp_evaluation_cases.yaml \
     --validate-only
 
 # Run one manifest (default --jobs 2)
-python3.12 utilities/autopatcher/tools/run_cve_batch.py \
+python3 utilities/autopatcher/tools/run_cve_batch.py \
     --manifest utilities/autopatcher/tools/cfp_evaluation_cases.yaml
 
 # Run several manifests as one batch, explicit concurrency and a label
-python3.12 utilities/autopatcher/tools/run_cve_batch.py \
+python3 utilities/autopatcher/tools/run_cve_batch.py \
     --manifest utilities/autopatcher/tools/cfp_evaluation_cases.yaml \
     --manifest /path/to/release_cases.yaml \
     --jobs 2 --label release-rc1
 
 # Run only some cases (manifest order is kept)
-python3.12 utilities/autopatcher/tools/run_cve_batch.py \
+python3 utilities/autopatcher/tools/run_cve_batch.py \
     --manifest utilities/autopatcher/tools/cfp_evaluation_cases.yaml \
     --case starlette-cve-2023-29159 --case planet-client-python-cve-2023-32303
 
 # Resume an interrupted batch (finished cases are not rerun)
-python3.12 utilities/autopatcher/tools/run_cve_batch.py \
+python3 utilities/autopatcher/tools/run_cve_batch.py \
     --resume /tmp/openant-cve-batches/<batch-id>
 
 # Show what a resume would do, without running anything
-python3.12 utilities/autopatcher/tools/run_cve_batch.py \
+python3 utilities/autopatcher/tools/run_cve_batch.py \
     --resume /tmp/openant-cve-batches/<batch-id> --validate-only
 
 # Also rerun cases whose latest attempt FAILED
-python3.12 utilities/autopatcher/tools/run_cve_batch.py \
+python3 utilities/autopatcher/tools/run_cve_batch.py \
     --resume /tmp/openant-cve-batches/<batch-id> --rerun-failed
 
 # Regenerate summaries + ZIP only (never runs a case)
-python3.12 utilities/autopatcher/tools/run_cve_batch.py \
+python3 utilities/autopatcher/tools/run_cve_batch.py \
     --summarize /tmp/openant-cve-batches/<batch-id>
 
 # Long batch that survives closing the terminal
-nohup python3.12 utilities/autopatcher/tools/run_cve_batch.py \
+nohup python3 utilities/autopatcher/tools/run_cve_batch.py \
     --manifest utilities/autopatcher/tools/cfp_evaluation_cases.yaml \
     > /tmp/cve-batch.out 2>&1 &
 ```
@@ -68,17 +80,25 @@ changes the parent; `--batch-id` sets the id). The id is
 `<UTC timestamp>[-<label>]-<random>`, e.g. `20261005T101500Z-release-rc1-3f9a2c`.
 
 Before anything runs, the runner checks its preconditions and exits 2 if
-one fails: `LLM_PROVIDER` and `LLM_MODEL` must be **unset** (Auto Patcher
-rejects every value except `LLM_PROVIDER=mock`, which needs
-`--allow-mock-llm`); `<python> run_traced.py --help` must succeed, and so
-must importing what `run_traced.py` loads only after argument parsing
-(`core.patch` and the Auto Patcher pipeline) — so a missing dependency or a
-broken pipeline module stops the batch before the first clone; and the
-batch directory must not sit inside the OpenAnt work tree at a path git does
-not ignore (its clones and outputs would look like OpenAnt code changes).
-Make sure the OpenAnt work tree is in the state you want recorded
-(`--require-clean-openant` enforces a clean tree; recommended for the final
-regression run).
+one fails:
+
+- `LLM_PROVIDER` and `LLM_MODEL` must be **unset**. Auto Patcher rejects every
+  value except `LLM_PROVIDER=mock`, which needs `--allow-mock-llm`;
+  `LLM_MODEL` is then allowed.
+- The `--python` interpreter must be Python ≥ 3.11.
+- `<python> run_traced.py --help` must succeed, and so must importing what
+  `run_traced.py` loads only after argument parsing (`core.patch` and the Auto
+  Patcher pipeline). A missing dependency or a broken pipeline module
+  therefore stops the batch before the first clone.
+- The OpenAnt git state must be readable (and clean, with
+  `--require-clean-openant`).
+- The batch directory must not sit inside the OpenAnt work tree at a path git
+  does not ignore, because its clones and outputs would look like OpenAnt code
+  changes.
+
+Make sure the OpenAnt work tree is in the state you want recorded.
+`--require-clean-openant` enforces a clean tree, and is recommended for the
+final regression run.
 
 ---
 
@@ -90,11 +110,11 @@ regression run).
 | `--resume DIR` | Continue an existing batch (see §8). |
 | `--summarize DIR` | Regenerate `batch_summary.*`, `batch_results.csv` and the ZIP from the current state. Runs nothing. |
 | `--case ID` | Restrict to these case ids (repeatable). New batch: the batch contains only these. Resume: only these may run. |
-| `--jobs N` | Concurrent cases (default **2**). Values above 4 work but are **not experimentally validated**; the runner warns and records `jobs_validated: false`. |
-| `--validate-only` | Validate input and print the plan (or the resume plan); run nothing. |
+| `--jobs N` | Concurrent cases (default **2**, must be ≥ 1, no upper bound). Values above the runner's `VALIDATED_MAX_JOBS` (4) still run, but the runner prints a warning and records `jobs_validated: false` for the session. See §11. |
+| `--validate-only` | Check the preconditions, validate the input, and print the plan (or the resume plan). Never clones or runs a case, but can still exit 2 on a failed precondition. For a new batch it does not check whether `--batch-id` already exists. With `--resume` it still takes the batch lock. Ignored with `--summarize`. |
 | `--batch-root DIR` | Parent directory for new batches (default `/tmp/openant-cve-batches`). Must be outside the OpenAnt work tree unless git ignores the location. |
-| `--batch-id ID` | Explicit id for a new batch (`[A-Za-z0-9._-]`); default `<UTC timestamp>[-<label>]-<random>`. An existing batch directory is never reused. |
-| `--case-timeout-minutes M` | Kill a case's `run_traced.py` (whole process group) after M minutes; default 120, `0` = none. Historical cases take 3 s – 13 min. May differ per session (recorded per session). |
+| `--batch-id ID` | Explicit id for a new batch: starts with a letter or digit, then `[A-Za-z0-9._-]`, at most 100 characters. The default is `<UTC timestamp>[-<label>]-<random>`. An existing batch directory is never reused. |
+| `--case-timeout-minutes M` | Stop a case's `run_traced.py` (whole process group: SIGTERM, then SIGKILL after 20 s) after M minutes. Default 120 for a new batch; on resume, the batch's stored initial value. `0` = none. May differ per session (recorded per session). |
 | `--heartbeat-seconds S` | Print the running cases after S quiet seconds (default 300, `0` = off). |
 | `--blind-filter-policy {v1,v2}` | Forward `run_traced.py --blind-filter-policy`. Default: not passed (run_traced's default, v1 — the canonical setup). Frozen per batch. |
 | `--allow-duplicate-cve` | Allow one CVE in several cases with different repository/SHA. Identical CVE+repo+SHA is always an error. |
@@ -162,6 +182,13 @@ For every case, in its own attempt directory `cases/<id>/attempt-NN/`:
        --blind-evaluation --blind-strip-same-repo-github-references
    ```
 
+   `--context-budget-policy`/`--max-context-budget-windows` are deprecated
+   no-ops in Auto Patcher. Repository evidence is always bounded by technical
+   capacity (see the README's "Context budget"). `run_traced.py` prints a
+   deprecation notice for them on every case. The runner still passes both,
+   and resume enforces them, so every batch's command line stays identical to
+   earlier batches.
+
    The exact argv, CWD, timeout and the non-secret environment variables that
    matter (`LLM_*`, `OPENANT_*_CONFIG`, …) are written to `command.json`. The
    full environment is never recorded.
@@ -171,10 +198,8 @@ For every case, in its own attempt directory `cases/<id>/attempt-NN/`:
 **Isolation contract.** Every attempt has its own checkout, output directory
 and CWD. The CWD matters: `run_traced.py` sets `AUTOPATCHER_DEBUG=1` and the
 pipeline writes `./reports/debug/*` relative to the process CWD, so a shared
-CWD would overwrite or cross-attribute debug artifacts. This contract was
-validated experimentally for `--jobs 2` (overlapping Starlette + Planet runs:
-no cross-run contamination, debug artifacts isolated, checkouts unchanged).
-Each result is cross-checked against it: a run manifest whose CVE, commit,
+CWD would overwrite or cross-attribute debug artifacts. Each result is
+cross-checked against this contract: a run manifest whose CVE, commit,
 checkout path, output path or Trust Report path does not belong to the
 attempt is a `run_manifest_mismatch` failure; debug artifacts outside the
 attempt's CWD and a modified checkout are reported as anomalies.
@@ -190,7 +215,7 @@ OpenAnt Auto Patcher — real-CVE batch (run_cve_batch.py 1.0.0)
   Session    1 (initial)
   Cases      43 scheduled of 43 in batch
   Jobs       2
-  OpenAnt    0f96b716… (clean)
+  OpenAnt    <40-character OpenAnt HEAD> (clean)
   ...
 [10:15:02] START   starlette-cve-2023-29159  CVE-2023-29159  attempt 1   · running 1 · done 0/43
 [10:15:02] START   planet-client-python-cve-2023-32303  CVE-2023-32303  attempt 1   · running 2 · done 0/43
@@ -233,8 +258,8 @@ vulnerability artifact verified, same-repo stripping enabled).
 - **A — all requested cases:** GREEN+YELLOW+ORANGE+RED+GRAY+FAILED+INCOMPLETE.
 - **B — completed Auto Patcher executions:** GREEN+YELLOW+ORANGE+RED+GRAY only.
 
-Percentages are rounded to 2 decimals in JSON (1 in Markdown); `n/a` when a
-denominator is 0.
+Percentages are rounded to 2 decimals in JSON (1 in Markdown). When a
+denominator is 0 they are `null` in JSON and `n/a` in Markdown.
 
 **Failure kinds** (`failure_kind` in `result.json`, CSV and summaries):
 
@@ -261,12 +286,18 @@ denominator is 0.
 | `runner_exception` | bug in the batch runner (traceback in `runner_error.txt`) |
 
 **Anomalies** are warnings that do not change the outcome but are always
-listed: LLM-call count ≠ `checkpoints.jsonl` records, debug artifacts outside
-the attempt CWD, run used a different OpenAnt commit than the session
-recorded, **the OpenAnt work tree changed while the batch was running** (see
-§8), `mock` provider, context-budget settings differ, the target checkout was
-modified or its HEAD moved during the run, Trace Summary disagreeing with the
-manifest.
+listed. Most are checked only for completed attempts:
+
+- the LLM-call count differs from the `checkpoints.jsonl` records, or
+  `checkpoints.jsonl` is missing or unreadable;
+- debug artifacts appear outside the attempt CWD;
+- the run used a different OpenAnt commit than the session recorded;
+- **the OpenAnt work tree changed while the batch was running** (see §8), or
+  its state could not be read;
+- the provider was `mock`;
+- the context-budget settings differ;
+- the target checkout was modified, or its HEAD moved, during the run;
+- the Trace Summary disagrees with the manifest.
 
 **Other figures:**
 
@@ -280,7 +311,8 @@ manifest.
   Trace Summary on stderr (OpenAnt's TokenTracker), only for successful runs
   whose printed LLM-call count equals the manifest's. Cost is rounded to
   cents per case by `run_traced.py`. Failed runs report none.
-- *Durations* — case duration = checkout + `run_traced.py` (final attempt);
+- *Durations* — case duration = the final attempt's total time (checkout,
+  `run_traced.py`, and classification);
   wall clock = sum of the batch sessions' elapsed time; speedup = case time /
   wall clock.
 - *No-patch reason* — the Trust Report's `Patch Applicability` skip reason
@@ -293,6 +325,7 @@ manifest.
 
 ```
 <batch-root>/<batch-id>/
+    .batch.lock                one-runner-per-batch lock (flock)
     batch_manifest.json        exact provenance: inputs, resolved cases, run config, every session
     batch_summary.md           human-readable report
     batch_summary.json         complete machine-readable aggregate (every case row included)
@@ -301,11 +334,11 @@ manifest.
     inputs/01-<manifest>.yaml  byte-exact copies of the input manifests (SHA-256 in batch_manifest.json)
     logs/batch.log             every live-output line, all sessions, UTC timestamps
     provenance/                openant_worktree-session-NN[-end].diff (tracked OpenAnt changes at session start,
-                               and at session end if the tree changed during the session)
+                               and at session end if the tree changed during the session; only when non-empty)
     cases/<case-id>/
         case.json              frozen case spec + manifest provenance
         attempt-01/
-            command.json       exact argv, CWD, timeout, recorded env
+            command.json       exact argv, CWD, timeout, recorded env (absent if the checkout failed)
             stdout.log         run_traced.py stdout
             stderr.log         run_traced.py stderr (progress narration, Trace Summary, tracebacks)
             result.json        status, outcome, failure kind/detail, checkout verification,
@@ -326,14 +359,16 @@ platform, host, recorded environment, scheduled cases, result, exit code,
 ZIP info. `run_config` freezes the `run_traced.py` path, the interpreter
 (path + version), the exact flags and the expected blind `rule_id` (plus the
 initial timeout). Every attempt's `result.json` also records the OpenAnt
-fingerprint just before and just after its `run_traced.py` ran. Runner
-name/version and schema versions are recorded in every JSON file. (The copy
-of `batch_manifest.json` inside the ZIP predates the ZIP itself, so it lacks
+fingerprint just before and just after its `run_traced.py` ran. Runner name
+and version, and schema versions, are recorded in `batch_manifest.json` and
+`batch_summary.json`; `result.json` carries a `schema_version`. (The copy of
+`batch_manifest.json` inside the ZIP predates the ZIP itself, so it lacks
 that session's `zip` entry.)
 
 `batch_summary.md` contains batch metadata, overall statistics,
-distribution tables A and B, failures by kind, breakdowns by manifest/group
-(when there is more than one), the full case table (case, CVE, project,
+distribution tables A and B, failures by kind, a breakdown by manifest
+(when there is more than one) and by group (when any case has one), the full
+case table (case, CVE, project,
 repository, exact SHA, outcome, duration, LLM calls, reason, artifact
 path), failure details, anomalies, retry-like calls and definitions.
 Summaries are regenerated after every finished case, so they are useful
@@ -341,30 +376,45 @@ while a batch is still running; until the session ends their status is
 `RUNNING` (final statuses: `COMPLETE`, `COMPLETE_WITH_FAILURES`,
 `INCOMPLETE`, `INTERRUPTED`).
 
+`batch_results.csv` has one row per case with these columns: `order,
+case_id, cve, display_name, group, language, manifest, repo, sha, category,
+decision, status, failure_kind, reason, exit_code, attempts, started_at,
+finished_at, duration_seconds, llm_calls, retry_like_llm_calls,
+skipped_stages, tokens, cost_usd, provider, model, patcher_commit,
+blind_rule_id, blind_status, anomalies, attempt_dir, trust_report,
+run_manifest, stderr_log`. List fields are joined with `; `. `status` is one
+of `pending`, `incomplete`, `invalid`, `completed`, `failed` or
+`interrupted`.
+
 ### 7.1 ZIP
 
 `<batch-id>-results.zip` lives inside the batch directory, holds everything
 under one `<batch-id>/` folder, and is created at the end of every
-non-interrupted session (and by `--summarize`). Creating it never modifies
-the batch directory. It includes summaries, manifests, input copies, logs,
-per-attempt `command.json`/`result.json`/logs, the complete `output/`
-trace and patch artifacts, and the `cwd/` debug artifacts, plus a
-`zip_contents.json` describing what was included and excluded.
+non-interrupted session (and by `--summarize`). Creating it never alters
+existing artifacts; afterwards `batch_manifest.json` records the ZIP's path
+and size. The ZIP includes:
+
+- summaries, manifests, and input copies;
+- logs and the `provenance/` diffs;
+- per-attempt `command.json`, `result.json`, and logs;
+- the complete `output/` trace and patch artifacts;
+- the `cwd/` debug artifacts;
+- `zip_contents.json`, which describes what was included and excluded.
 
 Excluded:
 
 - target checkouts (`attempt-*/repo/`) — reconstruct from `repo` + `sha` in `case.json`;
-- `output/patch/*-investigation/` by default — derived parser output that
-  can reach gigabytes (ansible: 1.7 GB `dataset.json`; all 37 historical
-  PatchEval traces together are 48 MB vs 3.2 GB of investigation output).
-  Their paths and sizes are listed in `zip_contents.json`;
-  `--zip-include-investigation` packages them;
+- `output/patch/*-investigation/` by default. This is derived parser output
+  that can reach gigabytes for large repositories. Their paths and sizes are
+  listed in `zip_contents.json`, and `--zip-include-investigation` packages
+  them;
 - `.git/`, `__pycache__/`, `*.pyc`, caches, `.DS_Store`, symlinks, temp files, the lock file;
 - credential-like file names (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.git-credentials`, …);
-- any file containing the exact value of a credential-named environment
-  variable (`*API_KEY*`, `*TOKEN*`, `*SECRET*`, …) or an API key from
-  OpenAnt's `config.json` — excluded and reported as a warning (the value
-  itself is never printed).
+- any file containing the exact value (12 or more characters) of a
+  credential-named environment variable (`*API_KEY*`, `*TOKEN*`, `*SECRET*`,
+  …) or of an `api_key`/`token`/`secret`/`password` value in OpenAnt's
+  `config.json`. Such files are excluded and reported as a warning; the value
+  itself is never printed.
 
 ---
 
@@ -388,15 +438,23 @@ Evaluation semantics are frozen per batch: the interpreter, `run_traced.py`
 and the blind filter policy cannot change on resume, and the stored
 `run_config` must still describe the canonical flags — an edited
 `batch_manifest.json` (e.g. a dropped `--blind-strip-same-repo-github-references`)
-is refused. The runner fingerprints the OpenAnt work tree (HEAD, tracked
-diff, untracked file hashes) and **refuses to resume against different
-code** unless `--allow-openant-change`. Within a session it re-checks the
-fingerprint before and after every case and at the session end (read-only
-git: it never writes `.git/index`, so it cannot collide with your own git
-commands in the repository): any change
-is recorded, flagged as an anomaly on the affected cases, and reported in the
-summary and terminal ("OpenAnt code changed during the batch"). `--jobs` and
-`--case-timeout-minutes` may change per session.
+is refused. `--allow-mock-llm` carries over from the original run.
+
+The runner fingerprints the OpenAnt work tree (HEAD, tracked diff, untracked
+file hashes). It **refuses to resume against code that differs from the
+first session** unless `--allow-openant-change` is passed. Because HEAD is
+part of the fingerprint, committing the same changes also counts as a
+change. Within a session, the runner re-checks the fingerprint before and
+after every case and at the session end, using read-only git commands. Any
+change is recorded, flagged as an anomaly on the affected cases, and
+reported in the summary and the terminal ("OpenAnt code changed during the
+batch").
+
+`--jobs` (default 2 each session) and `--case-timeout-minutes` (default: the
+batch's stored initial value) may change per session. A session that was
+still marked in progress when its runner died is recorded as `abandoned`.
+Flags that do not apply to the current mode, such as `--label` or
+`--batch-id` on resume, are ignored.
 
 A batch must stay at its original path: run manifests record absolute
 paths, so a moved batch cannot be resumed or re-validated (the runner
@@ -436,22 +494,17 @@ file (`.batch.lock`, `flock`); a second runner on the same batch exits 2.
 `run_patcheval_python_37.py` is now a thin wrapper: it selects the 37
 PatchEval-Verified Python expansion cases (`opendiamond-cve-2022-31506`
 onward in `cfp_evaluation_cases.yaml`) and delegates to `run_cve_batch.py`
-with `--label patcheval-python-37`. `--case` narrows the selection and must
-name one of the 37 (anything else exits 2 — it never adds cases).
-`--results-root` is accepted as an alias of `--batch-root`; every other
-option passes through (`--jobs`, `--validate-only`, `--resume`, …).
-
-Changes from the old standalone runner: `--repos-root` is gone (each attempt
-clones into its own directory); runs are isolated per case (the old runner
-shared one CWD, so all debug artifacts landed in `libs/openant-core/reports/debug/`);
-the canonical context-budget flags are passed; a dirty OpenAnt work tree is
-recorded rather than refused (pass `--require-clean-openant` to refuse); and
-`run_traced.py` runs under the interpreter that launched the wrapper (or
-`--python`), verified by the `run_traced.py --help` pre-flight.
+with `--label patcheval-python-37`. For a new batch, `--case` narrows the
+selection and must name one of the 37: anything else exits 2, and it never
+adds cases. With `--resume`/`--summarize`, `--case` is forwarded unchecked.
+`--results-root` is accepted as an alias of `--batch-root`. Every other
+option passes through (`--jobs`, `--validate-only`, `--resume`, …). The old
+`--repos-root` option is rejected, because each attempt now clones into its
+own directory.
 
 ```bash
-python3.12 utilities/autopatcher/tools/run_patcheval_python_37.py --validate-only
-python3.12 utilities/autopatcher/tools/run_patcheval_python_37.py --jobs 2
+python3 utilities/autopatcher/tools/run_patcheval_python_37.py --validate-only
+python3 utilities/autopatcher/tools/run_patcheval_python_37.py --jobs 2
 ```
 
 ---
@@ -459,14 +512,15 @@ python3.12 utilities/autopatcher/tools/run_patcheval_python_37.py --jobs 2
 ## 11. Limitations
 
 - POSIX only (process groups, `flock`).
-- `--jobs` above 2 is not experimentally validated (provider rate limits and
-  machine load are the unknowns, not isolation).
+- Concurrency: the runner warns above `VALIDATED_MAX_JOBS` (4). Provider rate
+  limits, NVD rate limits, and machine load are the practical limits; per-case
+  isolation does not depend on `--jobs`.
 - Each attempt makes a full clone; large repositories (ansible, django,
   airflow, mlflow) cost disk and time, and checkouts are kept in the batch
   directory (delete `cases/*/attempt-*/repo/` after packaging if space is
-  needed — they are reconstructible from URL + SHA). For scale: the 37
-  historical PatchEval checkouts took 9.8 GB and their investigation output
-  3.2 GB, so budget ~15 GB for the 43-case `cfp_evaluation_cases.yaml` batch.
+  needed — they are reconstructible from URL + SHA). As a rough estimate
+  from earlier runs, budget about 15 GB for the 43-case
+  `cfp_evaluation_cases.yaml` batch.
 - Token/cost totals depend on `run_traced.py`'s human Trace Summary and are
   rounded to cents per case.
 - Outcome parsing depends on the Trust Report decision card format; any
@@ -478,7 +532,7 @@ python3.12 utilities/autopatcher/tools/run_patcheval_python_37.py --jobs 2
 ## 12. Tests
 
 ```bash
-python3.12 -m pytest tests/patch/test_run_cve_batch.py -q
+python3 -m pytest tests/patch/test_run_cve_batch.py -q
 ```
 
 Hermetic: local bare repositories served for `https://github.com/...` URLs

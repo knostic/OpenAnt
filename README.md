@@ -289,44 +289,53 @@ openant project switch <org/repo> # switch active project
 
 ## Auto Patcher
 
-Auto Patcher exists to answer one question: **does this AI-generated patch deserve to be trusted?** Generating a candidate patch is only the first step. Auto Patcher focuses on producing the evidence humans need to decide whether that patch should be trusted and deployed.
+Auto Patcher exists to answer one question: **does this AI-generated patch deserve to be trusted?** Generating a candidate patch is only the first step. Auto Patcher focuses on producing the evidence a human needs to decide whether to trust and deploy that patch.
 
-Given a known CVE or a specific finding from an OpenAnt scan, it runs the candidate patch through a multi-stage pipeline — repository grounding and remediation planning, patch generation, adversarial challenge, calibration, review, confidence scoring, deterministic impact/test analysis — and produces a Trust Report that states whether the patch is fit to deploy, backed by the evidence behind that call. It does not autofix your repository: the patch and its Trust Report are written to disk for a human to review, and the target repository is never modified.
+Given a known CVE or a finding from an OpenAnt scan, Auto Patcher does the following:
+
+1. Grounds the vulnerability in the target repository.
+2. Plans a remediation from verified repository evidence.
+3. Generates a candidate patch.
+4. Checks the patch deterministically.
+5. Challenges the patch adversarially.
+6. Writes a Trust Report whose recommendation is computed by a fixed policy from the evidence collected.
+
+Auto Patcher does not autofix your repository. The patch and its Trust Report are written to disk for a human to review. Patches are only ever applied to temporary copies of the repository, never to the repository itself.
 
 **Learn more:**
-- [Auto Patcher architecture](docs/auto-patcher/auto-patcher-architecture.md) — the full pipeline: every stage, execution order, how production and replay share code, and how execution artifacts/provenance work.
-- [Recommendation policy](docs/auto-patcher/recommendation-policy.md) — exactly how the Trust Report's evidence and final recommendation are decided.
-- [Tracing & debugging guide](libs/openant-core/utilities/autopatcher/tools/TRACING_AND_DEBUGGING.md) — running a traced evaluation, inspecting execution manifests, and replaying individual pipeline stages during development.
+- [Auto Patcher architecture](docs/auto-patcher/auto-patcher-architecture.md): components, stages, information and evidence flow, fail-closed boundaries, recording and replay.
+- [Recommendation policy](docs/auto-patcher/recommendation-policy.md): exactly how the Trust Report's evidence and recommendation are decided, and what they do not prove.
+- [Tracing & debugging guide](libs/openant-core/utilities/autopatcher/tools/TRACING_AND_DEBUGGING.md): traced runs, execution manifests, single-stage replay.
+- [Real-CVE batch runner](libs/openant-core/utilities/autopatcher/tools/RUN_CVE_BATCH.md): parallel, resumable evaluation over YAML manifests of historical CVEs (evaluation tooling, not needed for normal use).
 
 ### Why AI-generated patches can't be trusted at face value
 
-A patch produced by an LLM can look correct — it compiles, it touches the right function, it reads like a competent fix — without actually closing the vulnerability. It may narrow the attack surface without eliminating it, fix the described case while missing an adjacent one, or apply cleanly against one version of a file and silently fail against another. Fluent output is not verified output, and asking the same model that wrote a patch whether the patch is good doesn't close that gap — it just repeats the same blind spot.
+A patch produced by an LLM can look correct — it compiles, it touches the right function, it reads like a competent fix — without actually closing the vulnerability. It may narrow the attack surface without eliminating it, fix the described case while missing an adjacent one, or apply cleanly against one version of a file and silently fail against another. Fluent output is not verified output.
 
-### What Auto Patcher does differently
+### How it works
 
-Rather than returning a single "here's the fix," every candidate patch goes through a trust-building process:
+A run moves through five phases, shown in the terminal as it goes:
 
-```
-Generate a candidate patch
-        │
-        ▼
-Challenge it from an adversarial perspective
-        │
-        ▼
-Collect deterministic evidence — does it apply cleanly? does it introduce obvious defects?
-        │
-        ▼
-Produce a recommendation, backed by the evidence collected above
-```
+1. **Analyze.** Auto Patcher locates and parses the code the vulnerability concerns, then builds a deterministic picture of the repository around it. An LLM planner proposes a remediation. If the planner explicitly asks for more evidence, that evidence is acquired deterministically, within a fixed number of attempts. Specific planner claims are then checked by a separate verification call.
+2. **Prepare.** A final strategy is derived from verified evidence only. Auto Patcher then builds the exact source of the target code. If any intended edit still lacks verified, patch-ready source, generation stops rather than guessing.
+3. **Generate.** The LLM generates one candidate diff, and deterministic code then checks it:
+   - wrong hunk headers are repaired;
+   - the patch must touch only the approved target files;
+   - the diff is checked for hygiene problems and with `git apply --check`.
 
-The adversarial pass is a distinct reasoning step whose only job is to argue the patch doesn't hold up — not to confirm that it does. The deterministic checks (applying the patch against the real repository, scanning the diff for hygiene issues) never rely on an LLM's opinion of its own work. The final recommendation is computed from all of this evidence by a fixed decision policy, not read off an LLM's self-reported confidence.
+   Each kind of failure gets at most one bounded retry. The patch is then applied to an isolated copy of the repository and the original vulnerable locations are re-analyzed.
+4. **Validate.** An adversarial Challenger call reports concerns as specific facts backed by verbatim quotes. Code checks those quotes against the evidence the Challenger was actually shown, and derives the verdict from the checked facts. The model's own stated verdict never decides it. Free-text findings are then calibrated, at most one repair attempt can run, and the patch is reviewed.
+5. **Decide.** Deterministic Trust Signals and a fixed decision policy produce the recommendation.
+
+LLM judgment is used for planning, strategy, patch generation, adversarial review, finding calibration, and narrative review. Everything that decides whether a patch is applicable, conformant, or recommended is deterministic code operating on that output. Code checks the structure of LLM output and the provenance of its citations, but not the soundness of its reasoning. The same configured model performs every LLM step, including the adversarial one, so the Challenger narrows but does not remove the risk of a shared blind spot.
 
 ### Philosophy
 
 - **Never communicate more certainty than the evidence supports.** A check that didn't run is reported as unverified, never as a quiet pass.
-- **Recommendations come from deterministic policy, not from an LLM's self-assessment.** Each of the four possible recommendations is computed from evidence gates a human can audit — not a model grading its own patch.
-- **Every recommendation ships with the evidence behind it.** The Trust Report separates what was mechanically verified from what is heuristic, adversarial-review judgment, so a reviewer never has to guess which is which.
-- **The deployment decision stays with a human.** Auto Patcher never applies a patch to the target repository — it produces a recommendation for someone accountable to act on.
+- **A fixed, auditable policy makes the call.** No self-reported confidence score influences the recommendation.
+- **Fail closed.** When a gate cannot establish the evidence it needs, Auto Patcher stops before generation or lands on Manual Review Required rather than guessing upward. One known exception is described under [Outcomes and exit codes](#outcomes-and-exit-codes).
+- **Every recommendation ships with the evidence behind it.** The Trust Report separates deterministic checks from heuristic, adversarial-review judgment.
+- **The deployment decision stays with a human.** Auto Patcher never applies a patch to the target repository.
 
 ### Quick start
 
@@ -343,7 +352,9 @@ openant patch \
   --output /tmp/patch-report
 ```
 
-Auto Patcher's LLM provider and model come from OpenAnt's own configuration, not a separate system: run `openant setup llm` once, and every `openant patch` run inherits that config's `analyze` phase provider/model automatically — including the built-in default if you've never run the wizard (e.g. after `openant set-api-key`). There's no provider or model picker specific to Auto Patcher; if the configuration is missing or unusable, the run fails clearly and points you at `openant setup llm` rather than opening a menu. `LLM_PROVIDER=mock` remains available as an explicit way to run without a real provider, for testing/research.
+The CVE record is fetched from NVD. Setting `NVD_API_KEY` raises NVD's rate limits but is optional.
+
+Auto Patcher's LLM provider and model come from OpenAnt's own configuration, not a separate system. Run `openant setup llm` once, and every `openant patch` run inherits that config's `analyze` phase provider and model. If you have never run the wizard (for example after `openant set-api-key`), it uses the built-in default. There is no Auto Patcher-specific provider or model picker. Setting `LLM_PROVIDER`/`LLM_MODEL` to select a real provider is an error. If the configuration is missing or unusable, the run fails before any repository work and points you at `openant setup llm`. `LLM_PROVIDER=mock` is available only as an explicit way to run without a real provider, for testing and research.
 
 ### Example
 
@@ -358,22 +369,9 @@ openant patch \
   --output /tmp/urllib3-report
 ```
 
-### Context budget
-
-Every pipeline stage that pulls repository source into an LLM call (final-target slicing, pre-patch and post-patch source acquisition) is bounded by the **real technical capacity** of the active model — the model's documented context window (when known), minus the exact overhead already reserved for output tokens, the system prompt, and other prompt content, minus a small safety margin. There is no arbitrary "budget window" ceiling, and no user-facing resource/cost limit: by default, every run acquires as much justified repository evidence as the model can technically hold. Resolved evidence that genuinely cannot fit in one call is recorded (never silently dropped) with a structured `technical_capacity` reason.
-
-`--context-budget-policy` and `--max-context-budget-windows` are **deprecated** — they no longer control whether evidence reaches an LLM call. They are still accepted (a passing script or CI job keeps working) but only print a one-time notice; they have no further effect.
-
-```bash
-openant patch \
-  --cve CVE-2023-43804 \
-  --repo-root /tmp/urllib3-eval \
-  --output /tmp/urllib3-report
-```
-
 ### Remediating a finding instead
 
-Auto Patcher can also remediate a finding already produced by an OpenAnt scan (`openant scan` / `openant build-output`), instead of a CVE. Pick a finding whose verdict is patch-eligible — `confirmed`, `agreed`, `vulnerable`, or `bypassable` — from the `findings` array in your project's `pipeline_output.json` (the snippet below requires [`jq`](https://jqlang.org/)):
+Auto Patcher can also remediate a finding that an OpenAnt scan already produced (`openant scan` / `openant build-output`), instead of a CVE. Pick a finding whose verdict is patch-eligible from the `findings` array in your project's `pipeline_output.json`. The eligible verdicts are `confirmed`, `agreed`, `vulnerable`, and `bypassable`; any other verdict is rejected. This snippet lists findings and verdicts (it requires [`jq`](https://jqlang.org/)):
 
 ```bash
 jq -r '.findings[] | "\(.id)\t\(.stage2_verdict // .stage1_verdict)"' pipeline_output.json
@@ -383,22 +381,88 @@ jq -r '.findings[] | "\(.id)\t\(.stage2_verdict // .stage1_verdict)"' pipeline_o
 openant patch --finding-id VULN-001
 ```
 
+With no path argument, the active project's `pipeline_output.json` is used, and `--repo-root` and `--output` default to the active project's repository and scan directory.
+
+### Options
+
+| Flag | Meaning |
+|---|---|
+| `--cve <CVE-ID>` | Remediate a public CVE (requires `--repo-root`, or an active project to default to). Mutually exclusive with `--finding-id`. |
+| `--finding-id <id>` | Remediate a finding from `pipeline_output.json`. |
+| `--repo-root <path>` | The target repository checkout. Defaults to the active project's repository. |
+| `--output`, `-o <dir>` | Output directory. Defaults to the active project's scan directory, or a new temporary directory when there is no active project. |
+| `--verbose` | Show detailed per-stage diagnostics and full error detail. |
+| `--quiet`, `--json` | Global flags: suppress progress output, or print the raw JSON result envelope. |
+
+`--context-budget-policy` and `--max-context-budget-windows` are deprecated. They are still accepted so existing scripts keep working, but they only print a one-time notice and have no effect (see [Context budget](#context-budget)). Existing Test Comparison (`--compare-existing-tests`) is available on the Python CLI and the tracing tool, not on `openant patch`; see [Known limitations](#known-limitations).
+
+The Go CLI stops a Python subprocess after 30 minutes by default. Set `OPENANT_INVOKE_TIMEOUT` (for example `OPENANT_INVOKE_TIMEOUT=2h`) for unusually long runs.
+
+### Outcomes and exit codes
+
+The Trust Report leads with one outcome:
+
+- **Deploy After Validation**, **Deploy With Caution**, **Manual Review Required**, or **Do Not Apply**: a final candidate patch exists, and the fixed policy evaluated it.
+- **NO PATCH PRODUCED**: the run completed, but a fail-closed gate stopped it before a final candidate patch existed. For example, the evidence could not justify a target, the target source could not be verified, or the generated patch edited the wrong files. This is an outcome of the run, not a recommendation, and there is nothing to review or deploy.
+
+Deploy With Caution belongs to the policy's vocabulary, but the current evidence model does not produce it. On non-Python repositories, deployment risk cannot be verified, so the best possible recommendation is Manual Review Required.
+
+**No recommendation proves that the vulnerability is fixed.** Deploy After Validation means the patch applies cleanly, its diff has no hygiene problems, adversarial review left no blocking or unresolved concern, and the change has a low or moderate impact surface. It does not mean an exploit was attempted, that every attack path was closed, or that the patch matches the upstream maintainers' fix.
+
+`openant patch` exits with:
+
+| Exit code | Meaning |
+|---|---|
+| 0 | A Trust Report was written, whatever its outcome (including NO PATCH PRODUCED). |
+| 2 | The run failed and no Trust Report was written. Examples: invalid LLM configuration, an LLM API failure in a non-best-effort stage, an ineligible or unknown finding, a missing `--repo-root`, or an NVD fetch error. |
+| 130 | Interrupted. |
+
+Some stages are best-effort, such as planning, evidence acquisition, and calibration. If one of them fails, the run prints a warning and continues with less evidence. That usually makes the outcome more cautious, and can mean NO PATCH PRODUCED. There is one exception: if planning or the final strategy produces no result at all, for example because of an LLM error, the patch is generated without the target-readiness and target-conformance gates. The adversarial review and the policy still apply to it. Treat a run that printed such warnings with extra care.
+
 ### The Trust Report
 
-Each run writes two files under `patch/` in the project's scan directory, named after the input (a CVE id or a finding id):
+Each run writes to `<output>/patch/`, with files named after the input (a CVE id or a finding id):
 
-- `{id}-vulnerability.md` — the input as rendered into what Auto Patcher worked from.
-- `{id}-trust-report.md` — the Trust Report.
+- `{id}-vulnerability.md`: the input, as rendered into the text Auto Patcher worked from.
+- `{id}-trust-report.md`: the Trust Report. It is written only when the run completes, and a stale report from an earlier failed run is removed first.
+- `{id}-investigation/`: parser artifacts from repository analysis.
 
-If no final candidate patch could be produced, the report leads with **NO PATCH PRODUCED** — an execution outcome, not a recommendation. Otherwise, it leads with a single recommendation — **Deploy After Validation**, **Deploy With Caution**, **Manual Review Required**, or **Do Not Apply** — computed by a fixed decision policy, never an LLM's self-assessment. A Trust Signals table below it shows the evidence behind that call: whether the patch applies cleanly, whether its edited content was actually verified against the repository, whether adversarial review found it addresses the vulnerability, whether tests already cover the affected code, and what deployment risk it carries. Each signal is marked as either a deterministic check or a heuristic judgment, and a check that didn't run is reported as unverified, never as a quiet pass.
+`openant patch` also writes `<output>/patch.report.json`, OpenAnt's step report for the run. It records the run's inputs, outputs, status, duration, and token and cost usage, including on failure.
 
-A clean apply and passing hygiene checks mean the patch is well-formed — not that the vulnerability is fixed. Post-Patch Investigation re-checks the vulnerability's original code locations against the patched repository for evidence closer to that claim. When the input is a CVE, the report also flags that the advisory's own claims are unverified against the repository, and that the recommendation is based on evidence gathered against it — not the advisory's severity score.
+Below the outcome, a Trust Signals table shows the evidence behind it:
+
+- whether the patch applies;
+- whether its edited content was found in the repository;
+- whether adversarial review found that it addresses the vulnerability;
+- whether there are unresolved concerns;
+- whether relevant tests already exist;
+- what deployment risk the change carries;
+- whether existing tests newly fail (when that check was requested).
+
+Each row is marked as a deterministic check or a heuristic judgment, and a check that didn't run is reported as unverified. The report also includes the structured Challenger concerns, a Post-Patch Investigation of the patched copy, Validation Actions to run before deploying, and Run Metadata (repository commit, OpenAnt commit, provider and model).
+
+A clean apply and passing hygiene checks mean the patch is well-formed, not that the vulnerability is fixed. When the input is a CVE, the report states that the advisory's claims are not verified against the repository, and that the recommendation is based on evidence gathered from the repository, not on the advisory's severity score.
+
+### Context budget
+
+Repository evidence placed in an LLM call is limited by a per-call technical capacity. There is no cost or spend limit, and no "budget window" setting. The limit is computed per call as:
+
+> (model context window − output-token reserve − 2,000-token safety margin) × 3 characters per token − the exact size of the rest of the prompt
+
+The output-token reserve is `LLM_MAX_TOKENS`, which defaults to 4,096.
+
+**Current behavior:** OpenAnt's model registry (`config/models.json`) does not yet record a context window for any model. Every run therefore uses the documented conservative fallback of **60,000 tokens**, whatever the configured model's real window is. With the default output reserve, that leaves about 160,000 characters of prompt per call, before the system prompt and other mandatory content.
+
+Evidence that is resolved but does not fit is omitted whole, never truncated mid-block, and recorded with the reason `technical_capacity`. If the target source that patch generation requires does not fit, the run stops with NO PATCH PRODUCED instead of sending an incomplete request.
+
+Separately, fixed structural limits bound how much exploration happens. These include up to 5 planning attempts, 2 deterministic and 2 guided acquisition rounds with 5,000 characters of new source per round, one post-patch recovery round, and a whole-function rendering limit of about 3,300 characters per unanchored target. See [the architecture document](docs/auto-patcher/auto-patcher-architecture.md#context-capacity) for details.
 
 ### Known limitations
 
-- Auto Patcher is an early-stage capability — its own reports are labeled MVP output today.
-- Some evidence signals (impact analysis, existing-test discovery) currently run meaningfully only on Python codebases; on other languages they report as not applicable rather than being silently skipped.
-- The Trust Report's "Do relevant tests already exist?" signal is a **discovery** check (does a matching test file exist on disk), not an execution check — it doesn't tell you whether those tests pass. Auto Patcher can optionally also *execute* the repository's existing test suite, in Docker, once before and once after the patch, and report any newly-introduced failures (Existing Test Comparison) — but this is opt-in, not yet exposed as an `openant patch` flag, and its result is informational only: it does not affect the recommendation. See [Existing Test Comparison](docs/auto-patcher/recommendation-policy.md#current-limitations) for the exact distinction.
+- Auto Patcher is an early-stage capability; its reports are labeled MVP output.
+- Impact analysis and existing-test discovery currently run only on Python repositories. Elsewhere they report "not applicable" rather than being silently skipped, which also caps non-Python runs at Manual Review Required.
+- "Do relevant tests already exist?" is a **discovery** check (does a matching test file exist?), not a test run. Existing Test Comparison does run the repository's existing tests, in Docker, against unpatched and patched copies, and reports newly failing tests. However, it is opt-in, it is not exposed as an `openant patch` flag (run the Python entry point the CLI uses, for example `~/.openant/venv/bin/python -m openant patch --cve <CVE-ID> --repo-root <path> --compare-existing-tests`), it requires Docker, and it does not affect the recommendation. See the [recommendation policy](docs/auto-patcher/recommendation-policy.md#current-limitations).
+- Adversarial review, calibration, and narrative review are LLM calls. Two runs on the same input can reach different outcomes.
 - This is a decision aid for a human reviewer, not a replacement for manual security review.
 
 ## Roadmap

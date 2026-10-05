@@ -1,530 +1,296 @@
 # The Trust Report and Recommendation Policy
 
-This document explains how Auto Patcher's Trust Report is produced, and — more
-importantly — how its final recommendation is decided. It is written for
-security engineers who need to know exactly what a recommendation is and is
-not based on before acting on it.
+This document explains what an Auto Patcher Trust Report contains and exactly
+how its recommendation is decided. It is written for security engineers who
+need to know what a recommendation is and is not based on before acting on it.
 
 For what Auto Patcher is and how to run it, see the
 [Auto Patcher section of the README](../../README.md#auto-patcher). For the
-complete pipeline/system architecture — every canonical stage, execution
-recording, provenance/lineage, and how replay works — see
-[auto-patcher-architecture.md](auto-patcher-architecture.md). This document
-goes one level deeper than either of those: it describes the evidence-to-
-decision machinery behind the report `openant patch` produces. In the
-architecture document's terms, everything below is the internals of two
-canonical stages — S12 (`trust_signals_and_recommendation`) and, for how the
-recommendation surfaces in the report, S13 (`report_generation`) — which in
-the current implementation are computed together, inside `_build_report`;
-see that document's
-[Terminal reporting architecture](auto-patcher-architecture.md#terminal-reporting-architecture)
-section for exactly what "computed together" means and why S12 has no
-independent execution record of its own.
+pipeline as a whole (stages, information flow, fail-closed boundaries,
+recording and replay), see
+[auto-patcher-architecture.md](auto-patcher-architecture.md). In that
+document's terms, everything below happens in the last two canonical stages,
+`trust_signals_and_recommendation` and `report_generation`, which are computed
+together by `_build_report` in `utilities/autopatcher/pipeline.py`.
 
-Everything below is grounded in the current implementation of
-`utilities/autopatcher/pipeline.py` in `libs/openant-core`, plus the stage
-modules it calls directly and cites by name throughout: `patch_challenger.py`,
-`finding_calibration.py`, `patch_reviewer.py`, `confidence_scorer.py`,
-`source_verification.py`, `diff_hunk_repair.py`, `post_patch_investigation.py`,
-and `post_patch_evaluation.py`. Function names are cited so this document can
-be re-verified against source at any time; treat any mismatch you find as this
-document being stale, not the code.
+Function names are cited so each statement can be checked against the code in
+`libs/openant-core/utilities/autopatcher/`. If this document and the code
+disagree, the code is authoritative.
 
-## Purpose
+## Contents
 
-A Trust Report does not tell you a patch is correct. It tells you what was
-checked, what that checking found, and — given exactly that evidence and
-nothing else — what a fixed, auditable policy recommends. The recommendation
-is a starting point for review, not a substitute for it. Nothing in this
-system applies a patch to a repository; every run writes its output to disk
-for a human to read.
+- [What a recommendation is, and is not](#what-a-recommendation-is-and-is-not)
+- [Outcomes](#outcomes)
+- [Evidence](#evidence)
+- [Trust Signals](#trust-signals)
+- [Recommendation Policy](#recommendation-policy)
+- [Which outcomes are reachable today](#which-outcomes-are-reachable-today)
+- [How to read each outcome](#how-to-read-each-outcome)
+- [Evidence caveats and the Manual Review scope note](#evidence-caveats-and-the-manual-review-scope-note)
+- [What does not affect the recommendation](#what-does-not-affect-the-recommendation)
+- [The Trust Report layout](#the-trust-report-layout)
+- [Current limitations](#current-limitations)
 
-## Philosophy
+## What a recommendation is, and is not
 
-The recommendation policy (`_compute_trust_signals`, `_build_recommendation_v1`
-in `pipeline.py`) is built around a small set of invariants, documented
-in-code directly above `_compute_trust_signals`. Restated here:
+A Trust Report does not tell you a patch is correct. It reports what was
+checked, what those checks found, and what a fixed, auditable policy
+recommends given exactly that evidence. In particular:
 
-- **No positive inference from missing evidence.** If a check didn't run —
-  timed out, was skipped, raised an exception — that reads as "not verified"
-  or "unknown," never as a passing result. A check that never ran must never
-  look identical to a check that ran and passed.
-- **Whitelists, not blacklists.** Every gate in the recommendation policy is
-  phrased as "value is in this specific set of known-good values," never as
-  "value is not the one known-bad value." A blacklist silently admits any
-  future or unrecognized value as if it were good; a whitelist doesn't.
-- **Heuristic evidence is never treated as proof.** Output from the
-  adversarial LLM challenger is classified and counted, but it never on its
-  own reaches the strongest recommendation or the strongest rejection —
-  see [Recommendation Policy](#recommendation-policy).
-- **The report never communicates more certainty than the evidence supports.**
-  This governs both the policy's gates and the report's own wording — e.g. a
-  "Minor Issues" patch-integrity result is deliberately excluded from the
-  "positive" whitelist even though it doesn't hard-block, because it is real
-  observed evidence of a defect, not an absence of evidence.
+- **No recommendation proves the vulnerability is fixed.** Even the strongest
+  label, Deploy After Validation, means the deterministic checks passed and the
+  adversarial review left no blocking or unresolved concern. It does not
+  mean an exploit was attempted, that every path to the vulnerability was
+  closed, or that the patch matches what an upstream maintainer shipped. Auto
+  Patcher has no upstream-patch comparison feature.
+- **The policy is deterministic; some of its inputs are not.** The decision
+  tree (`_build_recommendation_v1`) and the signal derivation
+  (`_compute_trust_signals`) are plain code. But two of their inputs come from
+  LLM calls: the Challenger's reported facts and Finding Calibration's
+  grouping. Code validates and classifies those outputs, but their semantic
+  correctness is model judgment. Two runs on the same input can therefore
+  produce different recommendations.
+- **The recommendation is a starting point for review, not a substitute for
+  it.** Auto Patcher never applies a patch to the target repository; patches
+  are applied only to temporary copies.
 
-## Two kinds of outcome
+The policy is built around invariants written in code directly above
+`_compute_trust_signals` (I1–I6). In short:
 
-Auto Patcher's report leads with exactly one top-level outcome, but that
-outcome comes from one of two different axes, and they must not be confused:
+- **No positive inference from missing evidence.** A check that did not run,
+  timed out, or raised reads as "Not Verified" / "Unknown", never as a pass.
+- **Whitelists, not blacklists.** Every positive gate is "value is in this set
+  of known-good values", never "value is not the known-bad value".
+- **Heuristic evidence alone never reaches the strongest rejection.** Do Not
+  Apply requires a deterministic failure; adversarial-review findings cap out at
+  Manual Review Required.
+- **Inconclusive evidence defaults to Manual Review Required.**
 
-**A. Execution outcome — did a final candidate patch exist at all?**
+## Outcomes
 
-- ⚫ **NO PATCH PRODUCED** — the pipeline never produced a final candidate
-  patch to evaluate. There is nothing to deploy, review, or validate.
+A run ends in one of three ways. They must not be confused.
 
-**B. Recommendation Policy outcome — given a candidate patch, what does the
-evidence support?**
-
-- 🟢 Deploy After Validation
-- 🟡 Deploy With Caution
-- 🟠 Manual Review Required
-- 🔴 Do Not Apply
-
-`NO PATCH PRODUCED` is **not** a fifth recommendation, not a
-Recommendation-Policy branch, and not equivalent to `Do Not Apply` or `Manual
-Review Required` — both of those presuppose a real candidate patch exists for
-the policy to judge. `NO PATCH PRODUCED` means there was no candidate to
-judge in the first place. See [NO PATCH PRODUCED](#no-patch-produced) below
-for the exact trigger and rendering behavior.
-
-Auto Patcher's evidence-to-decision flow, in full:
-
-```
-Pipeline execution
-       │
-       ▼
- final candidate patch exists?   (result.patch non-empty — see _build_report)
-       │
-   ┌───┴────────────┐
-   NO               YES
-   │                 │
-   ▼                 ▼
-⚫ NO PATCH      Evidence
-  PRODUCED       │   (deterministic checks + an adversarial LLM Challenger
-                 │    call, grounded in repository evidence and, when still
-                 │    current, Post-Patch Investigation findings — the
-                 │    Challenger's free-text findings then classified by a
-                 │    deterministic rule)
-                 ▼
-             Trust Signals
-                 │   (eight named values; seven shown as their own report row)
-                 ▼
-          Recommendation Policy
-                 │   (a fixed decision tree over four of those signals)
-                 ▼
-            Recommendation
-                  (one of four labels, with a fixed reason string and, for
-                   the top two labels, an evidence-check caveat where
-                   warranted)
-```
-
-Before this flow starts, several more LLM stages — remediation planning,
-remediation strategy, and (best-effort, inside guided repository-context
-acquisition) a narrow `guided_context_request` call — help assemble the
-repository evidence (`code_context`) that Patch Generation, the Challenger,
-Finding Calibration, and the Confidence Scorer all read. After the
-Challenger runs, two more LLM stages — Finding Calibration and Patch Review
-— plus the Confidence Scorer produce additional report content. **None of
-these stages write to Trust Signals or the Recommendation Policy.** See
-[Evidence](#evidence) for what each one actually does, and
-[What does NOT affect the recommendation](#what-does-not-affect-the-recommendation)
-for the ones whose output is discarded or report-only.
-
-One implementation detail worth knowing: Trust Signals and the Recommendation
-Policy are computed **unconditionally**, even on a no-patch run (on
-whatever empty/default hygiene, applicability, and challenger data exist) —
-and so do Finding Calibration, Patch Review, and the Confidence Scorer, which
-run against whatever patch text exists with no early return gating them on a
-non-empty patch. That computed recommendation is deliberately never shown or
-acted on — `_build_report` reads the `no_patch` flag and renders the
-`NO PATCH PRODUCED` card in its place instead. Nothing about this bypasses
-the policy; the policy result is simply discarded for presentation once there
-is no patch to attach it to.
-
-Each stage is described in its own section below. A stage further down the
-pipeline can only see what a prior stage already computed — nothing is
-recomputed or re-inferred at the Recommendation stage.
-
-## Evidence
-
-Exactly two categories of evidence feed the Trust Signals: deterministic
-checks, and the adversarial Challenger's classified output. Everything else
-in this section — Finding Calibration, Patch Reviewer, the Confidence Scorer,
-and Post-Patch Investigation — either shapes what the Challenger itself sees,
-or is computed and rendered without ever reaching `_compute_trust_signals` or
-`_build_recommendation_v1`. It matters which is which.
-
-### Deterministic evidence
-
-Produced by code with no LLM in the loop:
-
-| Source | What it checks | Module |
+| Outcome | What it means | Trust Report written? |
 |---|---|---|
-| Patch Hygiene | Diff-shape defects: empty hunks, duplicate constants, unused imports | `patch_hygiene.check_patch` |
-| Patch Applicability | Whether the diff applies to the target repository (`git apply --check`, read-only) | `patch_applicability.check_applicability` |
-| Test Support | Whether existing repository tests already cover the changed file/module — a discovery check, not a test *run* (see [Current limitations](#current-limitations)) | `testing_support.discover_tests` / `tests_for_file` / `score_test_support` |
-| Impact Surface | AST-based usage analysis of changed symbols — **Python-only**; reports "not applicable" for other languages | `impact_surface.LightweightImpactAnalyzer` |
+| A **recommendation** (one of four labels below) | A final candidate patch exists and the policy evaluated it. | Yes |
+| ⚫ **NO PATCH PRODUCED** | The run completed, but it ended without a final candidate patch, usually because a fail-closed gate stopped generation (see [the architecture document](auto-patcher-architecture.md#fail-closed-boundaries)). There is nothing to review or deploy. | Yes |
+| **Run failure** | The run itself failed (for example an LLM API error in a stage that is not best-effort, an invalid LLM configuration, an ineligible finding, a missing `--repo-root`, or an NVD fetch failure). | No. `openant patch` prints the error and exits with code 2. |
 
-Patch Applicability and Patch Hygiene — and, through `patch_integrity`, the
-Trust Signal built from them — always evaluate the diff *after* a chain of
-deterministic repair steps has already run against it, not the LLM's raw
-output. `diff_hunk_repair.repair_hunk_headers` recomputes arithmetically
-wrong `@@` hunk-header counts and, when `repo_root` is known, relocates a
-hunk's claimed old-side line number to wherever its content uniquely matches
-the real file. If the repaired diff still fails `git apply --check`,
-`diff_hunk_repair.reconstruct_hunk_context` gets one more deterministic
-attempt: it expands context lines for a hunk that is already positionally
-correct but too context-thin for `git apply` to accept. Both preserve every
-semantic `+`/`-` line; neither invents a change. `check_patch` and
-`check_applicability` always run on whichever diff text these repairs
-produced — every call site in `pipeline.py` runs header repair immediately
-before hygiene/applicability, for the original patch, the applicability
-retry, and the Challenger-driven repair loop alike. The same repair pass's
-per-hunk relocation records (`unique_match` / `ambiguous` / `no_match` /
-`skipped`) are the entire input to the `source_verification` signal — see
-[Trust Signals](#trust-signals).
-
-### Heuristic evidence: the adversarial Challenger
-
-One LLM output feeds the Trust Signals: the **Challenger**
-(`patch_challenger.challenge_patch`). It is a separate reasoning pass whose
-only instruction is to argue that the patch does *not* hold — not to confirm
-that it does. Its prompt always includes the vulnerability report and the
-proposed patch, and — when available — a `code_context` block: the same
-repository evidence (assembled from Repository Grounding, remediation
-planning/strategy, and Repository Understanding) that Patch Generation used
-to write the patch, plus, when Post-Patch Investigation has already run and
-still describes the current candidate patch, that investigation's rendered
-findings too (see [Post-Patch Investigation](#post-patch-investigation)
-below). This grounding is what lets the Challenger — and, downstream,
-Finding Calibration — distinguish a claim that is actually backed by
-repository content shown to it from one that is not.
-
-It returns:
-
-- `still_vulnerable` — a boolean the LLM asserts directly, parsed from its
-  response. This is a raw model judgment, not a derived value.
-- `edge_cases` / `potential_issues` — free-text findings.
-
-Those free-text findings are then run through a **deterministic** classifier,
-`_classify_finding` (pattern-matched against explicit-exploit phrasing,
-version/scope qualifiers, validation-gap language, and generic-observation
-language), sorting each into one of four categories:
-
-- `confirmed_defect` — an unambiguous claim the fix doesn't hold, with no
-  scope/version qualifier attached.
-- `plausible_risk` — a claim that reads as a scope or version limitation
-  rather than a primary fix failure.
-- `validation_gap` — the challenger states something wasn't tested/verified,
-  not that it's broken.
-- `generic` — a stylistic or non-security observation.
-
-`_classify_challenger` then aggregates these into counts
-(`confirmed_defect_count`, `plausible_risk_count`, `validation_gap_count`).
-**These counts, plus the raw `still_vulnerable` boolean, are the only pieces
-of Challenger output the Trust Signals or the Recommendation Policy read.**
-The challenger's prose itself is presentational (rendered in Review Results),
-not a policy input.
-
-A single-shot, Challenger-driven repair loop (`run`'s Phase C) can fire once,
-right after this first Challenger call: if the patch applies cleanly but
-carries one or more `confirmed_defect` findings, the pipeline regenerates the
-patch (against the plain `code_context`, without the Post-Patch Investigation
-addition) and re-challenges the result. If the regenerated patch applies and
-its re-challenge finds zero confirmed defects, it replaces `patch`,
-`challenger`, `hygiene_findings`, and `applicability_result` for every stage
-downstream — including all of the ones described in this document. This loop
-is not itself a new evidence source the Trust Signals read; it can only
-change *which* patch, and *which* classified-Challenger result, they see.
-
-### Finding Calibration
-
-After the Challenger's final result is classified, a second LLM pass,
-**Finding Calibration** (`finding_calibration.calibrate_findings`), reclassifies
-and rewords a subset of the classified findings. `validation_gap` findings
-are never sent to it in any case — those already carry unambiguous framing.
-Which of the remaining findings are included depends on whether Patch
-Repair's repair loop fires (see [S6](auto-patcher-architecture.md#per-stage-detail)
-in the architecture document for the repair loop itself):
-
-- **No repair fires** (the common case — no raw `confirmed_defect` finding
-  exists): calibration runs once, on only the `plausible_risk`/`generic`
-  findings; `confirmed_defect` findings are excluded here too.
-- **The repair loop fires** (at least one raw `confirmed_defect` finding
-  exists): calibration is deliberately widened to also include
-  `confirmed_defect` findings, alongside `plausible_risk`/`generic`, so the
-  deterministic repair accept/reject decision reads calibration-aware state
-  rather than the raw classifier alone. If a repair patch is generated and
-  re-challenged, calibration runs a second time on the same widened set
-  against the re-challenged findings — and that second pass becomes the
-  run's final, reported calibration if the repair is accepted.
-
-Either way, it reasons over the same evidence the Challenger saw
-(vulnerability text, patch, and the same `code_context`, including
-Post-Patch Investigation findings when still current) and sorts each input
-finding into exactly one of three epistemic groups, rewording it to match
-that group's certainty:
-
-- `observed` — directly backed by the repository evidence or diff actually
-  shown to it. Rendered under **Observed Facts**, with a subtitle stating
-  this is an evidence-status label, not a severity one — an Observed Fact
-  can be reassuring, neutral, or concerning; it means "backed by evidence,"
-  not "this is a problem."
-- `hypothesis` — a plausible inference, not directly observed in that
-  evidence. Rendered under **Validation Questions**. This is also the
-  fallback group for any `plausible_risk` finding calibration didn't classify
-  (calibration wasn't run, failed, or omitted that finding).
-- `hardening` — out of scope for the current advisory; a suggestion, not a
-  concern. Rendered under **Future Improvements**. This is the fallback
-  group for any uncalibrated `generic` finding.
-
-Combined with the `confirmed_defect` → **Potential Remaining Risks** and
-`validation_gap` → **Validation Gaps** groups (untouched by calibration),
-this produces the five subsections `_build_known_findings` populates in the
-report's Review Results section.
-
-**Calibration never changes the `confirmed_defect_count` /
-`plausible_risk_count` / `validation_gap_count` counts, or the raw
-`still_vulnerable` boolean, that the Trust Signals and Recommendation Policy
-read** — those are all computed by `_classify_challenger` from the
-Challenger's original four categories, before calibration ever runs.
-`finding_calibration.py`'s own module docstring states this is deliberate: it
-is additive presentation, not reclassification of the signals' inputs.
-
-It does have one indirect effect worth knowing, however: the secondary
-consistency check described under
-[Recommendation consistency vs. the decision itself](#recommendation-consistency-vs-the-decision-itself)
-counts findings that land in **Observed Facts** and **Validation
-Questions** (but not **Future Improvements**) toward its evidence-caveat
-summary. Because calibration decides which of those three groups a given
-`plausible_risk`/`generic` finding lands in, it can change what that summary
-says — even though it never changes `decision` itself, and never changes
-what the Trust Signals table shows.
-
-### Patch Reviewer
-
-**Patch Reviewer** (`patch_reviewer.review_patch`) runs once per run, after
-Finding Calibration. Its prompt receives only the vulnerability report and
-the final candidate patch — **no `code_context`, no Challenger output, and no
-Finding Calibration output.** Its raw response is split (`_split_review`)
-into three sections rendered directly into the report: **Explanation** (why
-the original code was vulnerable and how the patch fixes it — the report
-also extracts one sentence from this as a presentational "Security gain"
-lead-in, `_extract_security_gain`), **Affected areas**, and **Reviewer
-Notes** (rendered in Appendices, from the response's `validation_notes`
-section).
-
-**Provenance matters here.** The report itself already carries this warning:
-the Explanation section states that this text "reflects the reviewer LLM's
-analysis of the advisory, diff, and any injected code context — not
-independent execution or testing against the target repository," and adds
-explicitly that "any statement that a fix 'matches' or 'aligns with' an
-upstream release reflects the model's own prior knowledge, not a fetched or
-independently verified upstream comparison." Reviewer Notes carries the same
-point: "Reviewer-LLM guidance, not independently verified evidence... any
-reference to an upstream fix, release, or version number reflects the
-model's own prior knowledge, not evidence this pipeline fetched or
-verified." Take both literally. Because Patch Reviewer's prompt carries no
-repository evidence at all, any specific claim it makes about repository
-state, an upstream fix, or a named CVE/advisory detail comes from the
-model's own prior knowledge, not from anything Auto Patcher checked against
-this repository or against an actual upstream patch — Auto Patcher has no
-upstream-diff-comparison feature today. Model prior knowledge, a verified
-upstream comparison, and repository-backed evidence (the kind
-[Post-Patch Investigation](#post-patch-investigation) or the deterministic
-checks above produce) are three different things; only the latter two are
-"evidence" in the sense the rest of this document uses that word.
-
-Patch Reviewer's output is not read by `_compute_trust_signals` or
-`_build_recommendation_v1` — `_compute_trust_signals` takes no `review`
-parameter at all. Its only downstream consumer is the Confidence Scorer,
-next.
-
-### Confidence Scorer
-
-**Confidence Scorer** (`confidence_scorer.score_confidence`) runs last. Its
-prompt receives the vulnerability report, the final patch, Patch Reviewer's
-full output, and the same `code_context` the Challenger saw (including
-Post-Patch Investigation findings, when still current). Its numeric score is
-then deterministically discounted by the Challenger's own result (0.4× if
-`still_vulnerable`, 0.7× if any edge case/potential issue was found,
-unchanged otherwise) before being stored on the pipeline result. None of
-this — not the raw score, not the discounted score, not the reasoning text —
-is read by `_compute_trust_signals` or `_build_recommendation_v1`, or
-rendered anywhere in the Trust Report; see
-[What does NOT affect the recommendation](#what-does-not-affect-the-recommendation).
-
-### Post-Patch Investigation
-
-After a candidate patch exists and the applicability-retry loop has settled,
-Post-Patch Investigation re-checks a set of deterministic "Anchors" — derived
-both from the vulnerability's original code
-(`post_patch_investigation.derive_pre_patch_anchors`, computed before
-Candidate Selection ever ran) and from the final patch's own diff
-(`post_patch_evaluation.derive_patch_touched_anchors`, which catches an
-element the patch touches even when no selected candidate ever surfaced it)
-— against a freshly built `InvestigationContext` for the *patched* repository
-copy (`post_patch_evaluation.evaluate_anchors`). Anchor kinds covered:
-resolved functions, call edges, reachability, constant values, and
-vulnerability-pattern sink matches (a `sink_match` anchor is never
-re-evaluated and reports as `unresolved`, honestly, rather than guessed).
-Each resulting `AnchorObservation` records what changed — never a verdict on
-whether that change is a successful fix; `evaluate_anchors`'s own docstring
-is explicit that judging the observation is a downstream consumer's job.
-
-This runs exactly once, immediately before the first Challenger call —
-specifically so its rendered findings (`render_post_patch_investigation`) can
-be appended to the `code_context` that the Challenger, Finding Calibration,
-and the Confidence Scorer all read, not merely placed in the report. A
-staleness guard compares the investigated patch against whatever patch
-ultimately gets reported: if the Challenger-driven repair loop replaces
-`patch` afterward, this evidence is dropped from Finding Calibration's and
-the Confidence Scorer's `code_context` (they fall back to the plain
-`code_context` without it), and the report's own Post-Patch Investigation
-section renders "Not shown" instead of stale findings. The repair loop's own
-internal re-challenge call never receives this evidence either way, by
-design — extending it there is treated as a separate, later decision.
-
-**This evidence is not read by `_compute_trust_signals` or
-`_build_recommendation_v1` directly.** It shapes what the Challenger reasons
-about, which can change `still_vulnerable` and the classified finding counts
-— both of which *are* read by `_compute_trust_signals`/`_build_recommendation_v1`
-— and, transitively, what Finding Calibration and the Confidence Scorer see.
-Finding Calibration's own Observed/Hypothesis/Hardening groupings are a
-separate matter: they are never read by `_compute_trust_signals` or
-`_build_recommendation_v1` either, only by the secondary consistency-caveat
-count described under
-[Recommendation consistency vs. the decision itself](#recommendation-consistency-vs-the-decision-itself).
-The anchor observations and Anchor Coverage themselves are never consulted
-directly by `_compute_trust_signals` or the Recommendation Policy; the
-distinction — "grounds a heuristic LLM stage" vs. "is read by the
-deterministic policy" — matters and should not be collapsed.
-They are rendered as their own `## Post-Patch Investigation` report section —
-including an "Anchor Coverage" subsection showing how much of the diff's
-changed lines were actually tracked by at least one anchor — for a human to
-read directly. It is the piece of evidence closest to "did this change
-actually touch the vulnerable behavior," as distinct from "the diff applied
-cleanly" (`patch_integrity`) — but it remains a deterministic *observation*,
-not independent proof the vulnerability is fixed, and it does not itself move
-the Trust Signals or the recommendation.
-
-The section can instead read "Not evaluated" (no repository root, no
-anchors to re-evaluate, or the investigation itself did not complete) or "Not
-shown" (the patch was revised after this evidence was computed, so it no
-longer describes the reported patch) — see `render_post_patch_investigation`
-and `_build_report`'s `§9c` block.
-
-## Trust Signals
-
-`_compute_trust_signals` computes six named signals from the evidence above.
-Two more are merged into the same signals dict separately, each as its own
-dict key, each explicitly outside `_compute_trust_signals`'s own six-signal
-computation and its I1–I6 invariants: `source_verification`
-(`source_verification.py`'s Evidence Sufficiency Gate) and
-`existing_test_comparison` (`existing_test_regression.py`'s
-`classify_existing_test_comparison_signal`, opt-in — see
-[Current limitations](#current-limitations)). Of these eight, seven are
-rendered as their own row in the report's Trust Signals table; one —
-`security_improvement` — is computed but not separately displayed (dropped
-from *display* only, per the code's own history: an earlier report design
-found it a "peer-displayed duplicate" of two other rows; the policy still
-depends on it).
-
-| Signal | Possible values | Computed from | Shown as its own row? | Used by the primary decision? |
-|---|---|---|---|---|
-| `patch_integrity` | Clean · Minor Issues · Not Verified · Does Not Apply · Critical Issues | Hygiene findings + Applicability result (both evaluated on the deterministically repaired diff — see [Evidence](#deterministic-evidence)) | Yes — "Does the patch apply?" | **Yes** |
-| `security_improvement` | None · Unknown · Low · Medium · High | Applicability + Hygiene + classified Challenger counts | No | **Yes** |
-| `remediation_alignment` | Aligned · Likely Aligned · Partial · Misaligned | Classified Challenger counts + `still_vulnerable` | Yes — "Does it address the vulnerability?" | **Yes** |
-| `deployment_safety` | Low Risk · Medium Risk · High Risk · Not Verified | Impact Surface result | Yes — "Is deployment risk low?" | **Yes** |
-| `test_availability` | Tests Available · No Tests Found · Not Verified | Test Support rating | Yes — "Do relevant tests already exist?" | No — secondary caveat only (see below) |
-| `coverage_confidence` | High · Medium · Low | Classified Challenger counts | Yes — "Are there unresolved concerns?" | No — displayed only |
-| `source_verification` | Confirmed · Position Unconfirmed · Unverified · Not Verified | `diff_hunk_repair.repair_hunk_headers`'s hunk-vs-repository relocation records | Yes — "Was the edited content verified against the repository?" | No — displayed only |
-| `existing_test_comparison` | (mirrors `ExistingTestComparisonResult.status`) · Not Verified | Deterministic before/after existing-test-suite delta (S11, `existing_test_comparison` canonical stage) — see [Current limitations](#current-limitations) | Yes — "Were there new test failures after the patch?" | No — displayed only |
-
-Each signal also carries a short human-readable `notes` string explaining the
-specific evidence behind its value (e.g. which hygiene check fired, how many
-review findings remain open).
-
-**Why this distinction matters architecturally:** four signals
-(`patch_integrity`, `security_improvement`, `remediation_alignment`,
-`deployment_safety`) are the *only* inputs `_build_recommendation_v1` reads —
-these are the primary recommendation inputs. `test_availability` feeds only
-the secondary consistency caveat (below), never the primary decision.
-`coverage_confidence`, `source_verification`, and `existing_test_comparison`
-are computed and displayed for the reader's benefit but are not consulted by
-either the primary decision or the consistency caveat — `source_verification`
-explicitly by
-product decision recorded in its own module docstring ("do not yet decide
-how, or whether, it should affect the final recommendation... deferred to a
-later phase"), pending more real-run evidence on how often it fires and
-whether it correlates with bad patches.
-
-## Recommendation Policy
-
-`_build_recommendation_v1` turns evidence into exactly one of four labels.
-There is no fifth value and no numeric score anywhere in this function. It
-runs on every candidate-patch-bearing evaluation; whether its result is
-actually shown depends on the execution-outcome check described above.
-
-**The four recommendations:**
+The four recommendation labels (`_build_recommendation_v1`):
 
 | Recommendation | Meaning |
 |---|---|
-| 🟢 **Deploy After Validation** | All mandatory gates passed; run the listed validation actions, then deploy. |
-| 🟡 **Deploy With Caution** | Limited or uncertain security improvement, but no blocking evidence. |
-| 🟠 **Manual Review Required** | Evidence is inconclusive, heuristic-only, or partially contradictory. |
-| 🔴 **Do Not Apply** | A deterministic check failed: the patch has critical hygiene issues or does not apply to the repository. |
+| 🟢 **Deploy After Validation** | Every mandatory gate has positive evidence. Run the listed validation actions before deploying. |
+| 🟡 **Deploy With Caution** | Limited or uncertain security improvement, but nothing blocking. (Part of the policy vocabulary, but not reachable with today's signals. See [reachability](#which-outcomes-are-reachable-today).) |
+| 🟠 **Manual Review Required** | The evidence is inconclusive, heuristic-only, partly contradictory, or shows high deployment risk. |
+| 🔴 **Do Not Apply** | A deterministic check failed: the patch does not apply to the repository, or it has a critical hygiene defect. |
 
-> **Policy expressiveness vs. current signal expressiveness.** The four
-> labels above are the intended, full vocabulary of `_build_recommendation_v1`
-> — not merely what today's evidence happens to produce. The policy
-> deliberately leaves room for recommendation states that the current Trust
-> Signal derivation (`_compute_trust_signals`) cannot yet safely distinguish.
-> See the reachability notes under "Deploy With Caution" and "Deploy After
-> Validation" below for exactly where the literal policy and the live,
-> pipeline-reachable subset of it currently diverge.
+NO PATCH PRODUCED is not a fifth recommendation. It is not the same as Do Not
+Apply or Manual Review Required, because both of those assume a candidate patch
+exists. `_build_report` still computes the signals and policy on the empty
+evidence, but it discards the result. Instead it renders a
+`## ⚫ NO PATCH PRODUCED` card (`_render_no_patch_card`) and omits the Trust
+Signals, Recommendation, Validation Actions, Challenger concerns and Review
+Results sections. The terminal banner shows `⚫ NO PATCH PRODUCED` as well.
 
-**Decision order** (each check is evaluated in sequence; the first match
-wins):
+## Evidence
 
-1. `patch_integrity` is a hard blocker (Critical Issues / Does Not Apply) →
-   **Do Not Apply**. This is the only path to this label, and it is reached
-   only through deterministic evidence — heuristic Challenger findings alone
-   can never produce it.
-2. `remediation_alignment` is `Misaligned` (i.e. `confirmed_defect_count > 0`)
-   → **Manual Review Required**.
-3. `still_vulnerable` is true but `confirmed_defect_count == 0` (an unresolved
-   heuristic claim with no confirmed defect behind it) → **Manual Review
-   Required**.
-4. Only if `patch_integrity == Clean` **and** `security_improvement` is
-   `High`/`Medium` **and** `deployment_safety` is `Low Risk`/`Medium Risk` (an
-   explicit three-way whitelist, not "didn't hit a worse case") →
-   **Deploy After Validation**.
-5. `security_improvement == Low` and `deployment_safety == Low Risk` →
-   **Deploy With Caution**.
-6. `deployment_safety == High Risk` → **Manual Review Required**.
-7. Anything else — including `Unknown`/`Not Verified` on any axis — →
-   **Manual Review Required** (the catch-all; nothing falls through to a
-   stronger label by default).
+```
+final candidate patch
+        │
+        ├── deterministic checks ───────────────┐  hygiene, git apply --check, source
+        │                                       │  verification, test discovery, impact surface
+        │                                       │
+        ├── Challenger (LLM) ──► deterministic ─┤  verification status + per-finding categories
+        │                        classification │
+        │                                       │
+        └── Finding Calibration (LLM) ──────────┤  calibration-aware defect count; may narrow
+                                                │  a VERIFIED_FIXED verdict
+                                                ▼
+                                         Trust Signals (8)
+                                                ▼
+                              Recommendation Policy (fixed decision tree)
+                                                ▼
+                                          Recommendation
+```
 
-Expressed as pseudocode (derived from `_build_recommendation_v1`, current as
-of this writing):
+### Deterministic checks
+
+Produced by code with no LLM in the loop:
+
+| Check | What it establishes | Module |
+|---|---|---|
+| Patch Hygiene | Diff-shape defects: empty hunks (HIGH), duplicate assignments (MEDIUM), unused imports (MEDIUM). | `patch_hygiene.check_patch` |
+| Patch Applicability | Whether the diff applies to the target repository (`git apply --check`, read-only). | `patch_applicability.check_applicability` |
+| Source verification | Whether each hunk's old-side content was found in the repository at a unique position. | `source_verification.classify_source_verification` |
+| Test Support | Whether test files that cover the changed file exist on disk. This is a discovery check, not a test run. **Python only.** | `testing_support` |
+| Impact Surface | AST-based usage analysis of changed symbols (blast radius). **Python only.** Other languages report "not applicable". | `impact_surface.LightweightImpactAnalyzer` |
+| Post-Patch Investigation | Re-evaluates deterministic "anchors" (resolved functions, call edges, reachability, constant values) against an isolated, patched copy of the repository. | `post_patch_investigation`, `post_patch_evaluation` |
+| Existing Test Comparison (opt-in) | Runs the repository's existing tests in Docker against unpatched and patched copies, and reports newly failing tests. | `existing_test_regression` |
+
+Hygiene and applicability always evaluate the diff after deterministic repair
+(`generated_patch_processing.process_generated_patch`):
+`diff_hunk_repair.repair_hunk_headers` recomputes wrong `@@` counts and moves a
+hunk to the line where its content uniquely matches the real file, and, on the
+initial generation path, `reconstruct_hunk_context` can add context lines that
+`git apply` requires. These repairs keep every `+`/`-` line unchanged and never
+invent a change. The repair's per-hunk relocation records are the only input
+to the source-verification signal.
+
+Post-Patch Investigation records observations, not verdicts. It is never read
+by the policy directly. Its findings are added to the context the Challenger
+sees, and they are rendered in their own report section.
+
+### The Challenger (adversarial review)
+
+The Challenger (`patch_challenger.challenge_patch`) is a separate LLM call with
+an adversarial role: it is asked to find reasons the patch does not hold. It
+uses the same configured model as every other Auto Patcher call. It receives
+the vulnerability report, the patch, and the repository evidence that Patch
+Generation used. When Post-Patch Investigation completed, it also receives
+those findings and the post-change source of the changed functions, as far as
+they fit the call's technical capacity.
+
+**Structured response (the current prompt).** The Challenger reports one
+`primary` concern (does the described vulnerability still occur?) and any
+number of `additional` concerns. Each concern states a fixed set of facts
+(whether the operation is present in the evidence, whether a guard precedes it,
+the guard's default state and effect, whether re-entry preserves state,
+whether a non-default action is required, and whether the advisory's scope
+covers that action). Each fact must carry a short verbatim quote. Code then
+does the following:
+
+1. **Checks citations.** A quote counts only if it appears in the
+   repository-derived context the Challenger was actually shown, in the diff,
+   or (for scope facts) in the vulnerability report. Planner and Strategy prose
+   is not citation authority. A fact with an ungrounded citation is treated as
+   `unresolved`.
+2. **Assigns each concern a consequence**: `BLOCKING`, `UNRESOLVED`, or
+   `NON_BLOCKING` (`_concern_consequence`). A missing, invalid or ungrounded
+   fact can never lead to `NON_BLOCKING`; a malformed concern is
+   `UNRESOLVED`.
+3. **Derives the run-level verification status** (`_derive_status_from_concerns`):
+   - any `BLOCKING` concern → `RESIDUAL_VULNERABILITY`;
+   - otherwise any `UNRESOLVED` concern → `INSUFFICIENT_EVIDENCE`;
+   - all `NON_BLOCKING` → `VERIFIED_FIXED`;
+   - fails closed to `INSUFFICIENT_EVIDENCE` if there is not exactly one primary
+     concern, or if the response also puts free-form content in its
+     `Edge cases`, `Potential issues` or `Summary` sections.
+
+The model's own `Verification status:` line is not used for the decision
+once a `Concerns:` section is present. `BLOCKING` means the reported facts met the blocking rule;
+it does not mean a defect was independently verified. `VERIFIED_FIXED` means
+no concern met the blocking or unresolved rules; it does not mean the fix was
+proven.
+
+**Legacy free-form response.** A response without a `Concerns:` section is
+still supported. Its `Verification status:` header (or an older
+`Still vulnerable:` header) is parsed directly, and an unrecognized value fails
+closed. Its free-text findings are sorted by a deterministic lexical classifier
+(`_classify_finding`) into `confirmed_defect`, `behavioral_defect`,
+`plausible_risk`, `validation_gap` or `generic`. A legacy
+`RESIDUAL_VULNERABILITY` claim with no `confirmed_defect` or
+`behavioral_defect` finding behind it is downgraded to `INSUFFICIENT_EVIDENCE`
+(`_classify_challenger`).
+
+`still_vulnerable` is true for every status except `VERIFIED_FIXED`, including
+an unknown or unparseable one.
+
+### Finding Calibration
+
+Finding Calibration (`finding_calibration.calibrate_findings`) is a second LLM
+pass over the Challenger's free-text findings. It does not process structured
+concerns, so with today's structured Challenger output it usually has nothing
+to calibrate and makes no call. For each finding it returns:
+
+- a group: `observed` (backed by evidence shown to it), `hypothesis` (a
+  plausible inference) or `hardening` (outside the advisory's scope), plus a
+  reworded version whose certainty matches the group. A finding cannot stay
+  `observed` if the model's own output lists one of its required dependencies
+  as unresolved;
+- a remediation impact for unresolved dependencies: `proof_required`,
+  `validation_only` or `unclear`. A missing or invalid value is `unclear`.
+
+If calibration asks for specific repository evidence that is needed to resolve
+a finding, it gets one bounded follow-up
+(`_calibrate_findings_with_evidence_acquisition`). The requested files or
+symbols are resolved deterministically (at most 3 requests). If new evidence
+fits, calibration runs once more and that second result is final.
+
+Calibration affects the policy in exactly two ways, both computed in
+`_build_report`:
+
+1. **Calibration-aware defect count.** A raw `confirmed_defect` finding counts
+   toward the policy's defect count only if calibration grouped it `observed`
+   or did not calibrate it at all. A missing calibration counts as a defect.
+   A `confirmed_defect` calibrated `hypothesis` or `hardening` does not count
+   (`_build_known_findings`, `potential_remaining_risks`).
+2. **Narrowing a `VERIFIED_FIXED` verdict.**
+   `_reconcile_verification_status_with_calibration` changes `VERIFIED_FIXED`
+   to `INSUFFICIENT_EVIDENCE` (and `still_vulnerable` to true) when any
+   `plausible_risk`/`validation_gap`/`generic` finding still blocks remediation
+   proof:
+   - an uncalibrated `validation_gap` finding blocks;
+   - a calibrated finding with unresolved dependencies blocks unless its impact
+     is `validation_only`;
+   - nothing else blocks.
+
+   This reconciliation only ever narrows a verdict. It never clears
+   `RESIDUAL_VULNERABILITY` or `INSUFFICIENT_EVIDENCE`.
+
+Calibration can therefore move a recommendation toward caution, for example
+from Deploy After Validation to Manual Review Required. It can also remove a
+raw `confirmed_defect` from the count that would otherwise force Manual Review
+Required through the Misaligned branch. Calibration also decides how free-text
+findings are grouped in the report and whether the Challenger-driven repair
+loop may run (see the
+[architecture document](auto-patcher-architecture.md#s6--patch_repair_and_calibration)).
+
+## Trust Signals
+
+`_compute_trust_signals` computes six signals. `_build_report` then adds two
+more as separate keys: `source_verification` and `existing_test_comparison`.
+Seven of the eight have a row in the report's Trust Signals table.
+`security_improvement` is used by the policy but not shown as its own row.
+
+| Signal | Values | Computed from | Report row | Read by the decision? |
+|---|---|---|---|---|
+| `patch_integrity` | Clean · Minor Issues · Not Verified · Does Not Apply · Critical Issues | Hygiene + applicability | "Does the patch apply?" | **Yes** |
+| `security_improvement` | None · Unknown · Low · Medium · High | Applicability, hygiene, calibration-aware defect count, `still_vulnerable`, raw plausible-risk count | (not shown) | **Yes** |
+| `remediation_alignment` | Aligned · Likely Aligned · Partial · Misaligned | Calibration-aware defect count, `still_vulnerable`, raw plausible-risk count | "Does it address the vulnerability?" | **Yes** |
+| `deployment_safety` | Low Risk · Medium Risk · High Risk · Not Verified | Impact Surface level (High Risk also when a HIGH hygiene defect exists) | "Is deployment risk low?" | **Yes** |
+| `coverage_confidence` | High · Medium · Low | Defect count; structured concern consequences; raw plausible-risk and validation-gap counts | "Are there unresolved concerns?" | No (display only) |
+| `test_availability` | Tests Available · No Tests Found · Not Verified | Test Support | "Do relevant tests already exist?" | Only by the [evidence caveat](#evidence-caveats-and-the-manual-review-scope-note) |
+| `source_verification` | Confirmed · Position Unconfirmed · Unverified · Not Verified | Hunk relocation records | "Was the edited content verified against the repository?" | No (display only) |
+| `existing_test_comparison` | PASS · NEW_FAILURES_DETECTED · PRE_EXISTING_FAILURES_ONLY · TEST_EXECUTION_ERROR · NOT_VERIFIED | Existing Test Comparison (opt-in; NOT_VERIFIED when not requested) | "Were there new test failures after the patch?" | No (display only) |
+
+The decision itself also reads `still_vulnerable`, the calibration-aware
+defect count, and (for wording only) the verification status.
+
+Each signal carries a short `notes` string that names the specific evidence
+behind its value. The report labels Patch Integrity, Test Availability and
+Deployment Risk as deterministic checks, and Remediation Alignment and Coverage
+Confidence as derived from heuristic adversarial review.
+
+## Recommendation Policy
+
+`_build_recommendation_v1` evaluates these checks in order. The first match
+wins:
 
 ```
 if patch_integrity in {"Does Not Apply", "Critical Issues"}:
-    return "Do Not Apply"
+    return "Do Not Apply"                                    # I4: deterministic only
 
-if remediation_alignment == "Misaligned":
+if remediation_alignment == "Misaligned":                    # calibration-aware defect count > 0
     return "Manual Review Required"
 
-if still_vulnerable and confirmed_defect_count == 0:
+if still_vulnerable and defect_count == 0:                   # verdict is not VERIFIED_FIXED
     return "Manual Review Required"
 
 if (patch_integrity == "Clean"
         and security_improvement in {"High", "Medium"}
         and deployment_safety in {"Low Risk", "Medium Risk"}):
-    return "Deploy After Validation"
+    return "Deploy After Validation"                         # I3: explicit whitelist
 
 if security_improvement == "Low" and deployment_safety == "Low Risk":
     return "Deploy With Caution"
@@ -532,412 +298,223 @@ if security_improvement == "Low" and deployment_safety == "Low Risk":
 if deployment_safety == "High Risk":
     return "Manual Review Required"
 
-return "Manual Review Required"   # catch-all: Unknown/Not Verified/anything
-                                   # not explicitly matched above
+return "Manual Review Required"                              # I5: catch-all
 ```
 
-A secondary, non-decision-changing step, `_check_recommendation_consistency`,
-runs only when the decision is Deploy After Validation or Deploy With
-Caution. It checks `test_availability` and a category-labeled breakdown of
-Review Results findings, and — if either is unfavorable — appends an
-"Evidence check" caveat sentence to the report. It never changes which of
-the four labels is shown; it only makes sure a confident-sounding label
-doesn't sit next to undisclosed weak evidence. See
-[Recommendation consistency vs. the decision itself](#recommendation-consistency-vs-the-decision-itself)
-below.
+There is no numeric score anywhere in this function.
 
-The `reason` strings quoted in this document are each decision's fixed lead
-sentence. `Deploy After Validation`'s `reason` is exactly that sentence,
-never extended further. Every other decision's `reason` may append one more
-sentence naming the specific Trust Signal(s) that drove that branch, quoting
-that signal's own already-rendered `notes` (e.g. "Remediation alignment: …"
-for the Misaligned/still-vulnerable branches, or "Patch integrity: …" for
-Do Not Apply, or "Deployment risk could not be verified because …" for a
-branch reached after the Deploy After Validation whitelist fails). This is
-presentation only — it never changes which of the four labels is picked —
-but it means the exact `reason` text a report shows can be longer than the
-lead sentence quoted throughout this document.
+Each decision has a fixed lead sentence as its `reason`. Every decision except
+Deploy After Validation may add one sentence that names the signal behind it,
+quoting that signal's `notes`. For example: "Remediation alignment: …", or
+"Deployment risk could not be verified because impact analysis is not
+supported for this language yet." Manual Review Required decisions also carry a
+short "why" phrase for the report's "Why manual review" line. For the
+`still_vulnerable` branch, the wording depends on the verification status:
 
-> Note: an older function, `build_recommendation`, also exists in
-> `pipeline.py` with a different, three-label vocabulary (Safe to deploy /
-> Deploy with caution / Do not deploy yet) that reads a numeric confidence
-> score. It is exercised only by its own unit tests (`tests/patch/test_pipeline.py`)
-> and is not called by the report-building path (`_build_report` calls
-> `_build_recommendation_v1` exclusively). It should not be treated as
-> describing current behavior — see [Current limitations](#current-limitations).
+- `RESIDUAL_VULNERABILITY` (structured): a concern met the deterministic
+  blocking rule, based on citation-checked, model-reported facts. The issue was
+  not independently verified.
+- `RESIDUAL_VULNERABILITY` (legacy): adversarial review reported affirmative
+  evidence that the vulnerability may remain.
+- `INSUFFICIENT_EVIDENCE`: the available evidence was not enough to verify the
+  fix.
+- Unknown or unclassified: stronger confidence is not justified.
 
-## How to interpret each recommendation
+This wording never changes the decision.
+
+## Which outcomes are reachable today
+
+The policy can express more states than today's signals produce. With the
+current signal derivation:
+
+- **Do Not Apply** is reached only when `git apply --check` rejects the repaired
+  diff, or when the diff has an empty hunk (the only HIGH hygiene check).
+- **Deploy After Validation** requires every one of the following:
+  - the patch applies with no hygiene findings;
+  - the verification status is `VERIFIED_FIXED` after calibration
+    reconciliation;
+  - the calibration-aware defect count is zero;
+  - Impact Surface reports low or medium impact.
+
+  `security_improvement` "Medium" and the second way "High" is produced both
+  require `still_vulnerable`, so the earlier branch always intercepts them.
+  **Impact Surface supports only Python. On any other repository,
+  `deployment_safety` is "Not Verified", so Deploy After Validation cannot be
+  reached.** The best outcome there is Manual Review Required.
+- **Deploy With Caution** is not reachable. Every state that yields
+  `security_improvement == "Low"` also triggers an earlier branch: a HIGH
+  hygiene defect means Critical Issues and therefore Do Not Apply, and a nonzero
+  defect count means Misaligned and therefore Manual Review Required. The label
+  stays in the policy vocabulary for a future evidence model that can tell a
+  "positive but weaker" state apart from those cases.
+- **Manual Review Required** covers everything else: a Misaligned alignment,
+  any verification status other than `VERIFIED_FIXED`, high deployment risk,
+  Minor Issues integrity, applicability that could not be checked, impact
+  analysis that is unavailable or not applicable, or any unrecognized value.
+
+## How to read each outcome
 
 ### 🟢 Deploy After Validation
 
-- **What the system knows:** `patch_integrity == Clean` (applies with zero
-  hygiene defects), `security_improvement` is High or Medium (adversarial
-  review found either no remaining exploit path, or only validation-gap-style
-  unresolved risk with zero high-confidence findings), and `deployment_safety`
-  is Low or Medium Risk (Impact Surface found a localized-to-moderate blast
-  radius). All three must hold simultaneously — an explicit whitelist, never
-  "didn't hit a worse case."
-- **What uncertainty may still remain:** `coverage_confidence`,
-  `test_availability`, and `source_verification` are *not* gated on here. A
-  Deploy After Validation report can still show "Are there unresolved
-  concerns? Medium," "No Tests Found," or an unverified `source_verification`
-  row. When `test_availability == "No Tests Found"` or decision-relevant
-  Review Results findings remain open, the report attaches an "Evidence
-  check" caveat sentence (`_check_recommendation_consistency`) — read it; the
-  label alone does not tell the whole story.
-- **Why this is not "safe to deploy immediately":** the deterministic part of
-  this label (`patch_integrity`) only proves the diff is well-formed;
-  `security_improvement`/`remediation_alignment` behind it are heuristic —
-  classified adversarial-review output, not independently verified proof the
-  vulnerability is fixed.
-- **What "After Validation" means operationally:** run the report's listed
-  Validation Actions (targeted tests, manual checks) before deploying — this
-  is the literal wording of the recommendation's `reason` string.
-- **What a reviewer should do next:** read Validation Actions, check for an
-  Evidence check caveat, and only then decide.
-
-> **Current reachability note.** The whitelist above literally accepts
-> `security_improvement` of `"High"` *or* `"Medium"`. Under the current
-> `_compute_trust_signals` derivation, `"Medium"` only occurs when
-> `still_vulnerable == True` — and that state is intercepted by the earlier
-> `still_vulnerable`/`confirmed_defect_count` gate (Decision order, step 3)
-> before this branch is ever reached. The same earlier gate also intercepts
-> one of the two ways `"High"` is produced (`still_vulnerable == True` with
-> zero plausible-risk findings). In practice, the only state that reaches
-> this branch today is `security_improvement == "High"` via
-> `still_vulnerable == False` — the challenger found no remaining exploit
-> path at all. Do not read a `"Medium"` `security_improvement` value as
-> evidence of an observed live Deploy After Validation path; it describes
-> what the literal whitelist permits, not what the pipeline currently
-> exercises.
+- **What the system knows:** the repaired diff applies cleanly and has no
+  hygiene findings. Adversarial review produced no concern that met the
+  blocking or unresolved rule, and calibration did not narrow that verdict.
+  Python impact analysis found a localized or moderate blast radius.
+- **What it does not know:** whether the vulnerability is actually closed
+  under real execution, whether other variants or paths remain, and whether
+  the patch is equivalent to the upstream fix. Coverage confidence, test
+  availability and source verification are not gated here. Check the Trust
+  Signals table and any "Evidence check" caveat.
+- **What to do next:** run the report's Validation Actions (the top action
+  targets the strategy's security invariant when one was produced), then
+  decide.
 
 ### 🟡 Deploy With Caution
 
-- **How it differs from Deploy After Validation:** reached only when the
-  Deploy After Validation whitelist test fails, **and**
-  `security_improvement == "Low"`, **and** `deployment_safety == "Low Risk"`.
-- **Which evidence is weaker:** `security_improvement == "Low"` means either a
-  HIGH-severity hygiene defect exists (the patch may be a no-op) or the
-  Challenger found one or more `confirmed_defect_count` findings — either
-  way, a real signal of concern, just not strong enough on its own to
-  escalate further given deployment risk is low.
-- **Why not Manual Review Required:** deployment risk is low and
-  `remediation_alignment` hasn't hit `Misaligned` or the
-  still-vulnerable-with-zero-confirmed-defects gate — the policy treats "weak
-  fix, low blast radius" as caution-level, not stop-and-review-level.
-- **What's expected before deployment:** the recommendation's own `reason`
-  string says "Manual security review recommended" — the same Evidence check
-  caveat mechanism as Deploy After Validation still applies here too.
-
-> **Current reachability note.** `Deploy With Caution` remains part of the
-> intended Recommendation Policy vocabulary, but no state the pipeline's
-> current Trust Signal derivation actually produces reaches it. Every input
-> combination that yields `security_improvement == "Low"` today also forces
-> a *stronger*, earlier gate first: `high_hygiene` simultaneously forces
-> `patch_integrity == "Critical Issues"` (→ Do Not Apply), and
-> `confirmed_defect_count > 0` simultaneously forces `remediation_alignment
-> == "Misaligned"` (→ Manual Review Required) — see
-> `_compute_trust_signals`. This is a property of the *current*
-> evidence/signal derivation, not proof that the yellow policy state is
-> conceptually unnecessary. The branch is intentionally retained for a
-> genuinely positive-but-weaker evidence state that today's evidence model
-> cannot yet safely distinguish from those stronger gates — richer
-> deterministic validation, remediation assessment, deployment-risk
-> analysis, and other evidence may eventually make such a state safely
-> distinguishable. Improving deployment-risk assessment alone would not be
-> sufficient: the shadowing happens entirely on the
-> `patch_integrity`/`remediation_alignment` side, not on
-> `deployment_safety`. No specific future gate is proposed here.
+Not produced by the current signal derivation (see above). If it ever appears,
+it means low security improvement with low deployment risk, and the report's
+reason asks for manual security review.
 
 ### 🟠 Manual Review Required
 
-This single label covers four distinct code paths, each reached for a
-different reason:
+This label covers several distinct situations. The report's "Why manual
+review" line names which one applies:
 
-1. **Heuristic concern (remediation misalignment).**
-   `remediation_alignment == "Misaligned"` — the Challenger found one or more
-   `confirmed_defect_count` findings: a high-confidence claim of an alternate
-   exploit path. Unresolved heuristic evidence, not a verified exploit.
-2. **Unresolved heuristic claim.** `still_vulnerable` is true but
-   `confirmed_defect_count == 0` — the Challenger flagged something it
-   couldn't fully substantiate as a confirmed defect.
-3. **High deployment risk.** `deployment_safety == "High Risk"` — deterministic
-   Impact Surface evidence of a wide blast radius, independent of whether the
-   fix itself looks correct.
-4. **Catch-all / inconclusive evidence.** Nothing above matched — covers
-   `Unknown`/`Not Verified` on any axis (e.g. no repository root, impact
-   analysis unavailable), `Minor Issues` integrity, or any other state the
-   policy doesn't explicitly recognize as positive.
+1. **Misaligned:** at least one Challenger finding that calibration did not
+   discount reads as a confirmed alternate exploit path. This is unresolved
+   heuristic evidence, not a verified exploit.
+2. **Not verified fixed:** the Challenger verdict is `RESIDUAL_VULNERABILITY`
+   or `INSUFFICIENT_EVIDENCE` (including verdicts narrowed by calibration, and
+   every fail-closed structured response).
+3. **High deployment risk:** Impact Surface found a high-impact change.
+4. **Inconclusive:** anything else, such as Not Verified deployment safety
+   (no repository root, non-Python repository, impact analysis unavailable),
+   Minor Issues integrity, or applicability that could not be checked.
 
-The report also renders a short scope note for this label specifically
-(`_render_manual_review_scope_note`) — a category-labeled breakdown of open
-Review Results findings, followed by "— see Review Results below for
-details" — so a reader doesn't have to hunt for why review is needed. It
-shares its counting/describing logic with the Evidence check caveat; see
-[Recommendation consistency vs. the decision itself](#recommendation-consistency-vs-the-decision-itself)
-for exactly what it counts and how it's worded.
-
-**This is not equivalent to "the patch is bad."** In paths 2–4, nothing
-deterministic points to an actual defect; the label reflects insufficient or
-inconclusive evidence, not a confirmed problem. Per the I5 invariant,
-inconclusive evidence must never resolve to a stronger label by default —
-only an explicit positive whitelist membership earns Deploy After Validation
-or Deploy With Caution, so anything short of that lands here rather than
-being guessed upward.
+Manual Review Required does not mean "the patch is bad". In cases 2–4 nothing
+deterministic points to a defect. The label reflects evidence that is missing
+or inconclusive.
 
 ### 🔴 Do Not Apply
 
-- **Exact trigger:** `patch_integrity` is exactly `"Does Not Apply"` or
-  `"Critical Issues"` — i.e. either `git apply --check` rejected the
-  (deterministically repaired) diff outright, or a HIGH-severity hygiene
-  defect was found. Nothing else.
-- **Remains deterministic-only.** This is the *only* path to this label
-  (I4 invariant) — heuristic Challenger findings, including a `Misaligned`
-  `remediation_alignment` (`confirmed_defect_count > 0`), can never produce
-  it on their own; that evidence caps out at Manual Review Required.
-- **Why this is stronger than Manual Review Required:** it reflects a
-  verified, mechanical failure — the diff doesn't apply, or contains a defect
-  the hygiene checker can point at with certainty — rather than absent or
-  ambiguous evidence.
+The only trigger is `patch_integrity` being "Does Not Apply" (`git apply
+--check` rejected the repaired diff) or "Critical Issues" (an empty hunk).
+Heuristic findings can never produce this label.
 
-## Comparison at a glance
+### ⚫ NO PATCH PRODUCED
 
-| Outcome | Candidate patch exists? | How it's reached | Blocking deterministic failure? | Dominant evidence type | Reviewer action |
-|---|---|---|---|---|---|
-| ⚫ NO PATCH PRODUCED | No | `result.patch` is empty | N/A — no patch to check | N/A | Nothing to review; investigate why generation didn't complete |
-| 🔴 Do Not Apply | Yes | `patch_integrity` blocked (git-apply rejection or HIGH hygiene defect) | Yes | Deterministic only | Do not deploy; fix the target mismatch/generation issue |
-| 🟠 Manual Review Required | Yes | Misaligned / unresolved `still_vulnerable` / High deployment risk / catch-all | No | Mixed — often heuristic, sometimes deterministic-but-inconclusive | Read Review Results and Impact Surface; decide manually |
-| 🟡 Deploy With Caution | Yes | Low security improvement + Low deployment risk | No | Heuristic-leaning | Manual security review, then deploy if satisfied |
-| 🟢 Deploy After Validation | Yes | Clean integrity + High/Medium improvement + Low/Medium Risk safety | No | Mixed — deterministic gate + heuristic improvement signal | Run listed Validation Actions, check the Evidence caveat, then deploy |
+The pipeline ended without a final candidate patch. Common causes:
 
-## Recommendation consistency vs. the decision itself
+- Planning could not reach a grounded plan.
+- A Planner claim stayed contradicted after one revision.
+- The final strategy named no target, or left its target's authority
+  unresolved.
+- Not every intended edit had verified source.
+- The required target source did not fit Patch Generation's technical
+  capacity.
+- The generator's response stayed invalid after its contract retry.
+- The generated patch edited the wrong files and post-patch recovery could not
+  fix that.
 
-`_check_recommendation_consistency` (see [Recommendation
-Policy](#recommendation-policy) above) is easy to conflate with the decision
-itself; it is not the same mechanism:
+Each of these is a deliberate fail-closed stop, not a crash. The cause is shown
+in the terminal output; `--verbose` adds detail. For most causes the report's
+Patch Applicability section also shows the skip reason.
 
-- **The recommendation decision** (`_build_recommendation_v1`) picks one of
-  the four labels. It runs once, is deterministic given the signals, and
-  never changes once computed.
-- **The evidence caveat** (`_check_recommendation_consistency`) runs *after*
-  the decision, only for the two top-tier labels, and only appends a sentence
-  to the rendered report — reusing `notes` text already shown elsewhere in
-  the Trust Signals table for the test-coverage caveat, and a finding count
-  drawn from the same Review Results categories rendered elsewhere for the
-  second caveat, never inventing new evidence. It cannot change `decision`;
-  its entire job is making sure a confident-sounding label never sits beside
-  undisclosed weak evidence (no test coverage, or open decision-relevant
-  Review Results findings) without saying so.
+## Evidence caveats and the Manual Review scope note
 
-Both this caveat's second sentence and the Manual Review Required scope note
-(`_render_manual_review_scope_note`) share one describing function,
-`_describe_decision_relevant_findings`. It sums the same four categories —
-**Potential Remaining Risks** + **Validation Gaps** + **Observed Facts** +
-**Validation Questions** — deliberately excluding **Future Improvements**,
-since those are explicitly out of the current advisory's scope, and renders
-a per-category breakdown (e.g. "3 items to weigh: 1 flagged risk · 1
-validation gap · 1 observed fact") rather than a single undifferentiated
-count. It deliberately never uses "open" or "remain" language, specifically
-so that an **Observed Fact** — Finding Calibration's own label for a claim
-directly backed by the repository evidence shown to it, which may be
-reassuring, neutral, or concerning — is not described the same way a
-**Validation Gap** or **Validation Question** (both genuinely unresolved
-concerns) is. This is a deliberate correction to earlier report wording that
-described this same aggregate as "N decision-relevant finding(s) remain
-open," which did not make that distinction; if you see that phrase in an
-older report, or in cached documentation, it predates this fix.
+Two presentation helpers add context without changing the decision:
 
-An older function, `_decision_relevant_finding_count`, still exists in
-`pipeline.py` and still computes the same four-category sum as a bare
-integer — but it is no longer called by `_check_recommendation_consistency`
-or `_render_manual_review_scope_note`; today it is exercised only by its own
-unit tests, the same unused-but-present status as the legacy
-`build_recommendation` function described under
-[Recommendation Policy](#recommendation-policy) above.
+- **Evidence check caveat** (`_check_recommendation_consistency`). This runs
+  only for Deploy After Validation and Deploy With Caution. It adds a caveat
+  sentence when `test_availability` is "No Tests Found", or when Review Results
+  contains decision-relevant findings.
+- **Manual Review scope note** (`_render_manual_review_scope_note`). For Manual
+  Review Required, it lists the open Review Results findings by category.
 
-## What does NOT affect the recommendation
+Both describe findings with `_describe_decision_relevant_findings`. It counts
+Potential Remaining Risks, Validation Gaps, Observed Facts and Validation
+Questions, but not Future Improvements, and it renders a per-category
+breakdown, for example "3 items to weigh: 1 flagged risk · 1 validation gap ·
+1 observed fact". It deliberately avoids "open" or "remaining" wording,
+because an Observed Fact is an evidence-status label: it can be reassuring as
+well as concerning.
 
-The report contains more evidence than the recommendation policy uses. This
-section exists so that evidence you see in a Trust Report is not mistaken for
-evidence that shaped its recommendation.
+## What does not affect the recommendation
 
-- **Confidence score.** The Confidence Scorer stage still runs — fed the
-  vulnerability text, final patch, Patch Reviewer's output, and the same
-  repository/Post-Patch-Investigation evidence context the Challenger saw —
-  and its output is still deterministically discounted (0.4× if the
-  Challenger found the patch still vulnerable, 0.7× if it found edge
-  cases/issues, otherwise unchanged). But this number is never read by
-  `_compute_trust_signals` or `_build_recommendation_v1`, and it is not
-  rendered anywhere in the Trust Report. It is computed and then discarded.
-  See [Confidence Scorer](#confidence-scorer) above.
-- **Patch Reviewer output.** Rendered verbatim as Explanation / Affected
-  areas / Reviewer Notes. See [Patch Reviewer](#patch-reviewer) above for its
-  (narrow) inputs and, importantly, the provenance distinction between model
-  prior knowledge and verified evidence. Not read by `_compute_trust_signals`
-  or `_build_recommendation_v1`; its only downstream consumer is the
-  (also-discarded) Confidence Scorer.
-- **Finding calibration.** See [Finding Calibration](#finding-calibration)
-  above for the full behavior. In short: it rewords and regroups
-  `plausible_risk`/`generic` Challenger findings into Observed Facts /
-  Validation Questions / Future Improvements for Review Results, and never
-  changes the confirmed/plausible/gap/generic classification or counts the
-  Trust Signals and Recommendation Policy read — but it does influence what
-  the consistency caveat and Manual Review scope note report (see
-  [Recommendation consistency vs. the decision itself](#recommendation-consistency-vs-the-decision-itself)).
-- **Deterministic static signals** (constraint/remediation-signal scripts,
-  when available for the target repository). Rendered as their own
-  "Deterministic Signals" table in the report's Appendices. Not read by
-  `_compute_trust_signals` or the recommendation policy.
-- **Behavior Summary.** A diff-only, language-agnostic summary of what the
-  patch appears to do. Feeds the report's Validation Actions suggestions, not
-  the Trust Signals.
-- **Repository Context (grounding).** Explains which repository locations
-  were used to inform patch generation and review. Purely explanatory; not an
-  input to any signal.
-- **Post-Patch Investigation's anchor observations and Anchor Coverage.**
-  Deterministic, but not read directly by `_compute_trust_signals` or the
-  Recommendation Policy — see
-  [Post-Patch Investigation](#post-patch-investigation) above. Its rendered
-  findings do feed the Challenger's (and, when still current, Finding
-  Calibration's and the Confidence Scorer's) prompt evidence, which is a
-  different thing from feeding the policy directly; that section explains
-  the distinction.
-- **`coverage_confidence`.** Computed and rendered as its own row, but not
-  read by `_build_recommendation_v1` or `_check_recommendation_consistency` —
-  it is derived from the same Challenger counts that `remediation_alignment`
-  already uses, presented as a separate lens ("how much did we look").
-- **`source_verification`.** Computed and rendered as its own row, but not
-  read by `_build_recommendation_v1` or `_check_recommendation_consistency`
-  either — an explicit, documented product decision to defer wiring it into
-  the policy until more real runs show how it behaves.
-- **`test_availability`.** Rendered as its own row and does feed the
-  secondary consistency-caveat check, but is not one of the four signals the
-  primary decision (`_build_recommendation_v1`) gates on.
-- **Existing Test Comparison.** See
-  [Current limitations](#current-limitations) below for what this opt-in
-  feature checks. Its `existing_test_comparison` Trust Signal is rendered as
-  its own row but is explicitly observability-only, exactly like
-  `source_verification` above — never read by `_build_recommendation_v1` or
-  `_check_recommendation_consistency`. A newly-failing existing test after
-  the patch is a factual delta the report surfaces for a human to interpret,
-  not a signal the policy currently acts on.
+The report contains more evidence than the policy uses. None of the following
+change the decision:
 
-## NO PATCH PRODUCED
+- **Confidence score.** The Confidence Scorer runs, and its score is discounted
+  by the Challenger's result (×0.4 if still vulnerable, ×0.7 if any finding was
+  raised), but the score is never read by the policy and never rendered.
+- **Patch Reviewer output.** This is rendered as Explanation, Affected areas,
+  and Reviewer Notes (in Appendices). The reviewer receives the vulnerability
+  report, the final patch and the calibration summary, but no repository
+  evidence. Any statement about repository state, an upstream fix, or "matching"
+  a release reflects the model's prior knowledge, and the report says so.
+- **Post-Patch Investigation observations and Anchor Coverage.** These shape
+  what the Challenger sees, but the policy does not read them.
+- **`coverage_confidence`, `source_verification`, `existing_test_comparison`.**
+  These are displayed only. `test_availability` feeds only the evidence caveat.
+- **Behavior Summary and Repository Context.** These are explanatory
+  sections, or inputs to the Validation Actions list.
+- **Deterministic static signals.** These render only when the optional
+  `scripts.constraint_signals` / `scripts.remediation_signals` modules can be
+  imported. Neither ships in this repository, so the section is normally
+  absent.
+- **The advisory itself.** For a CVE input, the report states that advisory
+  claims (description, CWE, severity) are not repository-verified and that the
+  recommendation does not depend on the advisory's CVSS score.
 
-- **Exact trigger:** `not (result.patch and result.patch.strip())` — the
-  pipeline's final candidate patch is empty or whitespace-only when
-  `_build_report` runs (`_build_report`'s `no_patch` flag).
-- **One deterministic upstream cause, among others:** the Edit Readiness Gate
-  (`remediation_planner.check_edit_readiness`) can decide that no intended
-  edit has verified, patch-ready repository source and skip Patch Generation
-  entirely, leaving `patch = ""`. This is one path to the trigger condition
-  above, not a separate execution outcome — the same check and the same card
-  render either way, regardless of why `patch` ended up empty.
-- **What still runs:** Trust Signals and the Recommendation Policy still
-  compute a result (on whatever default/empty evidence exists), and
-  Validation Actions are explicitly cleared to an empty list (there is
-  nothing to validate). None of this computed recommendation reaches the
-  reader.
-- **What the report shows instead:** a dedicated `## ⚫ NO PATCH PRODUCED`
-  card (`_render_no_patch_card`) stating the pipeline did not produce a final
-  candidate patch and that no patch is available for deployment or review,
-  plus a files-changed count. The normal Recommendation block is omitted
-  entirely (rendered as an empty string), not replaced with a
-  Manual-Review-shaped message.
-- **Terminal output:** the same run prints `[pipeline] Recommendation:` followed
-  by `⚫ NO PATCH PRODUCED` to stderr — never one of the four decision emoji —
-  so a human watching the run gets the same signal live.
-- **Why it must not be read as Do Not Apply:** `Do Not Apply` means a real
-  candidate patch exists and the policy found deterministic blocking
-  evidence against it (a failed `git apply --check`, or a HIGH hygiene
-  defect). `NO PATCH PRODUCED` means there is no candidate to hold that
-  evidence in the first place — a categorically different, and strictly
-  earlier, failure mode.
+## The Trust Report layout
 
-## LLM configuration note
+`_build_report` renders, in order:
 
-The evidence and policy described above are entirely deterministic-or-
-classified computation, apart from the two LLM calls this document depends
-on directly: the Challenger, and — informationally only — the Confidence
-Scorer, whose output is discarded (see above). Auto Patcher's pipeline runs
-several further LLM-backed stages — remediation planning, remediation
-strategy, a narrow best-effort `guided_context_request` call inside guided
-repository-context acquisition, Patch Generation, Finding Calibration, Patch
-Review, and — only when Existing Test Comparison is explicitly requested —
-one bounded Test Plan Discovery call — that assemble evidence or produce
-report-only text but do not themselves feed Trust Signals or the
-Recommendation Policy; see [Evidence](#evidence) for the ones central to
-this document's evidence model.
+1. Header and decision card (or the NO PATCH PRODUCED card).
+2. Vulnerability summary and primary references.
+3. Proposed patch.
+4. Patch Hygiene and Patch Applicability, plus notices when an applicability
+   retry or a Challenger-driven repair happened.
+5. Trust Signals.
+6. Recommendation, with its reason, the "why manual review" line, the top
+   validation action, and any evidence caveats.
+7. Explanation (reviewer output, labeled as model analysis).
+8. Validation Actions.
+9. Challenger concerns (structured responses) and Review Results (free-text
+   findings, grouped as Potential Remaining Risks, Validation Gaps, Observed
+   Facts, Validation Questions and Future Improvements).
+10. Repository Context.
+11. Post-Patch Investigation.
+12. Existing Test Comparison (shown as "not requested" unless it was enabled).
+13. Impact Surface.
+14. Appendices: deterministic static signals (only when available, see
+    above), language coverage gaps, test support and suggested tests, behavior
+    summary, affected areas, reviewer notes.
 
-Every one of these calls shares the same configuration story. Auto Patcher does not maintain
-an independent LLM provider/model configuration system for these calls; the
-provider and model come from OpenAnt's canonical `default_llm` → `analyze`
-phase binding (the same configuration `openant setup llm` writes), resolved
-through OpenAnt's shared provider/adapter infrastructure. `LLM_PROVIDER` /
-`LLM_MODEL` environment variables are **not** a supported way to select a
-real provider or model for any of these calls — setting either for that
-purpose is a hard, documented failure, never a silent no-op (see
-`llm_client.py`'s module docstring). `LLM_PROVIDER=mock` is a distinct,
-narrow, intentional test/research escape hatch, not part of real-provider
-configuration; a real-provider run normally has both variables unset. See the
-[README's Auto Patcher section](../../README.md#auto-patcher) for how to
-configure it; nothing about that configuration changes how the evidence
-above is interpreted.
+`core/patch.py` then appends a Run Metadata section: timestamp, input source,
+repository root and commit, OpenAnt commit, provider and model, LLM mode,
+configured max tokens, and per-stage stop reasons. For CVE input it also adds
+an input-source disclosure.
 
 ## Current limitations
 
-- Impact Surface and Test Support — the two deterministic signals behind
-  `deployment_safety` and `test_availability` — currently run meaningfully
-  only on Python codebases. On other languages they resolve to "not
-  applicable," which the policy treats as "not verified," never as a clean
-  result — so fewer of the eight signals carry real signal on non-Python
-  repositories today.
-- Test Support (`test_availability`) is a **discovery** check (does a
-  matching test file exist), never an execution check — it never builds the
-  target repository or runs its test suite. "Tests Available" means relevant
-  tests were found on disk, not that they were run or passed. **This is a
-  different feature from Existing Test Comparison** (`existing_test_comparison`,
-  canonical stages S10/S11): that one *does* execute the repository's
-  existing test suite, inside Docker, once against an unpatched copy and
-  once against the patched copy, and reports a deterministic before/after
-  failure delta — but only when explicitly requested
-  (`compare_existing_tests=True`; not currently exposed as a flag on the Go
-  `openant patch` CLI, though the underlying Python entry point and
-  `tools/run_traced.py` both accept `--compare-existing-tests` directly —
-  see TRACING_AND_DEBUGGING.md), only against tests that already
-  exist in the repository (it generates no new tests), and only as a
-  displayed, observability-only signal — never read by
-  `_build_recommendation_v1`. Do not conflate "tests were found" with
-  "tests were run": both signals exist in the same report, and they answer
-  different questions.
-- Patch Reviewer receives no repository evidence in its prompt — only the
-  vulnerability report and the final patch — so any specific claim it makes
-  about repository state, or about a prior/upstream fix, reflects the
-  model's own training-time knowledge, not something Auto Patcher verified
-  against this repository or an actual upstream patch. See
-  [Patch Reviewer](#patch-reviewer) for the exact provenance distinction; do
-  not read Reviewer Notes or Explanation text as repository-confirmed
-  evidence.
-- The Confidence Scorer stage still consumes an LLM call — fed the Patch
-  Reviewer's output and the same repository evidence the Challenger saw, in
-  addition to the vulnerability text and patch — and produces output that,
-  per [What does NOT affect the recommendation](#what-does-not-affect-the-recommendation),
-  is discarded before reaching the report or the policy. This is current
-  behavior, not a documentation gap — flagged here because it is easy to
-  assume otherwise from the pipeline's stage log output.
-- The Evidence check caveat and the Manual Review Required scope note
-  describe their finding aggregate with a category breakdown
-  (`_describe_decision_relevant_findings`), not a single "N remain open"
-  number — precisely so Observed Facts (evidence-backed) are not worded the
-  same as Validation Gaps/Questions (genuinely unresolved). See
-  [Recommendation consistency vs. the decision itself](#recommendation-consistency-vs-the-decision-itself)
-  for the exact mechanism. The Trust Report presentation/wording work is
-  ongoing and may still change exact phrasing further (section names,
-  captions, etc.); this document describes the policy code's current
-  counting/describing behavior, not that work's final output.
-- This document describes the recommendation policy as implemented in
-  `_build_recommendation_v1` today. The file also contains an unused,
-  differently-worded legacy function (`build_recommendation`, three labels,
-  numeric-score-driven); it still exists, is still exercised only by its own
-  unit tests, and is still not called by the report-building path. If it is
-  ever wired back in, this document must be updated accordingly.
+- **Python-only signals.** Impact Surface and Test Support work only on Python
+  repositories; elsewhere they report "not applicable". As a result, other
+  languages cannot reach Deploy After Validation.
+- **Test Support versus Existing Test Comparison.** `test_availability` checks
+  that matching test files exist. It does not run them. Existing Test
+  Comparison does run the repository's existing tests (Docker only; Python,
+  Node or Go runtimes), but only when explicitly requested. It is available as
+  `--compare-existing-tests` on the Python CLI and `tools/run_traced.py`, not
+  on the Go `openant patch` command. Its signal is displayed only. When enabled,
+  it can also make one bounded LLM call to amend an existing test that
+  contradicts the patch's stated security intent. If that amended patch is
+  accepted, it becomes the reported patch (see the
+  [architecture document](auto-patcher-architecture.md#s10s11--existing-test-comparison-opt-in)).
+- **Patch Reviewer has no repository evidence.** Treat its Explanation and
+  Reviewer Notes as model analysis, not verified fact.
+- **Nondeterminism.** The Challenger and calibration are LLM calls. Code
+  validates their output structure and citations, but not their reasoning.
+- **Legacy code.** `pipeline.py` still contains an older three-label
+  `build_recommendation()` and `_decision_relevant_finding_count()`. Neither is
+  used to build the report. Their only callers are their own unit tests.
