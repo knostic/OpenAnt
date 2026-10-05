@@ -327,6 +327,7 @@ def scan_repository(
     # keys / typo'd model IDs / unreachable endpoints surface here as
     # a clean LLMError rather than mid-scan.
     from utilities.llm import (
+        binding_policy_summary,
         build_phase_registry,
         load_config_file,
         probe_registry_or_raise,
@@ -504,6 +505,7 @@ def scan_repository(
 
         with step_context("app-context", output_dir, inputs={
             "repo_path": repo_path,
+            "llm": binding_policy_summary(registry, "app_context"),
         }) as ctx:
             # A threat model committed to the scanned repo is authoritative and
             # short-circuits generation. Loaded OUTSIDE the try below on
@@ -635,6 +637,7 @@ def scan_repository(
             "dataset_path": active_dataset_path,
             "model": llm_reach_binding.model,
             "provider": llm_reach_binding.provider_name,
+            "llm": binding_policy_summary(registry, "llm_reach"),
         }) as ctx:
             try:
                 dataset = read_json(active_dataset_path)
@@ -1074,6 +1077,7 @@ def scan_repository(
             "analyzer_output_path": parse_result.analyzer_output_path,
             "repo_path": repo_path,
             "mode": enhance_mode,
+            "llm": binding_policy_summary(registry, "enhance"),
         }) as ctx:
             # Enhance is OPTIONAL: a failure here must not discard the completed
             # parse work. Catch-and-continue (matching app-context /
@@ -1107,9 +1111,16 @@ def scan_repository(
                     "error_count": enhance_result.error_count,
                     "classifications": enhance_result.classifications,
                     "mode": enhance_mode,
+                    # #611: the three-bucket identity's own fields
+                    "incomplete_count": enhance_result.incomplete_count,
+                    "total_units": enhance_result.total_units,
                 }
                 if enhance_result.error_summary:
                     ctx.summary["error_summary"] = enhance_result.error_summary
+                # #615: the degenerate-exit kind histogram
+                if getattr(enhance_result, "incomplete_summary", None):
+                    ctx.summary["incomplete_summary"] = \
+                        enhance_result.incomplete_summary
                 ctx.outputs = {
                     "enhanced_dataset_path": enhance_result.enhanced_dataset_path,
                 }
@@ -1146,6 +1157,7 @@ def scan_repository(
         "dataset_path": active_dataset_path,
         "model": analyze_binding.model,
         "provider": analyze_binding.provider_name,
+        "llm": binding_policy_summary(registry, "analyze"),
         "limit": limit,
     }) as ctx:
         analyze_result = run_analysis(
@@ -1195,6 +1207,11 @@ def scan_repository(
         or analyze_result.metrics.bypassable > 0
     )
 
+    # #621: the verify step stamps the attacker-model descriptor on its
+    # result (the summary's server-rendered Methodology reads it verbatim);
+    # None on every path that did not run verification.
+    attacker_model = None
+
     if verify and has_findings:
         from core.verifier import run_verification
 
@@ -1203,6 +1220,7 @@ def scan_repository(
         with step_context("verify", output_dir, inputs={
             "results_path": analyze_result.results_path,
             "analyzer_output_path": parse_result.analyzer_output_path,
+            "llm": binding_policy_summary(registry, "verify"),
         }) as ctx:
             # Verify is OPTIONAL: a failure here must not discard completed
             # parse/analyze work (step_context re-raises otherwise).
@@ -1234,6 +1252,7 @@ def scan_repository(
 
                 result.verified_results_path = verify_result.verified_results_path
                 active_results_path = verify_result.verified_results_path
+                attacker_model = getattr(verify_result, "attacker_model", None)
 
                 print(f"  Confirmed: {verify_result.confirmed_vulnerabilities} vulnerabilities",
                       file=sys.stderr)
@@ -1255,16 +1274,24 @@ def scan_repository(
                     # #509: a Stage-2 disagreement corrected to
                     # ``inconclusive`` is an explicitly-unconfirmable finding —
                     # it threads into inconclusive, NEVER into safe (the
-                    # plain-disagreement fold above covers only genuine
+                    # plain-disagreement fold below covers only genuine
                     # downgrades to safe).
                     inconclusive=analyze_result.metrics.inconclusive
                     + verify_result.disagreed_inconclusive,
-                    protected=analyze_result.metrics.protected,
+                    # #622: a disagreement corrected to ``protected`` is
+                    # protected-by-controls — the destination category
+                    # reaches the scan metrics (the recount always counted
+                    # it here; the scanner fold was the only divergence).
+                    protected=analyze_result.metrics.protected
+                    + verify_result.disagreed_protected,
+                    # #622: the residual ``disagreed`` (corrected to safe or
+                    # an unrecognised verdict) is ALL that folds into safe.
                     safe=analyze_result.metrics.safe + verify_result.disagreed,
                     errors=analyze_result.metrics.errors + verify_result.error_count,
                     verified=verify_result.findings_verified,
                     stage2_agreed=verify_result.agreed,
                     stage2_disagreed=verify_result.disagreed,
+                    stage2_disagreed_protected=verify_result.disagreed_protected,
                     needs_review=verify_result.needs_review,
                 )
             except Exception as e:
@@ -1341,6 +1368,9 @@ def scan_repository(
             # report skips are recorded later and remain in scan.report.json.
             skipped_steps=list(result.skipped_steps),
             skipped_step_reasons=dict(result.skipped_step_reasons),
+            # #621: the attacker-model descriptor the verify step stamped —
+            # present-only (None when verify never ran stays absent).
+            attacker_model=attacker_model,
         )
 
         ctx.outputs = {"pipeline_output_path": pipeline_output_path}
@@ -1364,6 +1394,7 @@ def scan_repository(
 
             with step_context("dynamic-test", output_dir, inputs={
                 "pipeline_output_path": pipeline_output_path,
+                "llm": binding_policy_summary(registry, "dynamic_test"),
             }) as ctx:
                 # Dynamic test is OPTIONAL: a failure here must not discard
                 # completed work (step_context re-raises otherwise).
@@ -1418,6 +1449,7 @@ def scan_repository(
 
         with step_context("report", output_dir, inputs={
             "pipeline_output_path": pipeline_output_path,
+            "llm": binding_policy_summary(registry, "report"),
         }) as ctx:
             report_dir = os.path.join(output_dir, "report")
             os.makedirs(report_dir, exist_ok=True)
@@ -2050,9 +2082,17 @@ def _print_summary(result: ScanResult) -> None:
               f"(verification incomplete)", file=sys.stderr)
     print(f"  Errors:         {result.metrics.errors}", file=sys.stderr)
     if result.metrics.verified:
-        print(f"  Verified:       {result.metrics.verified} "
-              f"({result.metrics.stage2_agreed} agreed, "
-              f"{result.metrics.stage2_disagreed} disagreed)", file=sys.stderr)
+        # #622: the disagreement split, composed as ONE line — the residual
+        # `disagreed` excludes the reclassifications, so the companion must
+        # state them (a bare shrinking number is the issue's own failure
+        # class) without implying a subset of the figure beside it.
+        line = (f"  Verified:       {result.metrics.verified} "
+                f"({result.metrics.stage2_agreed} agreed, "
+                f"{result.metrics.stage2_disagreed} disagreed to safe")
+        if result.metrics.stage2_disagreed_protected:
+            line += (f"; {result.metrics.stage2_disagreed_protected} "
+                     f"reclassified protected-by-controls")
+        print(line + ")", file=sys.stderr)
     print(f"  Cost:           ${result.usage.total_cost_usd:.4f}", file=sys.stderr)
     print(f"  Output:         {result.output_dir}", file=sys.stderr)
     if result.skipped_steps:

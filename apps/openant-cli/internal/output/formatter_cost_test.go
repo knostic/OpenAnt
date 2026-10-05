@@ -33,10 +33,10 @@ func captureUsageOutput(fn func()) string {
 func TestReportSummaryRendersIncompleteness(t *testing.T) {
 	out := captureUsageOutput(func() {
 		PrintReportSummary(map[string]any{
-			"format":     "summary",
+			"format":      "summary",
 			"output_path": "/tmp/x",
 			"usage": map[string]any{
-				"total_cost_usd": 0.0,
+				"total_cost_usd":  0.0,
 				"cost_incomplete": true,
 				"unpriced_models": []any{"claude-sonnet-4-6", "mystery/model"},
 			},

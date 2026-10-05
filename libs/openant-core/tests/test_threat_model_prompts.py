@@ -6,10 +6,18 @@ else" — which cannot express, say, a developer with commit access to a watched
 manifest repo but no shell on the host. A threat model declares its own
 attacker profiles, and verification must adopt each in turn.
 
-Every legacy assertion here is deliberate: the no-threat-model path must be
-BYTE-IDENTICAL, because `test_threat_model_untrusted_input_gate.py` pins its
-wording and because changing it would silently move every existing user's
-verdicts.
+Every legacy assertion here is deliberate: the GOLDEN no-threat-model classes
+(the all-trusted CLI/library and the None context) keep their persona, rule,
+and sentinel texts byte-identical, because `test_threat_model_untrusted_input_gate.py`
+pins that wording and because changing them would silently move every existing
+user's verdicts. (#621 adds the Trust Boundaries section to the all-trusted
+Stage-2 CONTEXT BLOCK — a deliberate, additive render change; the persona/rule
+texts are what stays pinned.) #621 deliberately changed the two remaining
+classes: the untrusted-input class (suppress_local_only()==False with untrusted
+boundaries — previously the bare browser persona plus the CLI local-access
+rule, contradicting an attacker-supplied-input attack surface) and remote/web
+apps (which lose the CLI local-access rule; the browser persona already
+excludes local access).
 """
 
 

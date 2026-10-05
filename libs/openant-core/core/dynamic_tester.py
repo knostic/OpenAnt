@@ -57,6 +57,11 @@ def run_tests(
         "cost_usd": _phase_baseline.total_cost_usd,
         "tokens": _phase_baseline.total_tokens,
         "calls": _phase_baseline.total_calls,
+        # #624: the turns delta must be phase-scoped too — a holder without
+        # it would leave the baseline's turns at 0 and the line would print
+        # the RUN-cumulative turns as the phase delta (the #214 defect in
+        # the new field).
+        "turns": _phase_baseline.total_turns,
     }
     # Check Docker availability
     if not shutil.which("docker"):
@@ -118,6 +123,7 @@ def run_tests(
     # double-counts across a resume).
     _phase_baseline = UsageInfo(
         total_calls=_baseline_holder["calls"],
+        total_turns=_baseline_holder.get("turns", 0),
         total_tokens=_baseline_holder["tokens"],
         total_cost_usd=_baseline_holder["cost_usd"],
     )

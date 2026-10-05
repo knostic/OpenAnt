@@ -38,6 +38,11 @@ type AnalysisMetrics struct {
 	Verified        int `json:"verified"`
 	Stage2Agreed    int `json:"stage2_agreed"`
 	Stage2Disagreed int `json:"stage2_disagreed"`
+	// #622: the protected split of stage2_disagreed — non-partition
+	// telemetry. Forward-declared surface (this struct is not unmarshaled;
+	// the formatter reads the untyped map) kept in sync with the Python
+	// AnalysisMetrics field so the cross-language contract stays documented.
+	Stage2DisagreedProtected int `json:"stage2_disagreed_protected"`
 }
 
 // ReportData is returned by the `report` command.
@@ -93,6 +98,8 @@ type ScanMetrics struct {
 	Verified        int `json:"verified"`
 	Stage2Agreed    int `json:"stage2_agreed"`
 	Stage2Disagreed int `json:"stage2_disagreed"`
+	// #622: the protected split — mirrors AnalysisMetrics.
+	Stage2DisagreedProtected int `json:"stage2_disagreed_protected"`
 }
 
 // EnhanceData is returned by the `enhance` command.
@@ -111,6 +118,11 @@ type VerifyData struct {
 	FindingsVerified         int       `json:"findings_verified"`
 	Agreed                   int       `json:"agreed"`
 	Disagreed                int       `json:"disagreed"`
+	// #622: BOTH reclassification siblings — the Python VerifyResult.to_dict
+	// envelope carries them (the "Disagreed (eliminated)" display's source);
+	// without them the companion lines are unrenderable.
+	DisagreedInconclusive    int       `json:"disagreed_inconclusive"`
+	DisagreedProtected       int       `json:"disagreed_protected"`
 	ConfirmedVulnerabilities int       `json:"confirmed_vulnerabilities"`
 	Usage                    UsageInfo `json:"usage"`
 }

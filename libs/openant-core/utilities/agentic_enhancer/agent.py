@@ -12,10 +12,12 @@ Supports reachability-aware classification to distinguish:
 """
 
 import json
+import sys
 from typing import Optional, Set, List
 
 from core.file_boundary import boundary_for_language
-from ..llm_client import TokenTracker, get_global_tracker
+from ..llm_client import (TokenTracker, get_global_tracker,
+                          record_accounting_error)
 from ..llm import (
     Message,
     PhaseBinding,
@@ -106,6 +108,12 @@ class AgentResult:
         cost_usd: float = 0.0,
         unpriced_models: Optional[list] = None,
         usage_details: Optional[list] = None,
+        # #615: WHICH degenerate exit produced this incomplete — the four
+        # exits differ in kind and remedy (three cheap model-behavior
+        # exits vs the budget-exhaustion one); a consumer reading only
+        # classification cannot split the 4-vs-41. Empty string = a
+        # completed analysis (NOT an incomplete marker).
+        exit_kind: str = "",
     ):
         self.include_functions = include_functions
         self.usage_context = usage_context
@@ -124,6 +132,7 @@ class AgentResult:
         self.unpriced_models = unpriced_models
         # #211 pass-through capture: per-turn detail dicts, verbatim.
         self.usage_details = usage_details
+        self.exit_kind = exit_kind
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -133,6 +142,9 @@ class AgentResult:
             "security_classification": self.security_classification,
             "classification_reasoning": self.classification_reasoning,
             "confidence": self.confidence,
+            # #615: present-only — a completed analysis (exit_kind="")
+            # serializes without the key (the legacy byte-identity).
+            **({"exit_kind": self.exit_kind} if self.exit_kind else {}),
             "agent_metadata": {
                 "iterations": self.iterations,
                 "total_tokens": self.total_tokens,
@@ -288,15 +300,102 @@ class ContextAgent:
                     messages=messages,
                 )
             except Exception as exc:
+                # #609: a failed attempt's spend must not vanish from
+                # accounting. The exits record via record_call; the raise
+                # did not, so the tracker and every summary/checkpoint
+                # under-reported the provider's real bill. Mirror the
+                # #616 idiom (finding_verifier.py's error-path record):
+                # fold the raising turn's tokens when the exception
+                # carries them (#537: an LLMResponseError's rejected reply
+                # was billed), zero-token guard (a turn-1 connection
+                # failure billed nothing — no $0 record, no spurious
+                # unpriced marker), and a None per-turn entry for the
+                # raising turn (the list length equals the turns billed).
+                # #609 review: the coercions are GUARDED — a foreign
+                # exception with a non-int-coercible token attr must not
+                # replace the original (the ENG-1 class; in-tree carriers
+                # int-coerce at construction, this is the belt).
+                try:
+                    exc_in = int(getattr(exc, "input_tokens", 0) or 0)
+                    exc_out = int(getattr(exc, "output_tokens", 0) or 0)
+                except Exception:
+                    exc_in = exc_out = 0
+                attempt_cost = 0.0
+                attempt_unpriced = None
+                if (total_input_tokens or total_output_tokens
+                        or exc_in or exc_out):
+                    # ENG-1 (#609 pre-code check): an accounting failure
+                    # here must never replace the original exception —
+                    # its retryability class (rate_limit vs connection vs
+                    # structural) is what the enhance retry loop keys on.
+                    # The guard is load-bearing, not hygiene: a poisoned
+                    # pricing dict would otherwise reclassify a transient
+                    # rate limit as a non-retryable KeyError.
+                    try:
+                        call_record = self.tracker.record_call(
+                            model=self.binding.model,
+                            input_tokens=total_input_tokens + exc_in,
+                            output_tokens=total_output_tokens + exc_out,
+                            pricing=lookup_pricing(self.binding),
+                            usage_details=per_turn_usage_details
+                            + ([None] if (exc_in or exc_out) else []),
+                            turns=len(per_turn_usage_details
+                            + ([None] if (exc_in or exc_out) else [])),
+                        )
+                        # the reads live INSIDE the guard's try: a double
+                        # returning None from record_call must hit the
+                        # guard, not turn into an AttributeError that
+                        # replaces the original exception.
+                        attempt_cost = call_record.get("cost_usd", 0.0)
+                        attempt_unpriced = sorted(getattr(
+                            getattr(self.tracker, "_thread_local", None),
+                            "unit_unpriced", set())) or None
+                    except Exception:
+                        # #609/#605: the swallowed accounting failure must be
+                        # LOUD in the artifacts, not just stderr — tick the
+                        # accounting-error counter so get_totals()/the step
+                        # reports carry the marker (never a complete-looking
+                        # artifact). The import is module-level: an import
+                        # failure here would replace the original exception
+                        # (the ENG-1 class). The print is itself guarded: a
+                        # closed/encoding-broken stderr raising HERE would
+                        # replace the original exception — the exact class
+                        # this handler exists to prevent.
+                        try:
+                            record_accounting_error()
+                        except Exception:
+                            pass  # the counter is module-level: unreachable
+                                  # in-tree; a poisoned registry module is the
+                                  # concern — the original error outranks it
+                        try:
+                            print(f"[agent] accounting record failed for the "
+                                  f"failed attempt of {unit_id}: "
+                                  f"{sys.exc_info()[0].__name__} (the tracker "
+                                  f"has no record of this attempt; "
+                                  f"agent_state carries its tokens but "
+                                  f"cost_usd=0.0 and no unpriced marker; the "
+                                  f"original error is re-raised)",
+                                  file=sys.stderr)
+                        except Exception:
+                            pass  # stderr unavailable — the #605 counter is
+                                  # the durable signal
                 # Attach agent state so the caller knows how far we got.
                 # Covers LLMRateLimitError (adapter has already reported
-                # to the global rate limiter) and anything else.
+                # to the global rate limiter) and anything else. #609:
+                # the state carries the SAME numbers the tracker recorded
+                # (tokens incl. the raising turn's; priced cost; the #216
+                # unpriced marker, present-only) so the enhance summary,
+                # checkpoints, and resume fold what the tracker has.
                 exc.agent_state = {
                     "iteration": iterations,
                     "max_iterations": MAX_ITERATIONS,
-                    "tokens_used": total_input_tokens + total_output_tokens,
-                    "input_tokens": total_input_tokens,
-                    "output_tokens": total_output_tokens,
+                    "tokens_used": (total_input_tokens + exc_in)
+                    + (total_output_tokens + exc_out),
+                    "input_tokens": total_input_tokens + exc_in,
+                    "output_tokens": total_output_tokens + exc_out,
+                    "cost_usd": attempt_cost,
+                    **({"unpriced_models": attempt_unpriced}
+                       if attempt_unpriced else {}),
                 }
                 raise
 
@@ -328,6 +427,7 @@ class ContextAgent:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
+                    turns=len(per_turn_usage_details),
                 )
                 return AgentResult(
                     include_functions=[],
@@ -335,6 +435,7 @@ class ContextAgent:
                     security_classification=INCOMPLETE_CLASSIFICATION,
                     classification_reasoning="Analysis incomplete",
                     confidence=0.3,
+                    exit_kind="end_turn_without_finish",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
                     is_entry_point=is_entry_point,
@@ -403,6 +504,7 @@ class ContextAgent:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
+                    turns=len(per_turn_usage_details),
                 )
                 return AgentResult(
                     include_functions=[],
@@ -410,6 +512,7 @@ class ContextAgent:
                     security_classification=INCOMPLETE_CLASSIFICATION,
                     classification_reasoning="Analysis incomplete - finish call truncated",
                     confidence=0.3,
+                    exit_kind="finish_truncated",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
                     is_entry_point=is_entry_point,
@@ -433,6 +536,7 @@ class ContextAgent:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
+                    turns=len(per_turn_usage_details),
                 )
 
                 return AgentResult(
@@ -476,6 +580,7 @@ class ContextAgent:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
+                    turns=len(per_turn_usage_details),
                 )
                 return AgentResult(
                     include_functions=[],
@@ -483,6 +588,7 @@ class ContextAgent:
                     security_classification=INCOMPLETE_CLASSIFICATION,
                     classification_reasoning="Analysis incomplete - no tool calls",
                     confidence=0.3,
+                    exit_kind="no_tool_calls",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
                     is_entry_point=is_entry_point,
@@ -508,6 +614,7 @@ class ContextAgent:
             output_tokens=total_output_tokens,
             pricing=lookup_pricing(self.binding),
             usage_details=per_turn_usage_details,
+            turns=len(per_turn_usage_details),
         )
 
         return AgentResult(
@@ -516,6 +623,7 @@ class ContextAgent:
             security_classification=INCOMPLETE_CLASSIFICATION,
             classification_reasoning="Could not complete analysis within iteration limit",
             confidence=0.2,
+            exit_kind="max_iterations",
             iterations=iterations,
             total_tokens=total_input_tokens + total_output_tokens,
             is_entry_point=is_entry_point,
@@ -585,39 +693,61 @@ def enhance_unit_with_agent(
     unit["agent_context"] = result.to_dict()
 
     # Assemble additional code if functions were identified
+    # #614: the assembly is PRESERVE-ON-FAILURE — a raise here must never
+    # let the caller's except overwrite the completed, paid classification
+    # stored above (the context_enhancer handler replaced it with an error
+    # dict, destroying the verdict and its metadata). The completed
+    # context stays; the assembly failure is marked separately.
     if result.include_functions:
-        additional_code = []
-        additional_files = set()
+        try:
+            additional_code = []
+            additional_files = set()
 
-        for func_info in result.include_functions:
-            func_id = func_info.get("id", "")
-            func_data = index.get_function(func_id)
+            for func_info in result.include_functions:
+                func_id = func_info.get("id", "")
+                func_data = index.get_function(func_id)
 
-            if func_data and func_data.get("code"):
-                additional_code.append(func_data["code"])
+                if func_data and func_data.get("code"):
+                    additional_code.append(func_data["code"])
 
-                # Extract file path from func_id
-                colon_idx = func_id.rfind(":")
-                if colon_idx > 0:
-                    additional_files.add(func_id[:colon_idx])
+                    # Extract file path from func_id
+                    colon_idx = func_id.rfind(":")
+                    if colon_idx > 0:
+                        additional_files.add(func_id[:colon_idx])
 
-        # Append to primary_code with file boundaries
-        if additional_code:
-            # Emit the marker in the UNIT'S comment syntax. A `//` line injected
-            # into Python or Ruby source is a syntax error, and the downstream
-            # split would not find it in the form those parsers emit.
-            FILE_BOUNDARY = boundary_for_language(unit.get("language"))
-            current_code = unit["code"]["primary_code"]
-            assembled = current_code + FILE_BOUNDARY + FILE_BOUNDARY.join(additional_code)
-            unit["code"]["primary_code"] = assembled
-
-            # Update metadata
-            origin = unit["code"].get("primary_origin", {})
-            current_files = set(origin.get("files_included", []))
-            origin["files_included"] = list(current_files | additional_files)
-            origin["deps_inlined"] = True
-            origin["enhanced_length"] = len(assembled)
-            unit["code"]["primary_origin"] = origin
+            # Append to primary_code with file boundaries
+            if additional_code:
+                # Emit the marker in the UNIT'S comment syntax. A `//` line injected
+                # into Python or Ruby source is a syntax error, and the downstream
+                # split would not find it in the form those parsers emit.
+                FILE_BOUNDARY = boundary_for_language(unit.get("language"))
+                current_code = unit["code"]["primary_code"]
+                assembled = current_code + FILE_BOUNDARY + FILE_BOUNDARY.join(additional_code)
+                # #614 review: compute the metadata into locals FIRST and
+                # commit primary_code + primary_origin LAST — a raise in the
+                # metadata computation no longer leaves inlined code with
+                # deps_inlined unset (a partial state the wrap would swallow).
+                origin = unit["code"].get("primary_origin", {})
+                current_files = set(origin.get("files_included", []))
+                origin["files_included"] = list(current_files | additional_files)
+                origin["deps_inlined"] = True
+                origin["enhanced_length"] = len(assembled)
+                unit["code"]["primary_code"] = assembled
+                unit["code"]["primary_origin"] = origin
+        except Exception as exc:
+            # #614: PRESERVE the completed classification + its usage — the
+            # caller's except must never overwrite paid work with an error
+            # dict. The failure is marked INSIDE the stored context (a
+            # separate assembly_error key; the classification, the reasoning,
+            # the confidence, and the recorded usage all survive).
+            unit["agent_context"].setdefault("assembly_error", {
+                "exception_class": type(exc).__name__,
+                "message": str(exc)[:500],
+            })
+            print(f"[Enhance] assembly failed after a completed analysis "
+                  f"({type(exc).__name__}): {exc} — the classification is "
+                  "preserved; the additional code was not inlined",
+                  file=sys.stderr)
 
     return unit
 

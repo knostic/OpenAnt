@@ -30,7 +30,7 @@ from core.language_selection import (
     report_exclusions,
     select_languages,
 )
-from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+from core.verdict_taxonomy import FINDING_VERDICT_ORDER, fold_legacy_finding
 from utilities.file_io import normalize_results, read_json
 
 
@@ -472,6 +472,7 @@ def cmd_generate_context(args):
     from core.schemas import success, error
     from core.step_report import step_context
     from utilities.llm import (
+        binding_policy_summary,
         build_phase_registry,
         load_config_file,
         probe_registry_or_raise,
@@ -497,6 +498,9 @@ def cmd_generate_context(args):
                 cf, resolve_llm_config(cf, getattr(args, "llm_config", None))
             )
             probe_registry_or_raise(registry)
+            # #625: the effective policy rides the step's inputs — built
+            # here because the registry exists only inside this block.
+            ctx.inputs["llm"] = binding_policy_summary(registry, "app_context")
             app_context = generate_application_context(
                 Path(args.repo),
                 registry.get("app_context"),
@@ -579,9 +583,20 @@ def cmd_enhance(args):
                 "error_count": result.error_count,
                 "classifications": result.classifications,
                 "mode": args.mode,
+                # #611: the three-bucket identity's own fields — the SAME
+                # keys the scanner's step summary threads (both writers;
+                # getattr for stub-result callers like the limit test's)
+                "incomplete_count": getattr(result, "incomplete_count", 0),
+                "total_units": getattr(result, "total_units", 0),
             }
             if result.error_summary:
                 ctx.summary["error_summary"] = result.error_summary
+            # #615: the degenerate-exit kind histogram — FLAT, a sibling
+            # of the error_summary gate (NOT nested inside it: a zero-error
+            # run with incompletes carries the histogram too; the scanner's
+            # writer is the same shape)
+            if getattr(result, "incomplete_summary", None):
+                ctx.summary["incomplete_summary"] = result.incomplete_summary
             ctx.outputs = {
                 "enhanced_dataset_path": result.enhanced_dataset_path,
             }
@@ -775,6 +790,21 @@ def _discovery_from_step_reports(step_reports):
                 return block
     return None
 
+def _attacker_model_from_step_reports(step_reports):
+    """#621: the attacker-model descriptor recorded by the verify step's
+    summary — forwarded to the standalone build-output/report pipeline-output
+    constructions exactly the #600 discovery way (the step report is the
+    carrier; no re-derivation). BEST-EFFORT: absent summary (verify skipped /
+    never ran / an old scan) stays absent — present-only downstream, rendered
+    "not recorded" by the summary's honest-absence rule."""
+    for sr in step_reports or []:
+        if isinstance(sr, dict) and sr.get("step") == "verify":
+            summary = sr.get("summary") or {}
+            block = summary.get("attacker_model")
+            if isinstance(block, dict) and block:
+                return block
+    return None
+
 def cmd_build_output(args):
     """Build pipeline_output.json from analysis results."""
     from core.reporter import build_pipeline_output
@@ -802,6 +832,7 @@ def cmd_build_output(args):
                 processing_level=args.processing_level,
                 step_reports=step_reports,
                 discovery=_discovery_from_step_reports(step_reports),
+                attacker_model=_attacker_model_from_step_reports(step_reports),
             )
 
             ctx.outputs = {"pipeline_output_path": path}
@@ -1033,6 +1064,7 @@ def cmd_report(args):
                     repo_name=args.repo_name,
                     step_reports=step_reports,
                     discovery=_discovery_from_step_reports(step_reports),
+                    attacker_model=_attacker_model_from_step_reports(step_reports),
                 )
 
             if fmt == "html":
@@ -1206,6 +1238,12 @@ def cmd_report_data(args):
                 # absent, else finding-less vulnerable results are dropped from
                 # the count. Mirrors the canonical read in reporter.py.
                 verdict = str(result.get("finding") or result.get("verdict", "")).lower()
+                # #623: the legacy INSUFFICIENT_CONTEXT value is inconclusive's
+                # legacy synonym at every display aggregate — folding the read
+                # keeps THIS display self-consistent (grouping, chart, counts,
+                # actionable all agree, matching the metrics fold); the row's
+                # stored values keep the legacy verdict for provenance.
+                verdict = fold_legacy_finding(verdict)
                 file_path = route_key.rsplit(":", 1)[0] if ":" in route_key else route_key
                 unit = units_by_id.get(route_key, {})
                 verification = result.get("verification") or {}

@@ -310,6 +310,7 @@ class TestTraceHooksHermetic:
             "total_cost_usd": pytest.approx(
                 (1000 / 1_000_000) * 15.0 + (500 / 1_000_000) * 75.0
             ),
+            "total_turns": 1,
             "cost_incomplete": False,
             "unpriced_models": [],
         }

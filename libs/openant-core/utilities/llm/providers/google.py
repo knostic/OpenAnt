@@ -200,6 +200,7 @@ class GoogleAdapter:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_retries: int = 5,
+        request_timeout: Optional[int] = 600,
         _client: Optional[genai.Client] = None,
     ):
         """Construct the adapter.
@@ -220,8 +221,55 @@ class GoogleAdapter:
                 on top of the SDK's own
                 retry, our rate limiter coordinates 429 backoff across
                 workers — same division of labour as the other adapters.
+            request_timeout: Per-request HTTP timeout in SECONDS, mapped
+                to ``HttpOptions.timeout`` (MILLISECONDS). #604: genai's
+                default is explicitly UNBOUNDED (the SDK inserts
+                ``timeout=None``; the other five adapters inherit their
+                SDK's finite 600 s default), so this adapter defaults to
+                **600** for parity. ``None`` is the explicit unbounded
+                opt-out (the pre-#604 behavior). ``<= 0`` is rejected —
+                genai's timeout handling is truthiness-guarded, so a ``0``
+                would be SILENT-unbounded. Semantics, stated honestly:
+                the value bounds each transport OPERATION (httpx
+                connect/read/write/pool) — each read resets the read
+                timer, so a slow-drip response can outlast it; a
+                fully-stalled request times out at the configured value
+                PER ATTEMPT, with the SDK's own retry layer (tenacity
+                retries ``httpx.TimeoutException``/``ConnectError`` with
+                jittered backoff) and the pipeline's retry passes
+                multiplying on top. Note the connect leg: a single
+                HttpOptions timeout value bounds ALL FOUR httpx phases,
+                so connect waits up to the same 600 s here where the five
+                other adapters' SDKs carry ``connect=5`` — a connect-level
+                black hole blocks ~600 s per attempt (still finite, and
+                documented rather than worked around; a per-leg timeout
+                would need genai's client_args plumbing). genai also
+                couples the client timeout to an ``X-Server-Timeout:
+                ceil(seconds)`` header on every request — a
+                server-directed hint genai is alone in sending (every
+                SDK discloses its client timeout in SOME header form:
+                the anthropic/openai family's stainless headers already
+                do), but this one is an instruction to the server, which
+                is what a security scanner's fingerprint surface grows
+                by. An adapter adopts this knob by declaring the
+                ``request_timeout`` constructor kwarg (the
+                ``build_adapter`` capability check keys on it).
             _client: Injected SDK instance for testing.
         """
+        # #604: the rejection is an UNCONDITIONAL constructor contract —
+        # it fires before the ``_client`` injection early-return (an
+        # injected caller passing 0 must not slip the silent-unbounded
+        # trap downstream). Bools are rejected explicitly (``isinstance(
+        # True, int)`` is True — a ``True`` would silently become 1000 ms)
+        # and non-ints too (a float would defer to pydantic's ValidationError).
+        if request_timeout is not None and (
+                isinstance(request_timeout, bool)
+                or not isinstance(request_timeout, int)
+                or request_timeout <= 0):
+            raise ValueError(
+                f"request_timeout must be a positive integer (seconds) or "
+                f"None (unbounded), got {request_timeout!r}"
+            )
         if _client is not None:
             self._client = _client
             return
@@ -235,9 +283,13 @@ class GoogleAdapter:
         # assemble one set of fields and only construct it if non-empty —
         # passing an empty HttpOptions would needlessly override the SDK
         # defaults. ``max_retries`` maps to ``HttpRetryOptions.attempts``.
+        # #604: ``request_timeout`` (seconds) maps to
+        # ``HttpOptions.timeout`` (milliseconds).
         http_options_fields: dict[str, Any] = {}
         if base_url is not None:
             http_options_fields["base_url"] = base_url
+        if request_timeout is not None:
+            http_options_fields["timeout"] = request_timeout * 1000
         if max_retries is not None:
             # F3 (round-5): the SDK's ``attempts`` field is the "Maximum
             # number of attempts, INCLUDING the original request" (verified
@@ -297,8 +349,14 @@ class GoogleAdapter:
                 raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
             if code == 429:
                 retry_after = _retry_after_from(exc)
-                report_rate_limit(retry_after)
-                raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
+                kind, g_delay = _google_429_details(exc)
+                if retry_after is None:
+                    retry_after = g_delay  # #663: RetryInfo carries the wait
+                # #716 hunt defect 3: quota never arms the all-worker pause
+                if kind != "quota":
+                    report_rate_limit(retry_after)
+                raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after,
+                                        kind=kind) from redacted_cause_from(exc)
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.ServerError as exc:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
@@ -343,7 +401,11 @@ class GoogleAdapter:
                 raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
             if code == 429:
                 retry_after = _retry_after_from(exc)
-                raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
+                kind, g_delay = _google_429_details(exc)
+                if retry_after is None:
+                    retry_after = g_delay  # #663: RetryInfo carries the wait
+                raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after,
+                                        kind=kind) from redacted_cause_from(exc)
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.ServerError as exc:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
@@ -589,6 +651,59 @@ def _http_code_from(exc: Any) -> Optional[int]:
     if isinstance(code, int):
         return code
     return None
+
+
+def _google_429_details(exc: Any) -> tuple[str, Optional[float]]:
+    """Classify a genai 429 from its structured details (#663).
+
+    Google's 429 (RESOURCE_EXHAUSTED) is EITHER a short-window throttle
+    (RPM/TPM -- bounded backoff helps) OR a hard quota (a daily cap, an
+    explicitly-enforced zero -- backoff does not restore access). The
+    discriminator lives in the error details, NEVER in the prose:
+    - QuotaFailure.violations[].quotaId carrying "PerDay" -> quota;
+    - RetryInfo.retryDelay ("12s") -> a throttle with a KNOWN wait,
+      surfaced as retry_after (Google's 429s never carry the header);
+    - bare RESOURCE_EXHAUSTED with neither -> throttle (the vendor's own
+      troubleshooting doc: exponential backoff).
+    """
+    # T1 round-1 (F3): the genai SDK sets APIError.details = the ENTIRE
+    # response JSON ({"error": {...}}) -- there is no .error/._error attr.
+    body = getattr(exc, "_error", None) or getattr(exc, "error", None)
+    details = None
+    if isinstance(body, dict):
+        details = body.get("details")
+    if not isinstance(details, list):
+        raw = getattr(exc, "details", None)  # the full response dict
+        if isinstance(raw, dict):
+            inner = raw.get("error")
+            if isinstance(inner, dict):
+                details = inner.get("details")
+    if not isinstance(details, list):
+        return "throttle", None
+    retry_after = None
+    for d in details:
+        if not isinstance(d, dict):
+            continue
+        dtype = d.get("@type", "")
+        if "QuotaFailure" in dtype:
+            violations = d.get("violations") or []
+            for v in violations:
+                quota_id = str(v.get("quotaId", ""))
+                # An explicitly-enforced zero is a quota whatever the
+                # metric's window: the entitlement IS the zero — backoff
+                # cannot restore it (the docstring's own promise, read).
+                quota_value = str(v.get("quotaValue", "")).strip()
+                if ("PerDay" in quota_id or "perday" in quota_id.lower()
+                        or quota_value in ("0", "0.0")):
+                    return "quota", None
+        elif "RetryInfo" in dtype:
+            delay = str(d.get("retryDelay", ""))
+            if delay.endswith("s"):
+                try:
+                    retry_after = float(delay[:-1])
+                except ValueError:
+                    pass
+    return "throttle", retry_after
 
 
 def _retry_after_from(exc: Any) -> Optional[float]:

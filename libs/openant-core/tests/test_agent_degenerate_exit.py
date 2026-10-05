@@ -116,7 +116,10 @@ def test_degenerate_exit_records_spend():
 def _finish_block(classification):
     # a COMPLETE, valid finish call (all required fields, valid classification)
     return ToolUseBlock(id="t1", name="finish", input={
-        "include_functions": ["f"], "usage_context": "ctx",
+        # #614: a list of OBJECTS — the fixture's bare string was the exact
+        # malformed shape the finish validator now rejects (presence-only
+        # validation let it through to the assembly).
+        "include_functions": [{"id": "f"}], "usage_context": "ctx",
         "security_classification": classification,
         "classification_reasoning": "r", "confidence": 0.5,
     })

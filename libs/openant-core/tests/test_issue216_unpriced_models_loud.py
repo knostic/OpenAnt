@@ -92,8 +92,12 @@ def test_registry_records_for_the_issue_slugs_exist():
     records with the live-catalogue source convention."""
     import json
     from pathlib import Path as P
+    # #601: encoding pinned (the registry loader pins it; a bare
+    # read_text() is a cp1252 hazard on Windows runners for a file that
+    # carries em-dashes in its source strings)
     registry = json.loads(
-        (P(__file__).parents[3] / "config" / "models.json").read_text())
+        (P(__file__).parents[3] / "config" / "models.json").read_text(
+            encoding="utf-8"))
     ids = {m["id"] for m in registry["models"]}
     for slug in ("anthropic/claude-opus-5", "anthropic/claude-sonnet-5",
                  "anthropic/claude-fable-5"):

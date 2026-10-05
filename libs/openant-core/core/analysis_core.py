@@ -44,6 +44,14 @@ if TYPE_CHECKING:  # avoids a runtime cycle: context/ imports utilities/ which
     # imports prompts/ which imports core/. The annotation is a string either way.
     from context.application_context import ApplicationContext
 
+# #611: the enhance non-verdict sentinels (the constant lives in
+# core.verdict_taxonomy — the shared vocabulary's home): a classification
+# in that set is NOT a verdict. The durable signal is the per-row
+# security_classification stamp; those values never reach the Stage-1
+# prompt as a "classification" hint (the gate is in
+# prompts/vulnerability_analysis.py).
+
+
 def _normalize_result(result: dict) -> dict:
     """Normalize LLM response fields to canonical names.
 

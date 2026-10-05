@@ -14,9 +14,14 @@ Schema v2 lives at ``~/.config/openant/config.json``::
         "<name>": {
           "type": "anthropic",
           "api_key": "sk-...",
-          "base_url": null
+          "base_url": null,
+          "request_timeout": null
         }
       },
+      # #604: request_timeout (seconds, null = the adapter default) is
+      # consumed by the adapters that declare a request_timeout kwarg
+      # (google today; an unconsuming provider type warns loudly at
+      # build time — never a silent ignore).
       "llm_configs": {
         "<name>": {
           "analyze":      {"provider": "<provider-name>", "model": "claude-..."},
@@ -84,6 +89,21 @@ class ProviderConfig:
     type: str
     api_key: Optional[str] = None
     base_url: Optional[str] = None
+    # #604: per-provider HTTP request timeout in SECONDS (None = the
+    # adapter's default). Consumed by the adapters that declare a
+    # ``request_timeout`` constructor kwarg (the Google adapter today —
+    # the only one whose SDK default is UNBOUNDED); a provider type that
+    # does not consume it warns loudly at build time, never silently.
+    request_timeout: Optional[int] = None
+    # #625: request-side thinking policy (None = the adapter sends NO
+    # thinking parameter — the default instrument, unchanged). When set, the
+    # dict is passed VERBATIM as the SDK request's ``thinking`` value (the
+    # provider/model validates the shape: the newer SDKs accept adaptive;
+    # older accepts enabled/disabled with a budget). Consumed by the adapters
+    # that declare a ``thinking`` constructor kwarg (anthropic + bedrock
+    # today); a provider type that does not consume it warns loudly at
+    # build time, never silently.
+    thinking: Optional[dict] = None
 
 
 @dataclass(frozen=True)
@@ -260,11 +280,26 @@ def _parse_providers(raw: dict) -> dict[str, ProviderConfig]:
             raise ConfigError(
                 f"config.json: provider {name!r}: 'type' is required and must be a non-empty string"
             )
+        request_timeout = _positive_int_or_none(
+            entry.get("request_timeout"), name)
+        # #625: verbatim dict pass-through (None when absent). The
+        # provider-side SDK validates the shape — we do not second-guess
+        # it here (a wrong shape fails loudly at request time, with the
+        # provider's own error naming the field).
+        thinking = entry.get("thinking")
+        if thinking is not None and not isinstance(thinking, dict):
+            raise ConfigError(
+                f"config.json: provider {name!r}: 'thinking' must be a "
+                f"JSON object (the SDK thinking parameter), got "
+                f"{type(thinking).__name__}"
+            )
         out[name] = ProviderConfig(
             name=name,
             type=ptype,
             api_key=_optional_str(entry.get("api_key")),
             base_url=_optional_str(entry.get("base_url")),
+            request_timeout=request_timeout,
+            thinking=thinking,
         )
     return out
 
@@ -353,6 +388,24 @@ def _optional_str(value) -> Optional[str]:
     return stripped or None
 
 
+def _positive_int_or_none(value, provider_name: str) -> Optional[int]:
+    """#604: ``request_timeout`` (SECONDS) — absent/null keeps the adapter
+    default; present must be a positive int. Bools are rejected explicitly
+    (``isinstance(True, int)`` is True in Python, so a JSON ``true`` would
+    otherwise slip through as 1), and <= 0 is rejected (a ``0`` would be
+    SILENT-unbounded downstream — genai's timeout handling is
+    truthiness-guarded)."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(
+            f"config.json: provider {provider_name!r}: 'request_timeout' "
+            f"must be a positive integer (seconds) or null, got "
+            f"{value!r}"
+        )
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Serialisation back to dict (for the Go CLI / file save)
 # ---------------------------------------------------------------------------
@@ -390,6 +443,10 @@ def _serialise_provider(p: ProviderConfig) -> dict:
         entry["api_key"] = p.api_key
     if p.base_url is not None:
         entry["base_url"] = p.base_url
+    # #604: the knob is config surface — dropping it on serialise would be
+    # the no-silent-drops violation (parse is serialise's declared inverse).
+    if p.request_timeout is not None:
+        entry["request_timeout"] = p.request_timeout
     return entry
 
 

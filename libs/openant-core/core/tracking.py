@@ -22,6 +22,9 @@ def get_usage() -> UsageInfo:
     totals = tracker.get_totals()
     return UsageInfo(
         total_calls=totals["total_calls"],
+        # .get (the #216 read pattern): a stubbed/old get_totals shape
+        # lacks the key — the honest zero, never a KeyError.
+        total_turns=totals.get("total_turns", 0),
         total_input_tokens=totals["total_input_tokens"],
         total_output_tokens=totals["total_output_tokens"],
         total_tokens=totals["total_tokens"],
@@ -44,14 +47,27 @@ def log_usage(prefix: str = "", baseline: "UsageInfo | None" = None):
     usage = get_usage()
     if baseline is not None:
         calls = usage.total_calls - baseline.total_calls
+        turns = usage.total_turns - baseline.total_turns
         tokens = usage.total_tokens - baseline.total_tokens
         cost = usage.total_cost_usd - baseline.total_cost_usd
     else:
-        calls, tokens, cost = (
-            usage.total_calls, usage.total_tokens, usage.total_cost_usd,
+        calls, turns, tokens, cost = (
+            usage.total_calls, usage.total_turns,
+            usage.total_tokens, usage.total_cost_usd,
         )
     label = f"{prefix}: " if prefix else ""
+    # #624: the line names BOTH populations — the completions the records
+    # cover (turns; one per single completion, the billed turns per
+    # conversation) and the records themselves. The old "N API calls"
+    # label lied per phase (enhance records units; single-shot records
+    # completions; the verifier records conversations). Exclusions,
+    # stated: SDK-internal HTTP retries, raising turns that billed
+    # nothing, KeyboardInterrupt'd turns, add_prior_usage-injected
+    # summary spend, and the threat-model repo-explorer loop (which
+    # records nothing to the tracker at all — a named follow-up) all lie
+    # outside the counts (tracker-observed, not network claims).
     print(
-        f"  {label}{calls} API calls, {tokens:,} tokens, ${cost:.4f}",
+        f"  {label}{turns} completions ({calls} records), "
+        f"{tokens:,} tokens, ${cost:.4f}",
         file=sys.stderr,
     )

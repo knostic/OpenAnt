@@ -18,6 +18,267 @@ if TYPE_CHECKING:
 
 VERIFICATION_SYSTEM_PROMPT = """You are a penetration tester. You only report vulnerabilities you can actually exploit."""
 
+# #621: the builtin attacker personas, hoisted to module constants so verify's
+# checkpoint identity can hash them (core/verifier.py folds these into
+# templates_sha — a resumed scan must not adopt verdicts rendered under a
+# superseded persona). PERSONA_BROWSER_ONLY and PERSONA_REMOTE_ONLY are the
+# pre-#621 texts, byte-identical; PERSONA_UNTRUSTED_INPUT is the new arm for
+# contexts whose trust boundaries mark an input source untrusted (the
+# parser/archive class whose whole attack surface is attacker-supplied input).
+PERSONA_BROWSER_ONLY = """You are an attacker on the internet. You have a browser and nothing else. No server access, no admin credentials, no ability to modify files on the server."""
+
+PERSONA_REMOTE_ONLY = """You are an attacker on the internet. You have a browser and nothing else.
+No server access, no admin credentials, no ability to modify files on the server, and NO ABILITY TO RUN CLI COMMANDS.
+
+You must find a way to trigger this vulnerability REMOTELY. If the only attack path requires:
+- Running CLI commands locally
+- Having shell access to the server
+- Being the user who runs the application
+
+Then the vulnerability is NOT EXPLOITABLE by you, because local users can already do anything on their own machine."""
+PERSONA_REMOTE_ONLY_WEB = """You are an attacker on the internet. You have a browser and nothing else.
+No server access, no admin credentials, no ability to modify files on the server, and NO ABILITY TO RUN CLI COMMANDS.
+
+You must find a way to trigger this vulnerability REMOTELY, through the web. If the only attack path requires:
+- Operator-local access a browser user cannot reach
+- Shell access to the server
+
+Then the vulnerability is NOT EXPLOITABLE by you."""
+
+PERSONA_UNTRUSTED_INPUT = """You are an attacker who supplies the untrusted input this application processes.
+You can deliver crafted input through: {supply_list}.
+You have NO server access and no admin credentials, and you do NOT run the application yourself — an operator on that machine does. You CANNOT alter the application's own files, configuration, or trusted inputs: the ONLY thing you control is the content arriving through the untrusted sources above.
+You must exploit this vulnerability by getting the application to process YOUR malicious input."""
+
+# #621: the system prompt's context arms, hoisted to module constants for the
+# same reason as the personas (verify's checkpoint identity hashes them; see
+# _verify_template_texts in core/verifier.py). Byte-identical to the pre-#621
+# texts for the threat-model and suppress arms.
+SYSTEM_ARM_THREAT_MODEL = """
+
+IMPORTANT: This repository supplies its own threat model with explicit attacker
+profiles. Judge exploitability strictly within each profile's stated capabilities
+rather than assuming a generic remote browser attacker."""
+
+SYSTEM_ARM_REMOTE_ONLY = """
+
+IMPORTANT: This is a CLI tool or library. The user running this code has local filesystem access.
+You must exploit this as a REMOTE attacker. If the only way to trigger the vulnerability is by
+running CLI commands locally, it is NOT exploitable - the user can already access the filesystem."""
+SYSTEM_ARM_REMOTE_ONLY_WEB = """
+
+IMPORTANT: This is a web application. Its remote surface is the browser.
+You must exploit this as a REMOTE attacker. If the only way to trigger the vulnerability is by
+reaching operator-local access a browser user cannot reach, it is NOT exploitable in this class."""
+
+SYSTEM_ARM_UNTRUSTED_INPUT = """
+
+IMPORTANT: This application processes attacker-supplied untrusted input (the
+trust boundaries named in the application context). Judge exploitability as an
+attacker who can SUPPLY that input through those sources — not as a generic
+remote browser attacker."""
+
+
+def _is_untrusted_input_context(app_context: "ApplicationContext") -> bool:
+    """The #621 discriminator: the context's attack surface includes input the
+    attacker can supply.
+
+    NOT ``requires_remote_trigger`` — the context generator's own guideline
+    (application_context.py) instructs the LLM to set it True for exactly
+    this class (a parser/deserializer/codec processing untrusted data), so
+    keying on it would route the LLM-generated class back to the browser
+    persona the issue was filed over. ``application_type`` is enum-validated
+    on the LLM path; a web app's untrusted HTTP body is already deliverable
+    by the browser persona, so web_app keeps it.
+    """
+    return bool(
+        app_context is not None
+        and app_context.untrusted_boundaries()
+        and str(app_context.application_type) != "web_app"
+    )
+
+
+def _builtin_context_digest_renders() -> list[str]:
+    """#621: deterministic renders of the Stage-2 builtin context block over
+    FIXED fixture contexts (module constants, NOT per-scan data — the
+    backend-identity doctrine excludes LLM-generated per-scan output from
+    checkpoint keys; a frozen fixture is template text in spirit). Folded
+    into verify's templates_sha (core/verifier.py) so a wording change to the
+    block — including the Trust Boundaries section and the CRITICAL
+    suppression block — re-pays verify instead of being adopted silently on
+    resume. Two fixtures cover both branches: the all-trusted suppress block
+    and the untrusted-boundaries render.
+    """
+    # Runtime import (the module-level one is TYPE_CHECKING-only; matches
+    # the local-import pattern get_verification_prompt uses).
+    from context.application_context import ApplicationContext
+    suppress_fixture = ApplicationContext(
+        application_type="cli_tool",
+        purpose="digest fixture",
+        trust_boundaries={"digest_cli_args": "trusted"},
+        requires_remote_trigger=False,
+    )
+    untrusted_fixture = ApplicationContext(
+        application_type="library",
+        purpose="digest fixture",
+        trust_boundaries={"digest_source": "untrusted"},
+        requires_remote_trigger=True,
+    )
+    # #653: the third routing class — a degenerate web_app (all-trusted
+    # boundaries, no remote trigger): _is_untrusted_input_context is False
+    # (the web_app exclusion) and suppress_local_only is True, but the
+    # descriptor must NOT call it a CLI tool/library. Without this fixture,
+    # a routing change re-routing a web_app is invisible to the checkpoint
+    # fold (the exact #621 failure mode, one class wider).
+    web_app_fixture = ApplicationContext(
+        application_type="web_app",
+        purpose="digest fixture",
+        trust_boundaries={"http_body": "trusted", "http_headers": "trusted"},
+        requires_remote_trigger=False,
+    )
+    # #653 §1: the UNTRUSTED web app — the discriminator's own branch.
+    # The exclusion in _is_untrusted_input_context keeps it on the browser
+    # persona today; a routing edit that removes the exclusion re-routes it
+    # to the untrusted-input persona, and THAT edit is what the fold must
+    # catch (the all-trusted fixture above covers only the degenerate
+    # class — suppress_local_only fires before the discriminator).
+    web_app_untrusted_fixture = ApplicationContext(
+        application_type="web_app",
+        purpose="digest fixture",
+        trust_boundaries={"http_body": "untrusted"},
+        requires_remote_trigger=True,
+    )
+    return [
+        _format_builtin_app_context_for_verification(suppress_fixture),
+        _format_builtin_app_context_for_verification(untrusted_fixture),
+        _format_builtin_app_context_for_verification(web_app_fixture),
+        _format_builtin_app_context_for_verification(web_app_untrusted_fixture),
+    ]
+
+
+def _builtin_persona_digest_renders() -> list[str]:
+    """#621: full USER-prompt renders over the same two frozen fixtures —
+    the routing coverage half of the checkpoint fold. Hashing the persona
+    TEXTS alone would miss a routing edit (a discriminator change that
+    re-routes a fixture to a different persona moves this digest and re-pays
+    verify — the exact #621 failure mode: the persona existed, the routing
+    never selected it)."""
+    from context.application_context import ApplicationContext
+    suppress_fixture = ApplicationContext(
+        application_type="cli_tool",
+        purpose="digest fixture",
+        trust_boundaries={"digest_cli_args": "trusted"},
+        requires_remote_trigger=False,
+    )
+    untrusted_fixture = ApplicationContext(
+        application_type="library",
+        purpose="digest fixture",
+        trust_boundaries={"digest_source": "untrusted"},
+        requires_remote_trigger=True,
+    )
+    # #653: the web_app fixture joins the persona renders (three routing
+    # classes, not two) — the routing-coverage half of the digest fold.
+    # The web_app SYSTEM ARM + PERSONA render in the same fold: an inline
+    # literal at the system-prompt site was invisible to templates_sha
+    # (the T1 round-2 mutation finding — the exact #621 failure mode).
+    from context.application_context import ApplicationContext
+    web_app_fixture = ApplicationContext(
+        application_type="web_app",
+        purpose="digest fixture",
+        trust_boundaries={"http_body": "trusted", "http_headers": "trusted"},
+        requires_remote_trigger=False,
+    )
+    # #653 §1: the untrusted web app joins the persona renders too — the
+    # routing edit this fixture exists to catch changes WHICH persona the
+    # class renders, so the user-prompt render must be in the fold for
+    # the re-route to move the digest.
+    web_app_untrusted_fixture = ApplicationContext(
+        application_type="web_app",
+        purpose="digest fixture",
+        trust_boundaries={"http_body": "untrusted"},
+        requires_remote_trigger=True,
+    )
+    return [
+        get_verification_prompt(
+            code="", finding="", attack_vector="", reasoning="",
+            app_context=suppress_fixture),
+        get_verification_prompt(
+            code="", finding="", attack_vector="", reasoning="",
+            app_context=untrusted_fixture),
+        get_verification_prompt(
+            code="", finding="", attack_vector="", reasoning="",
+            app_context=web_app_fixture),
+        get_verification_prompt(
+            code="", finding="", attack_vector="", reasoning="",
+            app_context=web_app_untrusted_fixture),
+        # the web_app system arm + persona join the fold so a wording
+        # change re-pays verify (the #621 contract, extended to the arm).
+        get_verification_system_prompt(web_app_fixture),
+    ]
+
+
+def _untrusted_supply_list(app_context: "ApplicationContext") -> str:
+    """The comma-joined untrusted source names for PERSONA_UNTRUSTED_INPUT.
+
+    Boundary names are LLM-generated or attacker-authored (a repo-committed
+    OPENANT.json skips the enum check) — collapse each so an embedded newline
+    cannot forge a directive line in the verifier prompt.
+    """
+    return ", ".join(
+        collapse_inline(source) or "unnamed source"
+        for source in app_context.untrusted_boundaries()
+    )
+
+
+def attacker_model_descriptor(app_context: "ApplicationContext") -> dict:
+    """#621: the one-line attacker model the summary renders, from the SAME
+    selection the verification prompt uses (single producer: stamped on the
+    verify result at verify time; the report layer reads it verbatim and
+    never re-derives — re-derivation would fabricate a methodology for a run
+    whose verify step never executed).
+    """
+    if app_context is not None and app_context.has_threat_model():
+        return {
+            "kind": "threat_model",
+            "attacker": (
+                "Declared by the repository's own threat model; attacker "
+                "profiles are rendered per finding at verification time."),
+        }
+    if _is_untrusted_input_context(app_context):
+        supply = _untrusted_supply_list(app_context)
+        return {
+            "kind": "untrusted_input",
+            "attacker": (
+                f"An attacker who supplies the untrusted input this "
+                f"application processes ({supply}); no server access, no "
+                "admin credentials, no CLI access."),
+        }
+    if app_context is not None and app_context.suppress_local_only():
+        # #653: the "local access is the operator's own" framing is right
+        # for a CLI tool/library whose inputs are operator-controlled — a
+        # web_app reaching this branch (all-trusted boundaries, no remote
+        # trigger) is DEGENERATE: its remote surface is the browser, not
+        # an operator's local access, and calling it a CLI tool mis-states
+        # the methodology on every degenerate web_app scan.
+        is_web = str(getattr(app_context, "application_type", "")) == "web_app"
+        return {
+            "kind": "remote_only",
+            "attacker": (
+                "Remote attacker with browser access, no server-side "
+                "access, no admin credentials"
+                + (" — this web application's remote surface is the "
+                   "browser; no operator-local access applies."
+                   if is_web else
+                   "; this CLI tool/library's local access is the "
+                   "operator's own.")),
+        }
+    return {
+        "kind": "browser_only",
+        "attacker": (
+            "Remote attacker with browser access, no server-side access, "
+            "no admin credentials."),
+    }
+
 
 # Backward-compatible thin alias. The canonical implementation now lives in
 # ``prompts._fence.safe_code_fence`` so the Stage-1 analysis prompt and this
@@ -37,17 +298,20 @@ def get_verification_system_prompt(app_context: "ApplicationContext" = None) -> 
     base_prompt = VERIFICATION_SYSTEM_PROMPT
 
     if app_context and app_context.has_threat_model():
-        base_prompt += """
-
-IMPORTANT: This repository supplies its own threat model with explicit attacker
-profiles. Judge exploitability strictly within each profile's stated capabilities
-rather than assuming a generic remote browser attacker."""
+        base_prompt += SYSTEM_ARM_THREAT_MODEL
     elif app_context and app_context.suppress_local_only():
-        base_prompt += """
-
-IMPORTANT: This is a CLI tool or library. The user running this code has local filesystem access.
-You must exploit this as a REMOTE attacker. If the only way to trigger the vulnerability is by
-running CLI commands locally, it is NOT exploitable - the user can already access the filesystem."""
+        if str(getattr(app_context, "application_type", "")) == "web_app":
+            # #653: the web_app arm — module-level constant so the
+            # checkpoint fold can hash it (an inline literal is invisible
+            # to templates_sha; the #621 failure mode, one class wider).
+            base_prompt += SYSTEM_ARM_REMOTE_ONLY_WEB
+        else:
+            base_prompt += SYSTEM_ARM_REMOTE_ONLY
+    elif _is_untrusted_input_context(app_context):
+        # #621: the system prompt mirrors the user prompt's persona lattice
+        # (a supply-persona user prompt under a generic-attacker system
+        # prompt contradicts itself).
+        base_prompt += SYSTEM_ARM_UNTRUSTED_INPUT
 
     return base_prompt
 
@@ -88,6 +352,18 @@ def _format_builtin_app_context_for_verification(app_context: "ApplicationContex
             lines.append(f"- {collapse_inline(behavior)}")
         lines.append("")
 
+    if app_context.trust_boundaries:
+        # #621: Stage-2 sees the same trust boundaries Stage-1 renders
+        # (vulnerability_analysis.py renders them) — the verifier cannot
+        # model a file-supplying attacker against boundaries it never sees.
+        # Unbounded, mirroring Stage-1 (boundary dicts are small; the [:5]
+        # caps above are for free-form lists, not the boundary map). Keys
+        # and values are LLM-generated or attacker-authored — collapse both.
+        lines.append("**Trust Boundaries:**")
+        for source, level in app_context.trust_boundaries.items():
+            lines.append(f"- {collapse_inline(source)}: {collapse_inline(level)}")
+        lines.append("")
+
     if app_context.not_a_vulnerability:
         lines.append("**Do NOT flag as vulnerable:**")
         for item in app_context.not_a_vulnerability[:5]:  # Limit for verification prompt
@@ -95,9 +371,19 @@ def _format_builtin_app_context_for_verification(app_context: "ApplicationContex
         lines.append("")
 
     if app_context.suppress_local_only():
-        lines.append("**CRITICAL:** This is a CLI tool/library. Users have local filesystem access.")
-        lines.append("A vulnerability requires a REMOTE attacker to exploit it.")
-        lines.append("If the 'attack' requires running CLI commands locally, it's NOT a vulnerability.")
+        # #653: the degenerate web_app (all-trusted boundaries, no remote
+        # trigger) reaches this suppress branch too — but its framing is
+        # the browser, not the operator's local filesystem. The digest
+        # moves in the same PR (the third fixture), so the #621
+        # keep-the-text-stable rationale does not hold it here.
+        if str(getattr(app_context, "application_type", "")) == "web_app":
+            lines.append("**CRITICAL:** This is a web application. Its remote surface is the browser.")
+            lines.append("A vulnerability requires a REMOTE attacker to exploit it.")
+            lines.append("If the 'attack' requires operator-local access that a browser user cannot reach, it is out of scope.")
+        else:
+            lines.append("**CRITICAL:** This is a CLI tool/library. Users have local filesystem access.")
+            lines.append("A vulnerability requires a REMOTE attacker to exploit it.")
+            lines.append("If the 'attack' requires running CLI commands locally, it's NOT a vulnerability.")
         lines.append("")
 
     return "\n".join(lines)
@@ -179,27 +465,53 @@ Context:
     if app_context and app_context.has_threat_model():
         from prompts.threat_model_render import render_attacker_personas
         attacker_description = render_attacker_personas(app_context)
-    elif app_context and app_context.suppress_local_only():
-        attacker_description = """You are an attacker on the internet. You have a browser and nothing else.
-No server access, no admin credentials, no ability to modify files on the server, and NO ABILITY TO RUN CLI COMMANDS.
-
-You must find a way to trigger this vulnerability REMOTELY. If the only attack path requires:
-- Running CLI commands locally
-- Having shell access to the server
-- Being the user who runs the application
-
-Then the vulnerability is NOT EXPLOITABLE by you, because local users can already do anything on their own machine."""
+    elif app_context is None:
+        # No context at all: the conservative default, byte-identical to the
+        # pre-#621 render (verify's checkpoint identity hashes this arm).
+        attacker_description = PERSONA_BROWSER_ONLY
+    elif app_context.suppress_local_only():
+        # All-trusted CLI/library: byte-identical to the pre-#621 render
+        # (#653: a web_app reaching this branch gets the web persona —
+        # the CLI rationale's "being the user who runs the application"
+        # is false for a web app).
+        if str(getattr(app_context, "application_type", "")) == "web_app":
+            attacker_description = PERSONA_REMOTE_ONLY_WEB
+        else:
+            attacker_description = PERSONA_REMOTE_ONLY
+    elif _is_untrusted_input_context(app_context):
+        # #621: the untrusted-input class — a parser/CLI/library whose attack
+        # surface IS the attacker-supplied input. The browser-only persona
+        # contradicted this context (an attacker who cannot supply files), and
+        # the CLI local-access rule below contradicted it too (it fired for
+        # every non-threat-model context). Web apps keep the browser persona:
+        # a browser attacker already delivers the untrusted HTTP body.
+        attacker_description = PERSONA_UNTRUSTED_INPUT.format(
+            supply_list=_untrusted_supply_list(app_context))
     else:
-        attacker_description = """You are an attacker on the internet. You have a browser and nothing else. No server access, no admin credentials, no ability to modify files on the server."""
+        attacker_description = PERSONA_BROWSER_ONLY
 
     # The CLI-tool/local-access rule is a built-in-app-type heuristic. Under a
     # declared threat model the attacker profiles decide what local access
     # means, so keeping it would contradict the profiles rendered above.
+    # #621: gate it on the SAME predicate the persona uses — the rule fires
+    # only where local access is genuinely the operator's own machine (the
+    # all-trusted CLI/library, or no context at all, which keeps the
+    # pre-#621 render byte-identical). For the untrusted-input class the rule
+    # contradicted the persona (attacker-supplied input IS the attack
+    # surface, pushing parser findings toward SAFE); for remote/web apps the
+    # browser persona already excludes local access, so the rule was noise.
     local_access_rule = (
         ""
-        if (app_context and app_context.has_threat_model())
-        else ("\n- If this is a CLI tool/library and the attack requires "
-              "local access, it is NOT a vulnerability.")
+        if (app_context is not None and app_context.has_threat_model())
+        else ("\n- If this is a web application and the attack requires "
+              "operator-local access a browser user cannot reach, it is NOT a vulnerability."
+              if (app_context is not None
+                  and app_context.suppress_local_only()
+                  and str(getattr(app_context, "application_type", "")) == "web_app")
+              else ("\n- If this is a CLI tool/library and the attack requires "
+                    "local access, it is NOT a vulnerability."
+                    if (app_context is None or app_context.suppress_local_only())
+                    else ""))
     )
 
     # `reasoning` is Stage-1 LLM output (untrusted). It was interpolated raw

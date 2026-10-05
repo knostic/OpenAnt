@@ -16,8 +16,12 @@ A threat model replaces both: it declares its own attacker profiles, each with
 explicit capabilities and limits, and its own criteria for what counts as a
 vulnerability. These renderers turn that declaration into prompt text.
 
-The legacy path is untouched — callers branch on ``has_threat_model()`` and
-only reach this module when a threat model is present.
+This module's own reachability is unchanged — callers branch on
+``has_threat_model()`` and only reach these renderers when a threat model is
+present, and #621's builtin persona contract deliberately does NOT route through
+them (a builtin context has no threat-model provenance to render). The legacy
+builtin path itself changed in #621 (an untrusted-input persona arm); this
+module keeps rendering exactly the threat-model arm, byte-identical.
 """
 
 from prompts._fence import collapse_inline

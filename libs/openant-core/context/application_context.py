@@ -221,6 +221,23 @@ class ApplicationContext:
         """Get detailed information about this application type."""
         return APPLICATION_TYPE_INFO.get(self.application_type, {})
 
+    def untrusted_boundaries(self) -> list[str]:
+        """The input sources whose trust level is untrusted (insertion order).
+
+        #621: the single rule both the local-only suppression gate and the
+        Stage-2 persona contract consume — 'a boundary counts as untrusted if
+        its (LLM-generated, free-form) level CONTAINS the 'untrusted' token',
+        tolerating case and qualifiers such as 'untrusted (attacker-controlled)'
+        / 'untrusted - HTTP body'. No consumer re-implements the substring
+        test; a second copy would drift and the gate tests pin only the
+        suppression block, so the drift would be invisible.
+        """
+        boundaries = self.trust_boundaries if isinstance(self.trust_boundaries, dict) else {}
+        return [
+            str(source) for source, level in boundaries.items()
+            if "untrusted" in str(level).lower()
+        ]
+
     def suppress_local_only(self) -> bool:
         """Whether to tell the analyzer to flag only REMOTE-attacker vulnerabilities.
 
@@ -234,17 +251,10 @@ class ApplicationContext:
         """
         if self.requires_remote_trigger:
             return False
-        # A boundary counts as untrusted if its (LLM-generated, free-form) level
-        # CONTAINS the 'untrusted' token — tolerating case AND qualifiers such as
-        # 'untrusted (attacker-controlled)' / 'untrusted - HTTP body'. An exact
-        # '== untrusted' match let a qualified level slip past and re-enable suppression
-        # of the untrusted-input bug class the gate exists to protect.
-        # 'trusted'/'semi-trusted' do not contain the substring 'untrusted'.
-        boundaries = self.trust_boundaries if isinstance(self.trust_boundaries, dict) else {}
-        return not any(
-            "untrusted" in str(level).lower()
-            for level in boundaries.values()
-        )
+        # #621: delegate to untrusted_boundaries() — the substring rule lives
+        # in ONE place (see its docstring); this gate must answer the same
+        # question the Stage-2 persona asks, never a drifting second copy.
+        return not self.untrusted_boundaries()
 
 
 def _context_kwargs_from_dict(data: dict) -> dict:

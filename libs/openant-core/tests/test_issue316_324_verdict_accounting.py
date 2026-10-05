@@ -24,13 +24,13 @@ preserved under ``raw_finding``), and the four consumer predicates
 neither-key shape so legacy checkpoints are re-analyzed, not adopted.
 
 Documented residuals (deliberately NOT changed here):
-* an unrecognized VERDICT string (``{"verdict": "SOMETHING_WEIRD"}``) is
-  still dropped by ``_count_verdicts`` -- the F13-documented gap.
-* ``insufficient_context`` is mapped but has no counter bucket (a
-  results-partition question, not a coverage loss -- #293 rules it
-  completed).
 * legacy checkpoints carrying a PRE-fix garbage verdict (finding present,
   unrecognized) are still adopted; post-fix runs never write that shape.
+
+#623 UPDATE: the mapped-but-bucketless ``insufficient_context`` residual is
+CLOSED -- the legacy value folds to ``inconclusive``'s synonym at every
+counting sink (still #293-completed, still resume-adopted, now counted
+consistently). See test_issue623_rescue_enum_alignment.py.
 """
 import json
 import sys

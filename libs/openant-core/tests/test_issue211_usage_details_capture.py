@@ -78,11 +78,33 @@ def test_record_call_details_do_not_change_cost():
 def test_record_call_accepts_per_turn_list():
     t = TokenTracker()
     turns = [{"reasoning_tokens": 10}, {"reasoning_tokens": 20}, None]
+    # #624: a conversation record MUST declare its billed-turn count — the
+    # list shape alone no longer suffices (the ValueError guard makes a
+    # future list-producer fail loudly instead of silently billing one
+    # turn for N).
     rec = t.record_call(
         model="claude-opus-5", input_tokens=30, output_tokens=15,
         pricing={"input": 1.0, "output": 2.0}, usage_details=turns,
+        turns=len(turns),
     )
     assert rec["usage_details"] == turns
+    assert rec["turns"] == 3
+
+
+def test_record_call_rejects_undeclared_list_turns():
+    """#624: the guard — a per-turn list without a turns declaration is a
+    contract violation, never a silent 1."""
+    t = TokenTracker()
+    try:
+        t.record_call(
+            model="claude-opus-5", input_tokens=30, output_tokens=15,
+            pricing={"input": 1.0, "output": 2.0},
+            usage_details=[{"reasoning_tokens": 10}, None],
+        )
+    except ValueError as e:
+        assert "turns" in str(e)
+    else:
+        raise AssertionError("the #624 guard must fire for an undeclared list")
 
 
 # ---------------------------------------------------------------------------

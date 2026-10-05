@@ -133,6 +133,7 @@ class AnthropicAdapter:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_retries: int = 5,
+        thinking: Optional[dict] = None,
         _client: Optional[anthropic.Anthropic] = None,
     ):
         """Construct the adapter.
@@ -144,11 +145,24 @@ class AnthropicAdapter:
                 default (api.anthropic.com). Required when pointing
                 at OpenRouter or any other Anthropic-compat endpoint.
             max_retries: Forwarded to the SDK. The SDK's built-in
-                retry covers transient network blips; our rate
-                limiter handles 429-coordinated backoff on top.
+                retry covers transient network blips; our rate limiter
+                handles 429-coordinated backoff on top.
+            thinking: #625 — the request-side thinking policy, passed
+                VERBATIM as the request's ``thinking`` value when set
+                (the SDK validates the shape; the newer SDKs accept
+                adaptive, older enabled/disabled with a budget).
+                ``None`` (the default) sends NO thinking parameter —
+                the instrument stays byte-identical to the pre-#625
+                request (#242: changing the default changes the
+                instrument; verdict behavior must be evaluated
+                separately, never mixed with a usage-accounting
+                change).
             _client: Injected SDK instance for testing. Production
                 callers should not pass this.
         """
+        # The effective policy, readable by the checkpoint fingerprint
+        # (backend_identity) and the step-report policy summary (#625).
+        self.thinking = thinking
         if _client is not None:
             self._client = _client
             return
@@ -184,6 +198,27 @@ class AnthropicAdapter:
             request["system"] = system
         if tools:
             request["tools"] = [_tool_to_anthropic(t) for t in tools]
+        # #625: the configured thinking policy, verbatim. Absent ⇒ NO key —
+        # the default request is byte-identical to the pre-#625 shape.
+        if self.thinking is not None:
+            request["thinking"] = self.thinking
+
+        # #625 T1 guard (2026-09-21, the retro bug-hunt finding): a
+        # thinking-enabled request WITH tools requires the thinking blocks
+        # preserved on the echoed assistant turn (Anthropic's documented
+        # contract) — this adapter's loop echo filters to text/tool-use, so
+        # iteration 2 would 400 AFTER paying for iteration 1. Refuse the
+        # combination loudly at build time instead of paying for the
+        # failure; the full preserved-blocks handling is a separate change.
+        if (tools and self.thinking is not None
+                and self.thinking.get("type") not in (None, "disabled")):
+            raise LLMResponseError(
+                f"AnthropicAdapter refuses thinking+tools: thinking blocks must be "
+                "preserved on the echoed assistant turn for multi-turn tool "
+                "loops, and this adapter's loop echo does not carry them "
+                "(iteration 2 would fail after iteration 1 is billed). "
+                "Remove `thinking` from the provider entry for tool-using "
+                "phases, or set it to {\"type\": \"disabled\"}.")
 
         # Cooperate with the cross-worker backoff before issuing the
         # call — same pattern the legacy AnthropicClient used, now
@@ -200,8 +235,15 @@ class AnthropicAdapter:
             raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except anthropic.RateLimitError as exc:
             retry_after = _retry_after_from(exc)
-            report_rate_limit(retry_after)
-            raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
+            kind = _anthropic_rate_limit_kind(exc)
+            # #716 hunt defect 3: a QUOTA never arms the all-worker backoff —
+            # the global pause clears short-window throttles; a quota's
+            # recovery is never "wait N seconds" (it stalled every worker
+            # for 30s while the entitlement stayed exhausted).
+            if kind != "quota":
+                report_rate_limit(retry_after)
+            raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after,
+                                    kind=kind) from redacted_cause_from(exc)
         except anthropic.NotFoundError as exc:
             raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except anthropic.APIConnectionError as exc:
@@ -340,6 +382,7 @@ def _response_to_unified(
     ``AnthropicAdapter``.
     """
     content_blocks: list[ContentBlock] = []
+    dropped_block_kinds: dict[str, int] = {}
     for block in response.content:
         kind = getattr(block, "type", None)
         if kind == "text":
@@ -359,7 +402,11 @@ def _response_to_unified(
             # symptom isn't silent. For a security tool, a silently
             # dropped "refusal" paired with a benign stop_reason could
             # read as an empty success.
+            # #625: count it per kind — the dropped-block diagnostic (a
+            # count, never a token split; usage cannot split thinking).
             _warn_unknown_block_kind(str(kind), adapter=adapter)
+            dropped_block_kinds[str(kind)] = (
+                dropped_block_kinds.get(str(kind), 0) + 1)
 
     # R4-5: a usage-less response (rare, but seen on some proxies and on
     # error-shaped 200s) must not AttributeError here — the downstream
@@ -430,6 +477,8 @@ def _response_to_unified(
         input_tokens=getattr(usage, "input_tokens", 0),
         output_tokens=getattr(usage, "output_tokens", 0),
         usage_details=_extract_usage_details(usage),
+        # #625: present-only diagnostic (None when nothing was dropped).
+        dropped_block_kinds=dropped_block_kinds or None,
         # R2-C: an unknown/abnormal stop_reason defaults to "max_tokens" (not
         # "end_turn") — as the warning above notes, treating a refusal/abnormal
         # termination as end_turn masks false negatives. Known values (end_turn/
@@ -437,6 +486,38 @@ def _response_to_unified(
         stop_reason=_ANTHROPIC_STOP_REASONS.get(raw_stop, "max_tokens"),
         raw=response,
     )
+
+
+def _anthropic_rate_limit_kind(exc: Any) -> str:
+    """Classify an Anthropic 429 from its error body (#663).
+
+    Anthropic's 429 is normally the short-window rate_limit_error (a
+    throttle), BUT the enforced spend cap surfaces as the SAME 429 type
+    with error.details.error_code == "enforced_spend_limit_reached"
+    (docs: platform.claude.com/docs/en/api/rate-limits#reaching-your-
+    spend-cap) — a hard limit backoff cannot restore. The 400
+    usage-limits and 402 billing shapes already raise non-rate-limit
+    classes and are unaffected.
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            # T1 round-1 (F2): the documented shape carries details as a
+            # DICT ({"error_code": "enforced_spend_limit_reached"}); the
+            # list form is accepted too (older/observed variants).
+            details = err.get("details")
+            shapes = []
+            if isinstance(details, dict):
+                shapes = [details]
+            elif isinstance(details, list):
+                shapes = [d for d in details if isinstance(d, dict)]
+            for d in shapes:
+                ec = d.get("error_code")
+                if (ec == "enforced_spend_limit_reached"
+                        or "enforced_spend_limit" in str(ec or "")):
+                    return "quota"
+    return "throttle"
 
 
 def _retry_after_from(exc: Any) -> Optional[float]:

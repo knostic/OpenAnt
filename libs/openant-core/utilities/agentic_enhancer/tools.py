@@ -368,6 +368,26 @@ class ToolExecutor:
         if not (0.0 <= confidence <= 1.0):
             return {"error": "confidence must be between 0.0 and 1.0"}
 
+        # #614: the include_functions ELEMENT types — presence-only validation
+        # let a bare string / non-dict item through to the assembly loop,
+        # where func_info.get("id") raised AttributeError and destroyed a
+        # completed paid classification (the 12 raise-class errors' root).
+        if not isinstance(input.get("include_functions"), list):
+            return {"error": "include_functions must be a list"}
+        for item in input.get("include_functions"):
+            if not isinstance(item, dict):
+                return {
+                    "error": f"include_functions entries must be objects, "
+                    f"got {type(item).__name__}: {item!r}"[:200]}
+            # #614: the schema's `id: string` — an unhashable/absent id
+            # reaches the index lookup and raises (swallowed by the
+            # preserve wrap, but the model should self-correct instead)
+            if not isinstance(item.get("id"), str):
+                return {
+                    "error": f"include_functions entries must carry a "
+                    f"string id, got {type(item.get('id')).__name__}"
+                    f"{'' if item.get('id') is None else ': ' + repr(item.get('id'))[:60]}"}
+
         return {
             "status": "complete",
             "result": input

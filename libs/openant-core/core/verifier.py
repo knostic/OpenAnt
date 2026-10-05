@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from core.schemas import VerifyResult
-from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+from core.verdict_taxonomy import FINDING_VERDICT_ORDER, fold_legacy_finding
 from core import tracking
 from core.checkpoint import StepCheckpoint
 from core.progress import ProgressReporter
@@ -44,6 +44,49 @@ try:
 except ImportError:
     HAS_APP_CONTEXT = False
     load_context = None
+
+
+def _verify_template_texts():
+    """#621: verify's checkpoint template identity — the renderers whose
+    digests form ``templates_sha``.
+
+    Master folded ONLY the static SYSTEM prompt; the user template's builtin
+    personas (and the CLI local-access rule) were never hashed, so a resumed
+    scan adopted verdicts rendered under a superseded persona — the exact
+    blind spot of #621's fix. The two DIRECT renders render with
+    ``app_context=None`` (backend_identity doctrine: per-scan LLM output
+    never enters the key); the remaining members are the module constants and
+    frozen-fixture renders the None render cannot reach — the two non-None
+    user-prompt personas, the three system-prompt context arms, and the
+    context-block and full-prompt renders over four frozen fixtures (the
+    fixture prompts also carry the ROUTING: a discriminator edit that
+    re-routes a fixture re-pays verify, closing the "the persona existed but
+    was never selected" half of #621 for future edits).
+    """
+    from prompts.verification_prompts import (
+        get_verification_system_prompt,
+        get_verification_prompt,
+        PERSONA_REMOTE_ONLY,
+        PERSONA_UNTRUSTED_INPUT,
+        SYSTEM_ARM_THREAT_MODEL,
+        SYSTEM_ARM_REMOTE_ONLY,
+        SYSTEM_ARM_UNTRUSTED_INPUT,
+        _builtin_context_digest_renders,
+        _builtin_persona_digest_renders,
+    )
+    return [
+        lambda: get_verification_system_prompt(None),
+        lambda: get_verification_prompt(
+            code="", finding="", attack_vector="", reasoning="",
+            app_context=None),
+        lambda: PERSONA_REMOTE_ONLY,
+        lambda: PERSONA_UNTRUSTED_INPUT,
+        lambda: SYSTEM_ARM_THREAT_MODEL,
+        lambda: SYSTEM_ARM_REMOTE_ONLY,
+        lambda: SYSTEM_ARM_UNTRUSTED_INPUT,
+        lambda: "\x00".join(_builtin_context_digest_renders()),
+        lambda: "\x00".join(_builtin_persona_digest_renders()),
+    ]
 
 
 def run_verification(
@@ -134,6 +177,7 @@ def run_verification(
             agreed=0,
             disagreed=0,
             disagreed_inconclusive=0,
+            disagreed_protected=0,
             confirmed_vulnerabilities=0,
             # #302: the denominator survives the zero-findings early return —
             # a clean scan's scope statement is "adjudicated 0 of N", never
@@ -160,6 +204,13 @@ def run_verification(
     if app_context_path and HAS_APP_CONTEXT and os.path.exists(app_context_path):
         app_context = load_context(Path(app_context_path))
         print(f"[Verify] App context: {app_context.application_type}", file=sys.stderr)
+    # #621: the attacker-model descriptor stamped on the verify result at
+    # verify time — the summary's server-rendered Methodology reads it
+    # verbatim (single producer: the same selector the prompts consume).
+    # Always stamped: a verify with NO context rendered the browser persona,
+    # and that is the honest descriptor for it.
+    from prompts.verification_prompts import attacker_model_descriptor
+    attacker_model = attacker_model_descriptor(app_context)
 
     # If no code_by_route in experiment file, build from results
     if not code_by_route:
@@ -180,17 +231,18 @@ def run_verification(
     # I2 adopt gate. Runs AFTER the checkpoint.dir override above (line ~88 sets
     # ``verify_checkpoints``, not the StepCheckpoint default) and BEFORE
     # verify_batch's checkpoint.load(), so a backend swap archives the stale
-    # verify checkpoints aside instead of adopting them. The static verify
-    # system prompt is rendered with app_context=None. The producing analyze
+    # verify checkpoints aside instead of adopting them. The verify templates
+    # are rendered with app_context=None (backend_identity doctrine; #621
+    # folded the user template's None render + the persona constants in via
+    # _verify_template_texts — a template change now re-pays verify, the
+    # documented policy for template changes). The producing analyze
     # run's fingerprint is folded into verify's KEY: a verify checkpoint written
     # against analyze run A is NOT adopted once results.json carries analyze run
     # B (a model swap). This closes the finding where verify adopts a stale
     # checkpoint and ``finding_verifier.py`` ``r["finding"] = cp_data["finding"]``
     # overwrites the fresh Stage-1 verdict.
     from core.backend_identity import fingerprint_for_binding, render_template_texts
-    from prompts.verification_prompts import get_verification_system_prompt
-    _verify_texts = render_template_texts(
-        [lambda: get_verification_system_prompt(None)])
+    _verify_texts = render_template_texts(_verify_template_texts())
     checkpoint.sync_identity(fingerprint_for_binding(
         verify_binding, _verify_texts,
         extra_key={
@@ -270,8 +322,9 @@ def run_verification(
     needs_review = _counts["needs_review"]
     error_count = _counts["error_count"]
 
-    print(f"\n[Verify] Results: {agreed} agreed, {disagreed} disagreed "
-          f"({_counts['disagreed_inconclusive']} to inconclusive), "
+    print(f"\n[Verify] Results: {agreed} agreed, {disagreed} disagreed to safe "
+          f"({_counts['disagreed_inconclusive']} to inconclusive, "
+          f"{_counts['disagreed_protected']} to protected), "
           f"{needs_review} need manual review, "
           f"{confirmed_vulnerabilities} confirmed vulnerabilities", file=sys.stderr)
     if error_count:
@@ -316,6 +369,9 @@ def run_verification(
         agreed=agreed,
         disagreed=disagreed,
         disagreed_inconclusive=_counts["disagreed_inconclusive"],
+        # #622: the protected-correction sibling — threaded to
+        # metrics.protected, never folded into safe.
+        disagreed_protected=_counts["disagreed_protected"],
         confirmed_vulnerabilities=confirmed_vulnerabilities,
         needs_review=needs_review,
         error_count=error_count,
@@ -325,6 +381,9 @@ def run_verification(
         downgraded=_counts.get("downgraded", 0),
         upgraded=_counts.get("upgraded", 0),
         usage=tracking.get_usage(),
+        # #621: the descriptor the summary renders verbatim (None when no
+        # context existed — the honest absence, rendered "not recorded").
+        attacker_model=attacker_model,
     )
 
 
@@ -348,6 +407,12 @@ def _adjudication_coverage_line(*, counts: dict, verified_results: list,
     (printed as such — the buckets are not additive). Deliberately NOT a
     persisted bucket (a new VerifyResult/schema field would be #284's
     territory and a schema surface).
+    Reconciliation: the completed-adjudication buckets — agreed + disagreed +
+    confirmed-still-vulnerable + reclassified-inconclusive (#509) +
+    reclassified-protected (#622) — sum EXACTLY to the headline numerator
+    ``adjudicated``; ``errored`` and ``needs_review`` are the EXCLUDED
+    remainder (subtracted from the verified pool to form the numerator X;
+    they remain in the denominator Y, the Stage-2 candidates in).
     """
     adjudicated = len(verified_results) - counts["needs_review"] - counts["error_count"]
     refused = sum(
@@ -373,6 +438,8 @@ def _adjudication_coverage_line(*, counts: dict, verified_results: list,
         f"Adjudicated {adjudicated}/{candidates_total} ({pct_str}%): "
         f"agreed {counts['agreed']}, disagreed {counts['disagreed']}, "
         f"confirmed-still-vulnerable {confirmed_only}, "
+        f"reclassified-inconclusive {counts['disagreed_inconclusive']}, "
+        f"reclassified-protected {counts['disagreed_protected']}, "
         f"errored {counts['error_count']} (incl. refused {refused}), "
         f"needs_review {counts['needs_review']}"
     )
@@ -381,7 +448,7 @@ def _adjudication_coverage_line(*, counts: dict, verified_results: list,
 def _count_verification_outcomes(verified_results: list) -> dict:
     """Bucket verified results into agreed / disagreed / needs_review / error.
 
-    PR #69 F5/L4 — the four buckets are mutually exclusive and, crucially,
+    PR #69 F5/L4 — the buckets are mutually exclusive and, crucially,
     keep "incomplete" and "errored" findings OUT of the path that the scanner
     later folds into ``safe`` (``safe += disagreed``):
 
@@ -392,9 +459,21 @@ def _count_verification_outcomes(verified_results: list) -> dict:
                            potential vuln awaiting manual triage.
       * ``agreed``       — Stage 2 completed and agreed; if the final finding is
                            vulnerable/bypassable it is a confirmed vulnerability.
-      * ``disagreed``    — Stage 2 completed and actively disagreed (e.g.
-                           downgraded the verdict). ONLY this bucket is safe to
-                           fold into ``safe`` downstream.
+      * ``disagreed``    — Stage 2 completed and actively disagreed with a
+                           corrected verdict of ``safe`` OR an unrecognised
+                           verdict string (the residual arm — anything not
+                           vulnerable/bypassable/inconclusive/protected).
+                           ONLY this bucket is safe to fold into ``safe``
+                           downstream. NOTE the off-enum residual: a garbage
+                           corrected verdict still lands here and reads as
+                           safe — pre-existing behaviour, disclosed.
+      * ``disagreed_inconclusive`` — #509/#510: the corrected finding is
+                           ``inconclusive`` — threaded to metrics.inconclusive,
+                           never folded into safe.
+      * ``disagreed_protected`` — #622: the corrected finding is ``protected``
+                           (protected-by-controls — materially different from
+                           inherently-safe code). Threaded to
+                           metrics.protected, never folded into safe.
     """
     counts = {
         "agreed": 0,
@@ -402,6 +481,9 @@ def _count_verification_outcomes(verified_results: list) -> dict:
         # #509: disagreements whose corrected finding is ``inconclusive`` —
         # threaded to metrics.inconclusive, never folded into safe.
         "disagreed_inconclusive": 0,
+        # #622: disagreements whose corrected finding is ``protected`` —
+        # threaded to metrics.protected, never folded into safe.
+        "disagreed_protected": 0,
         "needs_review": 0,
         "confirmed_vulnerabilities": 0,
         "error_count": 0,
@@ -426,7 +508,8 @@ def _count_verification_outcomes(verified_results: list) -> dict:
         # touching `verification.agree`), so the direction computation below
         # runs for BOTH branches: a consistency-driven change is as much a
         # Stage-2 change as a disagreement.
-        finding = str(r.get("finding") or r.get("verdict", "")).lower()
+        finding = fold_legacy_finding(
+            str(r.get("finding") or r.get("verdict", "")).lower())
         if verification.get("agree", False):
             counts["agreed"] += 1
             if finding in ("vulnerable", "bypassable"):
@@ -449,6 +532,17 @@ def _count_verification_outcomes(verified_results: list) -> dict:
                 # would reclassify an explicitly-unconfirmable finding as
                 # safe in the aggregate metrics. Its own bucket.
                 counts["disagreed_inconclusive"] += 1
+            elif finding == "protected":
+                # #622: the verifier disagreed and corrected the verdict to
+                # ``protected`` — the unit is protected-by-controls,
+                # materially different from inherently-safe code. Falling
+                # through to the residual ``disagreed`` arm would (a) fold
+                # it into ``safe`` at the scanner and (b) render it "false
+                # positives eliminated" Go-side — losing the destination
+                # category from every summary (#509 recorded the open
+                # question; #510 fixed only the inconclusive sibling). Its
+                # own bucket, threaded to metrics.protected.
+                counts["disagreed_protected"] += 1
             else:
                 counts["disagreed"] += 1
         # #302: direction. `verdict` is the UN-overwritten Stage-1 original;
@@ -524,12 +618,33 @@ def _write_verified_results(
             continue
         # Canonical read: lowercase a PRESENT finding too (not only the
         # verdict/default), so a verdict-only result is classified correctly.
-        finding = str(r.get("finding") or r.get("verdict") or "error").lower()
+        # #623: the legacy INSUFFICIENT_CONTEXT value folds to inconclusive
+        # here too (its analyze-side synonym — the same four-consumer
+        # agreement; previously this ladder SILENTLY DROPPED the row: no
+        # bucket matched and the elif caught only ERROR, so the #284
+        # partition leaked it). The row's own values are never rewritten.
+        finding = fold_legacy_finding(
+            str(r.get("finding") or r.get("verdict") or "error").lower())
         if finding in counts:
             counts[finding] += 1
-        elif r.get("verdict") == "ERROR":
+        elif r.get("verdict") == "ERROR" or finding == "error":
             # Retained (#284's correction): legacy/foreign records carrying
-            # the uppercase ERROR verdict still bucket to errors.
+            # the uppercase ERROR verdict still bucket to errors. #623: the
+            # half-stamped ``finding == "error"`` WITHOUT verdict == "ERROR"
+            # joins them — _count_verdicts has handled exactly this twin
+            # (analyzer.py) since #316/#324; leaving it dropped here was the
+            # same silent-drop class this fix closes. NOTE: this elif also
+            # flips the both-keys shape {verdict: ERROR, finding:
+            # insufficient_context} from errors to inconclusive (the fold
+            # runs first, finding-first like the analyzer's counter) —
+            # resume still retries it (analyze_result_is_error is
+            # verdict-first, ERROR wins), the documented transient class.
+            counts["errors"] += 1
+        else:
+            # #623: the terminal else mirrors _count_verdicts' #427
+            # catch-all — an unrecognized non-empty finding is a malformed
+            # row, an ERROR in the metrics (never a silent drop); the #284
+            # partition closes for every shape now.
             counts["errors"] += 1
 
     output["metrics"] = {"total": len(merged_results), **counts}

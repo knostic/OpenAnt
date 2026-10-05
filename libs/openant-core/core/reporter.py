@@ -329,6 +329,10 @@ def build_pipeline_output(
     # #600: the discovery block (the excluded dirs NAMED, per language) —
     # present-only beside coverage.
     discovery: dict | None = None,
+    # #621: the attacker-model descriptor the verify step stamped (the
+    # summary's server-rendered Methodology reads it verbatim). Present-only:
+    # None (verify never ran / old callers) stays absent in the artifact.
+    attacker_model: dict | None = None,
 ) -> tuple[str, int]:
     """Build ``pipeline_output.json`` from analysis results.
 
@@ -426,7 +430,7 @@ def build_pipeline_output(
     confirmed_before_dedup = len(confirmed)
     confirmed = _dedup_caller_callee(confirmed, all_results, call_graph_path)
     # #423 (wave r1): the disclosure/metrics overlap, split by the recount's
-    # own predicates (verifier.py:497-513) — the confirmed rows the recount
+    # own predicates (the _write_verified_results recount in verifier.py) — the confirmed rows the recount
     # ALSO buckets into errors / needs_review, counted once (in vulnerable,
     # via the findings list) and subtracted from those buckets.
     _k_overlap_error = sum(1 for c in confirmed if c.get("error"))
@@ -598,9 +602,9 @@ def build_pipeline_output(
                if isinstance(finding.get("consistency_update"), dict) else {}),
             # #215 (partial repair): the two FINDING-SEMANTIC transit
             # fields — confidence (float 0.0-1.0 per the verdict schema,
-            # json_corrector.py:32; NOT analysis_core.py:181's error-shape
+            # json_corrector's _VULN_SCHEMA; NOT analysis_core.py's error-shape
             # default) and json_corrected (provenance: the finding's JSON
-            # was model-repaired, json_corrector.py:278) — populated
+            # was model-repaired, json_corrector's vuln_mode normalization) — populated
             # upstream, surviving into results_verified.json, previously
             # DROPPED by this fixed-key record. Present-only: absent
             # upstream stays absent (never a fabricated 0/False — a REAL
@@ -821,6 +825,10 @@ def build_pipeline_output(
         # Which path supplied the security model (Plan DoD #9). Additive key;
         # Go consumers use comma-ok access so it is safe to add.
         "context_source": context_source,
+        # #621: the attacker-model descriptor, present-only (stamped at verify
+        # time; absent when verification never ran or an old caller wrote
+        # the artifact). The summary renders the honest absence, never a guess.
+        **({"attacker_model": attacker_model} if attacker_model else {}),
         **(
             {"threat_model_sha256": threat_model_sha256}
             if threat_model_sha256
@@ -1257,6 +1265,9 @@ def _record_usage_in_tracker(usage: dict, binding):
                 # #211 pass-through capture: verbatim when the generator's
                 # usage dict carries it; never in the cost math.
                 usage_details=usage.get("usage_details"),
+                # #624: the aggregate record covers the report phase's
+                # completions (the merged count), never silently 1.
+                turns=usage.get("completions", 1),
             )
     except Exception as exc:
         # #605: the drop is COUNTED and NAMED, never silent — the report
@@ -1288,6 +1299,9 @@ def _usage_to_info(usage: dict):
     from core.schemas import UsageInfo
     return UsageInfo(
         total_calls=1,
+        # #624: the aggregate record's turn figure — the same completions
+        # count the tracker record carries (never 0 < calls).
+        total_turns=usage.get("completions", 1),
         total_input_tokens=usage.get("input_tokens", 0),
         total_output_tokens=usage.get("output_tokens", 0),
         total_tokens=usage.get("total_tokens", 0),

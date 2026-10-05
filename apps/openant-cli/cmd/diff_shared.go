@@ -11,10 +11,11 @@ import (
 
 // diffOpts collects the diff-mode flags that scan/parse/diff all share.
 type diffOpts struct {
-	base   string
-	pr     int
-	staged bool
-	scope  string
+	base     string
+	pr       int
+	prNumber int // #668: stamp-only (already-resolved PR; excluded from validate()/isSet())
+	staged   bool
+	scope    string
 }
 
 // isSet reports whether any diff flag was provided.
@@ -55,7 +56,8 @@ func (o diffOpts) validate() error {
 // outputDir must already exist (the caller should mkdir it). repoPath is
 // the absolute path to the working copy the diff is computed against.
 //
-// For --pr, the working tree is mutated (checkout of pr-head). Callers that
+// For --pr, the working tree is mutated (a detached checkout of the fetched PR
+// ref — the unique ref of internal/git/diff.go, not a shared branch). Callers that
 // care about HEAD stability must be aware.
 func prepareDiffManifest(repoPath, outputDir string, opts diffOpts) (string, error) {
 	if !opts.isSet() {
@@ -87,10 +89,14 @@ func prepareDiffManifest(repoPath, outputDir string, opts diffOpts) (string, err
 			}
 			baseRef = fetched
 			if !quiet {
-				fmt.Fprintf(os.Stderr, "PR #%d: base=%s (fetched and checked out pr-head)\n", opts.pr, baseRef)
+				fmt.Fprintf(os.Stderr, "PR #%d: base=%s (fetched into a unique ref, checked out detached)\n", opts.pr, baseRef)
 			}
 		}
-		built, err := git.BuildManifest(repoPath, baseRef, opts.scope, opts.pr)
+		stampPR := opts.pr
+		if stampPR == 0 {
+			stampPR = opts.prNumber // #668: the resolved PR (from modeDecision.PR), not a fetch request
+		}
+		built, err := git.BuildManifest(repoPath, baseRef, opts.scope, stampPR)
 		if err != nil {
 			return "", fmt.Errorf("build diff manifest: %w", err)
 		}

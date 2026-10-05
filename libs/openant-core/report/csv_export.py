@@ -126,7 +126,13 @@ def extract_file(unit_id: str) -> str:
 
 
 def get_stage1_verdict(result: dict) -> str:
-    """Get the original Stage 1 verdict before Stage 2 modification."""
+    """Get the original Stage 1 verdict before Stage 2 modification.
+
+    #623: every read in this module exports the STORED values verbatim BY
+    DESIGN (a provenance export — the legacy insufficient_context spelling
+    survives here while the HTML/CLI displays fold it to inconclusive's
+    synonym via core.verdict_taxonomy.fold_legacy_finding; nothing
+    programmatic recomputes buckets from the CSV)."""
     verification = result.get('verification', {})
     verification_note = result.get('verification_note', '')
 
@@ -141,6 +147,10 @@ def get_stage1_verdict(result: dict) -> str:
     # If Stage 2 agreed, current finding is Stage 1's finding
     # Fall back to 'verdict' so a verdict-only result exports its verdict, not blank.
     if verification.get('agree', True):
+        # #623: the CSV exports the STORED values verbatim BY DESIGN (a
+        # provenance export — the legacy insufficient_context spelling survives
+        # here while the HTML/CLI displays fold it to inconclusive's synonym;
+        # nothing programmatic recomputes buckets from the CSV).
         return result.get('finding') or result.get('verdict', '')
 
     # If disagreed but no note, try to infer
@@ -229,6 +239,7 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
 
         # Stage 2 verdict is the final finding
         # Fall back to 'verdict' so a verdict-only result exports its verdict, not blank.
+        # raw by design — see get_stage1_verdict's docstring (#623)
         stage2_verdict = result.get('finding') or result.get('verdict', '')
 
         # Build row

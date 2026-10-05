@@ -54,6 +54,7 @@ from .config import (
 from .registry import (
     PhaseBinding,
     PhaseRegistry,
+    binding_policy_summary,
     build_adapter,
     build_phase_registry,
     default_config_path,
@@ -100,6 +101,7 @@ __all__ = [
     # registry
     "PhaseBinding",
     "PhaseRegistry",
+    "binding_policy_summary",
     "build_adapter",
     "build_phase_registry",
     "default_config_path",

@@ -27,14 +27,17 @@ class TestPhaseDelta:
         _record(2)                       # this phase: 2 calls
         tracking.log_usage("Stage 2", baseline)
         err = capsys.readouterr().err
-        assert "Stage 2: 2 API calls" in err, (
+        # #624: the line names BOTH populations — completions and records.
+        # The single-completion fixture: 2 completions in 2 records.
+        assert "Stage 2: 2 completions (2 records)" in err, (
             f"expected the phase delta (2), got: {err.strip()!r}"
         )
-        assert "5 API calls" not in err   # not the cumulative total
+        assert "5 completions" not in err   # not the cumulative total
+        assert "API calls" not in err       # the lying label is gone
 
     def test_no_baseline_is_cumulative_backcompat(self, capsys):
         tracking.reset_tracking()
         _record(4)
         tracking.log_usage("Total")
         err = capsys.readouterr().err
-        assert "Total: 4 API calls" in err
+        assert "Total: 4 completions (4 records)" in err

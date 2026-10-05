@@ -96,6 +96,14 @@ class ParseResult:
 class UsageInfo:
     """Token usage and cost summary."""
     total_calls: int = 0
+    # #624: the completion count the records cover (a single-completion
+    # record carries 1; a conversation record its billed turns). A STATED
+    # additive-field decision — asdict means every RESULT ENVELOPE gains
+    # the key (Go decoders ignore unknown keys; old artifacts read as 0).
+    # Step reports and scan.report.json do NOT (their token_usage blocks
+    # are field-picked from explicit key lists). Never in the cost formula
+    # (pricing is token-only).
+    total_turns: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_tokens: int = 0
@@ -124,6 +132,14 @@ class AnalysisMetrics:
     verified: int = 0
     stage2_agreed: int = 0
     stage2_disagreed: int = 0
+    # #622: the protected split of stage2_disagreed — non-partition
+    # telemetry beside stage2_agreed/stage2_disagreed (do NOT sum it into
+    # any verdict-partition identity). The envelope carries only the
+    # POST-fold ``protected``, so the Go display cannot derive the split
+    # from existing fields — this field is the carrier (#510's inconclusive
+    # sibling did not need one: ``inconclusive`` existed as a rendered
+    # bucket; ``protected`` is pre-fold here).
+    stage2_disagreed_protected: int = 0
     # PR #69 F5: findings whose Stage-2 verification could not COMPLETE
     # (degenerate path or adapter error). These are preserved Stage-1
     # potential vulnerabilities awaiting manual review — they must NOT be
@@ -296,6 +312,14 @@ class EnhanceResult:
     error_count: int = 0
     error_summary: dict = field(default_factory=dict)
     classifications: dict = field(default_factory=dict)
+    # #611: the three-bucket identity's own fields — dropped before, the
+    # step report's shape was recoverable only by summing classifications
+    # (which omits errors by construction).
+    incomplete_count: int = 0
+    total_units: int = 0
+    # #615: the degenerate-exit kind histogram (exit_kind's aggregate);
+    # the empty dict = no incompletes (the present-only serialization)
+    incomplete_summary: dict = field(default_factory=dict)
     usage: UsageInfo = field(default_factory=UsageInfo)
 
     def to_dict(self) -> dict:
@@ -308,6 +332,10 @@ class EnhanceResult:
         }
         if self.error_summary:
             result["error_summary"] = self.error_summary
+        result["incomplete_count"] = self.incomplete_count
+        result["total_units"] = self.total_units
+        if self.incomplete_summary:
+            result["incomplete_summary"] = self.incomplete_summary
         return result
 
 
@@ -316,19 +344,22 @@ class EnhanceResult:
 # ---------------------------------------------------------------------------
 
 def verify_step_summary(result: "VerifyResult") -> dict:
-    """The verify step-report summary (issue #300; ten fields since #302).
+    """The verify step-report summary (issue #300; twelve fields since #622).
 
     Shared by every construction site — core/scanner.py (the pipeline),
     openant/cli.py's chained analyze --verify, and standalone openant
     verify — so the sites cannot drift. The reconciliation counters bound:
-    agreed + disagreed + disagreed_inconclusive + needs_review +
-    error_count accounts for every findings_input finding except the
-    disagreed-but-still-vulnerable case, which increments only
+    agreed + disagreed + disagreed_inconclusive + disagreed_protected +
+    needs_review + error_count accounts for every findings_input finding
+    except the disagreed-but-still-vulnerable case, which increments only
     confirmed_vulnerabilities (see core/verifier.py
     _count_verification_outcomes) — the counters are therefore a bound
     (<=), not exact equality. #509: ``disagreed_inconclusive`` is the
     disagreement arm whose corrected finding is ``inconclusive`` — the
     verifier could NOT confirm it, so it must never fold into ``safe``.
+    #622: ``disagreed_protected`` is the sibling whose corrected finding is
+    ``protected`` (protected-by-controls) — threaded to metrics.protected,
+    never folded into ``safe``.
     """
     return {
         "findings_input": result.findings_input,
@@ -336,6 +367,9 @@ def verify_step_summary(result: "VerifyResult") -> dict:
         "agreed": result.agreed,
         "disagreed": result.disagreed,
         "disagreed_inconclusive": result.disagreed_inconclusive,
+        # #622: the protected-correction sibling joins the shared summary
+        # (and the reconciliation bound above).
+        "disagreed_protected": result.disagreed_protected,
         "confirmed_vulnerabilities": result.confirmed_vulnerabilities,
         "needs_review": result.needs_review,
         "error_count": result.error_count,
@@ -346,6 +380,12 @@ def verify_step_summary(result: "VerifyResult") -> dict:
         # confirmed_vulnerabilities and downgraded.
         "downgraded": result.downgraded,
         "upgraded": result.upgraded,
+        # #621: the attacker-model descriptor the verify step actually used,
+        # present-only (the step report is the carrier for the standalone
+        # build-output/report lanes — the #600 discovery precedent). The
+        # summary's server-rendered Methodology reads it verbatim.
+        **({"attacker_model": result.attacker_model}
+           if getattr(result, "attacker_model", None) else {}),
     }
 
 
@@ -363,6 +403,12 @@ class VerifyResult:
     # they never fold into ``safe`` (the ->inconclusive arm of the
     # #374/#381 family).
     disagreed_inconclusive: int = 0
+    # #622: disagreements whose corrected finding is ``protected`` —
+    # protected-by-controls, materially different from inherently-safe
+    # code. Counted separately so the scanner threads them into
+    # ``protected`` and they never fold into ``safe`` (the ->protected
+    # sibling of the #509/#510 inconclusive arm).
+    disagreed_protected: int = 0
     confirmed_vulnerabilities: int = 0
     # PR #69 F5: findings whose Stage-2 verification could not COMPLETE
     # (degenerate path or adapter error). Counted separately so the scanner
@@ -378,19 +424,31 @@ class VerifyResult:
     downgraded: int = 0
     upgraded: int = 0
     usage: UsageInfo = field(default_factory=UsageInfo)
+    # #621: the attacker-model descriptor the verification actually used,
+    # stamped at verify time by the same selector the prompts consume (the
+    # summary's server-rendered Methodology reads it verbatim). None on the
+    # zero-findings early return and every path that never ran verification.
+    attacker_model: dict | None = None
 
     def step_summary(self) -> dict:
         """The verify step-report summary (issue #300): the shared
-        construction every site uses (ten fields since #302)."""
+        construction every site uses (twelve fields since #622)."""
         return verify_step_summary(self)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "verified_results_path": self.verified_results_path,
             "findings_input": self.findings_input,
             "findings_verified": self.findings_verified,
             "agreed": self.agreed,
             "disagreed": self.disagreed,
+            # #622: BOTH reclassification siblings join the envelope — this
+            # dict is the Go "Disagreed (eliminated)" display's source
+            # (cli.py's two envelopes -> PrintVerifySummary); an omitted
+            # sibling makes the companion lines unrenderable and the
+            # "eliminated" number silently narrower than its parts.
+            "disagreed_inconclusive": self.disagreed_inconclusive,
+            "disagreed_protected": self.disagreed_protected,
             "confirmed_vulnerabilities": self.confirmed_vulnerabilities,
             "needs_review": self.needs_review,
             "error_count": self.error_count,
@@ -399,6 +457,13 @@ class VerifyResult:
             "upgraded": self.upgraded,
             "usage": self.usage.to_dict(),
         }
+        # #653: the standalone-verify stdout envelope's source — carry the
+        # attacker_model present-only exactly like verify_step_summary
+        # (the shared construction, line 387): an omitted key drops the
+        # methodology line from the standalone lane the shared lane keeps.
+        if self.attacker_model:
+            d["attacker_model"] = self.attacker_model
+        return d
 
 
 # ---------------------------------------------------------------------------

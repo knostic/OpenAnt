@@ -32,6 +32,11 @@ def _family(model_id: str) -> str:
     """Normalise an id to its model family across every id convention in the file."""
     s = re.sub(r"^[a-z0-9][a-z0-9-]*/", "", model_id)    # vendor/ slug (OpenRouter, hyphens/digits incl.)
     s = re.sub(r"^(us|global|eu|apac|jp|au|ca|sa)\.[a-z0-9-]+\.", "", s)  # region.vendor. (Bedrock)
+    # plain vendor-prefixed Bedrock ids (the -5-generation serving shape:
+    # anthropic.claude-opus-5 — no region prefix, no ARN-versioned twins).
+    # Stripped AFTER the region rule so us.anthropic.* keeps its region
+    # handling first; only un-prefixed anthropic.* ids reach this arm.
+    s = re.sub(r"^anthropic\.", "", s)
     s = re.sub(r"-v\d+:\d+$", "", s)                   # Bedrock version suffix
     s = re.sub(r":[a-z0-9-]+$", "", s)                   # OpenRouter variant (:free, :thinking, :batch)
     s = re.sub(r"-\d{8}$", "", s)                     # Anthropic date stamp

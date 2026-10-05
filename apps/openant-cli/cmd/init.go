@@ -200,6 +200,44 @@ func runInit(cmd *cobra.Command, args []string) {
 		commitSHA = "nogit"
 	}
 
+	// #669: selectMode runs BEFORE the project save — the PR fetch may
+	// rewrite the working tree (FetchPR checks out pr-head), and the
+	// project identity + scan-dir key + meta.json must all point at the
+	// commit that was actually checked out, not the pre-checkout HEAD.
+	decision, err := selectMode(modeOpts{
+		full:        initFull,
+		incremental: initIncremental,
+		diffBase:    initDiffBase,
+		pr:          initPR,
+		scope:       initDiffScope,
+		projectName: name,
+		repoPath:    repoPath,
+	})
+	if err != nil {
+		output.PrintError(err.Error())
+		os.Exit(2)
+	}
+
+	// #669: if the PR fetch moved the tree, re-resolve the commit SHA
+	// so the project, the scan dir, and the meta all name the scanned tree.
+	if isGit && initPR > 0 {
+		// The body's promised guard: an explicit --commit is never silently
+		// overridden by the PR checkout — it is ignored WITH the warning.
+		if initCommit != "" {
+			output.PrintWarning("--commit ignored: the PR checkout determines the stamped SHA")
+		}
+		sha, warn, err := resolveLocalCommit(repoPath, "")
+		if err != nil {
+			output.PrintWarning(fmt.Sprintf(
+				"PR checkout moved the tree but the post-checkout SHA could not be re-resolved: %s — the project identity names the pre-checkout commit", err))
+		} else {
+			if warn != "" {
+				output.PrintWarning(warn)
+			}
+			commitSHA = sha
+		}
+	}
+
 	// Create project
 	project := config.NewProject(name, repoURL, repoPath, source, initLanguage, commitSHA)
 
@@ -220,32 +258,8 @@ func runInit(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Decide full vs incremental. selectMode handles flag validation,
-	// baseline lookup, TTY prompt, and non-TTY error.
-	decision, err := selectMode(modeOpts{
-		full:        initFull,
-		incremental: initIncremental,
-		diffBase:    initDiffBase,
-		pr:          initPR,
-		scope:       initDiffScope,
-		projectName: name,
-		repoPath:    repoPath,
-	})
-	if err != nil {
-		output.PrintError(err.Error())
-		os.Exit(2)
-	}
-
 	// Write scan-run meta.json reflecting the decision.
-	meta := config.NewScanMeta(
-		decision.Kind,
-		project.CommitSHA,
-		git.CurrentBranch(repoPath),
-		initLanguage,
-	)
-	meta.Base = decision.Base
-	meta.Scope = decision.Scope
-	if err := config.SaveScanMeta(name, project.CommitSHAShort, meta); err != nil {
+	if err := writeInitScanMeta(name, project, decision, git.CurrentBranch(repoPath)); err != nil {
 		output.PrintWarning(fmt.Sprintf("Failed to write scan meta: %s", err))
 	}
 
@@ -305,4 +319,25 @@ func gitRevParseLocal(repoPath, ref string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// writeInitScanMeta records init's pending scan decision in the run's
+// meta.json (#664: keyed on the init language — the same key scan reads
+// via project.Language). Extracted from runInit so the write site is
+// directly guardable (the linkage gate's finding: the inline site had no
+// test that fails when its key is wrong).
+func writeInitScanMeta(name string, project *config.Project, decision modeDecision, branch string) error {
+	// The language is derived from the project, never passed separately —
+	// an adjacent same-type (branch, language) pair is a silent arg-swap
+	// surface the linkage gate cannot see (the fable delta round's finding).
+	language := project.Language
+	meta := config.NewScanMeta(
+		decision.Kind,
+		project.CommitSHA,
+		branch,
+		language,
+	)
+	meta.Base = decision.Base
+	meta.Scope = decision.Scope
+	return config.SaveScanMeta(name, project.CommitSHAShort, language, meta)
 }

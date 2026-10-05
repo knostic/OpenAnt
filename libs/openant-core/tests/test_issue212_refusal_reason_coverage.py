@@ -133,7 +133,11 @@ def test_coverage_line_includes_denominator_and_percent():
     ]
     line = _adjudication_coverage_line(
         counts={"agreed": 1, "disagreed": 1, "needs_review": 1,
-                "error_count": 2, "confirmed_vulnerabilities": 0},
+                "error_count": 2, "confirmed_vulnerabilities": 0,
+                # #622: the counts dicts the real _count_verification_outcomes
+                # returns always carry both reclassification siblings (#510,
+                # #622) — the simulated shape matches.
+                "disagreed_inconclusive": 0, "disagreed_protected": 0},
         verified_results=results, candidates_total=5)
     assert "Adjudicated 2/5 (40%)" in line, (
         f"denominator + percent must appear (got {line!r})"
@@ -146,7 +150,8 @@ def test_coverage_line_zero_denominator_safe():
     from core.verifier import _adjudication_coverage_line
     line = _adjudication_coverage_line(
         counts={"agreed": 0, "disagreed": 0, "needs_review": 0,
-                "error_count": 0, "confirmed_vulnerabilities": 0},
+                "error_count": 0, "confirmed_vulnerabilities": 0,
+                "disagreed_inconclusive": 0, "disagreed_protected": 0},
         verified_results=[], candidates_total=0)
     assert "Adjudicated 0/0" in line
 
@@ -156,7 +161,8 @@ def test_coverage_line_refused_only_counts_refusal_errors():
     results = [_mk_result(error=OTHER_ERROR), _mk_result(error=OTHER_ERROR)]
     line = _adjudication_coverage_line(
         counts={"agreed": 0, "disagreed": 0, "needs_review": 0,
-                "error_count": 2, "confirmed_vulnerabilities": 0},
+                "error_count": 2, "confirmed_vulnerabilities": 0,
+                "disagreed_inconclusive": 0, "disagreed_protected": 0},
         verified_results=results, candidates_total=2)
     assert "refused 0" in line
 
@@ -223,7 +229,8 @@ def test_coverage_percent_one_decimal_when_not_exact():
     from core.verifier import _adjudication_coverage_line
     results = ([_mk_result(agree=True)] * 23 + [_mk_result(agree=False)] * 18)
     counts = {"agreed": 23, "disagreed": 18, "needs_review": 0,
-              "error_count": 0, "confirmed_vulnerabilities": 0}
+              "error_count": 0, "confirmed_vulnerabilities": 0,
+              "disagreed_inconclusive": 0, "disagreed_protected": 0}
     line = _adjudication_coverage_line(
         counts=counts, verified_results=results, candidates_total=223)
     assert "(18.4%)" in line, (
@@ -239,7 +246,8 @@ def test_coverage_multi_refusal_sum():
                _mk_result(agree=True)]
     line = _adjudication_coverage_line(
         counts={"agreed": 1, "disagreed": 0, "needs_review": 0,
-                "error_count": 3, "confirmed_vulnerabilities": 0},
+                "error_count": 3, "confirmed_vulnerabilities": 0,
+                "disagreed_inconclusive": 0, "disagreed_protected": 0},
         verified_results=results, candidates_total=4)
     assert "incl. refused 2" in line
     assert "errored 3" in line

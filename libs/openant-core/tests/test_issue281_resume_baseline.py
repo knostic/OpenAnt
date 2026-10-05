@@ -57,7 +57,9 @@ def test_analyzer_resume_baseline_excludes_prior(capfd):
     line = _capture_usage_line("Stage 1", baseline)
     # own work: 250k input + 50k output = 300k total tokens, $0.35
     assert "300,000" in line, f"delta must be the own tokens (got {line!r})"
-    assert "1 API calls" in line
+    # #624: the unit-honest line — 1 completion in 1 record.
+    assert "1 completions (1 records)" in line
+    assert "API calls" not in line
     assert "0.3500" in line, f"own cost $0.35 (got {line!r})"
     assert "8." not in line, (
         f"the restored $8 must NOT appear in the phase delta (got {line!r})"
