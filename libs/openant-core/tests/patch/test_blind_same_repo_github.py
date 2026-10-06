@@ -35,7 +35,6 @@ from tests.patch.test_blind_evaluation import (  # noqa: F401 -- fixtures/helper
     ISSUE_URL,
     MAILING_URL,
     MIXED_CVE,
-    ORDINARY_CVE,
     PIP_FIXTURE,
     PIP_ORIGINAL_SHA,
     URLLIB3_BLIND_SHA,

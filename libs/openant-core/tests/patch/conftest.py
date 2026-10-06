@@ -34,6 +34,13 @@ def _default_to_mock_and_isolated_config(monkeypatch):
     from utilities.llm import empty_config
 
     monkeypatch.setenv("LLM_PROVIDER", "mock")
+    # Git >= 2.47 may detach auto-maintenance after commit, leaving
+    # .git/objects/maintenance.lock alive briefly after `git commit` returns;
+    # tests that immediately copy the repository can race with that
+    # disappearing lock. Run auto-maintenance synchronously instead.
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "maintenance.autoDetach")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "false")
     monkeypatch.setattr(llm_client, "load_config_file", lambda: empty_config())
     monkeypatch.setattr(llm_client, "_cached_provider", None)
     monkeypatch.setattr(llm_client, "_cached_model", {})
