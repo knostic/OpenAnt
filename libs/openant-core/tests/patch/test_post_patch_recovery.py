@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 from unittest import mock
 
-import pytest
 
 from utilities.autopatcher.remediation_planner import build_recovery_targets
 
@@ -1358,7 +1357,7 @@ class TestRecoveryEligibility:
         ReadyEdit at all -- ReadyEdit approves only A. B must still be
         eligible and recoverable."""
         from utilities.autopatcher.remediation_planner import (
-            PatchConformanceReport, build_recovery_targets, recover_post_patch_source,
+            PatchConformanceReport, recover_post_patch_source,
         )
 
         (tmp_path / "b.py").write_text("CONST_B = 1\n", encoding="utf-8")

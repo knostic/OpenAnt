@@ -526,7 +526,7 @@ def _new_debug_artifacts(debug_dir: Path, since: float) -> list[str]:
 def _git_stdout(repo_root, *git_args) -> "str | None":
     try:
         proc = subprocess.run(
-            ["git", "-C", str(repo_root), *git_args], capture_output=True, text=True, timeout=30,
+            ["git", "-C", str(repo_root), *git_args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
         return None

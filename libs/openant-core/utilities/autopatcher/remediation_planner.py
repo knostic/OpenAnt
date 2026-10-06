@@ -840,6 +840,24 @@ def _deterministic_identifier_fallback(
     return _SymbolMatch(file=file, label=name, kind="constant", line=start_line, end_line=end_line, func_id=None)
 
 
+def _constant_matches(
+    qualified_name: str, record: dict, name: str, bare_name: str, class_qualifier: "str | None",
+) -> bool:
+    """Whether constants-table entry `qualified_name`/`record` is the
+    requested constant `name`. A class-qualified request ("Retry.DEFAULT")
+    matches only that class's constant -- never another class's, never a
+    module-level one -- mirroring the className check functions already get
+    in `_resolve_symbol_details`. An unqualified request keeps bare-name
+    matching."""
+    if qualified_name == name:
+        return True
+    if qualified_name.rsplit(".", 1)[-1] != bare_name:
+        return False
+    if class_qualifier is None:
+        return True
+    return (record or {}).get("class_name") == class_qualifier.rsplit(".", 1)[-1]
+
+
 def _resolve_symbol_details(
     raw: str, repo_root: Path, context, verified_files: "list[str] | None" = None,
 ) -> "_SymbolMatch | None":
@@ -903,7 +921,7 @@ def _resolve_symbol_details(
     files_to_check = [verified_file] if verified_file else list(constants.keys())
     for f in files_to_check:
         for qualified_name, record in constants.get(f, {}).items():
-            if qualified_name == name or qualified_name.rsplit(".", 1)[-1] == bare_name:
+            if _constant_matches(qualified_name, record, name, bare_name, class_qualifier):
                 line = record.get("line")
                 if line is not None:
                     return _SymbolMatch(
@@ -4428,6 +4446,10 @@ def _build_final_target_slice_inner(
     # _CATEGORY2_HEADING_LABEL, which is reserved for a genuinely
     # unverified/merely-referenced identifier with no matching target span.
     _verified_target_spans = {(m.file, m.line, m.end_line) for m in symbol_matches.values()}
+    # A verified target span queued here is NOT rendered yet -- Category 4
+    # below must not count it as covered until the commit further down
+    # actually adds its block (target span key -> category2_candidates index).
+    _queued_target_candidate: "dict[tuple, int]" = {}
     for term in strategy_terms:
         found = _lookup_identifier_definition(term, preferred_files, context, target_identity=target_identity)
         if found is None:
@@ -4457,6 +4479,8 @@ def _build_final_target_slice_inner(
             heading_label=_heading,
         )
         category2_candidates.append((text, found.file))
+        if key in _verified_target_spans:
+            _queued_target_candidate.setdefault(key, len(category2_candidates) - 1)
 
     # --- Category 3 candidates (usage/consumer windows) -- CANDIDATES
     # ONLY here too. Committed in two separate passes further below: 3b
@@ -4706,6 +4730,7 @@ def _build_final_target_slice_inner(
     # they must not be displaced by one-hop/category-2/category-3a/
     # category-5 content competing for the same budget.
     function_targets_with_window: set = set()
+    _awaiting_category2_commit: "dict[int, list[str]]" = {}  # candidate index -> target symbols it covers
     for (text, f, _label, raw_symbol) in category3_candidates:
         if raw_symbol is None:
             continue  # 3a (supporting) -- committed later, below
@@ -4725,6 +4750,14 @@ def _build_final_target_slice_inner(
         if match.kind != "function" or raw_symbol in function_targets_with_window:
             continue
         key = (match.file, match.line, match.end_line)
+        if key in _queued_target_candidate:
+            # Its source is a queued Category 2 block: covered only if that
+            # block is committed below, and attempted as an edit target now.
+            index = _queued_target_candidate[key]
+            if index not in _awaiting_category2_commit:
+                edit_target_attempted_chars += len(category2_candidates[index][0])
+            _awaiting_category2_commit.setdefault(index, []).append(raw_symbol)
+            continue
         if key in used_definition_keys:
             covered_symbols.add(raw_symbol)
             covered_files.add(match.file)
@@ -5006,10 +5039,11 @@ def _build_final_target_slice_inner(
     # --- Commit category 2's candidates now (SUPPORTING-context role,
     # tier 3) -- after every edit-target candidate AND the one-hop step
     # above have already had first claim on the budget.
-    for (text, f) in category2_candidates:
+    for index, (text, f) in enumerate(category2_candidates):
         if _try_add_to(blocks_by_category[2], text):
             covered_files.add(f)
             identifier_definition_covered.add(f)
+            covered_symbols.update(_awaiting_category2_commit.get(index, ()))
 
     # --- Commit category 3a's SUPPORTING-context candidates now (tier 4)
     # -- 3b's edit-target candidates were already committed above. Within
@@ -6213,8 +6247,8 @@ def _resolve_guided_symbol(
         files_to_check = [file_part] if file_part else list(constants.keys())
         const_candidate_files: set = set()
         for f in files_to_check:
-            for qn, _record in constants.get(f, {}).items():
-                if qn == name or qn.rsplit(".", 1)[-1] == bare_name:
+            for qn, record in constants.get(f, {}).items():
+                if _constant_matches(qn, record, name, bare_name, class_qualifier):
                     const_candidate_files.add(f)
         if len(const_candidate_files) > 1:
             return None, "ambiguous_identifier"

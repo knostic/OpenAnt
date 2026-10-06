@@ -1103,7 +1103,6 @@ class TestFullFileMode:
     def test_full_file_header_format(self, tmp_path):
         """Header must say '(full file, N lines)' in full-file mode."""
         from utilities.autopatcher.repo_locator import find_code_context
-        import re as _re
         content = "class Retry:\n    DEFAULT_REMOVE = frozenset(['Authorization'])\n"
         write(tmp_path / "src" / "retry.py", content)
         vuln = "The `Authorization` header is not stripped."

@@ -442,12 +442,22 @@ def _parse_response(resp: str, findings: List[str]) -> List[Dict[str, object]]:
                                         pipeline.py's bounded post-
                                         calibration evidence-acquisition
                                         orchestration, the only consumer.
+      calibration_failed              : bool -- True when this finding's
+                                        block was missing/unparseable or its
+                                        Unresolved field could not be read
+                                        (the fail-closed defaults above). Such
+                                        an entry carries NO calibration
+                                        answer: pipeline.py treats it exactly
+                                        like a finding calibration never saw,
+                                        never as "examined, nothing
+                                        unresolved".
     """
     blocks_by_number = _split_blocks_by_number(resp or "")
     results: List[Dict[str, object]] = []
     for i, original in enumerate(findings, start=1):
         block_text = blocks_by_number.get(i)
         fields = _BLOCK_FIELDS_RE.match(block_text) if block_text is not None else None
+        calibration_failed = fields is None
         if fields is not None:
             (
                 unresolved_raw, impact_raw, acquirability_raw, evidence_request_raw, group_raw, reworded,
@@ -469,6 +479,7 @@ def _parse_response(resp: str, findings: List[str]) -> List[Dict[str, object]]:
                 group = "hypothesis"
                 unresolved = []
                 impact = "unclear"
+                calibration_failed = True
             else:
                 if group == "observed" and unresolved:
                     # Deterministic consistency gate: the model's own
@@ -530,6 +541,7 @@ def _parse_response(resp: str, findings: List[str]) -> List[Dict[str, object]]:
             "remediation_impact": impact,
             "evidence_acquirability": acquirability,
             "evidence_request": evidence_request,
+            "calibration_failed": calibration_failed,
         })
     return results
 

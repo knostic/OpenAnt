@@ -13,8 +13,6 @@ All tests use synthetic inputs; no LLM calls are made.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
 import pytest
 

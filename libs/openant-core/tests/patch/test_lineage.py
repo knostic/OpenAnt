@@ -17,7 +17,6 @@ import pytest
 from utilities.autopatcher import lineage
 from utilities.autopatcher.lineage import (
     INVOCATION_KIND_INITIAL,
-    INVOCATION_KIND_REPLAY,
     INVOCATION_KIND_RETRY,
     RESOLVED,
     STALE,
@@ -369,16 +368,20 @@ class TestFindLatestExecutionIdentity:
         replay = _replay(tmp_path / "replay", parent=run, executions=[
             _execution("patch_generation_and_post_patch_investigation", 1),  # supersedes run's
         ])
-        stale_downstream = _replay(tmp_path / "stale-downstream", parent=run, executions=[
+        # Child of `replay`, whose challenger consumed `run`'s patch execution
+        # -- superseded by `replay`'s own, so it resolves STALE here.
+        stale_downstream = _replay(tmp_path / "stale-downstream", parent=replay, executions=[
             _execution("challenger", 1, consumed={
                 "patch_generation_and_post_patch_investigation": {"run": str(run), "execution_id": "001_patch_generation_and_post_patch_investigation"},
             }),
         ])
-        # From `replay`'s own lineage, "challenger" was never produced,
-        # but find_latest_execution_identity should still just report
-        # None honestly (nothing to find), not attempt staleness logic.
-        identity = find_latest_execution_identity(build_chain(replay), "challenger")
-        assert identity is None
+        chain = build_chain(stale_downstream)
+        assert resolve_effective(chain, "challenger", {}).state == STALE
+        identity = find_latest_execution_identity(chain, "challenger")
+        assert identity == {"run": str(stale_downstream), "execution_id": "001_challenger"}
+        # From `replay`'s own lineage, "challenger" was never produced --
+        # reported as None honestly (nothing to find).
+        assert find_latest_execution_identity(build_chain(replay), "challenger") is None
 
 
 # ---------------------------------------------------------------------------

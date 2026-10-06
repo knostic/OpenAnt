@@ -374,15 +374,12 @@ class TestTruncatedTap:
         text = "TAP version 13\n1..2\nok 1 - a\nnot ok 2 - b\n  ---\n  reason: cut off here\n"
         assert parse_tap(text) is None
 
-    def test_cut_off_mid_line_stream_with_recognizable_prefix_still_parses_what_it_saw(self):
-        """A stream truncated cleanly BETWEEN complete lines (no open
-        subtest, no open YAML block) is not itself ambiguous -- the
-        parser reports what it could read. Truncation that leaves a
-        construct open (see the two cases above) is what triggers None."""
+    def test_stream_cut_off_before_its_plan_is_fulfilled_fails_closed(self):
+        """A stream truncated cleanly BETWEEN complete lines still announced
+        how many results it would report -- fewer than planned means the run
+        stopped early, so it is never read as "no failures"."""
         text = "TAP version 13\n1..3\nok 1 - a\nok 2 - b\n"
-        parsed = parse_tap(text)
-        assert parsed is not None
-        assert parsed.passed == 2
+        assert parse_tap(text) is None
 
 
 class TestExactMinimistCapturedOutput:

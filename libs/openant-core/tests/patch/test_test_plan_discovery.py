@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from unittest import mock
 
 from utilities.autopatcher.test_plan_discovery import _SYSTEM_PROMPT, _parse_response, discover_test_plan
 

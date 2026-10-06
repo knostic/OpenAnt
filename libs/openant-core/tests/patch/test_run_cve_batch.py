@@ -29,6 +29,10 @@ import yaml
 from utilities.autopatcher.tools import run_cve_batch as rcb
 from utilities.autopatcher.tools import run_patcheval_python_37 as wrapper
 
+# The runner is POSIX-only (process groups, flock -- RUN_CVE_BATCH.md); the
+# module itself still imports on Windows (see test_non_posix_host_is_refused).
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="run_cve_batch.py is POSIX-only")
+
 TOOLS_DIR = Path(rcb.__file__).resolve().parent
 REAL_MANIFEST = TOOLS_DIR / "cfp_evaluation_cases.yaml"
 
@@ -320,6 +324,14 @@ def test_wrapper_rejects_repos_root(capsys):
     with pytest.raises(SystemExit) as exc:
         wrapper.main(["--repos-root", "/tmp/x"])
     assert exc.value.code == 2
+
+
+def test_non_posix_host_is_refused_before_anything_runs(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(rcb, "fcntl", None)  # what the guarded import yields on Windows
+    code = rcb.main(["--manifest", str(REAL_MANIFEST), "--validate-only", "--batch-root", str(tmp_path / "b")])
+    assert code == rcb.EXIT_INVALID_INPUT
+    assert "requires POSIX" in capsys.readouterr().err
+    assert not (tmp_path / "b").exists()
 
 
 def test_real_run_traced_is_launched_with_canonical_flags_in_the_attempt_cwd(env, monkeypatch):

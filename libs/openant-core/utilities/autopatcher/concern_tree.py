@@ -53,7 +53,7 @@ from .remediation_planner import (
     _read_symbol_source,
     _render_source_excerpt,
 )
-from .patch_challenger import _point_citation_valid, _normalize_for_provenance, _strip_quote_wrapping
+from .patch_challenger import _point_citation_valid, _normalize_for_provenance
 from .technical_capacity import compute_source_capacity
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "concern_tree_evaluator.md"

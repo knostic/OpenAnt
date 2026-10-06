@@ -17,9 +17,9 @@ _build_repair_hint unit tests alongside its full pipeline.run() tests):
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest import mock
 
-import pytest
 
 from utilities.autopatcher import pipeline as pipeline_mod
 from utilities.autopatcher.pipeline import _dispatch_narrower_mode, _run_planner_claim_verification
@@ -1101,7 +1101,7 @@ class TestS1ExecutionArtifact:
 
     def _s1_artifact(self, recorder):
         s1 = recorder.executions[0]
-        return json.loads(open(s1["artifact_path"], encoding="utf-8").read())
+        return json.loads(Path(s1["artifact_path"]).read_text(encoding="utf-8"))
 
     def test_records_verifier_v1_and_forced_skip_on_double_contradiction(self, tmp_path):
         revised = _plan_with_real_target(tmp_path, narrower="revised, still rejected")

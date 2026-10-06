@@ -30,6 +30,28 @@ Shipped manifests: `cfp_evaluation_cases.yaml` (43 cases) and
 
 ---
 
+## Evaluation methodology
+
+A batch measures whether each Trust Report recommendation is justified by
+the evidence Auto Patcher collected. It does not measure how often Auto
+Patcher produces a correct patch.
+
+- **Pinned revision.** Every case is pinned to an exact vulnerable repository
+  SHA (§3).
+- **Reference fix held out.** Upstream fix references are removed from the
+  advisory before generation (blind evaluation, §4), or the case fails as
+  `blind_evaluation_aborted`. Any comparison with the upstream fix is a
+  separate step after the run. The runner never makes it.
+- **Isolation and provenance.** Every attempt uses a fresh, isolated checkout
+  and keeps its trace and provenance (§4, §7).
+- **Honest denominators.** `NO PATCH PRODUCED` is a legitimate Auto Patcher
+  outcome. Infrastructure and runtime failures are reported separately and
+  stay in denominator A (§6).
+- **Not a success rate.** The recommendation distribution is not a patch
+  success rate.
+
+---
+
 ## 1. Quick start
 
 ```bash

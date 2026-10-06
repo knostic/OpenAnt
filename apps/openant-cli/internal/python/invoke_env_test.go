@@ -86,7 +86,7 @@ func writeEnvEchoScript(t *testing.T) string {
 	path := filepath.Join(dir, "echo_env.sh")
 	// Reads one optional stdin line and echoes both env vars and the stdin
 	// line back in a success envelope, so a single subprocess run can assert
-	// on env propagation and stdin connectivity together.
+	// on env propagation and stdin isolation together.
 	script := "#!/bin/sh\n" +
 		"read line\n" +
 		"printf '{\"status\":\"success\",\"data\":{\"my_test_var\":\"%s\",\"my_other_var\":\"%s\",\"stdin_line\":\"%s\"},\"errors\":[]}\\n' " +
@@ -170,7 +170,10 @@ func TestInvoke_NoGlobalEnvironmentMutationFromExtraEnv(t *testing.T) {
 	}
 }
 
-func TestInvoke_StdinIsConnected(t *testing.T) {
+// The subprocess must NOT inherit this process's stdin: Python-side prompts
+// (e.g. `report`'s dynamic-test prompt) rely on a non-TTY stdin to take their
+// non-interactive path instead of blocking on an invisible prompt.
+func TestInvoke_StdinIsNotInherited(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("stdin-pipe test uses os.Pipe")
 	}
@@ -195,8 +198,8 @@ func TestInvoke_StdinIsConnected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Invoke returned error: %v", err)
 	}
-	if got := dataString(t, res, "stdin_line"); got != "hello-from-test-stdin" {
-		t.Fatalf("subprocess read stdin line %q, want %q -- Invoke's cmd.Stdin is not connected", got, "hello-from-test-stdin")
+	if got := dataString(t, res, "stdin_line"); got != "" {
+		t.Fatalf("subprocess read stdin line %q, want EOF -- Invoke must not inherit os.Stdin", got)
 	}
 }
 

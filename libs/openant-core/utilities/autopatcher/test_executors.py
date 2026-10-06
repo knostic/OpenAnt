@@ -247,9 +247,24 @@ def _stage_build_context(workspace_root: Path, plan: TestExecutionPlan, image: s
     OVERWRITING anything the target repository itself shipped under
     those names. OpenAnt controls the execution container; it never
     builds or runs a Dockerfile authored by the repository under test."""
-    (workspace_root / ".dockerignore").write_text(_DOCKERIGNORE_CONTENT, encoding="utf-8")
-    (workspace_root / "Dockerfile").write_text(_generate_dockerfile(plan, image), encoding="utf-8")
-    (workspace_root / ".openant_run_test.sh").write_text(_generate_entrypoint_script(plan), encoding="utf-8")
+    _write_fresh_file(workspace_root / ".dockerignore", _DOCKERIGNORE_CONTENT)
+    _write_fresh_file(workspace_root / "Dockerfile", _generate_dockerfile(plan, image))
+    _write_fresh_file(workspace_root / ".openant_run_test.sh", _generate_entrypoint_script(plan))
+
+
+def _write_fresh_file(path: Path, content: str) -> None:
+    """Replace whatever the repository shipped at `path` with a NEW regular
+    file. A repository-supplied symlink is removed (unlink never follows
+    it), and exclusive-create mode "x" (O_CREAT|O_EXCL) refuses to open
+    anything that is still -- or again -- there, a symlink included, so
+    this can never write through a link to a path outside the workspace.
+    A directory at `path` raises (fail closed)."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    with open(path, "x", encoding="utf-8") as fh:
+        fh.write(content)
 
 
 def _extract_result(stdout: str) -> "str | None":

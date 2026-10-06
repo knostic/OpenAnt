@@ -1905,7 +1905,6 @@ class TestBuildPlannerSourceExcerptsPriority:
         # ~192 chars, PoolManager.urlopen excerpt ~3111 chars, overhead
         # ~317 chars -- 3620 total, under the existing 4000 budget once
         # prioritization is correct).
-        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
         retry_py = tmp_path / "src" / "urllib3" / "util" / "retry.py"
         retry_py.parent.mkdir(parents=True)
         retry_py.write_text(
@@ -2595,7 +2594,23 @@ class TestPipelineWiring:
     sits right after Repository Understanding regardless of whether
     grounding found anything."""
 
-    def _run_with_mocks(self, plan_result, repo_root=None, extra_patches=()):
+    @staticmethod
+    def _strategy_reply(target_files, target_symbols=()):
+        """An LLM `complete` side effect whose Final Strategy reply is a
+        real, successful one naming `target_files`/`target_symbols` -- so
+        Strategy is invoked AND succeeds (an unparseable reply would be an
+        invoked-and-failed Strategy, which now skips Patch Generation)."""
+        def complete(system_prompt, user_message, stage="unknown"):
+            if stage == "remediation_strategy":
+                return json.dumps({
+                    "extended_mechanism": None, "target_files": list(target_files),
+                    "target_symbols": list(target_symbols), "required_edits": ["stub edit"],
+                    "rejected_targets": [], "security_invariant": "stub", "insufficient_evidence": [],
+                })
+            return "{}"
+        return complete
+
+    def _run_with_mocks(self, plan_result, repo_root=None, extra_patches=(), llm_complete=None):
         # Fix A: these tests are about how plan/evidence TEXT flows into
         # code_context, not about the evidence-sufficiency gate itself --
         # force every plan_result passed in here to read as explicitly
@@ -2620,6 +2635,8 @@ class TestPipelineWiring:
         started = [p.start() for p in patches]
         try:
             started[0].return_value = mock.MagicMock()
+            if llm_complete is not None:
+                started[0].return_value.complete.side_effect = llm_complete
             from utilities.autopatcher.pipeline import run
             run("some vuln", api_key="", repo_root=repo_root)
         finally:
@@ -2658,7 +2675,10 @@ class TestPipelineWiring:
             target_files=["src/urllib3/util/retry.py"], target_symbols=[],
         )
 
-        _mock_plan, mock_gen = self._run_with_mocks(plan_result, repo_root=str(tmp_path))
+        _mock_plan, mock_gen = self._run_with_mocks(
+            plan_result, repo_root=str(tmp_path),
+            llm_complete=self._strategy_reply(["src/urllib3/util/retry.py"]),
+        )
 
         code_context = mock_gen.call_args.kwargs.get("code_context", "")
         assert "PLAN_MARKER" in code_context
@@ -2733,6 +2753,10 @@ class TestPipelineWiring:
                                      "exit_code": 0, "skipped_reason": None, "error": None}),
         ):
             mock_llm_cls.return_value = mock.MagicMock()
+            mock_llm_cls.return_value.complete.side_effect = self._strategy_reply(
+                ["src/urllib3/util/retry.py"],
+                ["src/urllib3/util/retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"],
+            )
             from utilities.autopatcher.pipeline import run
             run(vuln_text, api_key="", repo_root=str(tmp_path), investigation_output_dir=str(tmp_path / "out"))
 
@@ -4216,6 +4240,16 @@ class TestExtendExistingMechanismFixture:
 # Final-Target Remediation Slice
 # ---------------------------------------------------------------------------
 
+def _set_slice_budget(monkeypatch, max_chars: int) -> None:
+    """Pin the Final-Target Slice ceiling used when build_final_target_slice
+    is called without max_chars. Since Fix B that ceiling comes from
+    _effective_final_target_max (technical capacity), NOT the historical
+    FINAL_TARGET_SLICE_MAX_CHARS constant -- patching the constant would
+    leave the slice unbudgeted."""
+    from utilities.autopatcher import remediation_planner as rp
+    monkeypatch.setattr(rp, "_effective_final_target_max", lambda *a, **k: max_chars)
+
+
 def _make_strategy(
     target_files=None, target_symbols=None, extended_mechanism=None, required_edits=None,
     rejected_target_symbols=None, rejected_targets=None, insufficient_evidence=None,
@@ -4274,17 +4308,21 @@ class TestSliceGatingAndNoNewLLM:
             repo_path=tmp_path,
         )
 
-        def _fail_if_called(*a, **kw):
-            raise AssertionError("build_investigation_context must not be called by the slice builder")
-
+        # Record rather than raise: build_final_target_slice catches every
+        # Exception (an AssertionError included) into a "construction failed"
+        # result, so a raising guard could never fail this test.
+        calls = []
         monkeypatch.setattr(
-            "utilities.autopatcher.candidate_enrichment.build_investigation_context", _fail_if_called
+            "utilities.autopatcher.candidate_enrichment.build_investigation_context",
+            lambda *a, **kw: calls.append(a),
         )
 
         from utilities.autopatcher.remediation_planner import build_final_target_slice
         strategy = _make_strategy(target_files=["a.py"], target_symbols=["a.py:A.X"])
-        build_final_target_slice(strategy, str(tmp_path), context)
-        # no exception -- build_investigation_context was never reached
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert calls == []  # build_investigation_context was never reached
+        assert "construction failed" not in result.rendered
+        assert "A.X" in result.rendered
 
     def test_no_parser_reimport_triggered(self, tmp_path, monkeypatch):
         (tmp_path / "a.py").write_text("class A:\n    X = 1\n", encoding="utf-8")
@@ -4293,14 +4331,17 @@ class TestSliceGatingAndNoNewLLM:
             repo_path=tmp_path,
         )
 
-        def _fail_if_called(*a, **kw):
-            raise AssertionError("parse_repository must not be called by the slice builder")
-
-        monkeypatch.setattr("utilities.autopatcher.candidate_enrichment.parse_repository", _fail_if_called)
+        calls = []  # recorded, not raised -- see the test above
+        monkeypatch.setattr(
+            "utilities.autopatcher.candidate_enrichment.parse_repository", lambda *a, **kw: calls.append(a)
+        )
 
         from utilities.autopatcher.remediation_planner import build_final_target_slice
         strategy = _make_strategy(target_files=["a.py"], target_symbols=["a.py:A.X"])
-        build_final_target_slice(strategy, str(tmp_path), context)
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert calls == []  # parse_repository was never reached
+        assert "construction failed" not in result.rendered
+        assert "A.X" in result.rendered
 
 
 class TestPaddedLineRange:
@@ -5427,7 +5468,7 @@ class TestFinalTargetSliceEvidenceAdmissionOrderIndependence:
     @pytest.mark.parametrize("order", ["large_candidate_mentioned_first", "small_consumer_mentioned_first"])
     def test_target_connected_consumer_survives_regardless_of_mention_order(self, tmp_path, monkeypatch, order):
         from utilities.autopatcher import remediation_planner as rp
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 2000)
+        _set_slice_budget(monkeypatch, 2000)
         context = self._context(tmp_path)
         mechanism = {
             "large_candidate_mentioned_first": (
@@ -5454,7 +5495,7 @@ class TestFinalTargetSliceEvidenceAdmissionOrderIndependence:
 
     def test_generous_budget_keeps_both_regardless_of_order_non_interference(self, tmp_path, monkeypatch):
         from utilities.autopatcher import remediation_planner as rp
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 8000)
+        _set_slice_budget(monkeypatch, 8000)
         context = self._context(tmp_path)
         for mechanism in (
             "dispatch_request already performs the relevant check. The fix also adjusts THRESHOLD_VALUE.",
@@ -5519,7 +5560,7 @@ class TestFinalTargetSliceTargetOwnedClassMemberPriority:
     @pytest.mark.parametrize("order", ["large_candidate_mentioned_first", "small_consumer_mentioned_first"])
     def test_same_class_member_survives_regardless_of_mention_order(self, tmp_path, monkeypatch, order):
         from utilities.autopatcher import remediation_planner as rp
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 2000)
+        _set_slice_budget(monkeypatch, 2000)
         context = self._context(tmp_path)
         mechanism = {
             "large_candidate_mentioned_first": (
@@ -5546,7 +5587,7 @@ class TestFinalTargetSliceTargetOwnedClassMemberPriority:
 
     def test_generous_budget_keeps_both_regardless_of_order_non_interference(self, tmp_path, monkeypatch):
         from utilities.autopatcher import remediation_planner as rp
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 8000)
+        _set_slice_budget(monkeypatch, 8000)
         context = self._context(tmp_path)
         for mechanism in (
             "run_batch_worker already performs the relevant check. The fix also adjusts batch_limit.",
@@ -5654,7 +5695,7 @@ class TestFinalTargetSliceTargetOwnedClassMemberPriorityIndexResolvedClass:
 
     def test_same_class_member_survives_when_target_resolves_via_index(self, tmp_path, monkeypatch):
         from utilities.autopatcher import remediation_planner as rp
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 2000)
+        _set_slice_budget(monkeypatch, 2000)
         context = self._context(tmp_path)
         mechanism = (
             "run_batch_worker already performs the relevant check. "
@@ -5761,7 +5802,7 @@ class TestFinalTargetSliceTargetOwnedClassMemberPriorityNoQualifyingConstant:
 
     def test_same_class_member_currently_lost_with_no_qualifying_constant(self, tmp_path, monkeypatch):
         from utilities.autopatcher import remediation_planner as rp
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 500)
+        _set_slice_budget(monkeypatch, 500)
         context = self._context(tmp_path)
         mechanism = (
             "process_batch already performs the relevant check. "
@@ -5808,7 +5849,7 @@ class TestFinalTargetSliceTargetOwnedClassMemberPriorityNoQualifyingConstant:
         assert match.func_id == "gateway.py:Coordinator"
         assert rp._label_is_confirmed_class("Coordinator", context, func_id=match.func_id) is False
 
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 500)
+        _set_slice_budget(monkeypatch, 500)
         mechanism = (
             "process_batch already performs the relevant check. "
             "The fix also adjusts queue_depth."
@@ -5928,7 +5969,7 @@ class TestFinalTargetSliceEvidenceContinuityAfterRejectedQualifiedTarget:
 
     def test_same_class_member_gains_band_a_after_rejected_qualifier_reverification(self, tmp_path, monkeypatch):
         from utilities.autopatcher import remediation_planner as rp
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 500)
+        _set_slice_budget(monkeypatch, 500)
         context = self._context(tmp_path)
         strategy = self._strategy(rejected_target_symbols=["Container.runtime_limit"])
 
@@ -5954,7 +5995,7 @@ class TestFinalTargetSliceEvidenceContinuityAfterRejectedQualifiedTarget:
         same tight budget, same competing candidate, no crash, no
         admission."""
         from utilities.autopatcher import remediation_planner as rp
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 500)
+        _set_slice_budget(monkeypatch, 500)
         context = self._context(tmp_path)
         strategy = self._strategy(rejected_target_symbols=["Bogus.runtime_limit"])
 
@@ -5970,7 +6011,7 @@ class TestFinalTargetSliceEvidenceContinuityAfterRejectedQualifiedTarget:
         common case), behavior is byte-for-byte unchanged from before this
         fix -- same tight-budget race, same loser."""
         from utilities.autopatcher import remediation_planner as rp
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 500)
+        _set_slice_budget(monkeypatch, 500)
         context = self._context(tmp_path)
         strategy = self._strategy(rejected_target_symbols=[])
 
@@ -6189,7 +6230,7 @@ class TestCategoryPriorityAndOrdering:
 
     def test_exact_definitions_never_displaced_by_budget(self, tmp_path, monkeypatch):
         from utilities.autopatcher import remediation_planner as rp
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 60)  # smaller than even one definition block
+        _set_slice_budget(monkeypatch, 60)  # smaller than even one definition block
         (tmp_path / "policy.py").write_text(
             "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
         )
@@ -6226,7 +6267,7 @@ class TestBudgetBoundedness:
 
     def test_no_block_truncated_mid_line(self, tmp_path, monkeypatch):
         from utilities.autopatcher import remediation_planner as rp
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 100)
+        _set_slice_budget(monkeypatch, 100)
         (tmp_path / "policy.py").write_text(
             "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
         )
@@ -6339,9 +6380,6 @@ class TestCoverageReporting:
         assert "Uncovered" in result.warning_text
 
     def test_zero_coverage_prevents_first_patch_generator_call(self, tmp_path):
-        from unittest import mock as _mock
-        plan_result = _make_strategy  # not used directly; construct via helper below
-
         strategy = _make_strategy(target_files=["missing.py"], target_symbols=["missing.py:Missing.thing"])
         context = _make_context(repo_path=tmp_path)  # nothing resolves; file doesn't even exist on disk
         from utilities.autopatcher.remediation_planner import build_final_target_slice
@@ -6757,7 +6795,7 @@ class TestUrllib3StyleDeterministicSelfContained:
         )
         pool_py.write_text(f"class PoolManager:\n{consumer_code}", encoding="utf-8")
 
-        const_line = 401  # 400 filler lines (1..400) + line 401 is "class Retry:" -- constant is line 402
+        # 400 filler lines (1..400) + line 401 is "class Retry:" -- constant is line 402
         context = _make_context(
             functions={
                 "src/urllib3/poolmanager.py:PoolManager.urlopen": {
@@ -7104,7 +7142,7 @@ class TestOneHopDependencyExpansion:
         # referenced it. Measured against this fixture: the padded
         # definition block is 221 characters; definition + consumer combined
         # is 434. 300 sits cleanly between the two.
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 300)
+        _set_slice_budget(monkeypatch, 300)
         result = rp.build_final_target_slice(strategy, str(tmp_path), context, max_chars=300)
         assert 'DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])' in result.rendered
         assert "Discovered consumer" not in result.rendered
@@ -7519,7 +7557,7 @@ class TestEditTargetBudgetExhaustion:
         strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A", "mod.py:CONST_B"])
         # Both constants resolve; a budget too small to fit even ONE
         # padded definition block forces edit_target_budget_exhausted.
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 10)
+        _set_slice_budget(monkeypatch, 10)
         result = rp.build_final_target_slice(strategy, str(tmp_path), context, max_chars=10)
         assert result.edit_target_budget_exhausted is True
         # Not silently narrowed to "coverage complete" -- both remain uncovered.
@@ -7539,7 +7577,7 @@ class TestEditTargetBudgetExhaustion:
             repo_path=tmp_path,
         )
         strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A", "mod.py:CONST_B"])
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 10)
+        _set_slice_budget(monkeypatch, 10)
         slice_result = rp.build_final_target_slice(strategy, str(tmp_path), context, max_chars=10)
         intended_edits = rp.build_intended_edits(strategy)
         readiness = rp.check_edit_readiness(intended_edits, slice_result)
@@ -7588,7 +7626,7 @@ class TestEditTargetOrderedBeforeSupportingContext:
         strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:Mod.target_func"])
 
         # Measure: function-only vs function+one-hop-constant.
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 1_000_000)
+        _set_slice_budget(monkeypatch, 1_000_000)
         full_result = rp.build_final_target_slice(strategy, str(tmp_path), context)
         function_only_size = len(full_result.rendered)
         assert "target_func" in full_result.rendered
@@ -7597,7 +7635,7 @@ class TestEditTargetOrderedBeforeSupportingContext:
         # Now set a budget that fits the function alone but not the
         # one-hop constant too.
         just_function_size = function_only_size - len("CONST_X = 1")  # rough lower slack
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", max(1, just_function_size - 50))
+        _set_slice_budget(monkeypatch, max(1, just_function_size - 50))
         tight_result = rp.build_final_target_slice(strategy, str(tmp_path), context)
 
         # The edit target (the function itself) must still be included --
@@ -8029,7 +8067,7 @@ class TestDeterministicAcquisition:
         # A round budget that fits the function alone but not the
         # one-hop constant too (measured the same way the existing
         # ordering test measures it).
-        monkeypatch.setattr(rp, "FINAL_TARGET_SLICE_MAX_CHARS", 1_000_000)
+        _set_slice_budget(monkeypatch, 1_000_000)
         full_result = rp.build_final_target_slice(strategy, str(tmp_path), context)
         assert "CONST_X = 1" in full_result.rendered
         tight_budget = max(1, len(full_result.rendered) - len("CONST_X = 1") - 50)
@@ -9266,7 +9304,6 @@ class TestGuidedAcquisitionTraceArtifact:
 
     def test_trace_artifact_contains_deterministic_and_guided_states(self, tmp_path, monkeypatch):
         import json as _json
-        import os as _os
 
         stage_calls: list = []
         unready_result = mock.MagicMock(
@@ -10194,7 +10231,7 @@ class TestOneHopRepoWideUniqueFallback:
         and is never itself referenced by any already-selected source."""
         from utilities.autopatcher.remediation_planner import build_final_target_slice
 
-        context = self._predicate_context(tmp_path)
+        self._predicate_context(tmp_path)  # writes the base fixture files
         # Add a second, unrelated symbol to predicate_module.py that is
         # never called from consumer.py at all -- if the helper's file were
         # promoted into preferred_files, later strategy-term/usage lookups

@@ -14,7 +14,6 @@ import subprocess
 from pathlib import Path
 from unittest import mock
 
-import pytest
 
 import utilities.autopatcher.existing_test_regression as etr
 import utilities.autopatcher.test_executors as test_executors_mod

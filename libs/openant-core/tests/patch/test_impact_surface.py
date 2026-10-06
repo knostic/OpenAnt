@@ -1,6 +1,4 @@
-import os
 from pathlib import Path
-import json
 
 from utilities.autopatcher.impact_surface import LightweightImpactAnalyzer
 from utilities.autopatcher.pipeline import enhance_findings_with_impact, TargetRepoContext

@@ -56,7 +56,7 @@ from .remediation_planner import (
     _read_symbol_source,
     _render_source_excerpt,
 )
-from .patch_challenger import _point_citation_valid, _normalize_for_provenance, _strip_quote_wrapping
+from .patch_challenger import _point_citation_valid
 from .technical_capacity import compute_source_capacity
 
 _PASS1_PROMPT_PATH = Path(__file__).parent / "prompts" / "simple_concern_analyze.md"

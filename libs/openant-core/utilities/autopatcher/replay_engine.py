@@ -160,6 +160,7 @@ from .pipeline import (
     _run_remediation_signals,
     _run_repository_analysis_and_remediation_planning,
     _STATIC_SIGNALS_AVAILABLE,
+    _strategy_invocation_failure,
 )
 from .post_patch_investigation import derive_pre_patch_anchors
 from .remediation_planner import (
@@ -671,15 +672,21 @@ def _run_replay_remediation_strategy(
     llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
     _assert_llm_ownership(capture.calls, REMEDIATION_STRATEGY)
 
+    strategy_failure_reason = _strategy_invocation_failure(planner_evidence_ctx, strategy_result)
     if planning_forced_skip:
         outcome = "skipped_planning_ungrounded"
+    elif strategy_failure_reason is not None:
+        outcome = "unavailable"
     elif strategy_result is not None and strategy_result.rendered:
         outcome = "generated"
     elif not planner_evidence_ctx:
         outcome = "skipped_no_planner_evidence"
     else:
         outcome = "unavailable"
-    artifact = {"strategy_result": to_jsonable(strategy_result)}
+    artifact = {
+        "strategy_result": to_jsonable(strategy_result),
+        "strategy_failure_reason": strategy_failure_reason,
+    }
     artifact_path = output_dir / "remediation_strategy.json"
     artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
 
@@ -745,6 +752,9 @@ def _run_replay_guided_context_acquisition(
             _strategy_result=strategy_result, _plan_result=plan_result, _investigation_context=None,
             _verifier_forced_skip=verifier_forced_skip, _verifier_skip_reason=verifier_skip_reason,
             _planning_forced_skip=planning_forced_skip, _planning_skip_reason=planning_skip_reason,
+            # S2's own recorded decision, consumed as recorded -- never
+            # re-derived from `strategy_result` being unevaluated.
+            _strategy_failure_reason=s2.get("strategy_failure_reason"),
         )
 
     llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)

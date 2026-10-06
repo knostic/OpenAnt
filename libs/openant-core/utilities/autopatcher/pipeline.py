@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1086,6 +1085,13 @@ def _challenger_findings_duplicate_match(text_a: str, text_b: str) -> "dict | No
     return None
 
 
+# How strongly each `_classify_finding` category bears on the decision --
+# used only to decide which of two duplicate findings survives dedup.
+_FINDING_CATEGORY_STRENGTH = {
+    "confirmed_defect": 4, "behavioral_defect": 3, "validation_gap": 2, "plausible_risk": 1, "generic": 0,
+}
+
+
 def _dedupe_challenger_findings(
     edge_cases: "list[str]", potential_issues: "list[str]"
 ) -> "tuple[list[str], list[str], list[dict]]":
@@ -1097,9 +1103,13 @@ def _dedupe_challenger_findings(
     narrowly scoped to the confirmed defect (the same concern restated
     across the two sections), not a general dedup pass.
 
-    For each duplicate pair found, the SHORTER text is dropped and the
-    LONGER (more informative) text is kept -- ties keep the `edge_cases`
-    item. Nothing is silently discarded: every drop is recorded in the
+    For each duplicate pair found, the item with the STRONGER
+    `_classify_finding` category is kept (confirmed_defect >
+    behavioral_defect > validation_gap > plausible_risk > generic), so a
+    weaker restatement can never displace a stronger finding. Between equal
+    categories the SHORTER text is dropped and the LONGER (more informative)
+    text is kept -- equal lengths keep the `potential_issues` item. Nothing
+    is silently discarded: every drop is recorded in the
     returned `dedup_record` list as
     `{"reason", "shared_identifiers", "word_jaccard", "kept_section",
     "kept_text", "dropped_section", "dropped_text"}`, so the removed text
@@ -1124,7 +1134,13 @@ def _dedupe_challenger_findings(
             match = _challenger_findings_duplicate_match(e_text, p_text)
             if match is None:
                 continue
-            if len((p_text or "").strip()) >= len((e_text or "").strip()):
+            p_strength = _FINDING_CATEGORY_STRENGTH[_classify_finding(p_text)]
+            e_strength = _FINDING_CATEGORY_STRENGTH[_classify_finding(e_text)]
+            if p_strength != e_strength:
+                keep_potential = p_strength > e_strength
+            else:
+                keep_potential = len((p_text or "").strip()) >= len((e_text or "").strip())
+            if keep_potential:
                 dropped_edge_indices.add(ei)
                 kept_section, kept_text = "potential_issues", p_text
                 dropped_section, dropped_text = "edge_cases", e_text
@@ -1384,6 +1400,27 @@ def _classify_challenger(challenger: dict) -> dict:
 _REMEDIATION_PROOF_LEXICAL_CATEGORIES = ("plausible_risk", "validation_gap", "generic")
 
 
+def _calibration_entry_failed(entry: dict) -> bool:
+    """True when `entry` carries no calibration answer: Finding Calibration
+    could not parse this finding's block (see finding_calibration.
+    _parse_response's `calibration_failed`). Entries persisted before that
+    marker existed are recognised by the only shape the parser's fail-closed
+    path ever produced -- unresolved=[] with impact "unclear" (a parsed
+    "Unresolved: none" is always normalized to "validation_only")."""
+    if "calibration_failed" in entry:
+        return bool(entry["calibration_failed"])
+    return not entry.get("unresolved_dependencies") and entry.get("remediation_impact") == "unclear"
+
+
+def _usable_calibration_entries(finding_calibration: "list[dict] | None") -> "list[dict]":
+    """Calibration entries that carry a real answer. A failed entry is
+    dropped, so every consumer sees exactly what it sees for a finding
+    calibration never ran on (recommendation-policy.md: a missing
+    calibration counts as a defect; an uncalibrated validation_gap blocks)
+    -- never "examined, nothing unresolved"."""
+    return [entry for entry in finding_calibration or [] if not _calibration_entry_failed(entry)]
+
+
 def _match_calibration_entries(finding_calibration: "list[dict] | None") -> "dict[str, dict | None]":
     """Positive, text-exact association from a finding's own original text
     to its calibration entry -- never fuzzy matching, never positional
@@ -1400,7 +1437,7 @@ def _match_calibration_entries(finding_calibration: "list[dict] | None") -> "dic
     happen to agree are not ambiguous and resolve normally.
     """
     by_text: "dict[str, dict | None]" = {}
-    for entry in finding_calibration or []:
+    for entry in _usable_calibration_entries(finding_calibration):
         text = entry.get("original")
         if not text:
             continue
@@ -1854,7 +1891,7 @@ def _build_known_findings(classified_challenger: dict, finding_calibration: list
     )
 
     calibration_by_original = {
-        entry.get("original"): entry for entry in (finding_calibration or [])
+        entry.get("original"): entry for entry in _usable_calibration_entries(finding_calibration)
     }
 
     potential_remaining_risks: list[str] = []
@@ -1987,7 +2024,7 @@ def _repair_eligible_calibration_entries(
     semantics, just no longer confirmed_defect-only.
     """
     calibration_by_original = {
-        entry.get("original"): entry for entry in (finding_calibration or [])
+        entry.get("original"): entry for entry in _usable_calibration_entries(finding_calibration)
     }
     all_findings = (
         list(classified_challenger.get("classified_edge_cases") or [])
@@ -2245,6 +2282,13 @@ _NO_OPEN_ADVERSARIAL_CONCERN_NOTES = (
 )
 
 
+def _challenger_still_vulnerable(challenger: "dict | None") -> bool:
+    """Only an explicit `still_vulnerable is False` reads as "not still
+    vulnerable" -- a missing or non-boolean value (an older persisted
+    artifact, a hand-built dict) is never the favorable reading."""
+    return (challenger or {}).get("still_vulnerable") is not False
+
+
 def _compute_trust_signals(
     hygiene: list | None,
     applicability: dict | None,
@@ -2269,7 +2313,7 @@ def _compute_trust_signals(
     defect_count = classified_challenger.get("confirmed_defect_count", 0)
     risk_count = classified_challenger.get("plausible_risk_count", 0)
     gap_count = classified_challenger.get("validation_gap_count", 0)
-    still_vulnerable = bool((classified_challenger or {}).get("still_vulnerable"))
+    still_vulnerable = _challenger_still_vulnerable(classified_challenger)
     # Authoritative tri-state signal (patch_challenger.VERIFICATION_STATUSES),
     # or None for a pre-existing/legacy/unclassified challenger dict -- used
     # ONLY to pick accurate notes text below (never int_val/imp_val/aln_val,
@@ -4014,7 +4058,7 @@ def _build_report(result: PipelineResult) -> str:
         # add, remove, or reprioritize an action, and never a second call
         # into finding_calibration itself.
         calibration_by_original = {
-            entry.get("original"): entry for entry in (result.finding_calibration or [])
+            entry.get("original"): entry for entry in _usable_calibration_entries(result.finding_calibration)
         }
 
         # Suggested tests -> up to 2. `cap_bucket` reproduces the bucket the
@@ -4367,7 +4411,7 @@ def _build_report(result: PipelineResult) -> str:
         progress.success("Trust signals evaluated")
     trust_rec = _build_recommendation_v1(
         signals,
-        still_vulnerable=classified_challenger.get("still_vulnerable", False),
+        still_vulnerable=_challenger_still_vulnerable(classified_challenger),
         defect_count=calibrated_defect_count,
         verification_status=classified_challenger.get("verification_status"),
         structured_challenger=_is_structured_challenger(classified_challenger),  # display only
@@ -6143,12 +6187,13 @@ def _run_patch_generation_and_investigation(
     # actually generated. Reuses _final_repair_meta.relocations (already
     # computed above, as a side effect of repair_hunk_headers' own repair
     # pass over THIS `patch`) for old-side verification -- no second
-    # relocation mechanism, no new git call. Best-effort: any failure here
-    # leaves `patch` exactly as already computed.
+    # relocation mechanism, no new git call. Fails closed: a failure here
+    # before conformance is established for the current patch withdraws it.
     _patch_target_conformance = None        # initial conformance (this section's own PipelineResult field)
     _regenerated_patch_target_conformance = None  # only set if regeneration actually ran
     _post_patch_recovery = None
     _initial_patch_before_slice4 = patch     # captured for the trace artifact below, regardless of outcome
+    _conformance_established = False         # set only where the CURRENT patch is known to conform
     if patch and patch.strip() and repo_root and _edit_readiness is not None:
         try:
             from .remediation_planner import (
@@ -6179,6 +6224,7 @@ def _run_patch_generation_and_investigation(
                 f"edited files={_patch_target_conformance.edited_files}"
                 + (f", trigger_reasons={_recovery_reasons}" if _recovery_reasons else ""))
             if not _recovery_reasons:
+                _conformance_established = True
                 progress.success(
                     "Target conformance passed",
                     detail=f"Files changed: {', '.join(_patch_target_conformance.edited_files)}",
@@ -6326,12 +6372,23 @@ def _run_patch_generation_and_investigation(
                             _final_repair_meta = _regen_meta
                             _slice_result = _post_patch_recovery.slice_result
                             _patch_target_conformance = _regen_conformance
+                            _conformance_established = True
                             progress.recovery("Patch regenerated to match approved target")
                         else:
                             progress.warning("Regenerated patch still fails target conformance")
                             patch = ""
         except Exception as exc:
             progress.verbose(f"[pipeline] Patch Target Conformance unavailable: {type(exc).__name__}: {exc}")
+            if not _conformance_established and patch and patch.strip():
+                # Conformance never completed for the current patch -- it is
+                # unchecked, or already known not to conform (a crash during
+                # recovery). Withdraw it; never let it continue as if checked.
+                progress.warning("Target conformance could not be completed — patch withdrawn")
+                patch = ""
+                _patch_validation_skip_reason = (
+                    "Patch Target Conformance could not be completed -- candidate patch withdrawn "
+                    f"({type(exc).__name__}: {exc})"
+                )
 
     if os.environ.get("AUTOPATCHER_DEBUG"):
         try:
@@ -7814,6 +7871,15 @@ def _run_repository_analysis_and_remediation_planning(
                         f"({len(_planner_evidence_ctx)} chars).")
             except Exception as exc:
                 progress.verbose(f"[pipeline] Planner candidate evidence unavailable: {type(exc).__name__}: {exc}")
+                # Planning failed to establish grounded evidence -- same
+                # outcome as the ungrounded branch above, never State A.
+                _planner_evidence_ctx = ""
+                _planner_evidence_result = None
+                _planning_forced_skip = True
+                _planning_terminal_state = f"planning_failed ({type(exc).__name__}: {exc})"
+                _planning_skip_reason = f"planning_ungrounded: {_planning_terminal_state}"
+                progress.warning("Remediation planning could not establish a grounded plan")
+                return locals()
 
             # Planner Claim Verifier: sits between this Planner call and S2
             # (Remediation Strategy), still owned by this same canonical
@@ -7988,6 +8054,20 @@ def _run_repository_analysis_and_remediation_planning(
                 except Exception as exc:
                     progress.warning("Plan verification failed unexpectedly")
                     progress.verbose(f"[pipeline] Planner Claim Verifier unavailable: {type(exc).__name__}: {exc}")
+                    # Verification was required (a narrower-alternative claim
+                    # exists) but did not complete -- possibly after v2 was
+                    # half-adopted (plan swapped, evidence/gate not). Never
+                    # proceed as though it passed: same outcome as an
+                    # uncleared verification ("none" above).
+                    _planner_evidence_ctx = ""
+                    _planner_evidence_result = None
+                    _active_verifier_result = None
+                    _plan_authority_version = None
+                    _verifier_forced_skip = True
+                    _verifier_skip_reason = (
+                        "Planner Claim Verifier: verification did not complete "
+                        f"({type(exc).__name__}: {exc})"
+                    )
         except ModelUnavailableError:
             # An explicit execution/configuration decision (non-interactive
             # rejection, or a declined/cancelled interactive reselection),
@@ -7997,7 +8077,30 @@ def _run_repository_analysis_and_remediation_planning(
         except Exception as exc:
             progress.warning("Remediation planning unavailable")
             progress.verbose(f"[pipeline] Remediation planning unavailable: {type(exc).__name__}: {exc}")
+            # Planning raised before establishing grounded evidence -- same
+            # outcome as an ungrounded plan, never State A.
+            _planner_evidence_ctx = ""
+            _planner_evidence_result = None
+            _planning_forced_skip = True
+            _planning_terminal_state = f"planning_failed ({type(exc).__name__}: {exc})"
+            _planning_skip_reason = f"planning_ungrounded: {_planning_terminal_state}"
     return locals()
+
+
+def _strategy_invocation_failure(planner_evidence_ctx, strategy_result) -> "str | None":
+    """Why an INVOKED Final Strategy produced no usable result, or None.
+    generate_remediation_strategy skips its LLM call only when
+    `planner_evidence_ctx` is empty (not invoked -- State A); with evidence
+    it either returns an evaluated result or swallows a call/parse failure
+    into an unevaluated one. That failure must not read as "not invoked"."""
+    if not (planner_evidence_ctx or "").strip():
+        return None
+    if strategy_result is not None and getattr(strategy_result, "evaluated", False):
+        return None
+    return (
+        "Final Remediation Strategy was invoked but produced no usable result -- "
+        "edit readiness and target authority could not be established"
+    )
 
 
 def _run_guided_context_acquisition(
@@ -8005,7 +8108,7 @@ def _run_guided_context_acquisition(
     _strategy_result, _plan_result, _investigation_context,
     _verifier_forced_skip=False, _verifier_skip_reason=None,
     _planning_forced_skip=False, _planning_skip_reason=None,
-    _planner_evidence_result=None,
+    _planner_evidence_result=None, _strategy_failure_reason=None,
 ):
     """Reusable Stage-3 (guided_context_acquisition) executor -- the
     COMPLETE current production contract (Final-Target Remediation Slice,
@@ -8080,6 +8183,11 @@ def _run_guided_context_acquisition(
         _planning_skip_reason if _planning_forced_skip
         else (_verifier_skip_reason if _verifier_forced_skip else None)
     )
+    if _strategy_failure_reason and not _skip_patch_generation:
+        # Strategy was invoked and failed: the gates it establishes (edit
+        # readiness, target authority) cannot run -- never State A.
+        _skip_patch_generation = True
+        _skip_patch_generation_reason = _strategy_failure_reason
     _edit_readiness = None  # EditReadinessResult | None -- see PipelineResult.edit_readiness
     _edit_acquisition = None  # AcquisitionResult | None -- see PipelineResult.edit_acquisition
     _guided_acquisition = None  # GuidedAcquisitionResult | None -- see PipelineResult.guided_acquisition
@@ -8429,6 +8537,14 @@ def _run_guided_context_acquisition(
         except Exception as exc:
             progress.warning("Target context unavailable")
             progress.verbose(f"[pipeline] Final-Target Remediation Slice unavailable: {type(exc).__name__}: {exc}")
+            # The Edit Readiness Gate did not complete -- readiness is
+            # unknown, never assumed. Same outcome as a gate that ran and
+            # found the edit source not ready.
+            _skip_patch_generation = True
+            _skip_patch_generation_reason = _skip_patch_generation_reason or (
+                "Edit Readiness could not be established -- the target-context step failed "
+                f"({type(exc).__name__}: {exc})"
+            )
     elif _strategy_has_named_target:
         # Final Strategy named a real, repository-resolvable target/
         # mechanism, but -- even after the bounded evidence-gap
@@ -8894,6 +9010,7 @@ def run(
 
     _strategy_ctx = ""
     _strategy_result = None  # read again below by the Final-Target Remediation Slice builder
+    _strategy_failure_reason = None  # set only when Strategy was invoked and failed
     if _planner_evidence_ctx:
         try:
             from .remediation_planner import (
@@ -8949,6 +9066,7 @@ def run(
                 discovery_plan_ctx=_plan_ctx,
                 planner_evidence_ctx=_planner_evidence_ctx,
             )
+            _strategy_failure_reason = _strategy_invocation_failure(_planner_evidence_ctx, _strategy_result)
             _strategy_ctx = _strategy_result.rendered
             if _strategy_ctx:
                 progress.success("Final strategy generated")
@@ -8968,6 +9086,10 @@ def run(
         except Exception as exc:
             progress.warning("Final strategy unavailable")
             progress.verbose(f"[pipeline] Final remediation strategy unavailable: {type(exc).__name__}: {exc}")
+            _strategy_failure_reason = (
+                f"Final Remediation Strategy was invoked but failed ({type(exc).__name__}: {exc}) -- "
+                "edit readiness and target authority could not be established"
+            )
 
     # Evidence-Gap Strategy Fallback: Final Strategy #1 evaluated a real
     # response and either (a) named zero authoritative targets while
@@ -9086,6 +9208,8 @@ def run(
             # _run_guided_context_acquisition's own docstring on
             # `_planning_forced_skip`.
             _s2_outcome = "skipped_planning_ungrounded"
+        elif _strategy_failure_reason is not None:
+            _s2_outcome = "unavailable"
         elif _strategy_result is not None:
             _s2_outcome = "generated"
         elif not _planner_evidence_ctx:
@@ -9097,6 +9221,7 @@ def run(
             outcome=_s2_outcome,
             artifact={
                 "strategy_result": to_jsonable(_strategy_result),
+                "strategy_failure_reason": _strategy_failure_reason,
                 "evidence_gap_fallback": to_jsonable(
                     {
                         "attempted": _evidence_gap_fallback["attempted"],
@@ -9186,6 +9311,7 @@ def run(
         _verifier_skip_reason=_verifier_skip_reason,
         _planning_forced_skip=_planning_forced_skip,
         _planning_skip_reason=_planning_skip_reason,
+        _strategy_failure_reason=_strategy_failure_reason,
     )
     _slice_ctx = _s3_result["_slice_ctx"]
     _coverage_warning_ctx = _s3_result["_coverage_warning_ctx"]

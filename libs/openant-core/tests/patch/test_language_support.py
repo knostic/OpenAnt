@@ -3,7 +3,6 @@ gate Python-only deterministic signals on non-Python repositories."""
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 

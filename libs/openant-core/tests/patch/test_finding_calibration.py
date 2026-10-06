@@ -11,11 +11,8 @@ parseable).
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from unittest import mock
 
-import pytest
 
 
 from utilities.autopatcher.finding_calibration import (
@@ -48,6 +45,7 @@ class TestParseResponse:
             "remediation_impact": "validation_only",  # normalized: Unresolved parsed to []
             "evidence_acquirability": None,
             "evidence_request": None,
+            "calibration_failed": False,
         }
         assert result[1]["group"] == "hypothesis"
         assert result[1]["unresolved_dependencies"] == [
@@ -75,6 +73,7 @@ class TestParseResponse:
             "remediation_impact": "unclear",
             "evidence_acquirability": None,
             "evidence_request": None,
+            "calibration_failed": True,
         }
 
     def test_invalid_group_name_falls_back_to_hypothesis(self):
@@ -159,6 +158,7 @@ class TestCalibrateFindings:
             "remediation_impact": "validation_only",  # normalized: Unresolved parsed to []
             "evidence_acquirability": None,
             "evidence_request": None,
+            "calibration_failed": False,
         }]
 
     def test_user_message_includes_code_context_and_findings(self):
@@ -725,6 +725,7 @@ class TestBlockLocalParsing:
             "remediation_impact": "unclear",
             "evidence_acquirability": None,
             "evidence_request": None,
+            "calibration_failed": True,
         }
 
     def test_duplicate_block_numbers_do_not_corrupt_other_findings(self):
@@ -826,6 +827,7 @@ class TestDuplicateBlockNumberFailsClosed:
             "remediation_impact": "unclear",
             "evidence_acquirability": None,
             "evidence_request": None,
+            "calibration_failed": True,
         }
 
     def test_duplicate_number_observed_vs_hypothesis_still_fails_closed(self):
@@ -936,6 +938,7 @@ class TestDuplicateBlockNumberFailsClosed:
             "remediation_impact": "unclear",
             "evidence_acquirability": None,
             "evidence_request": None,
+            "calibration_failed": True,
         }
 
 
@@ -3532,7 +3535,7 @@ class TestActionableViaReferencePassthrough:
 
 class TestFindingCalibrationCapacityContract:
     def test_capacity_accounts_for_system_prompt_vuln_patch_and_findings(self):
-        from utilities.autopatcher.finding_calibration import compute_finding_calibration_capacity, _PROMPT_PATH
+        from utilities.autopatcher.finding_calibration import compute_finding_calibration_capacity
 
         findings = ["finding one", "finding two"]
         cap_small = compute_finding_calibration_capacity("v", "p", findings)
@@ -3548,7 +3551,7 @@ class TestFindingCalibrationCapacityContract:
         patch/findings, which are always-present fixed overhead)."""
         from utilities.autopatcher.finding_calibration import compute_finding_calibration_capacity
 
-        cap = compute_finding_calibration_capacity("v", "p", ["f"])
+        compute_finding_calibration_capacity("v", "p", ["f"])
         # A capacity computed with a nonsense huge code_context isn't even
         # accepted as a parameter -- this just documents that the function
         # signature has no such parameter to begin with.

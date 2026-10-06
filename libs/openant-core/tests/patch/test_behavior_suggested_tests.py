@@ -4,7 +4,6 @@ when a behavior summary exists (mock LLM mode).
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 

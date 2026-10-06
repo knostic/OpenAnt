@@ -8,10 +8,8 @@ All file-system tests use pytest's tmp_path fixture — no real repos needed.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-import pytest
 
 
 from utilities.autopatcher.vulnerability_patterns import (

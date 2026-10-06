@@ -17,9 +17,9 @@ end-to-end (mock-mode LLM) proof through tools/run_traced.py.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest import mock
 
-import pytest
 
 from utilities.autopatcher.execution_recorder import ExecutionRecorder
 from utilities.autopatcher.stage_registry import (
@@ -217,7 +217,7 @@ class TestArtifacts:
         assert len(set(paths)) == len(paths)  # every execution has a DISTINCT artifact file
         for p in paths:
             assert json.loads  # sanity: json module usable
-            json.loads(open(p, encoding="utf-8").read())  # every artifact is valid JSON
+            json.loads(Path(p).read_text(encoding="utf-8"))  # every artifact is valid JSON
 
     def test_s1_artifact_contains_real_structured_output_not_a_boolean(self, tmp_path):
         _, rec = _run_with_recorder(
@@ -225,7 +225,7 @@ class TestArtifacts:
             patches_chall=[_CHALLENGER_CLEAN],
         )
         s1 = rec.executions[0]
-        artifact = json.loads(open(s1["artifact_path"], encoding="utf-8").read())
+        artifact = json.loads(Path(s1["artifact_path"]).read_text(encoding="utf-8"))
         assert "plan_result" in artifact
         assert isinstance(artifact["plan_result"], dict)  # a real RemediationPlanResult dict, not a bool
         assert set(artifact["plan_result"].keys()) >= {"rendered", "target_files", "target_symbols"}
@@ -240,7 +240,7 @@ class TestArtifacts:
             patches_chall=[_CHALLENGER_CLEAN],
         )
         s3 = rec.executions[2]
-        artifact = json.loads(open(s3["artifact_path"], encoding="utf-8").read())
+        artifact = json.loads(Path(s3["artifact_path"]).read_text(encoding="utf-8"))
         assert "slice_result" in artifact
         assert "edit_readiness" in artifact
         assert "skip_patch_generation" in artifact
@@ -250,17 +250,27 @@ class TestArtifacts:
         assert not isinstance(artifact["slice_result"], bool)
         assert not isinstance(artifact["edit_readiness"], bool)
 
-    def test_artifacts_immutable_after_later_execution_finishes(self, tmp_path):
+    def test_artifacts_immutable_after_later_execution_finishes(self, tmp_path, monkeypatch):
+        # Snapshot S1's artifact bytes at the moment S1 itself finishes, then
+        # compare after every later execution has finished.
+        snapshots = []
+        original_finish = ExecutionRecorder.finish
+
+        def _finish_and_snapshot(self, handle, **kwargs):
+            record = original_finish(self, handle, **kwargs)
+            if not snapshots:
+                snapshots.append((record["artifact_path"], Path(record["artifact_path"]).read_bytes()))
+            return record
+
+        monkeypatch.setattr(ExecutionRecorder, "finish", _finish_and_snapshot)
         _, rec = _run_with_recorder(
             tmp_path, patches_gen=[_CLEAN_DIFF], patches_app=[_APPLICABILITY_CLEAN],
             patches_chall=[_CHALLENGER_CLEAN],
         )
-        s1_path = rec.executions[0]["artifact_path"]
-        before = open(s1_path, "rb").read()
-        # s5 (the last execution) has already finished by the time we read
-        # this -- re-read s1 and confirm it was never touched.
-        after = open(s1_path, "rb").read()
-        assert before == after
+        s1_path, before = snapshots[0]
+        assert s1_path == rec.executions[0]["artifact_path"]
+        assert len(rec.executions) > 1  # later executions really did finish afterwards
+        assert Path(s1_path).read_bytes() == before
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +284,7 @@ class TestS4Artifact:
             patches_chall=[_CHALLENGER_CLEAN],
         )
         s4 = rec.executions[3]
-        artifact = json.loads(open(s4["artifact_path"], encoding="utf-8").read())
+        artifact = json.loads(Path(s4["artifact_path"]).read_text(encoding="utf-8"))
         assert artifact["patch"] == _CLEAN_DIFF
         for key in (
             "original_patch", "retry_patch", "retry_attempted", "retry_succeeded",
@@ -300,7 +310,7 @@ class TestS5Artifact:
             patches_chall=[_CHALLENGER_WITH_DEFECT],
         )
         s5 = rec.executions[4]
-        artifact = json.loads(open(s5["artifact_path"], encoding="utf-8").read())
+        artifact = json.loads(Path(s5["artifact_path"]).read_text(encoding="utf-8"))
         assert artifact["challenger"] == _CHALLENGER_WITH_DEFECT
         assert "classified_challenger" in artifact
         assert artifact["classified_challenger"]["confirmed_defect_count"] >= 1
@@ -355,8 +365,8 @@ class TestRepairLoopDoesNotFabricateS4_2OrS5_2:
             patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
             patches_chall=[_CHALLENGER_WITH_DEFECT, _CHALLENGER_CLEAN],
         )
-        s4 = json.loads(open(rec.executions[3]["artifact_path"], encoding="utf-8").read())
-        s5 = json.loads(open(rec.executions[4]["artifact_path"], encoding="utf-8").read())
+        s4 = json.loads(Path(rec.executions[3]["artifact_path"]).read_text(encoding="utf-8"))
+        s5 = json.loads(Path(rec.executions[4]["artifact_path"]).read_text(encoding="utf-8"))
         # S4's own recorded `patch` is the INITIAL candidate, even though
         # the repair loop later replaced the pipeline's own `patch` local
         # with the repair diff for the report.
@@ -383,7 +393,7 @@ class TestSkippedAndDegradedOutcomes:
             tmp_path, patches_gen=[""], patches_app=[], patches_chall=[], no_candidate=True,
         )
         s4 = rec.executions[3]
-        artifact = json.loads(open(s4["artifact_path"], encoding="utf-8").read())
+        artifact = json.loads(Path(s4["artifact_path"]).read_text(encoding="utf-8"))
         assert not artifact["patch"]
 
     def test_s2_s3_honestly_skip_when_no_planner_evidence(self, tmp_path):

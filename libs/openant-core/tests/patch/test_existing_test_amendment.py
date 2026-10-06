@@ -16,16 +16,13 @@ import subprocess
 from pathlib import Path
 from unittest import mock
 
-import pytest
 
 import utilities.autopatcher.existing_test_amendment as eta
 from utilities.autopatcher.existing_test_regression import (
     STATUS_NEW_FAILURES_DETECTED,
-    STATUS_NOT_VERIFIED,
     STATUS_PASS,
     STATUS_PRE_EXISTING_FAILURES_ONLY,
     ExistingTestComparisonResult,
-    TestRunResult,
 )
 from utilities.autopatcher.test_execution_models import TestExecutionPlan, TestExecutionResult
 
@@ -325,7 +322,7 @@ class TestAttemptExistingTestAmendment:
         _make_git_repo(tmp_path)
 
         class _BrokenLLM:
-            def complete(self, *a, **kw):
+            def complete(self, system_prompt, user_message, stage="unknown"):
                 raise RuntimeError("provider unavailable")
 
         outcome = eta.attempt_existing_test_amendment(

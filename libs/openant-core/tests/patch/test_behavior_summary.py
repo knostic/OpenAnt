@@ -1,5 +1,4 @@
 from pathlib import Path
-import sys
 
 
 from utilities.autopatcher.behavior_summary import BehaviorAnalyzer

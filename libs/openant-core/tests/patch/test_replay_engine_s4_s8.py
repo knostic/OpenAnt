@@ -78,6 +78,14 @@ def _manifest(run_dir: Path) -> dict:
     from utilities.autopatcher import lineage
     return lineage.load_manifest(run_dir)
 
+def _source_outcome(run_dir: Path, stage_name: str):
+    """The outcome the SOURCE run recorded for `stage_name` -- a replay of
+    that stage on identical inputs must reproduce it (not degrade to e.g.
+    "unavailable" because an upstream artifact failed to load)."""
+    executions = [e for e in _manifest(run_dir)["executions"] if e["canonical_stage"] == stage_name]
+    assert executions, f"source run never executed {stage_name}"
+    return executions[-1]["outcome"]
+
 
 # ---------------------------------------------------------------------------
 # Each stage independently replayable from the full run
@@ -120,6 +128,7 @@ class TestIndependentReplay:
             source_run=full_run, stage_name="patch_repair_and_calibration",
             output_dir=tmp_path / "replay-s6", repo_root_override=str(repo_root),
         )
+        assert result.outcome == _source_outcome(full_run, "patch_repair_and_calibration")
         manifest = _manifest(tmp_path / "replay-s6")
         execution = manifest["executions"][0]
         assert set(execution["consumed"].keys()) == {"patch_generation_and_post_patch_investigation", "challenger"}
@@ -134,6 +143,7 @@ class TestIndependentReplay:
             source_run=full_run, stage_name="patch_review",
             output_dir=tmp_path / "replay-s7", repo_root_override=str(repo_root),
         )
+        assert result.outcome == _source_outcome(full_run, "patch_review")
         manifest = _manifest(tmp_path / "replay-s7")
         execution = manifest["executions"][0]
         assert set(execution["consumed"].keys()) == {"patch_repair_and_calibration"}
@@ -145,6 +155,7 @@ class TestIndependentReplay:
             source_run=full_run, stage_name="confidence_scoring",
             output_dir=tmp_path / "replay-s8", repo_root_override=str(repo_root),
         )
+        assert result.outcome == _source_outcome(full_run, "confidence_scoring")
         manifest = _manifest(tmp_path / "replay-s8")
         execution = manifest["executions"][0]
         assert set(execution["consumed"].keys()) == {"patch_repair_and_calibration", "patch_review"}

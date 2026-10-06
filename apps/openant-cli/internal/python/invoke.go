@@ -92,9 +92,10 @@ type InvokeResult struct {
 //   - extraEnv overrides/adds arbitrary env vars in the subprocess ONLY -- it is
 //     merged into a copy of this process's environment and never mutates the
 //     calling process's own os.Environ() (no os.Setenv is ever called here)
-//   - stdin is connected to this process's stdin, so a subprocess that needs to
-//     read interactive input (e.g. Auto Patcher's own legacy provider prompt,
-//     when invoked directly and not resolved by the Go-side caller first) can
+//   - stdin is NOT connected (the subprocess reads EOF): Python-side prompts
+//     detect the non-TTY stdin and take their non-interactive path (e.g.
+//     `report`'s dynamic-test prompt); stderr is line-buffered, so a
+//     newline-less Python prompt would otherwise block invisibly
 func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey string, extraEnv map[string]string) (*InvokeResult, error) {
 	// -P keeps the process working directory off sys.path. `-m openant` otherwise
 	// prepends the CWD, and this engine inherits the user's shell CWD — which in the
@@ -145,13 +146,6 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 		overrides[k] = v
 	}
 	cmd.Env = mergeEnv(os.Environ(), overrides)
-
-	// Connect stdin so a subprocess that needs to read interactive input can
-	// do so when this process itself has a real terminal attached. Callers
-	// that resolve everything up front (e.g. cmd/patch_llm.go) never need
-	// this, but it must be wired for direct/manual invocations and general
-	// subprocess correctness.
-	cmd.Stdin = os.Stdin
 
 	// #431: route stdout/stderr through MANAGED writers (invoke_ctx.go's
 	// pattern) instead of StdoutPipe/StderrPipe + this function's own copy

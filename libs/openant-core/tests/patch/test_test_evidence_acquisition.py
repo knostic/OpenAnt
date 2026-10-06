@@ -442,7 +442,7 @@ class TestBoundedReadsDoNotLoadArbitrarilyLargeFiles:
     def test_read_bounded_text_never_exceeds_raw_limit(self, tmp_path: Path):
         huge = tmp_path / "huge.toml"
         huge.write_text("x" * (_MAX_RAW_READ_BYTES * 4), encoding="utf-8")
-        text = _read_bounded_text(huge, raw_limit=_MAX_RAW_READ_BYTES)
+        text = _read_bounded_text(huge, root=tmp_path, raw_limit=_MAX_RAW_READ_BYTES)
         assert text is not None
         assert len(text) <= _MAX_RAW_READ_BYTES
 

@@ -15,9 +15,9 @@ real Docker daemon or LLM.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest import mock
 
-import pytest
 
 from utilities.autopatcher.execution_recorder import ExecutionRecorder
 from utilities.autopatcher.existing_test_amendment import AmendmentOutcome, AmendmentRerunOutcome
@@ -285,7 +285,7 @@ class TestNoPlanDiscovered:
         s10, s11 = _s10_s11(rec)
         assert s10["outcome"] == "rejected"
         assert s11["outcome"] == "skipped_no_plan"
-        artifact10 = json.loads(open(s10["artifact_path"], encoding="utf-8").read())
+        artifact10 = json.loads(Path(s10["artifact_path"]).read_text(encoding="utf-8"))
         assert artifact10["reason"] == early_result.reason
 
 
@@ -302,7 +302,7 @@ class TestProductionReplayContractParity:
         import dataclasses
         _, rec, _, _ = _run_with_recorder(tmp_path)
         s10, _ = _s10_s11(rec)
-        artifact = json.loads(open(s10["artifact_path"], encoding="utf-8").read())
+        artifact = json.loads(Path(s10["artifact_path"]).read_text(encoding="utf-8"))
         # Round-trip the reference through JSON too (tuples -> lists) --
         # both production's and replay's own artifacts undergo the exact
         # same JSON conversion; comparing structural/JSON shape, not

@@ -13,6 +13,7 @@ and correctly attributed.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -109,7 +110,7 @@ def _run_with_recorder(tmp_path, *, patches_gen, patches_app, patches_chall, cal
 
 def _s6(rec):
     s6 = rec.executions[5]
-    artifact = json.loads(open(s6["artifact_path"], encoding="utf-8").read())
+    artifact = json.loads(Path(s6["artifact_path"]).read_text(encoding="utf-8"))
     return s6, artifact
 
 

@@ -25,9 +25,9 @@ throughout -- no repo/CVE-specific wording.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest import mock
 
-import pytest
 
 from utilities.autopatcher import pipeline as pipeline_mod
 from utilities.autopatcher.remediation_planner import (
@@ -272,7 +272,7 @@ class TestImplementationEvidenceGap:
         assert _NARROW_MECHANISM in code_context
 
         s2 = next(e for e in recorder.executions if e["canonical_stage"] == "remediation_strategy")
-        artifact = json.loads(open(s2["artifact_path"], encoding="utf-8").read())
+        artifact = json.loads(Path(s2["artifact_path"]).read_text(encoding="utf-8"))
         assert artifact["verified_authority"]["strategy_reported_implementation_gap"] is True
         assert artifact["verified_authority"]["semantic_authority_source"] == "planner"
 
@@ -477,8 +477,8 @@ class TestObservability:
         )
         s1 = next(e for e in recorder.executions if e["canonical_stage"] == "repository_analysis_and_remediation_planning")
         s2 = next(e for e in recorder.executions if e["canonical_stage"] == "remediation_strategy")
-        s1_artifact = json.loads(open(s1["artifact_path"], encoding="utf-8").read())
-        s2_artifact = json.loads(open(s2["artifact_path"], encoding="utf-8").read())
+        s1_artifact = json.loads(Path(s1["artifact_path"]).read_text(encoding="utf-8"))
+        s2_artifact = json.loads(Path(s2["artifact_path"]).read_text(encoding="utf-8"))
         return s1_artifact, s2_artifact
 
     def test_verified_path_metadata(self, tmp_path):
@@ -744,7 +744,7 @@ class TestFix2StaleEditAuthorityExcludedFromPatchGeneration:
             e for e in recorder.executions
             if e["canonical_stage"] == "patch_generation_and_post_patch_investigation"
         )
-        artifact = json.loads(open(s4["artifact_path"], encoding="utf-8").read())
+        artifact = json.loads(Path(s4["artifact_path"]).read_text(encoding="utf-8"))
         conformance = artifact["patch_target_conformance"]
         assert conformance["all_conformant"] is False
         assert "other.py" in conformance["unexpected_files"]

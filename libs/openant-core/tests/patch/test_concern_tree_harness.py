@@ -14,7 +14,6 @@ from utilities.autopatcher.tools.concern_tree_harness import (
     extract_archived_concerns,
     run_comparison,
     run_tree_only,
-    _build_investigation_context,
     _load_inputs,
     _ReplayLLM,
     _V2_ONLY_KEYS,
@@ -90,7 +89,7 @@ class _RaisingIfCalledLLM:
     sampling at all (a stronger check than merely inspecting the
     resulting JSON)."""
 
-    def complete(self, *args, **kwargs):
+    def complete(self, system_prompt, user_message, stage="unknown"):
         raise AssertionError("baseline arm made an LLM call in paired-replay mode")
 
 

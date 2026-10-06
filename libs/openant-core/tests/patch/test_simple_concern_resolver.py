@@ -359,8 +359,20 @@ class TestIsolation:
 
     def test_resolver_only_imports_provenance_helpers_from_patch_challenger(self):
         """Item 26."""
+        import ast
         src = Path("utilities/autopatcher/simple_concern_resolver.py").read_text()
-        assert "from .patch_challenger import _point_citation_valid, _normalize_for_provenance, _strip_quote_wrapping" in src
+        provenance_helpers = {"_point_citation_valid", "_normalize_for_provenance", "_strip_quote_wrapping"}
+        imported = set()
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.ImportFrom) and node.module == "patch_challenger":
+                assert node.level == 1
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and "patch_challenger" in node.module:
+                raise AssertionError(f"unexpected patch_challenger import form: {node.module}")
+            elif isinstance(node, ast.Import):
+                assert not any("patch_challenger" in alias.name for alias in node.names)
+        assert "_point_citation_valid" in imported
+        assert imported <= provenance_helpers, imported - provenance_helpers
 
     def test_no_production_module_imports_simple_concern_resolver(self):
         challenger_src = Path("utilities/autopatcher/patch_challenger.py").read_text()

@@ -34,7 +34,6 @@ from __future__ import annotations
 
 from unittest import mock
 
-import pytest
 
 from utilities.autopatcher.pipeline import (
     _run_guided_context_acquisition,
@@ -97,9 +96,10 @@ class TestFinalStrategyRanWithTargets:
         ) as mock_build:
             result = _run_gate(_strategy_result=strategy)
         mock_build.assert_called_once()
-        # The pre-existing exception handler for THIS branch (not the new
-        # gate) catches the failure and never touches _skip_patch_generation.
-        assert result["_skip_patch_generation"] is False
+        # THIS branch's own exception handler (not the authority gate)
+        # caught the failure -- and fails closed: readiness never established.
+        assert result["_skip_patch_generation"] is True
+        assert "Edit Readiness could not be established" in result["_skip_patch_generation_reason"]
 
     def test_validation_only_evidence_gap_still_enters_existing_slice_path(self):
         """A named target with `target_authority_unresolved=False` must
@@ -119,7 +119,10 @@ class TestFinalStrategyRanWithTargets:
         ) as mock_build:
             result = _run_gate(_strategy_result=strategy)
         mock_build.assert_called_once()
-        assert result["_skip_patch_generation"] is False
+        # Reached the Edit Readiness path (whose crash fails closed with its
+        # own reason), never the authority gate.
+        assert result["_skip_patch_generation"] is True
+        assert "Edit Readiness could not be established" in result["_skip_patch_generation_reason"]
 
 
 class TestFinalStrategyRanWithZeroTargets:
@@ -223,7 +226,10 @@ class TestFinalStrategyRanWithNamedTargetButAuthorityUnresolved:
         ) as mock_build:
             result = _run_gate(_strategy_result=strategy)
         mock_build.assert_called_once()
-        assert result["_skip_patch_generation"] is False
+        # Reached the Edit Readiness path (whose crash fails closed with its
+        # own reason), never the authority gate.
+        assert result["_skip_patch_generation"] is True
+        assert "Edit Readiness could not be established" in result["_skip_patch_generation_reason"]
 
     def test_gate_does_not_read_rendered_for_authority_gap_either(self):
         strategy_rendered_empty = _strategy(

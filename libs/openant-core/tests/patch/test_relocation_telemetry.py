@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import subprocess
 
-import pytest
 
 from utilities.autopatcher.relocation_telemetry import (
-    HunkRelocationTelemetry,
     RelocationTelemetry,
     build_relocation_telemetry,
     summarize,

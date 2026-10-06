@@ -10,7 +10,6 @@ Actions" now includes Reason too, so nothing unique was lost.
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 

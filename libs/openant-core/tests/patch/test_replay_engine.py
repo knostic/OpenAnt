@@ -35,7 +35,7 @@ from utilities.autopatcher.replay_engine import (
     _repo_preflight,
     replay_stage,
 )
-from utilities.autopatcher.stage_registry import STAGE_SPECS, StageSpec
+from utilities.autopatcher.stage_registry import STAGE_SPECS
 
 
 # ---------------------------------------------------------------------------

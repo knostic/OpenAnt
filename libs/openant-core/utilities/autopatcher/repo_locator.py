@@ -41,7 +41,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import List, NamedTuple, Tuple
+from typing import NamedTuple
 
 from .repository_grounding_models import (
     DiscoveryEvidence,

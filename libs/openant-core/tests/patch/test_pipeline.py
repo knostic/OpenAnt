@@ -7,7 +7,6 @@ All tests run in mock mode (no OPENAI_API_KEY required).
 from __future__ import annotations
 
 import os
-import sys
 import textwrap
 from pathlib import Path
 from unittest import mock
@@ -1209,7 +1208,7 @@ class TestReleasePolishReportBehaviors:
         challenger = {"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""}
         result = PipelineResult(**self._kwargs(tmp_path, challenger, None))
         report = _build_report(result)
-        assert "## Validation Actions" in report or True  # must not raise
+        assert "## Validation Actions" in report
 
     # --- Decision 7: upstream-provenance disclaimer ---
 
@@ -3802,7 +3801,7 @@ class TestDefaultGuardReachabilityScope:
         assert set(calibration[0].keys()) == {
             "original", "group", "reworded", "unresolved_dependencies",
             "group_before_consistency_check", "remediation_impact",
-            "evidence_acquirability", "evidence_request",
+            "evidence_acquirability", "evidence_request", "calibration_failed",
         }
 
 

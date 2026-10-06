@@ -11,6 +11,7 @@ LLM) proof of LLM-call attribution/no-leakage across S6/S7/S8/S9.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -89,7 +90,7 @@ def _run_with_recorder(tmp_path, *, patches_gen, patches_app, patches_chall, no_
 
 def _artifact(rec, index):
     execution = rec.executions[index]
-    return execution, json.loads(open(execution["artifact_path"], encoding="utf-8").read())
+    return execution, json.loads(Path(execution["artifact_path"]).read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------

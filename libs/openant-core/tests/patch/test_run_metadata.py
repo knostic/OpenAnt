@@ -1,10 +1,7 @@
-import os
 import subprocess
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pytest
 
 
 from utilities.autopatcher.run_metadata import RunMetadata, auto_output_path, collect_git_info, render_metadata_section

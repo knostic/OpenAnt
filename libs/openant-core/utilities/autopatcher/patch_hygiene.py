@@ -15,7 +15,7 @@ Never raises — callers may rely on it returning [] on any error.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 # ---------------------------------------------------------------------------

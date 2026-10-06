@@ -100,6 +100,14 @@ def _manifest(run_dir: Path) -> dict:
     from utilities.autopatcher import lineage
     return lineage.load_manifest(run_dir)
 
+def _source_outcome(run_dir: Path, stage_name: str):
+    """The outcome the SOURCE run recorded for `stage_name` -- a replay of
+    that stage on identical inputs must reproduce it (not degrade to e.g.
+    "unavailable" because an upstream artifact failed to load)."""
+    executions = [e for e in _manifest(run_dir)["executions"] if e["canonical_stage"] == stage_name]
+    assert executions, f"source run never executed {stage_name}"
+    return executions[-1]["outcome"]
+
 
 # ---------------------------------------------------------------------------
 # Independent replay -- S1, S2, S3, S9, S11, report_generation (combined)
@@ -142,6 +150,7 @@ class TestIndependentReplay:
             source_run=full_run, stage_name="guided_context_acquisition",
             output_dir=tmp_path / "replay-s3", repo_root_override=str(repo_root),
         )
+        assert result.outcome == _source_outcome(full_run, "guided_context_acquisition")
         manifest = _manifest(tmp_path / "replay-s3")
         execution = manifest["executions"][0]
         assert set(execution["consumed"].keys()) == {
@@ -171,6 +180,7 @@ class TestIndependentReplay:
             source_run=full_run, stage_name="existing_test_comparison",
             output_dir=tmp_path / "replay-s11", repo_root_override=str(repo_root),
         )
+        assert result.outcome == _source_outcome(full_run, "existing_test_comparison")
         manifest = _manifest(tmp_path / "replay-s11")
         execution = manifest["executions"][0]
         # remediation_strategy added for the Existing Test Amendment

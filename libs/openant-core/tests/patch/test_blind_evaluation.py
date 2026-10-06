@@ -26,7 +26,6 @@ import utilities.autopatcher.investigation_adapters as adapters_module
 import utilities.autopatcher.pipeline as pipeline_module
 from utilities.autopatcher.cve_converter import cve_to_vuln_text as REAL_CVE_TO_VULN_TEXT
 from utilities.autopatcher.investigation_adapters import case_from_vulnerability_text
-from utilities.autopatcher.tools import blind_evaluation as be
 from utilities.autopatcher.tools.blind_evaluation import (
     DIRECT_REMEDIATION_COMMIT,
     DIRECT_REMEDIATION_COMPARE,

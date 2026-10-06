@@ -18,6 +18,7 @@ All hermetic: LLM_PROVIDER=mock, no network, no real repo, no Docker.
 
 import json
 import os
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -214,7 +215,7 @@ def test_run_patch_without_repo_root_never_scans_process_cwd(tmp_path, monkeypat
 
     result = run_patch(po_path, "F-001", str(tmp_path), repo_root=None)
 
-    report_text = open(result.trust_report_path, encoding="utf-8").read()
+    report_text = Path(result.trust_report_path).read_text(encoding="utf-8")
     assert "Not evaluated — no repository root was provided." in report_text
     openant_core_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     assert openant_core_root not in report_text
@@ -226,7 +227,7 @@ def test_run_patch_never_leaks_suggested_fix_into_artifact(tmp_path, monkeypatch
 
     result = run_patch(po_path, "F-001", str(tmp_path), repo_root=None)
 
-    vuln_text = open(result.vulnerability_path, encoding="utf-8").read()
+    vuln_text = Path(result.vulnerability_path).read_text(encoding="utf-8")
     assert "DO-NOT-LEAK-THIS-SUGGESTED-FIX" not in vuln_text
     assert "DO-NOT-LEAK-THIS-REJECTION-REASON" not in vuln_text
 
@@ -240,7 +241,7 @@ def test_run_patch_mock_mode_is_self_disclosing(tmp_path, monkeypatch):
 
     result = run_patch(po_path, "F-001", str(tmp_path), repo_root=None)
 
-    report_text = open(result.trust_report_path, encoding="utf-8").read()
+    report_text = Path(result.trust_report_path).read_text(encoding="utf-8")
     assert "MOCK MODE" in report_text
     assert "LLM mode | MOCK" in report_text
 
@@ -490,7 +491,7 @@ def test_run_patch_without_repo_root_creates_no_investigation_directory(tmp_path
     result = run_patch(po_path, "F-001", str(tmp_path), repo_root=None)
 
     assert not (tmp_path / "patch" / "F-001-investigation").exists()
-    vuln_text_written = open(result.vulnerability_path, encoding="utf-8").read()
+    vuln_text_written = Path(result.vulnerability_path).read_text(encoding="utf-8")
     assert vuln_text_written == render_vulnerability_markdown(FIXTURE_FINDING_ELIGIBLE)
 
 

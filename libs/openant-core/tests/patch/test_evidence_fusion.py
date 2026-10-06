@@ -15,7 +15,6 @@ from utilities.autopatcher.candidate_selection import CandidateSelection
 from utilities.autopatcher.evidence_fusion import (
     DEFAULT_MAX_CHARS,
     CandidateRelationship,
-    RepositoryUnderstanding,
     fuse_evidence,
     render_repository_understanding,
 )

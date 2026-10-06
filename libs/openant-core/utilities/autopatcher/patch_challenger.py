@@ -457,6 +457,9 @@ def _normalize_for_provenance(text: str) -> str:
     return normalized.strip()
 
 
+_MIN_CITATION_CHARS = 3
+
+
 def _point_citation_valid(raw: "Optional[str]", *sources: str) -> bool:
     """A resolved fact's citation is only trustworthy when the cited text
     is mechanically present in evidence this Challenger run actually
@@ -471,12 +474,16 @@ def _point_citation_valid(raw: "Optional[str]", *sources: str) -> bool:
     and a citation naming content omitted upstream for technical capacity
     still fails, since omitted content is never concatenated into the
     strings Challenger receives in the first place -- no separate
-    omission-ledger lookup is needed."""
+    omission-ledger lookup is needed.
+
+    A quote shorter than _MIN_CITATION_CHARS non-whitespace characters is
+    never a citation: a single letter or a two-character keyword occurs in
+    almost any corpus, so its containment proves nothing about provenance."""
     quoted = _strip_quote_wrapping(raw)
     if not quoted or quoted.lower() in ("none", "n/a", "unknown"):
         return False
     normalized_quote = _normalize_for_provenance(quoted)
-    if not normalized_quote:
+    if len(re.sub(r"\s", "", normalized_quote)) < _MIN_CITATION_CHARS:
         return False
     return any(normalized_quote in _normalize_for_provenance(source) for source in sources if source)
 

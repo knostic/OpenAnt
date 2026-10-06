@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from unittest import mock
 
-import pytest
 
 
 def _capacity(**kwargs):

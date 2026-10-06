@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from utilities.autopatcher.candidate_selection import CandidateSelection
-from utilities.autopatcher.repository_grounding_models import RepositoryCandidate
+from utilities.autopatcher.repository_grounding_models import CandidateEnrichment, RepositoryCandidate
 
 # best_tier values strong enough that a failure to resolve a function is
 # worth flagging as a divergence -- explicit_path (4) and symbol_definition

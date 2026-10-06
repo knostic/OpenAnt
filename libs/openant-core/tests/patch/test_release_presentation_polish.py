@@ -17,7 +17,6 @@ Covers:
 """
 from __future__ import annotations
 
-import sys
 import textwrap
 from unittest import mock
 

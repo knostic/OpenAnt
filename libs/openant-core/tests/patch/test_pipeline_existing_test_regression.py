@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from unittest import mock
 
-import pytest
 
 _MOCK_GROUNDED_PLANNER_JSON = (
     '{"remediation_mechanism": null, "target_files": [], "target_symbols": [], '
@@ -158,7 +157,7 @@ def _run_pipeline(
         mock.patch(
             "utilities.autopatcher.pipeline.discover_test_plan_for_comparison",
             return_value=discovery_return_value,
-        ) as mock_discover,
+        ),
         mock.patch(
             "utilities.autopatcher.pipeline.evaluate_existing_test_comparison_with_amendment",
             side_effect=_amendment_call,

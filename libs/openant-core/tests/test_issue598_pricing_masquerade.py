@@ -182,7 +182,9 @@ def test_every_production_call_site_passes_pricing():
                 if not any(k.arg == "pricing" for k in node.keywords):
                     offenders.append(f"{rel}:{node.lineno}")
                 checked += 1
-    assert checked == 18, f"the census changed: {checked} sites (was 18)"
+    # 19th site: utilities/autopatcher/llm_client.py (Auto Patcher call_llm),
+    # threaded via the adapter's own pricing like every other site.
+    assert checked == 19, f"the census changed: {checked} sites (was 19)"
     assert not offenders, f"unthreaded production callers: {offenders}"
 
 

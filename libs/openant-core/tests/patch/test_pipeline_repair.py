@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from unittest import mock
 
-import pytest
 
 _MOCK_GROUNDED_PLANNER_JSON = (
     '{"remediation_mechanism": null, "target_files": [], "target_symbols": [], '
@@ -1219,7 +1217,7 @@ class TestStillVulnerableRegressionEndToEnd:
                 "test vuln", api_key="", repo_root=str(tmp_path), execution_recorder=recorder,
             )
         s6 = next(e for e in recorder.executions if e["canonical_stage"] == "patch_repair_and_calibration")
-        artifact = json.loads(open(s6["artifact_path"], encoding="utf-8").read())
+        artifact = json.loads(Path(s6["artifact_path"]).read_text(encoding="utf-8"))
         assert artifact["repair_outcome"] == "attempted_applicable_rejected"
         assert artifact["authoritative_candidate"]["source"] == "original"
         assert artifact["authoritative_candidate"]["patch"] == _CLEAN_DIFF

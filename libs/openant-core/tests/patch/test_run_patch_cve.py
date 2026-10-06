@@ -11,6 +11,7 @@ for the equivalent run_patch() (Finding-mode) tests.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -69,7 +70,7 @@ class TestRunPatchCveHappyPath:
         with _mock_fetch_cve_at_source():
             result = run_patch_cve("CVE-2021-12345", str(repo_root), str(tmp_path))
 
-        report_text = open(result.trust_report_path, encoding="utf-8").read()
+        report_text = Path(result.trust_report_path).read_text(encoding="utf-8")
         assert "Input Source: CVE (CVE-2021-12345)" in report_text
         assert "not been verified against this repository" in report_text
         assert "| Input type | CVE (CVE-2021-12345, NVD) |" in report_text
@@ -84,7 +85,7 @@ class TestRunPatchCveHappyPath:
         with _mock_fetch_cve_at_source():
             result = run_patch_cve("CVE-2021-12345", str(repo_root), str(tmp_path))
 
-        vuln_text = open(result.vulnerability_path, encoding="utf-8").read()
+        vuln_text = Path(result.vulnerability_path).read_text(encoding="utf-8")
         assert vuln_text == cve_to_vuln_text(FIXTURE_CVE)
 
     def test_trust_report_mock_mode_is_self_disclosing(self, tmp_path, monkeypatch):
@@ -95,7 +96,7 @@ class TestRunPatchCveHappyPath:
         with _mock_fetch_cve_at_source():
             result = run_patch_cve("CVE-2021-12345", str(repo_root), str(tmp_path))
 
-        report_text = open(result.trust_report_path, encoding="utf-8").read()
+        report_text = Path(result.trust_report_path).read_text(encoding="utf-8")
         assert "MOCK MODE" in report_text
         assert "LLM mode | MOCK" in report_text
 

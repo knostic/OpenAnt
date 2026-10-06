@@ -29,6 +29,7 @@ orchestration (see test_planner_claim_verifier_orchestration.py):
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -1171,6 +1172,7 @@ class TestNamedTargetAuthorityGapFullPipelineWiring:
             ) as mock_slice,
         ):
             pipeline_mod.run(vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path))
+        assert spy_evidence.call_count == 2  # baseline + the one bounded reacquisition attempt
         assert spy_strategy.call_count == 1  # never rerun -- no new evidence to justify it
         mock_slice.assert_not_called()
 
@@ -1349,7 +1351,7 @@ class TestExecutionArtifactObservability:
                 vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path), execution_recorder=recorder,
             )
         s2 = next(e for e in recorder.executions if e["canonical_stage"] == "remediation_strategy")
-        artifact = json.loads(open(s2["artifact_path"], encoding="utf-8").read())
+        artifact = json.loads(Path(s2["artifact_path"]).read_text(encoding="utf-8"))
         return artifact
 
     def test_fallback_metadata_recorded_when_triggered(self, tmp_path):
@@ -1458,7 +1460,7 @@ class TestUrllib3TraceReplayRegression:
         assert s3["outcome"] != "skipped_no_strategy_targets"
 
         s2 = next(e for e in recorder.executions if e["canonical_stage"] == "remediation_strategy")
-        artifact = json.loads(open(s2["artifact_path"], encoding="utf-8").read())
+        artifact = json.loads(Path(s2["artifact_path"]).read_text(encoding="utf-8"))
         assert artifact["strategy_result"]["target_files"] == ["retry.py"]
         assert artifact["strategy_result"]["target_symbols"] == ["Retry"]
         assert artifact["evidence_gap_fallback"]["rerun_performed"] is True

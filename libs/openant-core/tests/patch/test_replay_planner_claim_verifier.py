@@ -25,7 +25,6 @@ from __future__ import annotations
 import json
 from unittest import mock
 
-import pytest
 
 from utilities.autopatcher import replay_engine
 from utilities.autopatcher.lineage import RESOLVED, Resolution

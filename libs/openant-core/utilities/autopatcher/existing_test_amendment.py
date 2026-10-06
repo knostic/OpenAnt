@@ -72,7 +72,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from .diff_parsing import parse_diff, semantic_delta
@@ -307,6 +307,30 @@ def _is_safe_repo_relative_path(path: str) -> bool:
     return True
 
 
+# Git diff sections that change a file without a "+++ b/<path>" line --
+# invisible to diff_parsing.parse_diff, so they could move, delete, re-mode
+# or replace files the scope check below never sees.
+_UNSCOPED_SECTION_RE = re.compile(
+    r"^(?:rename (?:from|to) |copy (?:from|to) |(?:old|new) mode |deleted file mode |"
+    r"\+\+\+ /dev/null|Binary files |GIT binary patch)",
+    re.MULTILINE,
+)
+_GIT_HEADER_RE = re.compile(r"^diff --git (.*)$", re.MULTILINE)
+_GIT_HEADER_PATHS_RE = re.compile(r"a/(\S+) b/(\S+)")
+
+
+def _unscoped_sections_reason(diff: str, parsed_files: "list[str]") -> "str | None":
+    """Why `diff` touches a file parse_diff did not report, or None."""
+    marker = _UNSCOPED_SECTION_RE.search(diff)
+    if marker:
+        return f"amendment diff contains a rename/copy/mode/delete/binary section ({marker.group(0).strip()!r})"
+    for header in _GIT_HEADER_RE.finditer(diff):
+        paths = _GIT_HEADER_PATHS_RE.fullmatch(header.group(1).strip())
+        if paths is None or paths.group(1) != paths.group(2) or paths.group(2) not in parsed_files:
+            return f"amendment diff has a file section with no reviewable content: {header.group(0)!r}"
+    return None
+
+
 def _validate_amendment_diff(
     diff: str, original_patch_files: "set[str]", grounded_files: "set[str]",
 ) -> "str | None":
@@ -325,6 +349,9 @@ def _validate_amendment_diff(
         return f"amendment diff could not be parsed: {type(exc).__name__}"
     if not amendment_files:
         return "amendment diff touched no recognizable files"
+    unscoped = _unscoped_sections_reason(diff, amendment_files)
+    if unscoped is not None:
+        return unscoped
     unsafe = [f for f in amendment_files if not _is_safe_repo_relative_path(f)]
     if unsafe:
         return f"amendment diff claimed unsafe/non-repository-relative path(s): {unsafe}"

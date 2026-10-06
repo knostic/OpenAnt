@@ -79,7 +79,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .llm_client import resolve_active_model, resolve_max_tokens
+from .llm_client import resolve_max_tokens
 from .technical_capacity import SourceCapacityResult, compute_source_capacity
 
 # Kept only so a stray import of the old policy vocabulary (tests, a

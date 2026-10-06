@@ -19,8 +19,6 @@ from utilities.autopatcher.concern_tree import (
     parse_action,
     Limits,
     EvidencePool,
-    ConcernTree,
-    resolve_node,
 )
 
 
@@ -106,12 +104,12 @@ class TestDecomposition:
         llm = _llm(
             _decompose(["question A"]),
             _decompose(["question A sub 1", "question A sub 2"]),
-            _proven(citation="x"),
-            _proven(citation="y"),
-            _refuted(citation="x", rationale="grandchildren resolve this"),  # "question A" reconsidered
-            _refuted(citation="x", rationale="question A resolves the root"),  # root reconsidered
+            _proven(citation="line_x"),
+            _proven(citation="line_y"),
+            _refuted(citation="line_x", rationale="grandchildren resolve this"),  # "question A" reconsidered
+            _refuted(citation="line_x", rationale="question A resolves the root"),  # root reconsidered
         )
-        result = evaluate_concern_tree("root question", code_context="x\ny", patch="", llm=llm)
+        result = evaluate_concern_tree("root question", code_context="line_x\nline_y", patch="", llm=llm)
         assert result["totals"]["max_depth_reached"] == 2
         assert result["root_final_status"] == "REFUTED"
         depths = sorted(n["depth"] for n in result["nodes"].values())
@@ -318,11 +316,11 @@ class TestParentReconsideration:
     def test_unresolved_child_still_reaches_parent_reconsideration(self):
         llm = _llm(
             _decompose(["question A", "question B"]),
-            _proven(citation="x"),
+            _proven(citation="line_x"),
             _unresolved(reason="cannot tell"),
             _unresolved(reason="one child unresolved, cannot conclude"),
         )
-        result = evaluate_concern_tree("root", code_context="x", patch="", llm=llm)
+        result = evaluate_concern_tree("root", code_context="line_x", patch="", llm=llm)
         root = result["nodes"][result["root_id"]]
         assert len(root["attempts"]) == 2  # initial DECOMPOSE + reconsideration
         assert root["attempts"][1]["action"] == "UNRESOLVED"
@@ -351,12 +349,12 @@ class TestParentReconsideration:
     def test_reconsideration_can_decompose_further(self):
         llm = _llm(
             _decompose(["question A"]),
-            _proven(citation="x"),
+            _proven(citation="line_x"),
             _decompose(["question B"], rationale="child A alone was insufficient"),
-            _proven(citation="y"),
-            _refuted(citation="x", rationale="now both hold"),
+            _proven(citation="line_y"),
+            _refuted(citation="line_x", rationale="now both hold"),
         )
-        result = evaluate_concern_tree("root", code_context="x\ny", patch="", llm=llm)
+        result = evaluate_concern_tree("root", code_context="line_x\nline_y", patch="", llm=llm)
         assert result["root_final_status"] == "REFUTED"
         root = result["nodes"][result["root_id"]]
         assert len(root["children"]) == 2

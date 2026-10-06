@@ -28,7 +28,8 @@ baseline-vs-patched diffing), not the full TAP14 specification:
   - YAML diagnostic blocks (``---`` ... ``...``) are skipped as opaque
     text, never mined for fake test identities.
   - "TAP version N" / "1..N" plan lines are structural markers, never
-    test lines.
+    test lines. Exactly one top-level plan is required, and must match the
+    number of top-level results (see ``parse_tap``).
   - a comment line that ISN'T "# Subtest: ..." is a free-form diagnostic
     and is always ignored -- it can never become a test identity.
 
@@ -76,7 +77,8 @@ if TYPE_CHECKING:
 from .result_parsers import _bounded_diagnostic
 
 _TAP_VERSION_RE = re.compile(r"^TAP version\s+\d+\s*$")
-_PLAN_RE = re.compile(r"^\d+\.\.\d+\s*$")
+_PLAN_RE = re.compile(r"^(?P<start>\d+)\.\.(?P<end>\d+)\s*(?:#.*)?$")  # "1..0 # SKIP reason" included
+_BAIL_OUT_RE = re.compile(r"^Bail out!", re.IGNORECASE)
 _SUBTEST_RE = re.compile(r"^#\s*Subtest:\s*(.*)$", re.IGNORECASE)
 _YAML_OPEN_RE = re.compile(r"^-{3}\s*$")
 _YAML_CLOSE_RE = re.compile(r"^\.{3}\s*$")
@@ -144,19 +146,42 @@ def parse_tap(text: "str | None") -> "ParsedTestCounts | None":
     declaration (an ambiguous/concatenated stream -- see module
     docstring), opens a "# Subtest:"/YAML block it never closes
     (truncated), nests a "# Subtest:" more than one level deep
-    (unsupported), or contains no recognizable TAP structure at all.
+    (unsupported), contains no recognizable TAP structure at all, contains
+    "Bail out!" (the producer aborted the run), declares more than one
+    top-level plan, or declares a top-level plan ("1..N") whose N does not
+    match the number of top-level test points actually reported (a
+    subtest is one point) -- a run that stopped early or emitted extra
+    results is never read as complete. A stream with NO top-level plan is
+    rejected too (TAP13/14 require one): without it a run that died part-way
+    is indistinguishable from a complete one.
 
     A caller receiving ``None`` must treat it exactly like a JUnit parse
     failure: fail closed (NOT_VERIFIED), never assume "no failures."
     """
+    return _parse_tap(text)[0]
+
+
+def tap_stream_incomplete(text: "str | None") -> bool:
+    """True when `text` is TAP that itself says the run did not complete --
+    "Bail out!", a missing or unfulfilled plan, or a subtest/YAML block left open.
+    Unlike unrecognisable output, such a stream is positive evidence the run
+    stopped early, so a caller must not fall back to the exit code as if the
+    stream said nothing."""
+    return _parse_tap(text)[1]
+
+
+def _parse_tap(text: "str | None") -> "tuple[ParsedTestCounts | None, bool]":
+    """(counts or None, incomplete) -- see parse_tap / tap_stream_incomplete."""
     if text is None or not text.strip():
-        return None
+        return None, False
 
     lines = text.splitlines()
     if len(lines) > _MAX_LINES:
-        return None
+        return None, False
 
     top_level: "list[tuple[str, str]]" = []  # (id, status)
+    top_level_points = 0  # what a top-level "1..N" plan counts: test lines + subtest rollups
+    planned: "int | None" = None
     open_subtest: "dict | None" = None  # {"name": str, "indent": int, "children": list}
     in_yaml_block = False
     yaml_block_lines: "list[str]" = []
@@ -207,6 +232,9 @@ def parse_tap(text: "str | None") -> "ParsedTestCounts | None":
         if content == "":
             continue
 
+        if _BAIL_OUT_RE.match(content):
+            return None, True  # the producer aborted the run -- never a complete result
+
         if _YAML_OPEN_RE.match(content):
             in_yaml_block = True
             yaml_block_lines = []
@@ -216,18 +244,25 @@ def parse_tap(text: "str | None") -> "ParsedTestCounts | None":
             saw_any_structure = True
             if indent == 0:
                 if top_version_seen:
-                    return None  # ambiguous/concatenated stream -- fail closed
+                    return None, False  # ambiguous/concatenated stream -- fail closed
                 top_version_seen = True
             continue
 
-        if _PLAN_RE.match(content):
+        plan_match = _PLAN_RE.match(content)
+        if plan_match:
             saw_any_structure = True
+            if open_subtest is None:
+                if planned is not None:
+                    return None, False  # two top-level plans -- ambiguous, fail closed
+                planned = int(plan_match.group("end")) - int(plan_match.group("start")) + 1
+                if planned < 0:
+                    return None, False  # malformed plan
             continue
 
         subtest_match = _SUBTEST_RE.match(content)
         if subtest_match:
             if open_subtest is not None:
-                return None  # nested deeper than one level -- unsupported, fail closed
+                return None, False  # nested deeper than one level -- unsupported, fail closed
             open_subtest = {
                 "name": subtest_match.group(1).strip() or "subtest",
                 "indent": indent,
@@ -258,20 +293,26 @@ def parse_tap(text: "str | None") -> "ParsedTestCounts | None":
             # This line is at or above the subtest's own indent -- it is
             # the subtest's ROLLUP line, not a new top-level test.
             appended = _drain_open_subtest(top_level, open_subtest, rollup_status=status)
+            top_level_points += 1
             open_subtest = None
             if appended:
                 last_result_id, last_result_status = appended[-1]
             continue
 
         top_level.append((description, status))
+        top_level_points += 1
         last_result_id, last_result_status = description, status
 
     if in_yaml_block:
-        return None  # truncated -- a YAML diagnostic block was never closed
+        return None, True  # truncated -- a YAML diagnostic block was never closed
     if open_subtest is not None:
-        return None  # truncated -- a subtest was opened but never rolled up
+        return None, True  # truncated -- a subtest was opened but never rolled up
     if not saw_any_structure:
-        return None  # nothing recognizable as TAP at all
+        return None, False  # nothing recognizable as TAP at all
+    if planned is None:
+        return None, True  # no top-level plan: completeness unknowable -- never positive evidence
+    if planned != top_level_points:
+        return None, True  # stopped early (or over-reported) -- the plan was not fulfilled
 
     from .result_parsers import ParsedTestCounts  # local import -- avoid a cycle at module load
 
@@ -290,7 +331,7 @@ def parse_tap(text: "str | None") -> "ParsedTestCounts | None":
     return ParsedTestCounts(
         passed=passed, failed=failed, skipped=skipped, errors=0,
         failed_test_ids=failed_ids, mode="full", failure_diagnostics=diagnostics,
-    )
+    ), False
 
 
 def _drain_open_subtest(

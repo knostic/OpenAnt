@@ -142,6 +142,24 @@ def parse_junit_xml(xml_text: "str | None") -> "ParsedTestCounts | None":
     return None
 
 
+def junit_reports_zero_tests(xml_text: "str | None") -> bool:
+    """True for a well-formed JUnit report that positively says no test ran
+    (no <testcase>, and its <testsuite> elements total tests="0").
+    parse_junit_xml returns None for that case, like for unreadable XML --
+    this tells the two apart, so a caller never treats "nothing ran" as
+    "the report said nothing"."""
+    if not xml_text or not xml_text.strip():
+        return False
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return False
+    if any(True for _ in root.iter("testcase")):
+        return False
+    suites = list(root.iter("testsuite"))
+    return bool(suites) and sum(_int_attr(s, "tests") for s in suites) == 0
+
+
 def _parse_tap(text: "str | None") -> "ParsedTestCounts | None":
     from .tap_parser import parse_tap  # local import -- avoid a cycle at module load
     return parse_tap(text)

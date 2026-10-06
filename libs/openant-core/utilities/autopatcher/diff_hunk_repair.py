@@ -394,6 +394,13 @@ def _repair(patch: str, meta: RepairResult, repo_root: "Path | None" = None) -> 
             i += 2
             continue
 
+        if stripped.startswith("diff --git "):
+            # A git section header ends the current hunk -- it is never a
+            # hunk body line (those start with " ", "+", "-" or "\"). It
+            # then falls through to the non-hunk handling below, like the
+            # "index"/mode lines that follow it.
+            flush_hunk()
+
         if in_hunk:
             hunk_body.append(line)
             i += 1

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from unittest import mock
 
-import pytest
 
 _CONTRACT_VIOLATION_RESPONSE = """\
 Here are two possible patches:

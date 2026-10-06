@@ -666,7 +666,7 @@ class TestFatalErrorPresentation:
 
         progress.configure()
         with pytest.raises(RuntimeError):
-            with step_context("patch", str(tmp_path)) as ctx:
+            with step_context("patch", str(tmp_path)):
                 raise RuntimeError("boom")
 
         err = capsys.readouterr().err
@@ -678,7 +678,7 @@ class TestFatalErrorPresentation:
 
         progress.configure(verbose=True)
         with pytest.raises(RuntimeError):
-            with step_context("patch", str(tmp_path)) as ctx:
+            with step_context("patch", str(tmp_path)):
                 raise RuntimeError("boom")
 
         err = capsys.readouterr().err
@@ -692,7 +692,7 @@ class TestFatalErrorPresentation:
         from core.step_report import step_context
 
         with pytest.raises(RuntimeError):
-            with step_context("patch", str(tmp_path)) as ctx:
+            with step_context("patch", str(tmp_path)):
                 raise RuntimeError("boom")
 
         import json
@@ -709,7 +709,7 @@ class TestFatalErrorPresentation:
 
         progress.configure()  # default -- would suppress a `patch` traceback
         with pytest.raises(RuntimeError):
-            with step_context("parse", str(tmp_path)) as ctx:
+            with step_context("parse", str(tmp_path)):
                 raise RuntimeError("boom")
 
         err = capsys.readouterr().err

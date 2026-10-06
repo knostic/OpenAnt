@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import subprocess
-import sys
 from pathlib import Path
 from unittest import mock
 
-import pytest
 
 _MOCK_GROUNDED_PLANNER_JSON = (
     '{"remediation_mechanism": null, "target_files": [], "target_symbols": [], '

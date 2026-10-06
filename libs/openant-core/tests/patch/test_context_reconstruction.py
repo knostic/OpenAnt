@@ -37,10 +37,8 @@ import subprocess
 from pathlib import Path
 from unittest import mock
 
-import pytest
 
 from utilities.autopatcher.diff_hunk_repair import (
-    ContextExpansionResult,
     reconstruct_hunk_context,
     repair_hunk_headers,
 )

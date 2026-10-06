@@ -29,7 +29,6 @@ import importlib.util
 import json
 import os
 import subprocess
-import sys
 import uuid
 from pathlib import Path
 from unittest import mock

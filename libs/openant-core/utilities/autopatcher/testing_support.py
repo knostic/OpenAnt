@@ -140,7 +140,6 @@ def score_test_support(matches: List[Dict], language: str = "python") -> Tuple[s
 
     same_file = sum(1 for m in matches if m.get("proximity") == "same-file")
     same_module = sum(1 for m in matches if m.get("proximity") == "same-module")
-    repo = sum(1 for m in matches if m.get("proximity") == "repo")
 
     total = len(matches)
 

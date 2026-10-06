@@ -19,10 +19,8 @@ Covers:
 from __future__ import annotations
 
 import subprocess
-import sys
 from pathlib import Path
 
-import pytest
 
 
 from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers, strip_empty_hunks, RepairResult

@@ -150,7 +150,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from utilities.autopatcher.patch_challenger import challenge_patch  # noqa: E402
-from utilities.autopatcher.concern_tree import evaluate_concern_tree, Limits  # noqa: E402
+from utilities.autopatcher.concern_tree import evaluate_concern_tree  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,3 @@
-import os
-import sys
 
 import pytest
 
@@ -1211,7 +1209,7 @@ def test_unpriced_model_still_records_tokens_with_zero_cost(monkeypatch, capsys)
     cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
     monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    fake = _install_fake_adapter(
+    _install_fake_adapter(
         monkeypatch, outcomes=[_completion_result(input_tokens=1000, output_tokens=500)]
     )
     # No fake.pricing set -- adapter reports no pricing for this model,

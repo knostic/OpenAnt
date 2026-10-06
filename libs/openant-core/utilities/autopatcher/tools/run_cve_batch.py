@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import fcntl
 import hashlib
 import io
 import json
@@ -58,6 +57,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+
+try:
+    import fcntl
+except ImportError:  # Windows: the runner is POSIX-only (main refuses);
+    fcntl = None     # importing this module for its pure helpers must still work.
 
 import yaml
 
@@ -398,7 +402,7 @@ def json_safe(value):
 def _git_text(args, cwd, timeout: int = GIT_TIMEOUT) -> "str | None":
     try:
         proc = subprocess.run(
-            ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout,
+            ["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             env=_git_env(),
         )
     except (OSError, subprocess.SubprocessError):
@@ -668,7 +672,7 @@ def collect_openant_state() -> dict:
     # stat-only changes stays empty either way).
     status = subprocess.run(
         ["git", "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"],
-        cwd=top, capture_output=True, text=True, timeout=GIT_TIMEOUT,
+        cwd=top, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=GIT_TIMEOUT,
     )
     diff = subprocess.run(
         ["git", "--no-optional-locks", "-c", "diff.autoRefreshIndex=false", "diff", "HEAD", "--binary"],
@@ -709,7 +713,7 @@ def probe_python(executable: str) -> dict:
         "'version': platform.python_version(), 'version_info': list(sys.version_info[:3])}))"
     )
     try:
-        proc = subprocess.run([executable, "-c", code], capture_output=True, text=True, timeout=120)
+        proc = subprocess.run([executable, "-c", code], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
     except (OSError, subprocess.SubprocessError) as exc:
         raise RunnerSetupError(f"--python {executable!r} cannot be executed: {exc}") from exc
     if proc.returncode != 0:
@@ -738,7 +742,7 @@ def probe_run_traced(python: str, run_traced: str) -> None:
     imports lazily after parsing (core.patch and the Auto Patcher pipeline)
     must import too. Nothing is executed beyond imports."""
     try:
-        proc = subprocess.run([python, run_traced, "--help"], capture_output=True, text=True, timeout=300,
+        proc = subprocess.run([python, run_traced, "--help"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
                               cwd=str(Path(run_traced).parent), stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as exc:
         raise RunnerSetupError(f"cannot execute {run_traced} with {python}: {exc}") from exc
@@ -752,7 +756,7 @@ def probe_run_traced(python: str, run_traced: str) -> None:
     modules = ", ".join(LAZY_IMPORT_PROBE)
     code = f"import sys; sys.path.insert(0, sys.argv[1]); import {modules}"
     try:
-        proc = subprocess.run([python, "-c", code, str(PROJECT_ROOT)], capture_output=True, text=True,
+        proc = subprocess.run([python, "-c", code, str(PROJECT_ROOT)], capture_output=True, text=True, encoding="utf-8", errors="replace",
                               timeout=300, cwd=str(PROJECT_ROOT), stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as exc:
         raise RunnerSetupError(f"cannot probe the Auto Patcher imports with {python}: {exc}") from exc
@@ -1588,7 +1592,7 @@ def post_run_checkout_state(repo_dir: Path) -> dict:
     head = _git_text(["rev-parse", "HEAD"], cwd=repo_dir)
     try:
         status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=repo_dir,
-                                capture_output=True, text=True, timeout=GIT_TIMEOUT, env=_git_env())
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=GIT_TIMEOUT, env=_git_env())
         clean = status.returncode == 0 and not status.stdout.strip()
         lines = status.stdout.splitlines()[:10]
     except (OSError, subprocess.SubprocessError):
@@ -3030,6 +3034,9 @@ def main(argv=None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(raw_argv)
     args.argv = [RUNNER_NAME, *raw_argv]
+    if fcntl is None:
+        _print_errors("run_cve_batch.py requires POSIX (process groups, flock)", [])
+        return EXIT_INVALID_INPUT
     if args.summarize:
         return cmd_summarize(args)
     if args.resume:

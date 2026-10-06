@@ -63,7 +63,8 @@ from pathlib import Path
 
 from .patch_applicability import apply_patch
 from .patch_workspace import temporary_repo_copy
-from .result_parsers import parse_result
+from .result_parsers import junit_reports_zero_tests, parse_result
+from .tap_parser import tap_stream_incomplete
 from .test_execution_models import TestExecutionPlan, TestExecutionResult
 from .test_executors import (
     DEFAULT_RUN_TIMEOUT,
@@ -730,6 +731,15 @@ def _build_evidence_from_exit_code(
     )
 
 
+def _unusable_structured_result(plan: TestExecutionPlan, raw: TestExecutionResult, reason: str) -> TestRunResult:
+    return TestRunResult(
+        command=plan.test_command, status="UNPARSEABLE", exit_code=raw.exit_code,
+        duration_seconds=raw.duration_seconds, passed=None, failed=None, skipped=None, errors=None,
+        failed_test_ids=None, stdout_excerpt=_excerpt(raw.stdout), stderr_excerpt=_excerpt(raw.stderr),
+        timed_out=False, evidence_level="UNAVAILABLE", reason=reason,
+    )
+
+
 def _to_test_run_result(plan: TestExecutionPlan, raw: TestExecutionResult) -> TestRunResult:
     if raw.setup_failed:
         return TestRunResult(
@@ -750,9 +760,16 @@ def _to_test_run_result(plan: TestExecutionPlan, raw: TestExecutionResult) -> Te
 
     if plan.result_strategy in _STRUCTURED_RESULT_LABELS:
         label = _STRUCTURED_RESULT_LABELS[plan.result_strategy]
-        parsed = parse_result(plan.result_strategy, _structured_source_text(plan, raw))
+        source_text = _structured_source_text(plan, raw)
+        parsed = parse_result(plan.result_strategy, source_text)
         if parsed is not None:
             total = parsed.passed + parsed.failed + parsed.skipped + parsed.errors
+            if total == 0:
+                # The report itself says nothing ran -- never let a clean exit
+                # code stand in for test evidence that does not exist.
+                return _unusable_structured_result(
+                    plan, raw, f"the {label} report shows zero tests executed",
+                )
             if total > 0:
                 return TestRunResult(
                     command=plan.test_command, status="COMPLETED", exit_code=raw.exit_code,
@@ -762,6 +779,18 @@ def _to_test_run_result(plan: TestExecutionPlan, raw: TestExecutionResult) -> Te
                     timed_out=False, evidence_level=("OK" if parsed.mode == "full" else "COUNTS_ONLY"),
                     reason=None, failure_diagnostics=(parsed.failure_diagnostics or None),
                 )
+        if plan.result_strategy == "junit" and junit_reports_zero_tests(source_text):
+            return _unusable_structured_result(
+                plan, raw, f"the {label} report shows zero tests executed",
+            )
+        if plan.result_strategy == "tap" and tap_stream_incomplete(source_text):
+            # The stream itself says the run aborted or stopped early ("Bail
+            # out!", an unfulfilled plan, an unclosed block) -- unlike
+            # unrecognisable output, that is evidence about the run, so the
+            # exit code must not be read as if the stream said nothing.
+            return _unusable_structured_result(
+                plan, raw, f"the {label} stream reports an aborted or incomplete test run",
+            )
         # Structured output was declared but is unavailable/unparseable/
         # empty (for TAP this also covers a parser that fails closed on
         # malformed/truncated/ambiguous input -- see tap_parser.parse_tap)
@@ -961,6 +990,45 @@ def compare_runs(
             reason="Baseline and patched test output could not be compared reliably.",
         )
 
+    for label, side in (("baseline", baseline), ("patched", patched)):
+        if _reports_zero_tests(side):
+            return ExistingTestComparisonResult(
+                status=STATUS_NOT_VERIFIED, command=command, baseline=baseline, patched=patched,
+                reason=f"The {label} run reports zero tests executed; there is no test evidence to compare.",
+            )
+
+    result = _compare_by_evidence(command, baseline, patched, effective_rank)
+    if (
+        baseline.exit_code == 0 and patched.exit_code not in (0, None)
+        and result.status in (STATUS_PASS, STATUS_PRE_EXISTING_FAILURES_ONLY)
+    ):
+        # Structured/count evidence and the exit status disagree: the patched
+        # run exited non-zero where the baseline did not, yet no new failure
+        # was identified (e.g. a crash after results were written). Neither
+        # side can be trusted over the other -- never report "no new failures".
+        return ExistingTestComparisonResult(
+            status=STATUS_NOT_VERIFIED, command=command, baseline=baseline, patched=patched,
+            reason=(
+                f"Baseline exited 0 but patched exited {patched.exit_code}, while the parsed results "
+                "show no new failure; the comparison cannot be trusted."
+            ),
+        )
+    return result
+
+
+def _reports_zero_tests(r: TestRunResult) -> bool:
+    """True when a counts-bearing run (not bare exit-code evidence) reports
+    that no test executed at all."""
+    if _EVIDENCE_LEVEL_RANK.get(r.evidence_level, 0) < _EVIDENCE_LEVEL_RANK["RUNNER_SUMMARY_COUNTS"]:
+        return False
+    counts = [c for c in (r.passed, r.failed, r.skipped, r.errors) if c is not None]
+    return bool(counts) and sum(counts) == 0
+
+
+def _compare_by_evidence(
+    command, baseline: TestRunResult, patched: TestRunResult, effective_rank: int,
+) -> ExistingTestComparisonResult:
+    """compare_runs' evidence-tier dispatch (see its docstring)."""
     if baseline.failed_test_ids is not None and patched.failed_test_ids is not None:
         return _compare_by_ids(command, baseline, patched)
 

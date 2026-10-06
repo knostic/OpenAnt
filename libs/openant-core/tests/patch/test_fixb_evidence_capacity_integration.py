@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import inspect
 
-import pytest
 
 
 class TestPipelineNoLongerReliesOnHardcodedDefaults:
@@ -175,7 +174,7 @@ class TestCombinedPromptCapacityAccounting:
         alone exceeds max_chars, the result is an empty, structurally
         marked failure -- never a mid-line truncated fragment."""
         from utilities.autopatcher.evidence_fusion import (
-            _candidate_roles, compute_repository_understanding_plan, fuse_evidence,
+            compute_repository_understanding_plan, fuse_evidence,
         )
         from utilities.autopatcher.candidate_selection import CandidateSelection
         from utilities.autopatcher.repository_grounding_models import RepositoryCandidate

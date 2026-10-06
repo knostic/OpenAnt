@@ -970,7 +970,6 @@ class TestPipelineProvenanceWhenPlanningUngrounded:
 
     def test_skip_reason_reaches_patch_generation_skip(self, tmp_path):
         from utilities.autopatcher.execution_recorder import ExecutionRecorder
-        import json as _json
 
         plan = _plan(gate="explicit_true", requests=[])
         recorder = ExecutionRecorder(
@@ -1138,7 +1137,6 @@ class TestProductionAndReplayShareTheSamePlanningExecutor:
         )
 
     def test_replay_s1_outcome_matches_production_vocabulary(self, tmp_path):
-        from utilities.autopatcher import replay_engine as replay_engine_mod
 
         plan = _plan(gate="explicit_true", requests=[], target_files=[], target_symbols=[])
         with mock.patch(
@@ -1300,7 +1298,7 @@ class TestPreFixAArtifactReplayCompatibility:
         # planning, which never reads Planning-specific fields from its own
         # prior artifact -- only `vulnerability_text`, the run-level input).
         from utilities.autopatcher import replay_engine
-        from utilities.autopatcher.lineage import RESOLVED, build_chain
+        from utilities.autopatcher.lineage import RESOLVED
 
         output_dir = tmp_path / "out"
         output_dir.mkdir()

@@ -17,7 +17,6 @@ import pytest
 from unittest import mock
 
 from utilities.autopatcher.concrete_trace import (
-    OUTCOME_VALUES,
     _ISOLATION_BOUNDARY_FIELDS,
     _parse_concrete_trace_response,
     resolve_concrete_trace,

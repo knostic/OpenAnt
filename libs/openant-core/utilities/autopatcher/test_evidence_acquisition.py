@@ -150,16 +150,25 @@ class EvidenceBundle:
         return "\n".join(parts)
 
 
-def _read_bounded_text(path: Path, raw_limit: int = _MAX_RAW_READ_BYTES) -> "str | None":
+def _read_bounded_text(path: Path, *, root: Path, raw_limit: int = _MAX_RAW_READ_BYTES) -> "str | None":
     """Read at most `raw_limit` raw bytes -- NEVER the whole file,
     however large it is on disk -- and decode. Returns None for anything
     unreadable. This is the one place a file is ever opened in this
     module; every caller below bounds its own further slicing on top of
-    this, but none of them can cause an unbounded read."""
-    if not path.is_file():
+    this, but none of them can cause an unbounded read.
+
+    Returns None as well for anything whose RESOLVED location is not a
+    regular file inside `root`: a repository symlink (on the file itself or
+    on any parent directory) must never send host file content to the LLM."""
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root.resolve(strict=True))
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if not resolved.is_file():
         return None
     try:
-        with open(path, "rb") as f:
+        with open(resolved, "rb") as f:
             raw = f.read(raw_limit)
     except OSError:
         return None
@@ -265,18 +274,18 @@ def _relevance_filtered_excerpt(text: str, limit: int) -> str:
     return excerpt
 
 
-def _read_bounded(path: Path, limit: int) -> "str | None":
+def _read_bounded(path: Path, limit: int, *, root: Path) -> "str | None":
     """Bounded read for direct-inclusion evidence files: reads at most a
     few times `limit` raw bytes (never the whole file), then bounds the
     decoded text to `limit` chars via _relevance_filtered_excerpt (never
     a naive head-only slice -- see that function's docstring)."""
-    text = _read_bounded_text(path, raw_limit=limit * 4)
+    text = _read_bounded_text(path, root=root, raw_limit=limit * 4)
     if text is None:
         return None
     return _relevance_filtered_excerpt(text, limit)
 
 
-def _package_json_relevant_fields(path: Path) -> "str | None":
+def _package_json_relevant_fields(path: Path, *, root: Path) -> "str | None":
     """Extract only the keys relevant to deciding how this repository's
     tests should be PREPARED and RUN -- never the full manifest.
 
@@ -299,7 +308,7 @@ def _package_json_relevant_fields(path: Path) -> "str | None":
     Reads through the same raw-bytes bound as everything else; a
     package.json larger than that bound will fail to parse as JSON and
     simply contributes no evidence, rather than being read in full."""
-    text = _read_bounded_text(path)
+    text = _read_bounded_text(path, root=root)
     if text is None:
         return None
     try:
@@ -326,9 +335,9 @@ def _gather_config_files(root: Path) -> "tuple[tuple[str, str], ...]":
         if not p.is_file():
             continue
         if name == "package.json":
-            content = _package_json_relevant_fields(p)
+            content = _package_json_relevant_fields(p, root=root)
         else:
-            content = _read_bounded(p, _MAX_FILE_BYTES)
+            content = _read_bounded(p, _MAX_FILE_BYTES, root=root)
         if content:
             out.append((name, content))
     return tuple(out)
@@ -353,7 +362,7 @@ def _gather_ci_snippets(root: Path) -> "tuple[tuple[str, str], ...]":
     for p in candidates:
         if len(out) >= _MAX_CI_FILES:
             break
-        text = _read_bounded_text(p)
+        text = _read_bounded_text(p, root=root)
         if text is None or not _CI_KEYWORD_RE.search(text):
             continue
         rel = f".github/workflows/{p.name}"
@@ -368,8 +377,11 @@ def _gather_directory_listing(root: Path) -> "tuple[str, ...]":
         for p in sorted(root.iterdir()):
             if p.name in _IGNORED_DIR_NAMES or p.name.startswith("."):
                 continue
-            entries.append(p.name + ("/" if p.is_dir() else ""))
-            if p.is_dir() and len(entries) < _MAX_TREE_ENTRIES:
+            # Never descend into a linked directory: its children could be
+            # host file names outside the repository.
+            is_real_dir = p.is_dir() and not p.is_symlink()
+            entries.append(p.name + ("/" if is_real_dir else ""))
+            if is_real_dir and len(entries) < _MAX_TREE_ENTRIES:
                 try:
                     for child in sorted(p.iterdir()):
                         if child.name in _IGNORED_DIR_NAMES or child.name.startswith("."):
@@ -393,7 +405,7 @@ def _gather_readme_excerpt(root: Path) -> "tuple[str, str] | None":
         p = root / name
         if not p.is_file():
             continue
-        text = _read_bounded_text(p)
+        text = _read_bounded_text(p, root=root)
         if text is None:
             return None
         lines = text.splitlines()
