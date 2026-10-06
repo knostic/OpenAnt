@@ -146,6 +146,12 @@ def _section(report, heading):
 
 
 def _trust_rows(report):
+    """Table rows of the report, excluding the Trust Signals reading guide
+    (its status key / provenance map are documentation, not signal rows)."""
+    guide = report.find("### How to read the Trust Signals")
+    if guide != -1:
+        end = report.find("\n## ", guide)
+        report = report[:guide] + (report[end:] if end != -1 else "")
     return [line for line in report.splitlines() if line.startswith("| ") and " | " in line[2:]]
 
 
@@ -253,12 +259,14 @@ class TestConcernNotBlocked:
 
     def test_legend_describes_rendered_rows(self, capsys):
         report, _ = _render("orange_high_impact", capsys)
-        legend = _section(report, "## Trust Signals").split("| Question |")[0]
+        section = _section(report, "## Trust Signals")
+        table, sep, legend = section.partition("### How to read the Trust Signals")
+        assert sep and "| Question |" in table and "| Question |" not in legend  # guide follows the table
         for row in _trust_rows(report)[1:8]:
             question = row.split(" | ")[0][2:]
-            assert f'"{question}"' in legend, question
-        assert "Static heuristics, nothing executed" in legend
-        assert "test-file name matching" in legend
+            assert question in legend, question
+        assert "Static heuristics" in legend and "nothing is executed" in legend
+        assert "Test-file name matching" in legend
         assert "not independent verification" in legend
         assert "Patch Integrity" not in legend
 

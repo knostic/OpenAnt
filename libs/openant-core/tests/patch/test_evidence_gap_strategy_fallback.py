@@ -1295,7 +1295,7 @@ class TestExistingBehaviorRegressionWhenNoTrigger:
         # disturb; Strategy is never evaluated at all, so the trigger can
         # never fire.
         report = pipeline_mod.run(vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path))
-        assert "# Auto Patcher MVP" in report
+        assert "# Auto Patcher — Security Patch Report" in report
 
     def test_normal_strategy_success_path_unaffected(self, tmp_path):
         """Strategy #1 itself already names a real target on the first

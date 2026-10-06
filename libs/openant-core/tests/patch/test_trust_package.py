@@ -1021,7 +1021,7 @@ class TestTrustSignalsV2Table:
         Coverage-vs-Missing-Behavioral-Validation bridge regardless of
         status (see test_testing_row_bridge_present_regardless_of_status)."""
         from utilities.autopatcher.pipeline import _render_trust_signals_table
-        table = _render_trust_signals_table(_signals_full())
+        table = _render_trust_signals_table(_signals_full()).split("### How to read the Trust Signals")[0]
         rows = [l for l in table.splitlines() if l.startswith("| ") and "Do relevant tests" not in l]
         for row in rows:
             assert "see" not in row.lower(), f"Unexpected forward pointer in a good row: {row!r}"

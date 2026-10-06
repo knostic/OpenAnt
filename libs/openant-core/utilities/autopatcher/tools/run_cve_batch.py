@@ -1026,7 +1026,9 @@ def read_run_manifest(trace_dir: Path) -> dict:
 
 
 _DECISION_CARD_RE = re.compile(r"^##\s+(?P<emoji>\S+)\s+(?P<label>[A-Z][A-Z ]*[A-Z])\s*$")
-_BOLD_LINE_RE = re.compile(r"^\*\*(?P<text>[^*]+)\*\*\s*$")
+# The Recommendation line: "**<Decision>**", optionally led by the decision
+# card's icon ("🟢 **Deploy After Validation**"); reports without it parse too.
+_BOLD_LINE_RE = re.compile(r"^(?:(?P<emoji>[^\s*]+)\s+)?\*\*(?P<text>[^*]+)\*\*\s*$")
 _SKIPPED_RE = re.compile(r"^\*\(Skipped — (?P<reason>.*?)\.?\)\*\s*$")
 _FILES_CHANGED_RE = re.compile(r"^Files changed:\s*(?P<n>\d+)\s*$")
 
@@ -1108,6 +1110,7 @@ def parse_trust_report(path: Path) -> dict:
     rec_line = _section_first_line(lines, headings, "## Recommendation")
     rec_match = _BOLD_LINE_RE.match(rec_line) if rec_line else None
     info["recommendation_section_decision"] = rec_match.group("text").strip() if rec_match else None
+    rec_emoji = rec_match.group("emoji") if rec_match else None
     skip_line = _section_first_line(lines, headings, "## Patch Applicability")
     skip_match = _SKIPPED_RE.match(skip_line) if skip_line else None
     info["applicability_skip_reason"] = skip_match.group("reason") if skip_match else None
@@ -1121,6 +1124,8 @@ def parse_trust_report(path: Path) -> dict:
             problems.append("no `## Recommendation` decision found")
         elif rec.lower() != outcome.decision.lower():
             problems.append(f"decision card says {outcome.decision!r} but Recommendation says {rec!r}")
+        elif rec_emoji is not None and rec_emoji.rstrip("\ufe0f") != outcome.emoji:
+            problems.append(f"Recommendation icon {rec_emoji!r} does not belong to {outcome.decision!r}")
     elif rec is not None:
         problems.append(f"no-patch card but the Recommendation section says {rec!r}")
     if problems:

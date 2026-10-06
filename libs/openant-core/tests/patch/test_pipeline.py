@@ -419,17 +419,21 @@ class TestPipeline:
         assert "## Recommendation" in report
         start = report.find("## Recommendation")
         block = report[start:start + 400]
-        # New V1 format: bold decision on its own line, followed by reason text
-        bold_lines = [ln for ln in block.splitlines() if ln.strip().startswith("**") and ln.strip().endswith("**")]
+        # Bold decision on its own line, led by the decision card's icon,
+        # followed by reason text.
+        import re as _re
+        from utilities.autopatcher.pipeline import _DECISION_CARD_EMOJI
+        bold_lines = [m for m in (_re.match(r"^(\S+) \*\*(.+)\*\*$", ln.strip()) for ln in block.splitlines()) if m]
         assert bold_lines, "Recommendation must have a bold decision line"
-        decision = bold_lines[0].strip().strip("*").strip()
+        icon, decision = bold_lines[0].group(1), bold_lines[0].group(2).strip()
+        assert icon == _DECISION_CARD_EMOJI[decision]
         valid_decisions = (
             "Deploy After Validation", "Deploy With Caution",
             "Manual Review Required", "Do Not Apply",
         )
         assert decision in valid_decisions, f"Unexpected decision value: {decision!r}"
         # Reason text must be a non-empty sentence after the decision line
-        non_empty = [ln.strip() for ln in block.splitlines() if ln.strip() and not ln.strip().startswith("#") and not ln.strip().startswith("**")]
+        non_empty = [ln.strip() for ln in block.splitlines() if ln.strip() and not ln.strip().startswith("#") and "**" not in ln]
         assert non_empty, "Recommendation must contain reason text"
         assert len(non_empty[0]) > 10
 
@@ -711,7 +715,7 @@ class TestDecisionCardInReport:
     def test_decision_card_is_first_section_after_title(self):
         from utilities.autopatcher.pipeline import run
         report = run(vulnerability_text=self._vuln_text(), api_key="")
-        title_idx = report.find("# Auto Patcher MVP — Security Patch Report")
+        title_idx = report.find("# Auto Patcher — Security Patch Report")
         first_heading_after_title = report.find("##", title_idx)
         assert first_heading_after_title == self._find_hero_banner(report)
 
@@ -810,7 +814,7 @@ class TestReportTerminologyCleanup:
         — it must still, per this test's own point, avoid naming a section."""
         from utilities.autopatcher.pipeline import run
         report = run(vulnerability_text=self._vuln_text(), api_key="")
-        idx = report.find("# Auto Patcher MVP")
+        idx = report.find("# Auto Patcher — Security Patch Report")
         banner = report[idx:report.find("## Vulnerability summary")]
         assert "section" not in banner.lower()
         assert "MANUAL REVIEW REQUIRED" in banner

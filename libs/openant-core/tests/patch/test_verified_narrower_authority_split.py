@@ -457,7 +457,7 @@ class TestNegativeCompatibility:
         `_active_verifier_result` stays at its default None, so the split
         can never activate."""
         report = pipeline_mod.run(vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path))
-        assert "# Auto Patcher MVP" in report
+        assert "# Auto Patcher — Security Patch Report" in report
 
 
 # ---------------------------------------------------------------------------

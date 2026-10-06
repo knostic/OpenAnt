@@ -1005,7 +1005,7 @@ class TestExistingBehaviorRegressionWhenNoTrigger:
         ) as spy_verify:
             report = pipeline_mod.run(vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path))
         spy_verify.assert_not_called()
-        assert "# Auto Patcher MVP" in report
+        assert "# Auto Patcher — Security Patch Report" in report
 
 
 class TestDoubleContradictionEndToEnd:

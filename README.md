@@ -468,7 +468,7 @@ Separately, fixed structural limits bound how much exploration happens. These in
 
 ### Known limitations
 
-- Auto Patcher is an early-stage capability; its reports are labeled MVP output.
+- Auto Patcher is an early-stage capability.
 - Impact analysis and existing-test discovery currently run only on Python repositories. Elsewhere they report "not applicable" rather than being silently skipped, which also caps non-Python runs at Manual Review Required.
 - "Do relevant tests already exist?" is a **discovery** check (does a matching test file exist?), not a test run. Existing Test Comparison does run the repository's existing tests, in Docker, against unpatched and patched copies, and reports newly failing tests. However, it is opt-in, it is not exposed as an `openant patch` flag (run the Python entry point the CLI uses, for example `~/.openant/venv/bin/python -m openant patch --cve <CVE-ID> --repo-root <path> --compare-existing-tests`), it requires Docker, and it does not affect the recommendation. See the [recommendation policy](docs/auto-patcher/recommendation-policy.md#current-limitations).
 - Adversarial review, calibration, and narrative review are LLM calls. Two runs on the same input can reach different outcomes.

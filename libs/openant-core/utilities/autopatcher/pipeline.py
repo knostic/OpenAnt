@@ -3041,7 +3041,8 @@ def _render_recommendation_block(
     preceding block is expected to end with one, matching prior layout)."""
     lines: list[str] = []
     lines.append("## Recommendation\n")
-    lines.append(f"**{recommendation['decision']}**\n")
+    # Same icon as the decision card at the top (_DECISION_CARD_EMOJI).
+    lines.append(f"{_DECISION_CARD_EMOJI.get(recommendation['decision'], '⚪')} **{recommendation['decision']}**\n")
     lines.append(f"{recommendation['reason']}\n")
 
     if why_line:
@@ -3332,33 +3333,6 @@ def _render_trust_signals_table(
     lines: list[str] = []
     lines.append("---\n")
     lines.append("## Trust Signals\n")
-    # Release polish: the legend names the rows exactly as rendered below
-    # and states how each one is established -- deterministic check, static
-    # heuristic (nothing executed), heuristic LLM review, or an opt-in test
-    # run -- plus what the ❌/? statuses mean.
-    lines.append("*How each row is established:*\n")
-    lines.append(
-        "- *Deterministic checks against the repository:* \"Does the patch apply?\", "
-        "\"Was the edited content verified against the repository?\""
-    )
-    lines.append(
-        "- *Adversarial review (Challenger) — a heuristic LLM review whose citations are "
-        "checked by code, not independent verification:* \"Does it address the "
-        "vulnerability?\", \"Are there unresolved concerns?\""
-    )
-    lines.append(
-        "- *Static heuristics, nothing executed:* \"Do relevant tests already exist?\" "
-        "(test-file name matching), \"Is deployment risk low?\" (symbol-name usage analysis)"
-    )
-    lines.append(
-        "- *Existing tests run only when Existing Test Comparison was requested:* \"Were "
-        "there new test failures after the patch?\"\n"
-    )
-    lines.append(
-        "*❌ Blocked: the check blocks this patch · ❌ Concern: an adverse finding that "
-        "requires review · ? Not verified: the check did not run or is unsupported — never "
-        "positive evidence.*\n"
-    )
     lines.append("| Question | Status | Notes |")
     lines.append("|---|---|---|")
     for question, key, status_map, target_section in _TRUST_SIGNALS_V2_ROWS:
@@ -3402,8 +3376,63 @@ def _render_trust_signals_table(
                 f"See {effective_target} section below"
         lines.append(f"| {question} | {status} | {notes} |")
     lines.append("")
+    lines.append(_render_trust_signals_guide())
 
     return "\n".join(lines) + "\n"
+
+
+# Status key for the Trust Signals table: every status a row can render
+# (the values of _TRUST_SIGNALS_V2_ROWS' status maps, plus the renderer's
+# "? Not verified" fallback), in display order.
+_TRUST_SIGNAL_STATUS_KEY = (
+    ("✅ Good", "Favorable result for this question"),
+    ("⚠️ Needs review", "Partial or uncertain result — see the row's notes"),
+    ("❌ Blocked", "The check blocks this patch"),
+    ("❌ Concern", "An adverse finding that requires review"),
+    ("❌ Content not found", "Some edited content could not be found in the repository"),
+    ("❌ New failures", "The patched run shows test failures the unpatched run did not"),
+    ("? Inconclusive", "The existing-test run could not be completed — no conclusion either way"),
+    ("? Not verified", "The check did not run or is unsupported — never positive evidence"),
+)
+
+# How each Trust Signals row is established: (evidence, row keys, what it is
+# -- and is not). Row questions are taken from _TRUST_SIGNALS_V2_ROWS itself.
+_TRUST_SIGNAL_PROVENANCE = (
+    ("Deterministic repository checks", ("patch_integrity", "source_verification"),
+     "Mechanical checks against the repository"),
+    ("Adversarial review (Challenger)", ("remediation_alignment", "coverage_confidence"),
+     "A heuristic LLM review whose citations are checked by code — not independent verification"),
+    ("Static heuristics", ("test_availability", "deployment_safety"),
+     "Test-file name matching and symbol-name usage analysis — nothing is executed"),
+    ("Existing Test Comparison", ("existing_test_comparison",),
+     "Existing tests are run only when Existing Test Comparison was requested"),
+)
+
+
+def _render_trust_signals_guide() -> str:
+    """Static guide rendered BELOW the Trust Signals table: a status key and
+    a map of how each row is established. Documentation for reading the
+    table -- never findings from the current run."""
+    question_by_key = {key: question for question, key, _status_map, _target in _TRUST_SIGNALS_V2_ROWS}
+    lines = [
+        "### How to read the Trust Signals\n",
+        "*A guide to the table above — what each status and row means, not findings from this run.*\n",
+        "**Status key**\n",
+        "| Status | Meaning |",
+        "|---|---|",
+    ]
+    lines += [f"| {status} | {meaning} |" for status, meaning in _TRUST_SIGNAL_STATUS_KEY]
+    lines += [
+        "",
+        "**How the signals are established**\n",
+        "| Evidence | Questions | What it is — and is not |",
+        "|---|---|---|",
+    ]
+    for evidence, keys, caveat in _TRUST_SIGNAL_PROVENANCE:
+        questions = " · ".join(question_by_key[key] for key in keys)
+        lines.append(f"| {evidence} | {questions} | {caveat} |")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _render_validation_actions_section(validation_actions: list[dict], decision: str = "") -> str:
@@ -4550,7 +4579,7 @@ def _build_report(result: PipelineResult) -> str:
 
     # §1: Header + Hero Banner
     report = f"""\
-# Auto Patcher MVP — Security Patch Report
+# Auto Patcher — Security Patch Report
 
 {decision_card}
 """
