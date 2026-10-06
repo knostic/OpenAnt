@@ -396,8 +396,8 @@ class TestBaselineIsolation:
         """concerns_v2 (`patch_challenger.py`) and `pipeline.py` must never
         import from this experimental module -- one-directional dependency
         only (concern_tree.py -> reused primitives, never the reverse)."""
-        challenger_src = Path("utilities/autopatcher/patch_challenger.py").read_text()
-        pipeline_src = Path("utilities/autopatcher/pipeline.py").read_text()
+        challenger_src = Path("utilities/autopatcher/patch_challenger.py").read_text(encoding="utf-8")
+        pipeline_src = Path("utilities/autopatcher/pipeline.py").read_text(encoding="utf-8")
         assert "concern_tree" not in challenger_src
         assert "concern_tree" not in pipeline_src
 

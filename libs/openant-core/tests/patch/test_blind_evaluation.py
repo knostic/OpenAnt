@@ -575,7 +575,7 @@ class TestFailClosed:
 
 class TestBenchmarkAgnostic:
     def test_no_benchmark_identifiers_in_implementation(self):
-        source = MODULE_PATH.read_text()
+        source = MODULE_PATH.read_text(encoding="utf-8")
         assert not re.search(r"CVE-\d{4}-\d+", source)
         assert not re.search(r"GHSA-[0-9a-z]{4}-", source, re.I)
         assert not re.search(r"\b[0-9a-f]{40}\b", source)
@@ -586,15 +586,15 @@ class TestBenchmarkAgnostic:
             assert outcome not in source
 
     def test_no_nvd_tag_based_filtering(self):
-        source = MODULE_PATH.read_text()
+        source = MODULE_PATH.read_text(encoding="utf-8")
         assert "tags" not in source and '"Patch"' not in source
 
     def test_production_modules_do_not_import_blind_evaluation(self):
         root = SCRIPT_PATH.parent.parent
         for rel in ("pipeline.py", "cve_converter.py", "cve_fetcher.py", "investigation_adapters.py"):
-            assert "blind_evaluation" not in (root / rel).read_text()
+            assert "blind_evaluation" not in (root / rel).read_text(encoding="utf-8")
         core_patch = SCRIPT_PATH.parents[3] / "core" / "patch.py"
-        assert "blind_evaluation" not in core_patch.read_text()
+        assert "blind_evaluation" not in core_patch.read_text(encoding="utf-8")
 
 
 # --- corrective pass: exact V1 grammar --------------------------------------
@@ -722,8 +722,8 @@ class TestGitHubDetectorAccuracy:
             "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/patch/?id=0123abc",
         ):
             assert classify_reference_url(url).category == ORDINARY
-        doc = MODULE_PATH.read_text()
-        tracing = (SCRIPT_PATH.parent / "TRACING_AND_DEBUGGING.md").read_text()
+        doc = MODULE_PATH.read_text(encoding="utf-8")
+        tracing = (SCRIPT_PATH.parent / "TRACING_AND_DEBUGGING.md").read_text(encoding="utf-8")
         for text in (doc, tracing):
             assert "Gerrit" in text and "Mercurial" in text and "cgit" in text
         assert "not a universal forge detector" in doc and "not a universal forge detector" in tracing

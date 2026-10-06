@@ -700,7 +700,7 @@ class TestV1Unchanged:
             BlindEvaluationSession(policy="v3").__enter__()
 
     def test_no_benchmark_identifiers_in_v2_implementation(self):
-        source = MODULE_PATH.read_text().lower()
+        source = MODULE_PATH.read_text(encoding="utf-8").lower()
         for name in ("waitress", "langchain", "advisory-review", "pylons", "recursive_url"):
             assert name not in source
 

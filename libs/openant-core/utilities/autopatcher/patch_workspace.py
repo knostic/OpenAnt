@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
+import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -44,7 +46,36 @@ def temporary_repo_copy(repo_root: "Path | str") -> Iterator[Path]:
         _remove_escaping_symlinks(dest)
         yield dest
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        rmtree_force(tmp_dir, ignore_errors=True)
+
+
+def rmtree_force(path: "Path | str", *, ignore_errors: bool = False) -> None:
+    """``shutil.rmtree`` that also removes read-only files.
+
+    On Windows, git writes ``.git/objects`` files read-only and
+    ``os.unlink`` refuses them (PermissionError) -- plain ``rmtree`` then
+    fails, or with ``ignore_errors=True`` silently leaves the whole copy
+    behind. On a removal error, clear the read-only bit and retry once;
+    anything still failing is raised unless ``ignore_errors``. Only the
+    write bit is added, and never through a symlink (chmod follows links;
+    a workspace copy comes from an untrusted repository).
+    """
+
+    def _retry_writable(func, failed_path, exc_or_info):
+        exc = exc_or_info[1] if isinstance(exc_or_info, tuple) else exc_or_info
+        try:
+            if not os.path.islink(failed_path):
+                mode = stat.S_IMODE(os.lstat(failed_path).st_mode)
+                os.chmod(failed_path, mode | stat.S_IWRITE)
+            func(failed_path)
+        except Exception:
+            if not ignore_errors:
+                raise exc from None
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_retry_writable)
+    else:  # Python 3.11: onexc does not exist yet; onerror passes exc_info
+        shutil.rmtree(path, onerror=_retry_writable)
 
 
 def _remove_escaping_symlinks(root: Path) -> None:

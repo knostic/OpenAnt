@@ -552,7 +552,9 @@ def _verify_file(raw_path, repo_root: Path) -> "str | None":
 
     if not candidate.is_file():
         return None
-    return str(rel)
+    # "/"-separated on every host OS -- callers compare this against index
+    # func_ids and constants keys, which the parser always emits with "/".
+    return rel.as_posix()
 
 
 def _split_symbol_entry(raw: str) -> "tuple[str | None, str]":

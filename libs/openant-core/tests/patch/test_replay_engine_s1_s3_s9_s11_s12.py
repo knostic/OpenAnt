@@ -90,7 +90,17 @@ def _full_run(run_traced, tmp_path, monkeypatch, *, compare_existing_tests=False
     argv = ["--cve", "CVE-2021-12345", "--repo-root", str(repo_root), "--output", str(output_dir)]
     if compare_existing_tests:
         argv.append("--compare-existing-tests")
-    with _mock_fetch_cve_at_source():
+    # The early whole-run gate (core.patch._require_test_comparison_environment)
+    # aborts with exit code 2 when Docker is unavailable (e.g. macOS CI
+    # runners) -- mock it ready, same as test_run_traced_wrapper, so these
+    # tests exercise replay lineage rather than this machine's Docker state.
+    # Existing Test Comparison's own inner executor preflight is NOT mocked:
+    # without Docker it still truthfully reports Not Verified.
+    from utilities.autopatcher.test_execution_models import ExecutorPreflightResult
+    with _mock_fetch_cve_at_source(), mock.patch(
+        "utilities.autopatcher.existing_test_regression.preflight_test_comparison_environment",
+        return_value=ExecutorPreflightResult(ready=True, status="OK", reason=None),
+    ):
         exit_code = run_traced.main(argv)
     assert exit_code == 0
     return repo_root, output_dir

@@ -407,9 +407,9 @@ class TestTargetRepositoryIdentity:
     def test_missing_repo_fails_before_llm(self, tmp_path):
         repo = _make_target_repo(tmp_path)
         provenance = self._provenance(tmp_path, repo)
-        import shutil
+        from utilities.autopatcher.patch_workspace import rmtree_force
 
-        shutil.rmtree(repo)
+        rmtree_force(repo)  # git objects are read-only on Windows
 
         with pytest.raises(StageReplayError, match="does not exist"):
             validate_target_repository(None, provenance, stage="test_plan_discovery")
@@ -417,9 +417,9 @@ class TestTargetRepositoryIdentity:
     def test_non_git_directory_fails(self, tmp_path):
         repo = _make_target_repo(tmp_path)
         provenance = self._provenance(tmp_path, repo)
-        import shutil
+        from utilities.autopatcher.patch_workspace import rmtree_force
 
-        shutil.rmtree(repo / ".git")
+        rmtree_force(repo / ".git")  # git objects are read-only on Windows
 
         with pytest.raises(StageReplayError, match="not a git repository"):
             validate_target_repository(None, provenance, stage="test_plan_discovery")

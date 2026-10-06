@@ -336,7 +336,7 @@ class TestIsolation:
         "Does NOT depend on concern_tree.py", so this checks import
         lines specifically, not the whole file text)."""
         import ast
-        src = Path("utilities/autopatcher/simple_concern_resolver.py").read_text()
+        src = Path("utilities/autopatcher/simple_concern_resolver.py").read_text(encoding="utf-8")
         tree = ast.parse(src)
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
@@ -348,7 +348,7 @@ class TestIsolation:
     def test_resolver_does_not_import_pipeline(self):
         """Item 25 -- same import-statement-only check as above."""
         import ast
-        src = Path("utilities/autopatcher/simple_concern_resolver.py").read_text()
+        src = Path("utilities/autopatcher/simple_concern_resolver.py").read_text(encoding="utf-8")
         tree = ast.parse(src)
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
@@ -360,7 +360,7 @@ class TestIsolation:
     def test_resolver_only_imports_provenance_helpers_from_patch_challenger(self):
         """Item 26."""
         import ast
-        src = Path("utilities/autopatcher/simple_concern_resolver.py").read_text()
+        src = Path("utilities/autopatcher/simple_concern_resolver.py").read_text(encoding="utf-8")
         provenance_helpers = {"_point_citation_valid", "_normalize_for_provenance", "_strip_quote_wrapping"}
         imported = set()
         for node in ast.walk(ast.parse(src)):
@@ -375,15 +375,15 @@ class TestIsolation:
         assert imported <= provenance_helpers, imported - provenance_helpers
 
     def test_no_production_module_imports_simple_concern_resolver(self):
-        challenger_src = Path("utilities/autopatcher/patch_challenger.py").read_text()
-        pipeline_src = Path("utilities/autopatcher/pipeline.py").read_text()
+        challenger_src = Path("utilities/autopatcher/patch_challenger.py").read_text(encoding="utf-8")
+        pipeline_src = Path("utilities/autopatcher/pipeline.py").read_text(encoding="utf-8")
         assert "simple_concern_resolver" not in challenger_src
         assert "simple_concern_resolver" not in pipeline_src
 
     def test_concern_tree_module_unmodified_untouched(self):
         """This module must never be imported BY concern_tree.py either --
         the two experiments are siblings, not layered."""
-        tree_src = Path("utilities/autopatcher/concern_tree.py").read_text()
+        tree_src = Path("utilities/autopatcher/concern_tree.py").read_text(encoding="utf-8")
         assert "simple_concern_resolver" not in tree_src
 
 

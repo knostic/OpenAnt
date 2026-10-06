@@ -521,7 +521,11 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
                 parts = [part for part in p.parts]
                 if any(ign in parts for ign in self.IGNORED_DIRS):
                     continue
-                rel = str(p.relative_to(repo_root))
+                # Canonical "/"-separated repo path on every host OS: it is
+                # compared against parse_diff()'s changed_files (always "/"),
+                # so a native "app\\x.py" on Windows would count a changed
+                # file as its own external caller.
+                rel = p.relative_to(repo_root).as_posix()
                 # skip tests
                 if self._is_test_path(rel):
                     continue
