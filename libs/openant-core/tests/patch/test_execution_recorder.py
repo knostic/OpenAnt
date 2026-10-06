@@ -155,7 +155,7 @@ class TestLLMCallAttribution:
         LLMCallCapture (or anything from llm_call_tracing) at all -- it has
         no business owning a capture/monkeypatch mechanism (Final
         Correction 2)."""
-        import utilities.autopatcher.execution_recorder as er_module
+        from utilities.autopatcher import execution_recorder as er_module
         assert "LLMCallCapture" not in dir(er_module)
         assert not hasattr(er_module, "llm_call_tracing")
 

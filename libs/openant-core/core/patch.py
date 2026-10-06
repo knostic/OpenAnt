@@ -350,7 +350,9 @@ def _run_engine_and_write_artifacts(
         os.remove(trust_report_path)
 
     vulnerability_path = os.path.join(patch_dir, f"{artifact_label}-vulnerability.md")
-    with open(vulnerability_path, "w", encoding="utf-8") as f:
+    # newline="": exact bytes on every platform -- blind evaluation verifies
+    # this artifact byte-for-byte against the text it was given.
+    with open(vulnerability_path, "w", encoding="utf-8", newline="") as f:
         f.write(vulnerability_text)
 
     from utilities.autopatcher import run_metadata as _rm

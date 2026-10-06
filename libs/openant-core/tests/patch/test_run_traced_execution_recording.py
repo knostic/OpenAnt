@@ -253,7 +253,7 @@ class TestStage6CalibrationFallback:
         artifact = json.loads(Path(s6["artifact_path"]).read_text())
         assert artifact["finding_calibration_source"] == "fallback"
         assert artifact["finding_calibration"]
-        trust_report = (output_dir / "patch" / "CVE-2021-12345-trust-report.md").read_text()
+        trust_report = (output_dir / "patch" / "CVE-2021-12345-trust-report.md").read_text(encoding="utf-8")
         first_reworded = artifact["finding_calibration"][0]["reworded"]
         assert first_reworded in trust_report
 

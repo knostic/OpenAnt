@@ -22,7 +22,7 @@ from unittest import mock
 
 import pytest
 
-import core.patch as core_patch
+from core import patch as core_patch
 from core.patch import TestComparisonEnvironmentError, run_patch, run_patch_cve
 from utilities.autopatcher.test_execution_models import ExecutorPreflightResult
 

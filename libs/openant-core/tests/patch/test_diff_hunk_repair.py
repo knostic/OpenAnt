@@ -578,14 +578,15 @@ class TestFencedPatch:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         stripped = "\n".join(lines).strip()
+        # Exact bytes, as patch_applicability sends them: Windows text-mode
+        # stdin would turn the bare blank context line into "\r" (corrupt).
         result = subprocess.run(
             ["git", "apply", "--check", "--whitespace=nowarn", "-"],
-            input=stripped + "\n",
+            input=(stripped + "\n").encode("utf-8"),
             cwd=str(repo),
             capture_output=True,
-            text=True,
         )
-        assert result.returncode == 0, f"git apply failed: {result.stderr.strip()}"
+        assert result.returncode == 0, f"git apply failed: {result.stderr.decode('utf-8', 'replace').strip()}"
 
 
 # ---------------------------------------------------------------------------

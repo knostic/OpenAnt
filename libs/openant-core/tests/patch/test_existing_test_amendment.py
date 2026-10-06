@@ -586,7 +586,7 @@ class TestPreScopeValidationBeforeRepair:
         """Sanity converse: a genuinely in-scope diff DOES reach the
         shared processor -- proves the pre-scope gate isn't simply
         rejecting everything."""
-        import utilities.autopatcher.generated_patch_processing as gpp
+        from utilities.autopatcher import generated_patch_processing as gpp
 
         _make_git_repo(tmp_path)
         llm = _FakeLLM(_amendment_json(diff=_VALID_TEST_DIFF))
@@ -879,7 +879,7 @@ class TestNoLocalPatchProcessingReimplementation:
     def test_amendment_call_reaches_the_real_shared_processor(self, tmp_path):
         """Spy (not a stub) on the real process_generated_patch -- proves
         this module calls through to it rather than around it."""
-        import utilities.autopatcher.generated_patch_processing as gpp
+        from utilities.autopatcher import generated_patch_processing as gpp
 
         _make_git_repo(tmp_path)
         llm = _FakeLLM(_amendment_json(diff=_VALID_TEST_DIFF))

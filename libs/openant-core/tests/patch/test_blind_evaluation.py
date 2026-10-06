@@ -21,8 +21,8 @@ from unittest import mock
 
 import pytest
 
-import utilities.autopatcher.cve_converter as cve_converter_module
-import utilities.autopatcher.investigation_adapters as adapters_module
+from utilities.autopatcher import cve_converter as cve_converter_module
+from utilities.autopatcher import investigation_adapters as adapters_module
 import utilities.autopatcher.pipeline as pipeline_module
 from utilities.autopatcher.cve_converter import cve_to_vuln_text as REAL_CVE_TO_VULN_TEXT
 from utilities.autopatcher.investigation_adapters import case_from_vulnerability_text
@@ -856,7 +856,10 @@ class TestOutputPathContainment:
         variant = base / "REALREPO"
         if not variant.exists():
             pytest.skip("filesystem is case-sensitive; case-variant alias cannot exist")
-        assert not (base / "REALREPO" / "out").resolve().is_relative_to(repo.resolve())  # lexical check alone misses it
+        if os.name != "nt":
+            # POSIX-only precondition: PureWindowsPath containment is already
+            # case-insensitive, so on Windows the lexical check catches it too.
+            assert not (base / "REALREPO" / "out").resolve().is_relative_to(repo.resolve())  # lexical check alone misses it
         assert path_resolves_inside(variant / "out", repo)
 
     def test_macos_data_volume_alias_rejected_when_present(self, layout):
