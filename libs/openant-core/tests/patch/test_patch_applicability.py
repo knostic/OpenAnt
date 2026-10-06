@@ -52,9 +52,10 @@ def _make_git_repo(tmp_path: Path) -> Path:
 
 
 def _mock_git_run(returncode: int, stderr: str = ""):
+    # git apply runs with binary stdio (W3), so stderr arrives as bytes.
     cm = mock.MagicMock()
     cm.returncode = returncode
-    cm.stderr = stderr
+    cm.stderr = stderr.encode("utf-8")
     return cm
 
 
@@ -162,13 +163,13 @@ class TestApplicabilityResult:
         (tmp_path / ".git").mkdir()
         captured = []
         def _capture(cmd, **kwargs):
-            captured.append(kwargs.get("input", ""))
+            captured.append(kwargs.get("input", b""))
             return _mock_git_run(0)
         with mock.patch("utilities.autopatcher.patch_applicability.run_utf8", side_effect=_capture):
             check_applicability(_FENCED_DIFF, tmp_path)
         assert captured
-        assert "```diff" not in captured[0]
-        assert "```" not in captured[0].strip().splitlines()[-1]
+        assert b"```diff" not in captured[0]
+        assert b"```" not in captured[0].strip().splitlines()[-1]
 
     def test_plain_diff_no_fences_also_accepted(self, tmp_path):
         from utilities.autopatcher.patch_applicability import check_applicability

@@ -59,6 +59,27 @@ def _truncate_stderr(stderr: str) -> str:
     return result
 
 
+def _run_git_apply(extra_args: "list[str]", raw_diff: str, cwd: Path) -> "tuple[int, str]":
+    """Run ``git apply [extra_args] --whitespace=nowarn -`` with the diff on stdin.
+
+    The diff is sent as strict UTF-8 bytes, never via text-mode stdin:
+    text mode on Windows rewrites ``\\n`` as ``\\r\\n``, which turns a bare
+    blank context line into ``\\r`` ("corrupt patch"). Line-ending matching
+    against the working tree is left to git's own autocrlf/attributes.
+    Strict encoding: an unencodable diff raises (caller fails closed)
+    rather than being silently altered. Returns (returncode, stderr).
+    """
+    payload = (raw_diff if raw_diff.endswith("\n") else raw_diff + "\n").encode("utf-8")
+    result = run_utf8(
+        ["git", "apply", *extra_args, "--whitespace=nowarn", "-"],
+        input=payload,
+        cwd=str(cwd),
+        capture_output=True,
+        timeout=_TIMEOUT_SECONDS,
+    )
+    return result.returncode, result.stderr.decode("utf-8", errors="replace")
+
+
 def check_applicability(patch: str, repo_root: "Path | str | None") -> dict:
     """Check whether the patch applies cleanly to repo_root.
 
@@ -93,21 +114,14 @@ def check_applicability(patch: str, repo_root: "Path | str | None") -> dict:
 
     # --- Run git apply --check ---
     try:
-        result = run_utf8(
-            ["git", "apply", "--check", "--whitespace=nowarn", "-"],
-            input=raw_diff if raw_diff.endswith("\n") else raw_diff + "\n",
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            timeout=_TIMEOUT_SECONDS,
-        )
+        returncode, stderr = _run_git_apply(["--check"], raw_diff, repo_root)
         return {
-            "applicable": result.returncode == 0,
+            "applicable": returncode == 0,
             "skipped": False,
             "skipped_reason": None,
             "error": None,
-            "exit_code": result.returncode,
-            "stderr": _truncate_stderr(result.stderr),
+            "exit_code": returncode,
+            "stderr": _truncate_stderr(stderr),
         }
 
     except FileNotFoundError:
@@ -185,21 +199,14 @@ def apply_patch(patch: str, workspace_root: "Path | str | None") -> PatchApplica
         )
 
     try:
-        result = run_utf8(
-            ["git", "apply", "--whitespace=nowarn", "-"],
-            input=raw_diff if raw_diff.endswith("\n") else raw_diff + "\n",
-            cwd=str(workspace_root),
-            capture_output=True,
-            text=True,
-            timeout=_TIMEOUT_SECONDS,
-        )
-        applied = result.returncode == 0
+        returncode, stderr = _run_git_apply([], raw_diff, workspace_root)
+        applied = returncode == 0
         return PatchApplicationResult(
             applied=applied,
-            exit_code=result.returncode,
+            exit_code=returncode,
             error=None,
             error_kind=None if applied else "apply_rejected",
-            stderr=_truncate_stderr(result.stderr),
+            stderr=_truncate_stderr(stderr),
         )
 
     except FileNotFoundError:
