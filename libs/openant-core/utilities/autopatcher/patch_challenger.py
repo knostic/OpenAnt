@@ -12,6 +12,9 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .llm_client import get_call_history
+from .run_metadata import _TRUNCATION_STOP_REASONS
+
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "patch_challenger.md"
 
 VERIFICATION_STATUSES = ("VERIFIED_FIXED", "RESIDUAL_VULNERABILITY", "INSUFFICIENT_EVIDENCE")
@@ -23,10 +26,10 @@ For a response using the structured `Concerns:` schema (see
 `_parse_concerns`/`_derive_status_from_concerns` below), these three
 strings are instead DERIVED deterministically from the concern facts --
 never read directly from a `Verification status:` header, which becomes
-report-only text for such a response. `_parse_verification` and this
-constant are unchanged and remain the sole authority for any response
-that does not contain a `Concerns:` section at all (see `challenge_patch`'s
-own new-schema/legacy branch)."""
+report-only text for such a response. A response without a `Concerns:`
+section is not decided by its own stated status either: `challenge_patch`
+fails it closed (RB-1). `_parse_verification` is kept for diagnostic
+tooling that re-reads archived responses."""
 
 CONCERN_ROLES = ("primary", "additional")
 """The only two values a concern block's `Role:` field may carry. Exactly
@@ -201,6 +204,69 @@ the model's own assertion of it is never trusted as completeness."""
 
 _CONCERN_BLOCK_HEADER_RE = re.compile(r"^[ \t]*(\d+)\.\s*Role:", re.MULTILINE)
 
+# Format-tolerant markers used only to detect structure the strict parser
+# above could not account for (RB-2) -- never to parse a concern. A
+# concern block whose header is written `2)`, `**2. Role:**`, `- Role:`,
+# `Concern 2 - Role:`, ... still carries a `Role` field line; if the
+# number of such lines differs from the number of strictly-parsed block
+# headers, some concern was not parsed as its own block and the response
+# fails closed instead of silently merging or dropping it. `Role` is the
+# only field label containing that word (see the prompt's field list).
+_LENIENT_ROLE_MARKER_RE = re.compile(
+    r"^[^\w\n]*(?:concern[ \t]*)?(?:\d+[ \t]*[.):\]-]*[ \t]*)?[^\w\n]*role[^\w\n]*:",
+    re.IGNORECASE | re.MULTILINE,
+)
+_CONCERN_FIELD_LABELS = (
+    "Role", "Description", "Default execution reachability", "Reachability provenance",
+    "Requires explicit non-default action", "Override provenance", "Contract addresses override",
+    "Scope provenance", "Operation present in evidence", "Operation provenance", "Preceding guard",
+    "Guard provenance", "Guard default state", "Guard default state provenance", "Guard effect",
+    "Guard effect provenance", "Reentry state propagation", "Reentry provenance",
+    "Function provenance", "Hypothesized outcome",
+)
+"""Every concern field label (v1 and v2). `Description` is mandatory in both
+schemas, so each concern carries exactly one; see
+`_concern_structure_ambiguous`."""
+
+
+def _lenient_label_re(label: str) -> "re.Pattern":
+    """A `label:` field line in any Markdown dress (`**Label:**`, `- Label:`,
+    `2) Label:` ...). Detection only -- never used to read a value."""
+    return re.compile(
+        rf"^[^\w\n]*(?:\d+[ \t]*[.):\]-]*[ \t]*)?[^\w\n]*{re.escape(label)}[^\w\n]*:",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+
+def _concern_structure_ambiguous(concerns_body: str) -> bool:
+    """True when the `Concerns:` body holds concern content the strict
+    `N. Role:` block parser cannot account for one block per concern
+    (RB-2): a block header written differently is merged into its
+    neighbor, so that concern -- possibly BLOCKING -- would otherwise
+    vanish. Format-independent signals: the number of `Role` and
+    `Description` field lines must equal the number of parsed block
+    headers, and no field label may repeat inside one parsed block (two
+    concerns merged into one span)."""
+    strict_blocks = len(_CONCERN_BLOCK_HEADER_RE.findall(concerns_body))
+    if len(_LENIENT_ROLE_MARKER_RE.findall(concerns_body)) != strict_blocks:
+        return True
+    if len(_lenient_label_re("Description").findall(concerns_body)) != strict_blocks:
+        return True
+    for span in _split_concern_blocks(concerns_body).values():
+        if span is None:
+            continue  # duplicate block number: already a malformed concern
+        if any(len(_lenient_label_re(label).findall(span)) > 1 for label in _CONCERN_FIELD_LABELS):
+            return True
+    return False
+
+
+# A line that is a `Concerns` section header in any Markdown dress
+# (`Concerns:`, `**Concerns:**`, `### Concerns`, ...). More than one means
+# `_split_sections` kept only the last section (RB-2).
+_LENIENT_CONCERNS_HEADER_RE = re.compile(
+    r"^[ \t>#*_-]*concerns[*_ \t]*(?::|$)", re.IGNORECASE | re.MULTILINE,
+)
+
 
 def _split_sections(text: str) -> Dict[str, str]:
     # Look for section headers used in the prompt and capture their bodies.
@@ -314,14 +380,12 @@ def _lines_from_bullets(text: str) -> List[str]:
 # `_reconcile_verification_status_with_calibration`) is unmodified and
 # unaware anything changed.
 #
-# A response containing NO `Concerns:` header at all is untouched by any of
-# this -- `_parse_verification` remains the sole authority for it, exactly
-# as before this schema existed (see `challenge_patch`'s own branch). A
+# A response containing NO `Concerns:` header at all carries no
+# citation-checked evidence, so `challenge_patch` fails it closed
+# (`(None, True)`) rather than trusting its own stated verdict (RB-1). A
 # response that DOES contain a `Concerns:` header, however malformed its
-# body, is NEVER routed through `_parse_verification` -- "new schema absent"
-# and "new schema present but malformed" are deliberately different
-# outcomes (legitimate legacy fallback vs. fail-closed under the new
-# schema), never conflated.
+# body, is decided only by the structured path above, which itself fails
+# closed on malformed or ambiguous structure (RB-2).
 # ---------------------------------------------------------------------------
 
 
@@ -1373,10 +1437,11 @@ def challenge_patch(
     in prose, with no corresponding structured block, must not be able to
     silently escape adjudication; any substantive (non-placeholder)
     content in `Summary:` (exactly like `Edge cases:`/`Potential issues:`)
-    instead forces the whole run closed. A response with NO `Concerns:`
-    header at all is completely unaffected: `_parse_verification` remains
-    its sole authority and `summary` remains the model's own raw text,
-    byte-for-byte identical to before this schema existed.
+    instead forces the whole run closed, as does a `Concerns:` structure
+    the strict block parser cannot fully account for (RB-2). A response
+    with NO `Concerns:` header at all always fails closed --
+    `verification_status` None, `still_vulnerable` True -- whatever verdict
+    it states (RB-1); its `summary` remains the model's own raw text.
     """
     system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
     context_section = (
@@ -1392,7 +1457,17 @@ def challenge_patch(
         + patch
     )
 
+    calls_before = len(get_call_history().get("challenger", []))
     resp = llm.complete(system_prompt, user_message, stage="challenger")
+    # RB-5: the provider's own stop signal, as llm_client records it for
+    # THIS call only (entries added by the call above -- never a stale one
+    # from an earlier call). A response cut off by the output limit is
+    # incomplete, so its parsed absence of concerns proves nothing. No
+    # recorded metadata (a client that records none) keeps prior behavior.
+    truncated = any(
+        (call.get("stop_reason") or "").lower() in _TRUNCATION_STOP_REASONS
+        for call in get_call_history().get("challenger", [])[calls_before:]
+    )
 
     sections = _split_sections(resp)
 
@@ -1427,11 +1502,35 @@ def challenge_patch(
             any(not _is_placeholder(line) for line in edge_cases + potential_issues)
             or not _is_placeholder(sections.get("summary"))
         )
-        verification_status, still = _derive_status_from_concerns(concerns, structural_violation)
+        # RB-2: structure the strict parser could not account for -- a
+        # concern block whose header differs from `N. Role:` (it would be
+        # merged into its neighbor, its own consequence lost), or a second
+        # `Concerns` section (`_split_sections` keeps only the last) --
+        # fails closed rather than being read as fewer concerns.
+        concerns_ambiguous = (
+            _concern_structure_ambiguous(concerns_body)
+            or len(_LENIENT_CONCERNS_HEADER_RE.findall(resp)) > 1
+        )
+        verification_status, still = _derive_status_from_concerns(
+            concerns, structural_violation or concerns_ambiguous or truncated,
+        )
         # The model's own free-form `Summary:` text is never returned as
         # the report-facing summary for a new-schema response -- see
         # `_synthesize_summary_from_concerns`'s own docstring for why.
-        summary = _synthesize_summary_from_concerns(concerns, structural_violation)
+        if truncated:
+            summary = (
+                "Truncated Challenger response: the provider reported the output was cut off "
+                "at its length limit, so concerns may be missing; this run failed closed and is "
+                "not summarized further."
+            )
+        elif concerns_ambiguous and not structural_violation:
+            summary = (
+                "Unparseable Concerns structure: the response contained concern blocks or "
+                "Concerns sections that could not each be parsed as one numbered block; this "
+                "run failed closed and is not summarized further."
+            )
+        else:
+            summary = _synthesize_summary_from_concerns(concerns, structural_violation)
         # The documented placeholder (`- none`) is the contract's way of
         # leaving these legacy sections EMPTY (see _is_placeholder and the
         # structural-violation gate above); it is never a finding, so it
@@ -1447,11 +1546,16 @@ def challenge_patch(
             "schema_version": "concerns_v2" if _response_uses_v2_schema(concerns_body) else "concerns_v1",
         }
 
-    verification_status, still = _parse_verification(sections)
-
+    # RB-1: no structured `Concerns:` section (missing, legacy-format, or a
+    # header the strict parser did not recognize) means there is no
+    # citation-checked evidence to derive a verdict from. The model's own
+    # `Verification status:`/`Still vulnerable:` answer must never decide
+    # the outcome, so this fails closed whatever it states -- the same
+    # `(None, True)` shape `_parse_verification` already uses for an
+    # unrecognized answer.
     return {
-        "verification_status": verification_status,
-        "still_vulnerable": still,
+        "verification_status": None,
+        "still_vulnerable": True,
         "edge_cases": edge_cases,
         "potential_issues": potential_issues,
         "summary": summary,

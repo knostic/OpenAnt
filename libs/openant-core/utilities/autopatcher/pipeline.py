@@ -2194,7 +2194,8 @@ def _resolve_impact_level(impact: dict | None) -> str:
     """
     if impact is None:
         return "unavailable"
-    return impact.get("impact_level") or "low"
+    # RB-3: a result without a level established nothing -- never "low".
+    return impact.get("impact_level") or "unavailable"
 
 
 # Structured Challenger (`Concerns:` schema) report semantics. Display only:
@@ -2260,7 +2261,7 @@ def _compute_trust_signals(
     """
     hygiene = hygiene or []
     applicability = applicability or {}
-    impact_level = (impact_level or "low").lower()
+    impact_level = (impact_level or "unavailable").lower()  # RB-3: absent is not "low"
 
     high_hygiene = [h for h in hygiene if h.get("severity") == "HIGH"]
     med_hygiene = [h for h in hygiene if h.get("severity") == "MEDIUM"]

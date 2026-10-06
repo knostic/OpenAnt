@@ -806,11 +806,11 @@ class TestResolveImpactLevel:
     def test_present_dict_reads_impact_level(self):
         assert _resolve_impact_level({"impact_level": "high"}) == "high"
 
-    def test_present_dict_missing_key_defaults_to_low(self):
+    def test_present_dict_missing_key_is_unavailable_not_low(self):
         # A real analyzer result always includes impact_level (see
-        # ImpactReport.to_dict()); this only guards a malformed dict, which
-        # is not the same failure mode as impact=None.
-        assert _resolve_impact_level({}) == "low"
+        # ImpactReport.to_dict()); a malformed dict without one established
+        # nothing, so it must never read as "low" (RB-3).
+        assert _resolve_impact_level({}) == "unavailable"
 
 
 # ---------------------------------------------------------------------------

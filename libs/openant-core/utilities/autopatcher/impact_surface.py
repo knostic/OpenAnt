@@ -36,6 +36,13 @@ from typing import List, Dict, Tuple, Optional
 
 from .diff_parsing import DiffHunk, parse_diff
 
+# A file deleted by the diff -- never reported by parse_diff (RB-3).
+_DELETED_FILE_HEADER_RE = re.compile(r"^\+\+\+ /dev/null\s*$", re.MULTILINE)
+# A complete single-line Python import statement (RB-3: such a hunk has no
+# symbol to attribute). A parenthesized multi-line import's continuation
+# lines do not match and stay attributable-or-abstaining as before.
+_IMPORT_LINE_RE = re.compile(r"^(?:from\s+[\w.]+\s+)?import\s+[\w.*]+(?:\s+as\s+\w+)?(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*\s*$")
+
 
 @dataclass
 class UsageMatch:
@@ -149,13 +156,27 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         # a trailing "()" (see F-XX: constants/fields must not appear
         # callable).
         symbol_kinds: Dict[str, str] = {}
+        # RB-3: every changed region this analysis could not attribute to a
+        # symbol (non-Python file, unreadable/unparseable file, unlocated or
+        # unresolvable hunk). Any entry makes the result "unavailable" below:
+        # "could not attribute the changed code" is not evidence of low risk.
+        unattributed: List[str] = []
+        # parse_diff only reports `+++ b/<path>` files, so a deleted file
+        # (`+++ /dev/null`) -- or a non-empty diff with no recognizable file
+        # at all -- is changed code this analysis never looked at.
+        for _ in _DELETED_FILE_HEADER_RE.finditer(patch_diff or ""):
+            unattributed.append("a deleted file was not analyzed")
+        if not changed_files and (patch_diff or "").strip():
+            unattributed.append("no changed file could be identified in the diff")
         for f in changed_files:
             if f.endswith(".py"):
                 hunks = file_hunks.get(f, [])
-                syms = self._extract_symbols(f, hunks, repo_context=repo_context)
+                syms = self._extract_symbols(f, hunks, repo_context=repo_context, unattributed=unattributed)
                 for name, kind in syms:
                     changed_symbols.append(name)
                     symbol_kinds.setdefault(name, kind)
+            else:
+                unattributed.append(f"{f}: not Python source")
 
         # Unique symbols
         changed_symbols = list(dict.fromkeys(changed_symbols))
@@ -178,6 +199,18 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         )
 
         recommendations = self._recommendations_for_level(impact_level)
+
+        if unattributed:
+            # RB-3: the existing "unavailable" level (impact not established),
+            # which the recommendation gate already treats as Not Verified.
+            impact_level = "unavailable"
+            impact_summary = (
+                "Not evaluated — part of the change could not be attributed to a Python symbol ("
+                + "; ".join(unattributed[:3])
+                + (f"; +{len(unattributed) - 3} more" if len(unattributed) > 3 else "")
+                + "), so its impact is unknown."
+            )
+            recommendations = []
 
         return ImpactReport(
             changed_files=changed_files,
@@ -223,6 +256,15 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         if not removed or not added:
             return False
         return removed == added
+
+    def _is_import_or_comment_only_hunk(self, hunk_lines: List[str]) -> bool:
+        """True when every added/removed line is blank, a comment, or a
+        single-line import statement -- changes with no symbol to attribute
+        and no callers to search, so not an attribution failure (RB-3)."""
+        changed = [self._normalize(l) for l in hunk_lines if l[:1] in ("+", "-")]
+        return bool(changed) and all(
+            not c or c.startswith("#") or _IMPORT_LINE_RE.match(c) for c in changed
+        )
 
     def _locate_hunk(self, anchors: List[str], file_lines: List[str]) -> Optional[int]:
         """Find the 0-indexed start line in file_lines where `anchors` best
@@ -308,7 +350,10 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         candidates.sort(key=lambda c: c[0])
         return candidates[0][1], candidates[0][2]
 
-    def _extract_symbols(self, file_path: Path | str, hunks: List[DiffHunk], repo_context=None) -> List[Tuple[str, str]]:
+    def _extract_symbols(
+        self, file_path: Path | str, hunks: List[DiffHunk], repo_context=None,
+        unattributed: "List[str] | None" = None,
+    ) -> List[Tuple[str, str]]:
         """Extract (name, kind) pairs for changed Python symbols in a file's
         hunks. `kind` (see _build_symbol_index) lets a caller distinguish a
         function/method from a constant/class-attribute/field assignment
@@ -318,10 +363,15 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         no symbol attribution); otherwise relocate its actual edit by
         content in the current file (never by the hunk header's line
         number) and resolve the innermost enclosing symbol there via ast.
-        Silently produces no symbol for a hunk that can't be confidently
-        relocated or a file that doesn't parse — never guesses.
+        Produces no symbol for a hunk that can't be confidently relocated or
+        a file that doesn't parse — never guesses. When `unattributed` is
+        given, each such abstention is recorded there (RB-3), so the caller
+        can tell "no affected code" apart from "changed code we could not
+        attribute". A new file (no pre-patch file; every hunk a pure
+        addition) has no pre-existing callers and is not an abstention.
         """
         symbols: List[Tuple[str, str]] = []
+        record = unattributed.append if unattributed is not None else (lambda _reason: None)
         try:
             if repo_context is not None:
                 rel = file_path if isinstance(file_path, str) else str(file_path)
@@ -329,20 +379,28 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
             else:
                 text = Path(file_path).read_text(encoding="utf-8")
         except Exception:
+            if not all(all(l[:1] == "+" for l in h.lines) for h in hunks):
+                record(f"{file_path}: unreadable")
             return symbols
 
         file_lines = text.splitlines()
         symbol_index = self._build_symbol_index(text)
         if symbol_index is None:
+            record(f"{file_path}: does not parse")
             return symbols
 
         for hunk in hunks:
             if self._is_whitespace_only_hunk(hunk.lines):
                 continue
+            if self._is_import_or_comment_only_hunk(hunk.lines):
+                # No symbol to attribute and no callers to search -- not an
+                # abstention (RB-3), same as a whitespace-only hunk.
+                continue
 
             anchors, changed_flags = self._anchor_lines(hunk.lines)
             start_idx = self._locate_hunk(anchors, file_lines)
             if start_idx is None:
+                record(f"{file_path}: hunk could not be located")
                 continue
 
             changed_positions = [start_idx + i for i, is_changed in enumerate(changed_flags) if is_changed]
@@ -359,8 +417,15 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
                 # anchor immediately adjacent to it on each side, and
                 # attribute a symbol only when both sides exist and agree --
                 # otherwise abstain for that run.
-                for resolved in self._resolve_insertion_run_symbols(hunk.lines, anchors, start_idx, symbol_index):
-                    symbols.append(resolved)
+                abstained_runs: List[List[str]] = []
+                symbols.extend(self._resolve_insertion_run_symbols(
+                    hunk.lines, anchors, start_idx, symbol_index, abstained=abstained_runs,
+                ))
+                # RB-3: each inserted run that could not be attributed --
+                # even when another run in the same hunk could -- is an
+                # abstention, unless it is only imports/comments.
+                if any(not self._is_import_or_comment_only_hunk(run) for run in abstained_runs):
+                    record(f"{file_path}: inserted lines not attributable to a symbol")
                 continue
 
             true_start = min(changed_positions) + 1  # 1-indexed
@@ -371,6 +436,8 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
                 resolved = self._resolve_symbol_at_line(symbol_index, true_end)
             if resolved:
                 symbols.append(resolved)
+            else:
+                record(f"{file_path}: changed lines not attributable to a symbol")
 
         return symbols
 
@@ -380,6 +447,7 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         anchors: List[str],
         start_idx: int,
         symbol_index: List[Tuple[int, int, str, str]],
+        abstained: "List[List[str]] | None" = None,
     ) -> List[Tuple[str, str]]:
         """For a pure-insertion hunk (no removed lines), resolve each maximal
         run of added ('+') lines against only the anchor immediately before
@@ -389,6 +457,7 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         of the hunk (missing one side) or whose two sides disagree
         contributes nothing: abstaining is preferred over guessing."""
         resolved_symbols: List[Tuple[str, str]] = []
+        abstained_runs: List[List[str]] = []
         anchor_idx = -1  # index into `anchors` of the last anchor line seen
         i = 0
         n = len(hunk_lines)
@@ -404,12 +473,19 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
                 j += 1
             preceding = anchor_idx if anchor_idx >= 0 else None
             following = anchor_idx + 1 if j < n and hunk_lines[j][:1] in (" ", "-") else None
+            resolved = None
             if preceding is not None and following is not None:
                 before = self._resolve_symbol_at_line(symbol_index, start_idx + preceding + 1)
                 after = self._resolve_symbol_at_line(symbol_index, start_idx + following + 1)
                 if before is not None and before == after:
-                    resolved_symbols.append(before)
+                    resolved = before
+            if resolved is not None:
+                resolved_symbols.append(resolved)
+            else:
+                abstained_runs.append(hunk_lines[i:j])
             i = j
+        if abstained is not None:
+            abstained.extend(abstained_runs)
         return resolved_symbols
 
     def _search_usages(self, symbols: List[str], repo_context=None) -> List[UsageMatch]:

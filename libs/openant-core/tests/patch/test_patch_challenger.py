@@ -21,6 +21,13 @@ Summary:
 - A concise paragraph summarising the adversarial findings.
 """
 
+def _stated_verdict(llm):
+    """The model's own stated verdict, as the diagnostic `_parse_verification`
+    reads it from the mocked response. Never decision-relevant (RB-1)."""
+    from utilities.autopatcher.patch_challenger import _parse_verification, _split_sections
+    return _parse_verification(_split_sections(llm.complete.return_value))
+
+
 _NEW_FORMAT_RESPONSE = """\
 Verification status: {status}
 
@@ -95,7 +102,7 @@ class TestCodeContextParameter:
 
         result = challenge_patch("some vuln", "some diff", llm)
 
-        assert result["still_vulnerable"] is False
+        assert result["still_vulnerable"] is True  # RB-1: no `Concerns:` section -> fails closed; the stated verdict is never trusted
         assert result["edge_cases"] == ["Some edge case"]
         assert result["potential_issues"] == ["Some potential issue"]
 
@@ -140,8 +147,10 @@ class TestChallengePatchBasicBehavior:
 
 
 class TestVerificationStatus:
-    """The authoritative tri-state signal and its backward-compatible
-    `still_vulnerable` projection -- see patch_challenger._parse_verification."""
+    """The tri-state signal and its backward-compatible `still_vulnerable`
+    projection. Without a `Concerns:` section, `challenge_patch` fails
+    closed whatever is stated (RB-1); `_stated_verdict` checks that the
+    diagnostic `_parse_verification` still reads the stated value."""
 
     def test_verified_fixed_new_format(self):
         from utilities.autopatcher.patch_challenger import challenge_patch
@@ -151,8 +160,9 @@ class TestVerificationStatus:
 
         result = challenge_patch("some vuln", "some diff", llm)
 
-        assert result["verification_status"] == "VERIFIED_FIXED"
-        assert result["still_vulnerable"] is False
+        assert result["verification_status"] is None  # RB-1: no `Concerns:` section -> fails closed; the stated verdict is never trusted
+        assert result["still_vulnerable"] is True
+        assert _stated_verdict(llm) == ("VERIFIED_FIXED", False)
 
     def test_residual_vulnerability_new_format(self):
         """Affirmative demonstrated bypass -> RESIDUAL_VULNERABILITY."""
@@ -163,8 +173,9 @@ class TestVerificationStatus:
 
         result = challenge_patch("some vuln", "some diff", llm)
 
-        assert result["verification_status"] == "RESIDUAL_VULNERABILITY"
+        assert result["verification_status"] is None  # RB-1: no `Concerns:` section -> fails closed; the stated verdict is never trusted
         assert result["still_vulnerable"] is True
+        assert _stated_verdict(llm) == ("RESIDUAL_VULNERABILITY", True)
 
     def test_insufficient_evidence_new_format(self):
         """Missing verification evidence -> INSUFFICIENT_EVIDENCE, not a
@@ -176,8 +187,9 @@ class TestVerificationStatus:
 
         result = challenge_patch("some vuln", "some diff", llm)
 
-        assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert result["verification_status"] is None  # RB-1: no `Concerns:` section -> fails closed; the stated verdict is never trusted
         assert result["still_vulnerable"] is True
+        assert _stated_verdict(llm) == ("INSUFFICIENT_EVIDENCE", True)
 
     def test_new_format_unrecognized_token_fails_closed(self):
         """A hallucinated/garbage value under the new header must never be
@@ -210,11 +222,10 @@ class TestVerificationStatus:
         assert result["verification_status"] is None
         assert result["still_vulnerable"] is True
 
-    def test_legacy_still_vulnerable_no_preserved_exactly(self):
-        """LEGACY-format-only response: `Still vulnerable: No` must remain
-        False, NOT be derived via `verification_status != VERIFIED_FIXED`
-        (which would incorrectly flip it to True since verification_status
-        is None for a legacy-only response)."""
+    def test_legacy_still_vulnerable_no_fails_closed(self):
+        """LEGACY-format-only response: `Still vulnerable: No` is read by
+        the diagnostic `_parse_verification` as before, but no longer
+        decides anything -- `challenge_patch` fails closed (RB-1)."""
         from utilities.autopatcher.patch_challenger import challenge_patch
 
         llm = mock.MagicMock()
@@ -223,7 +234,8 @@ class TestVerificationStatus:
         result = challenge_patch("some vuln", "some diff", llm)
 
         assert result["verification_status"] is None
-        assert result["still_vulnerable"] is False
+        assert result["still_vulnerable"] is True  # RB-1: no `Concerns:` section -> fails closed; the stated verdict is never trusted
+        assert _stated_verdict(llm) == (None, False)
 
     def test_legacy_still_vulnerable_yes_preserved_exactly(self):
         from utilities.autopatcher.patch_challenger import challenge_patch
@@ -255,8 +267,9 @@ class TestVerificationStatus:
 
         result = challenge_patch("some vuln", "some diff", llm)
 
-        assert result["verification_status"] == "VERIFIED_FIXED"
-        assert result["still_vulnerable"] is False
+        assert result["verification_status"] is None  # RB-1: no `Concerns:` section -> fails closed; the stated verdict is never trusted
+        assert result["still_vulnerable"] is True
+        assert _stated_verdict(llm) == ("VERIFIED_FIXED", False)
 
     def test_no_urllib3_cookie_cve_strings_in_production_files(self):
         """Genericity guard: the Challenger prompt/parser must never carry
@@ -378,8 +391,9 @@ class TestCompletePathReachabilityContract:
 class TestReachabilityOutcomesPassthrough:
     """Mocked-LLM tests: simulate a Challenger response that DOES follow the
     new complete-path reachability rule, for each of the outcomes the rule
-    can produce, and assert challenge_patch's own free-text parsing (never
-    LLM reasoning) preserves that outcome unchanged. These prove the
+    can produce, and assert the diagnostic free-text parser (never LLM
+    reasoning) reads that outcome unchanged -- while `challenge_patch`
+    itself fails closed for these unstructured responses (RB-1). These prove the
     mechanical parser does not fight, reinterpret, or require any
     special-casing for a contract-following response -- they cannot and do
     not prove an LLM will actually perform the trace; only a real
@@ -410,8 +424,9 @@ class TestReachabilityOutcomesPassthrough:
             ],
         )
         result = challenge_patch("some vuln", "some diff", llm, code_context="ctx")
-        assert result["verification_status"] == "RESIDUAL_VULNERABILITY"
+        assert result["verification_status"] is None  # RB-1: no `Concerns:` section -> fails closed; the stated verdict is never trusted
         assert result["still_vulnerable"] is True
+        assert _stated_verdict(llm) == ("RESIDUAL_VULNERABILITY", True)
 
     def test_c_explicit_override_in_scope_may_establish_residual_vulnerability(self):
         """Outcome C: the operation is only reachable via an explicit
@@ -430,8 +445,9 @@ class TestReachabilityOutcomesPassthrough:
             ],
         )
         result = challenge_patch("some vuln", "some diff", llm, code_context="ctx")
-        assert result["verification_status"] == "RESIDUAL_VULNERABILITY"
+        assert result["verification_status"] is None  # RB-1: no `Concerns:` section -> fails closed; the stated verdict is never trusted
         assert result["still_vulnerable"] is True
+        assert _stated_verdict(llm) == ("RESIDUAL_VULNERABILITY", True)
 
     def test_d_guard_default_or_order_unestablished_is_insufficient_evidence(self):
         """Outcome D: the guard/default/order cannot be established from
@@ -450,8 +466,9 @@ class TestReachabilityOutcomesPassthrough:
             ],
         )
         result = challenge_patch("some vuln", "some diff", llm, code_context="ctx")
-        assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert result["verification_status"] is None  # RB-1: no `Concerns:` section -> fails closed; the stated verdict is never trusted
         assert result["still_vulnerable"] is True
+        assert _stated_verdict(llm) == ("INSUFFICIENT_EVIDENCE", True)
 
     def test_default_blocked_path_recorded_as_non_blocking_edge_case_not_residual(self):
         """Outcome A/E combined: a complete trace shows the operation is
@@ -473,8 +490,9 @@ class TestReachabilityOutcomesPassthrough:
             potential_issues=[],
         )
         result = challenge_patch("some vuln", "some diff", llm, code_context="ctx")
-        assert result["verification_status"] == "VERIFIED_FIXED"
-        assert result["still_vulnerable"] is False
+        assert result["verification_status"] is None  # RB-1: no `Concerns:` section -> fails closed; the stated verdict is never trusted
+        assert result["still_vulnerable"] is True
+        assert _stated_verdict(llm) == ("VERIFIED_FIXED", False)
         assert len(result["edge_cases"]) == 1
 
 
@@ -884,10 +902,9 @@ class TestLegacyCompatibility:
     same way."""
 
     def test_true_legacy_response_has_no_concerns_key_and_is_unaffected(self):
-        """A response with no `Concerns:` header at all is untouched --
-        no `concerns`/`schema_version` keys appear, and
-        `verification_status` comes from `_parse_verification` exactly as
-        before this schema existed."""
+        """A response with no `Concerns:` header at all keeps the legacy
+        5-key shape (no `concerns`/`schema_version` keys), and fails closed
+        rather than taking its stated verdict (RB-1)."""
         from utilities.autopatcher.patch_challenger import challenge_patch
 
         llm = mock.MagicMock()
@@ -897,7 +914,8 @@ class TestLegacyCompatibility:
 
         assert "concerns" not in result
         assert "schema_version" not in result
-        assert result["verification_status"] == "VERIFIED_FIXED"
+        assert result["verification_status"] is None  # RB-1: no `Concerns:` section -> fails closed; the stated verdict is never trusted
+        assert result["still_vulnerable"] is True
         assert set(result.keys()) == {
             "verification_status", "still_vulnerable", "edge_cases", "potential_issues", "summary",
         }
@@ -1087,8 +1105,8 @@ class TestSummaryCannotHideAConcern:
     def test_d_true_legacy_response_summary_behavior_unchanged(self):
         """D. A true legacy response (no `Concerns:` header) keeps its
         existing Summary behavior exactly -- the model's own raw text,
-        never synthesized, never gated -- and the legacy
-        `_parse_verification` path, completely untouched by this fix."""
+        never synthesized, never gated -- while its verdict fails closed
+        (RB-1)."""
         from utilities.autopatcher.patch_challenger import challenge_patch
 
         llm = mock.MagicMock()
@@ -1097,7 +1115,7 @@ class TestSummaryCannotHideAConcern:
         result = challenge_patch("some vuln", "some diff", llm)
 
         assert result["verification_status"] is None
-        assert result["still_vulnerable"] is False
+        assert result["still_vulnerable"] is True  # RB-1: no `Concerns:` section -> fails closed; the stated verdict is never trusted
         assert result["summary"] == "- A concise paragraph summarising the adversarial findings."
         assert "concerns" not in result
 
