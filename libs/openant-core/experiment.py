@@ -752,7 +752,7 @@ def print_summary(experiment: dict):
     print("EXPERIMENT SUMMARY")
     print("=" * 60)
     print(f"Dataset: {experiment['dataset']}")
-    print(f"Model: {experiment['model']}")
+    print(f"Model: {experiment['analyze_model']}")
     print(f"Enhanced context: {experiment.get('enhanced', False)}")
     print(f"Total units: {metrics['total']}")
     print()
