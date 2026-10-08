@@ -330,8 +330,6 @@ def test_the_shared_extractor_is_a_strict_superset_of_the_naive_slice():
                 # the F1c bound: the pick must decode from SOME contiguous
                 # span of the text itself (a genuine competing object) --
                 # never a fabricated or third-party value
-                spans = [i for i, c in enumerate(s) if c == "{"] \
-                    + [len(s)]
                 decoded_spans = []
                 for i in range(len(s)):
                     if s[i] != "{":
