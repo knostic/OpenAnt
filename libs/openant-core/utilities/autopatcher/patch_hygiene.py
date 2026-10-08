@@ -64,9 +64,13 @@ def _parse_file_patches(patch: str) -> list[_FilePatch]:
                 context_lines=context[:],
             ))
 
-    lines = patch.splitlines()
+    # Split on "\n" only (dropping a CRLF's "\r"), exactly like
+    # diff_parsing.parse_diff: str.splitlines() also breaks on \f, \x85,
+    # U+2028 etc., cutting one diff line in two.
+    lines = [l[:-1] if l.endswith("\r") else l for l in patch.split("\n")]
     i = 0
     n = len(lines)
+    in_hunk = False
     while i < n:
         line = lines[i]
 
@@ -78,11 +82,18 @@ def _parse_file_patches(patch: str) -> list[_FilePatch]:
         # boundary from coincidental body content. Resolving the pair in one
         # step also flushes the PREVIOUS file using its own from_path/to_path
         # before either is overwritten, instead of leaking the next file's
-        # from_path into the previous file's is_new_file computation.
+        # from_path into the previous file's is_new_file computation. Inside a
+        # hunk the pair alone is not enough (a removed "-- x" line followed by
+        # an added "++ y" line forms the same raw pair), so there a genuine
+        # header must also be followed by its own "@@" line -- the rule
+        # diff_parsing.parse_diff and diff_hunk_repair use (F-14).
+        if line.startswith("diff --git "):
+            in_hunk = False
         if (
             line.startswith("--- ")
             and i + 1 < n
             and lines[i + 1].startswith("+++ ")
+            and (not in_hunk or (i + 2 < n and lines[i + 2].startswith("@@")))
         ):
             _flush()
             raw = line[4:].split("\t")[0].strip()
@@ -92,8 +103,12 @@ def _parse_file_patches(patch: str) -> list[_FilePatch]:
             added = []
             removed = []
             context = []
+            in_hunk = False
             i += 2
             continue
+
+        if to_path is not None and line.startswith("@@"):
+            in_hunk = True
 
         if to_path is not None:
             # A genuine "+++ "/"--- " header line would already have been

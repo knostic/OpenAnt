@@ -2430,6 +2430,14 @@ def _compute_trust_signals(
         elif total_concerns and verification_status == "VERIFIED_FIXED":
             cov_val = "High"
             cov_notes = f"All {total_concerns} structured Challenger concern(s) classified non-blocking"
+        elif total_concerns and classified_challenger.get("verdict_conflict"):
+            # All NON_BLOCKING, but the response contradicted itself (see
+            # patch_challenger._self_contradiction) and failed closed.
+            cov_val = "Medium"
+            cov_notes = (
+                f"All {total_concerns} structured Challenger concern(s) classified non-blocking, "
+                f"but {classified_challenger['verdict_conflict']}, so the review failed closed"
+            )
         elif total_concerns:
             # All NON_BLOCKING, but the run-level structural gates failed
             # closed (see patch_challenger._derive_status_from_concerns).
@@ -3184,6 +3192,11 @@ def _render_challenger_concerns(classified_challenger: dict | None) -> str:
         lines.append("No structured concern was reported.\n")
         return "\n".join(lines) + "\n"
     lines.append(f"{_describe_structured_concern_counts(_structured_concern_counts(classified_challenger))}.\n")
+    if classified_challenger.get("verdict_conflict"):
+        lines.append(
+            f"**Failed closed:** {classified_challenger['verdict_conflict']}, contradicting "
+            "its non-blocking concern facts, so the review is not read as verified.\n"
+        )
     lines.append("| # | Role | Consequence | Model-authored description |")
     lines.append("|---|---|---|---|")
     for index, concern in enumerate(concerns, 1):

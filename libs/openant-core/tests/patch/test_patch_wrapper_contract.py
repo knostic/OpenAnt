@@ -215,7 +215,10 @@ def test_run_patch_rejects_a_repo_root_that_is_not_a_directory(tmp_path, monkeyp
         bad.write_text("x")
 
     from utilities.autopatcher import pipeline as _pipeline_module
-    with mock.patch.object(_pipeline_module, "run") as engine:
+    # Reaching the engine at all is the failure: raise an AssertionError there
+    # so a missing check fails on this assertion, not on a mock's return value.
+    engine_reached = AssertionError("the engine ran for a --repo-root that is not a directory")
+    with mock.patch.object(_pipeline_module, "run", side_effect=engine_reached) as engine:
         with pytest.raises(ValueError, match="--repo-root does not exist"):
             run_patch(po_path, "F-001", str(tmp_path), repo_root=str(bad))
     engine.assert_not_called()

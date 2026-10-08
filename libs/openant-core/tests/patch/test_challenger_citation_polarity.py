@@ -55,10 +55,11 @@ POST_CTX_REMOVED = (
 )
 
 
-def _v2(op_prov, guard_prov, ds_prov="user.is_admin", eff_prov="raise PermissionError()"):
+def _v2(op_prov, guard_prov, ds_prov="user.is_admin", eff_prov="raise PermissionError()",
+        description="authorization check before delete", hypothesis="none", role="1. Role: primary"):
     return (
-        "1. Role: primary\n"
-        "   Description: authorization check before delete\n"
+        f"{role}\n"
+        f"   Description: {description}\n"
         "   Operation present in evidence: present\n"
         f"   Operation provenance: {op_prov}\n"
         "   Preceding guard: present\n"
@@ -74,14 +75,14 @@ def _v2(op_prov, guard_prov, ds_prov="user.is_admin", eff_prov="raise Permission
         "   Override provenance: none\n"
         "   Contract addresses override: not_applicable\n"
         "   Scope provenance: none\n"
-        "   Hypothesized outcome: none\n"
+        f"   Hypothesized outcome: {hypothesis}\n"
     )
 
 
-def _v1(reach_prov):
+def _v1(reach_prov, description="authorization check before delete"):
     return (
         "1. Role: primary\n"
-        "   Description: authorization check before delete\n"
+        f"   Description: {description}\n"
         "   Default execution reachability: blocked\n"
         f"   Reachability provenance: {reach_prov}\n"
         "   Requires explicit non-default action: false\n"
@@ -91,9 +92,10 @@ def _v1(reach_prov):
     )
 
 
-def _decide(patch, block, code_context="", tmp_path=None):
+def _decide(patch, block, code_context="", tmp_path=None, header="VERIFIED_FIXED"):
+    status_line = f"Verification status: {header}\n\n" if header is not None else ""
     reply = (
-        f"Verification status: VERIFIED_FIXED\n\nConcerns:\n\n{block}\n"
+        f"{status_line}Concerns:\n\n{block}\n"
         "Edge cases:\n- none\n\nPotential issues:\n- none\n\nSummary:\n- none\n"
     )
     llm = mock.MagicMock()
@@ -113,6 +115,7 @@ def _decide(patch, block, code_context="", tmp_path=None):
     decisions = re.findall(
         r"\*\*(Deploy After Validation|Deploy With Caution|Manual Review Required|Do Not Apply)\*\*", report
     )
+    _decide.last = (ch, report)
     return ch["verification_status"], decisions[0]
 
 
@@ -170,3 +173,132 @@ class TestMidIdentifierFragmentsAreNotCitations:
         status, decision = _decide(NOOP, _v1("ret"), "", tmp_path)
         assert status != "VERIFIED_FIXED"
         assert decision != "Deploy After Validation"
+
+
+ADDING_WITH_RULE = (
+    _HEADER + "@@ -1,3 +1,5 @@\n def delete_user(user, target):\n"
+    f"+    # ======\n+    {GUARD}\n     {OP}\n     return True\n"
+)
+
+
+class TestCitationMustContainIdentifierCharacter:
+    """A quote with no identifier character proves nothing even when it is
+    real post-change text: `======` is a genuine added line here."""
+
+    def test_punctuation_only_quote_is_never_a_citation(self, tmp_path):
+        status, decision = _decide(ADDING_WITH_RULE, _v1("======"), "", tmp_path)
+        assert status != "VERIFIED_FIXED"
+        assert decision != "Deploy After Validation"
+
+    def test_real_guard_citation_control(self, tmp_path):
+        status, decision = _decide(ADDING_WITH_RULE, _v1(GUARD), "", tmp_path)
+        assert status == "VERIFIED_FIXED"
+        assert decision == "Deploy After Validation"
+
+
+_BOTH_SCHEMAS = {
+    "v1": lambda **kw: _v1(GUARD, **{k: v for k, v in kw.items() if k == "description"}),
+    "v2": lambda **kw: _v2(OP, GUARD, **kw),
+}
+
+
+class TestSelfContradictingResponseFailsClosed:
+    """PR #763 review: when the Challenger's own text concludes that the
+    vulnerability is not fixed, valid citations that would otherwise compute
+    VERIFIED_FIXED must not turn that into Deploy After Validation."""
+
+    def _assert_failed_closed(self, status, decision, needle):
+        ch, report = _decide.last
+        assert status == "INSUFFICIENT_EVIDENCE"
+        assert decision == "Manual Review Required"
+        assert needle in ch["verdict_conflict"]
+        assert "**Failed closed:**" in report and needle in report
+
+    @pytest.mark.parametrize("schema", ["v1", "v2"])
+    @pytest.mark.parametrize("header", ["RESIDUAL_VULNERABILITY", "INSUFFICIENT_EVIDENCE"])
+    def test_negative_status_header(self, tmp_path, schema, header):
+        status, decision = _decide(ADDING, _BOTH_SCHEMAS[schema](), "", tmp_path, header=header)
+        self._assert_failed_closed(status, decision, header)
+
+    def test_legacy_still_vulnerable_yes_header(self, tmp_path):
+        status, decision = _decide(
+            ADDING, _v2(OP, GUARD), "", tmp_path, header="VERIFIED_FIXED\nStill vulnerable: Yes"
+        )
+        self._assert_failed_closed(status, decision, "Still vulnerable")
+
+    @pytest.mark.parametrize("schema", ["v1", "v2"])
+    def test_primary_description_says_still_exploitable(self, tmp_path, schema):
+        block = _BOTH_SCHEMAS[schema](description="The issue remains exploitable via the bulk endpoint.")
+        status, decision = _decide(ADDING, block, "", tmp_path)
+        self._assert_failed_closed(status, decision, "Description")
+
+    def test_primary_hypothesized_outcome_says_still_bypassable(self, tmp_path):
+        block = _v2(OP, GUARD, hypothesis="An attacker can still bypass the check through the bulk endpoint.")
+        status, decision = _decide(ADDING, block, "", tmp_path)
+        self._assert_failed_closed(status, decision, "Hypothesized outcome")
+
+    # --- controls: consistent responses keep their fact-based verdict ---
+
+    @pytest.mark.parametrize("schema", ["v1", "v2"])
+    def test_consistent_verified_response_still_deploys(self, tmp_path, schema):
+        status, decision = _decide(ADDING, _BOTH_SCHEMAS[schema](), "", tmp_path)
+        assert status == "VERIFIED_FIXED"
+        assert decision == "Deploy After Validation"
+        assert "verdict_conflict" not in _decide.last[0]
+
+    def test_question_and_negated_text_is_not_a_negative_conclusion(self, tmp_path):
+        block = _v2(
+            OP, GUARD,
+            description="Whether the issue remains exploitable after the patch under default execution.",
+            hypothesis="The delete is no longer exploitable because the guard raises before it runs.",
+        )
+        status, decision = _decide(ADDING, block, "", tmp_path)
+        assert status == "VERIFIED_FIXED"
+        assert decision == "Deploy After Validation"
+
+    def test_additional_concern_text_is_not_read(self, tmp_path):
+        block = _v2(OP, GUARD) + "\n" + _v2(
+            OP, GUARD, role="2. Role: additional",
+            description="The issue remains exploitable when a caller passes a non-default override.",
+        )
+        status, decision = _decide(ADDING, block, "", tmp_path)
+        assert status == "VERIFIED_FIXED"
+        assert decision == "Deploy After Validation"
+
+    def test_missing_header_keeps_the_fact_based_verdict(self, tmp_path):
+        status, decision = _decide(ADDING, _v2(OP, GUARD), "", tmp_path, header=None)
+        assert status == "VERIFIED_FIXED"
+        assert decision == "Deploy After Validation"
+
+
+class TestStillExploitableDetector:
+    @pytest.mark.parametrize("text", [
+        "The issue remains exploitable via the bulk endpoint.",
+        "The endpoint is still vulnerable to the same payload.",
+        "Guards were added; the original request remains fully exploitable.",
+        "An attacker can still bypass the check through the bulk endpoint.",
+        "The token could still be exploited by a replayed request.",
+    ])
+    def test_declarative_assertions(self, text):
+        from utilities.autopatcher.patch_challenger import _asserts_still_exploitable
+        assert _asserts_still_exploitable(text)
+
+    @pytest.mark.parametrize("text", [
+        None, "", "none",
+        "Whether the issue remains exploitable after the patch.",
+        "Is the endpoint still vulnerable?",
+        "If a caller passes allow_external=True, the operation remains exploitable.",
+        "The endpoint is no longer exploitable.",
+        "The operation is not still vulnerable after the guard.",
+        "Nothing remains exploitable once the guard raises.",
+        # real recorded primary-concern text (release-regression batches)
+        "Whether a server-supplied Content-Disposition filename with path separators or `../` can still "
+        "make file_path escape temp_dir.",
+        "In PoolManager.urlopen, with 'Cookie' now in the default set, the cross-origin strip loop removes "
+        "the Cookie header before re-invoking, closing this path.",
+        "Whether an attacker-supplied oversized range segment still reaches the backtracking-prone trimming "
+        "regexes in parseRange.",
+    ])
+    def test_non_assertions(self, text):
+        from utilities.autopatcher.patch_challenger import _asserts_still_exploitable
+        assert not _asserts_still_exploitable(text)

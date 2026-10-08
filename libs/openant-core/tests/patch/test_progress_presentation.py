@@ -737,3 +737,69 @@ class TestFatalErrorPresentation:
         progress.reset_for_tests()
 
 
+
+
+# ---------------------------------------------------------------------------
+# Post-patch investigation messaging vs. the isolated-copy apply outcome
+# (PR #763 review item 9) -- real mock-provider runs through core.patch.
+# ---------------------------------------------------------------------------
+
+class TestPostPatchMessageMatchesIsolatedApply:
+    """A patch that does not apply to the isolated copy must not be announced
+    as "Post-patch analysis completed", and the Trust Report must name the
+    apply failure. The mock generator always emits the same diff against
+    app/auth.py; the arms differ in whether that file matches it (each
+    finding names the function its file really contains, so grounding
+    resolves and Post-Patch Investigation runs in both arms)."""
+
+    _MATCHING = (
+        "import db\n\n" + "".join(f"# filler {i}\n" for i in range(39))
+        + "def authenticate(username: str, password: str) -> bool:\n"
+        "    query = f\"SELECT * FROM users WHERE username='{username}' AND password='{password}'\"\n"
+        "    cursor = db.execute(query)\n"
+        "    return cursor.fetchone() is not None\n"
+    )
+    _NOT_MATCHING = "import os\n\n\ndef run_cmd(x):\n    os.system(\"echo \" + x)\n"
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        yield
+        progress.reset_for_tests()
+
+    def _run(self, tmp_path, monkeypatch, capsys, source, function):
+        import json
+        import subprocess
+        from pathlib import Path
+        from core.patch import run_patch
+
+        repo = tmp_path / "repo"
+        (repo / "app").mkdir(parents=True)
+        (repo / "app" / "auth.py").write_text(source, encoding="utf-8")
+        for cmd in (["init", "-q"], ["add", "-A"],
+                    ["-c", "user.email=t@t.com", "-c", "user.name=T", "commit", "-qm", "init"]):
+            subprocess.run(["git", *cmd], cwd=repo, check=True, capture_output=True)
+        po = tmp_path / "pipeline_output.json"
+        po.write_text(json.dumps({"findings": [{
+            "id": "VULN-001", "name": f"Injection in {function}", "cwe_id": "89",
+            "cwe_name": "Injection", "stage1_verdict": "confirmed", "stage2_verdict": "confirmed",
+            "location": {"file": "app/auth.py", "function": function},
+            "description": f"User input reaches a sink in {function} without validation.",
+        }]}), encoding="utf-8")
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        progress.configure()
+        result = run_patch(str(po), "VULN-001", str(tmp_path / "out"), repo_root=str(repo))
+        report = Path(result.trust_report_path).read_text(encoding="utf-8")
+        return capsys.readouterr().err, report
+
+    def test_failed_isolated_apply_is_not_announced_as_completed(self, tmp_path, monkeypatch, capsys):
+        err, report = self._run(tmp_path, monkeypatch, capsys, self._NOT_MATCHING, "run_cmd")
+        assert "Post-patch analysis unavailable — the patch did not apply to the isolated copy" in err
+        assert "Post-patch analysis completed" not in err
+        assert "the patch did not apply to the isolated copy" in report
+        assert "no investigation context available for the patched copy" not in report
+
+    def test_applied_patch_is_announced_as_completed_control(self, tmp_path, monkeypatch, capsys):
+        err, report = self._run(tmp_path, monkeypatch, capsys, self._MATCHING, "authenticate")
+        assert "✓ Post-patch analysis completed" in err
+        assert "did not apply to the isolated copy" not in err
+        assert "the patch did not apply to the isolated copy" not in report

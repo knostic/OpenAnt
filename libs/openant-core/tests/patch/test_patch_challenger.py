@@ -840,19 +840,38 @@ class TestNewSchemaEndToEnd:
             num=1, role="primary", reachability="blocked", reach_prov="guard line", override="false",
         )
         llm = mock.MagicMock()
-        llm.complete.return_value = _response_with_concerns(concerns_text, status="RESIDUAL_VULNERABILITY")
+        llm.complete.return_value = _response_with_concerns(concerns_text, status="VERIFIED_FIXED")
 
         result = challenge_patch("some vuln", "some diff", llm, code_context="guard line")
 
-        # The legacy header says RESIDUAL_VULNERABILITY; the structured
-        # facts (blocked, no override) are what actually govern the
-        # derived, authoritative outcome -- proving the legacy header is
-        # report-only once Concerns: is present.
+        # The structured facts (blocked, no override) govern the derived,
+        # authoritative outcome (see the RESIDUAL_VULNERABILITY test below
+        # for the header never raising it).
         assert result["verification_status"] == "VERIFIED_FIXED"
         assert result["still_vulnerable"] is False
         assert result["schema_version"] == "concerns_v1"
         assert len(result["concerns"]) == 1
         assert result["concerns"][0]["consequence"] == "NON_BLOCKING"
+        assert "verdict_conflict" not in result
+
+    def test_negative_legacy_header_fails_a_verified_derivation_closed(self):
+        """PR #763 review: the header never raises the derived outcome, but a
+        negative header contradicting VERIFIED_FIXED facts fails the run closed
+        instead of being silently overridden."""
+        from utilities.autopatcher.patch_challenger import challenge_patch
+
+        concerns_text = _concern_block(
+            num=1, role="primary", reachability="blocked", reach_prov="guard line", override="false",
+        )
+        llm = mock.MagicMock()
+        llm.complete.return_value = _response_with_concerns(concerns_text, status="RESIDUAL_VULNERABILITY")
+
+        result = challenge_patch("some vuln", "some diff", llm, code_context="guard line")
+
+        assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert result["still_vulnerable"] is True
+        assert result["concerns"][0]["consequence"] == "NON_BLOCKING"
+        assert "RESIDUAL_VULNERABILITY" in result["verdict_conflict"]
 
     def test_valid_new_schema_response_derives_residual_vulnerability(self):
         from utilities.autopatcher.patch_challenger import challenge_patch

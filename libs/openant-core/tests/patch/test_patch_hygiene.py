@@ -571,3 +571,50 @@ class TestPipelineHygieneSection:
         end = report.find("---", start)
         section = report[start:end]
         assert "No obvious hygiene issues detected." in section
+
+
+class TestAdjacentDashDashPlusPlusContentLines:
+    """PR #763 review (Batch C): a valid hunk that removes a "-- x" line and
+    adds a "++ y" line has the raw lines "--- x" / "+++ y". Inside a hunk that
+    pair is content, not a new file header -- otherwise the real file looks
+    empty and a correct patch gets two HIGH empty_hunk findings."""
+
+    DIFF = (
+        "--- a/notes.sql\n+++ b/notes.sql\n@@ -1,3 +1,3 @@\n"
+        " a\n--- removed dashes\n+++ added pluses\n b\n"
+    )
+
+    def test_adjacent_pair_is_hunk_content(self):
+        from utilities.autopatcher.patch_hygiene import _parse_file_patches
+        fps = _parse_file_patches(self.DIFF)
+        assert [fp.filename for fp in fps] == ["notes.sql"]
+        assert fps[0].removed_lines == ["-- removed dashes"]
+        assert fps[0].added_lines == ["++ added pluses"]
+
+    def test_no_false_empty_hunk_finding(self):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        assert [f for f in check_patch(self.DIFF) if f["check"] == "empty_hunk"] == []
+
+    # --- controls: genuine headers and genuinely empty hunks are unchanged ---
+
+    def test_genuine_second_file_header_after_a_hunk_still_splits(self):
+        from utilities.autopatcher.patch_hygiene import _parse_file_patches
+        two = (
+            "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+b\n"
+            "--- a/y.txt\n+++ b/y.txt\n@@ -1 +1 @@\n-c\n+d\n"
+        )
+        assert [fp.filename for fp in _parse_file_patches(two)] == ["x.txt", "y.txt"]
+
+    def test_genuinely_empty_hunk_is_still_flagged(self):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        empty = "--- a/x.txt\n+++ b/x.txt\n@@ -1,2 +1,2 @@\n a\n b\n"
+        assert [f["check"] for f in check_patch(empty)] == ["empty_hunk"]
+
+    def test_header_without_any_hunk_is_still_flagged(self):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        assert [f["check"] for f in check_patch("--- a/x.txt\n+++ b/x.txt\n")] == ["empty_hunk"]
+
+    def test_unicode_line_separator_does_not_split_a_diff_line(self):
+        from utilities.autopatcher.patch_hygiene import _parse_file_patches
+        fps = _parse_file_patches("--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-s = 1\n+s = 'a b'\n")
+        assert fps[0].added_lines == ["s = 'a b'"]

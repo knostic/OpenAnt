@@ -25,8 +25,9 @@ the legacy `still_vulnerable` boolean and with malformed/missing input.
 For a response using the structured `Concerns:` schema (see
 `_parse_concerns`/`_derive_status_from_concerns` below), these three
 strings are instead DERIVED deterministically from the concern facts --
-never read directly from a `Verification status:` header, which becomes
-report-only text for such a response. A response without a `Concerns:`
+never read directly from a `Verification status:` header. The header can
+never raise the derived status; a NEGATIVE header can only fail a
+VERIFIED_FIXED derivation closed (see `_self_contradiction`). A response without a `Concerns:`
 section is not decided by its own stated status either: `challenge_patch`
 fails it closed (RB-1). `_parse_verification` is kept for diagnostic
 tooling that re-reads archived responses."""
@@ -1147,7 +1148,9 @@ def _parse_concern_block_v2(
     implication that goes beyond them" -- but that distinction is for a
     human reader, not for this function's own policy: the field's
     presence, absence, or content changes nothing about the returned
-    `reachability`/`consequence` values."""
+    `reachability`/`consequence` values. (The run-level
+    `_self_contradiction` gate in `challenge_patch` reads the PRIMARY
+    concern's two strings only to fail a VERIFIED_FIXED run closed.)"""
     role = _extract_concern_field(block, "Role")
     description = _extract_concern_field(block, "Description") or ""
     role = role.strip().lower() if role is not None else None
@@ -1402,6 +1405,77 @@ def _derive_status_from_concerns(
     return "VERIFIED_FIXED", False
 
 
+# ---------------------------------------------------------------------------
+# Self-contradicting structured responses (PR #763 review).
+#
+# The concern facts alone decide a structured response's verdict, but a
+# response must never be read as MORE favorable than it reads itself: when
+# the model's own text explicitly concludes that the vulnerability is not
+# fixed while its facts would compute VERIFIED_FIXED, the run fails closed to
+# INSUFFICIENT_EVIDENCE. Monotonic: this only ever demotes VERIFIED_FIXED,
+# never establishes BLOCKING or anything positive, so the deterministic
+# policy remains the only path to a favorable outcome.
+# ---------------------------------------------------------------------------
+
+_NEGATIVE_STATUS_RE = re.compile(r"\b(RESIDUAL_VULNERABILITY|INSUFFICIENT_EVIDENCE)\b", re.IGNORECASE)
+"""A non-positive answer in the model's own `Verification status:` header."""
+
+_STILL_EXPLOITABLE_RE = re.compile(
+    r"\b(?:remains?|still)\s+(?:(?:fully|readily|trivially|directly|potentially)\s+)?(?:exploitable|vulnerable)\b"
+    r"|\b(?:can|could|may)\s+still\s+(?:be\s+)?(?:exploit(?:ed)?|bypass(?:ed)?)\b",
+    re.IGNORECASE,
+)
+"""An explicit assertion that the vulnerability still occurs ("remains
+exploitable", "is still vulnerable", "can still be bypassed")."""
+
+_QUESTION_LEAD_RE = re.compile(
+    r"^[\W_]*(?:whether|if|when|unless|does|do|is|are|can|could|would|will|should|has|have)\b",
+    re.IGNORECASE,
+)
+_NEGATION_RE = re.compile(r"\b(?:not|no|never|nothing|none|cannot)\b|n't\b", re.IGNORECASE)
+
+
+def _asserts_still_exploitable(text: "Optional[str]") -> bool:
+    """Whether `text` contains a DECLARATIVE sentence asserting the
+    vulnerability still occurs. A question or conditional ("Whether the
+    issue is still exploitable ...", "If a caller passes ...") and a
+    negated form ("no longer exploitable", "is not still vulnerable") are
+    not such assertions. A lexical presence check, used only to fail a run
+    closed (`_self_contradiction`), never to establish anything."""
+    for sentence in re.split(r"(?<=[.!?;])\s+", text or ""):
+        sentence = sentence.strip()
+        if not sentence or sentence.endswith("?") or _QUESTION_LEAD_RE.match(sentence):
+            continue
+        for match in _STILL_EXPLOITABLE_RE.finditer(sentence):
+            if not _NEGATION_RE.search(sentence[max(0, match.start() - 24):match.start()]):
+                return True
+    return False
+
+
+def _self_contradiction(sections: dict, concerns: "List[dict]") -> "Optional[str]":
+    """Why a structured response contradicts a VERIFIED_FIXED derivation of
+    its own concern facts, or None. Two explicit negative conclusions count:
+    the model's `Verification status:` (or legacy `Still vulnerable: yes`)
+    header, and a declarative "still exploitable" statement in the PRIMARY
+    concern's own text -- the primary concern is, by definition, the
+    originally-described vulnerability under default execution. Additional
+    concerns' text is deliberately not read: it routinely describes
+    non-default or out-of-scope paths that the deterministic override/scope
+    policy classifies non-blocking by design."""
+    header = _NEGATIVE_STATUS_RE.search(sections.get("verification_status") or "")
+    if header:
+        return f"the Challenger's own Verification status header says {header.group(1).upper()}"
+    if re.match(r"^\W*yes\b", sections.get("still_vulnerable") or "", re.IGNORECASE):
+        return "the Challenger's own Still vulnerable header says yes"
+    for concern in concerns:
+        if concern.get("concern_role") != "primary":
+            continue
+        for key, label in (("description", "Description"), ("hypothesized_outcome", "Hypothesized outcome")):
+            if _asserts_still_exploitable(concern.get(key)):
+                return f"the Challenger's primary concern {label} states that the vulnerability remains exploitable"
+    return None
+
+
 _PLACEHOLDER_VALUES = ("", "none", "n/a")
 """Shared "this section is intentionally empty" vocabulary for every
 legacy free-text section (`Edge cases:`, `Potential issues:`, `Summary:`)
@@ -1603,10 +1677,23 @@ def challenge_patch(
         verification_status, still = _derive_status_from_concerns(
             concerns, structural_violation or concerns_ambiguous or truncated,
         )
+        # A response that itself concludes the vulnerability is not fixed is
+        # never read as VERIFIED_FIXED (see `_self_contradiction`).
+        verdict_conflict = None
+        if verification_status == "VERIFIED_FIXED":
+            verdict_conflict = _self_contradiction(sections, concerns)
+            if verdict_conflict:
+                verification_status, still = "INSUFFICIENT_EVIDENCE", True
         # The model's own free-form `Summary:` text is never returned as
         # the report-facing summary for a new-schema response -- see
         # `_synthesize_summary_from_concerns`'s own docstring for why.
-        if truncated:
+        if verdict_conflict:
+            summary = (
+                f"Self-contradicting Challenger response: {verdict_conflict}, while the concern "
+                "facts alone would compute VERIFIED_FIXED; this run failed closed. "
+                + _synthesize_summary_from_concerns(concerns, False)
+            )
+        elif truncated:
             summary = (
                 "Truncated Challenger response: the provider reported the output was cut off "
                 "at its length limit, so concerns may be missing; this run failed closed and is "
@@ -1633,6 +1720,8 @@ def challenge_patch(
             "summary": summary,
             "concerns": concerns,
             "schema_version": "concerns_v2" if _response_uses_v2_schema(concerns_body) else "concerns_v1",
+            # Present only when the run failed closed for self-contradiction.
+            **({"verdict_conflict": verdict_conflict} if verdict_conflict else {}),
         }
 
     # RB-1: no structured `Concerns:` section (missing, legacy-format, or a

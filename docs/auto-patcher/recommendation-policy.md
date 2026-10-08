@@ -184,10 +184,22 @@ matters after a fully cited `blocked` chain. Code then does the following:
    - all `NON_BLOCKING` → `VERIFIED_FIXED`;
    - fails closed to `INSUFFICIENT_EVIDENCE` if there is not exactly one primary
      concern, or if the response also puts free-form content in its
-     `Edge cases`, `Potential issues` or `Summary` sections.
+     `Edge cases`, `Potential issues` or `Summary` sections;
+   - fails a `VERIFIED_FIXED` result closed to `INSUFFICIENT_EVIDENCE` if the
+     response contradicts itself: its own `Verification status:` line says
+     `RESIDUAL_VULNERABILITY` or `INSUFFICIENT_EVIDENCE` (or a legacy
+     `Still vulnerable:` line says yes), or the primary concern's
+     `Description` or `Hypothesized outcome` states that the vulnerability
+     remains exploitable (a declarative sentence such as "remains
+     exploitable", "is still vulnerable" or "can still be bypassed";
+     questions, conditionals and negated forms do not count). The report
+     names the contradiction. Additional concerns' text is not read: it
+     often describes non-default or out-of-scope paths that the override
+     and scope rules classify as non-blocking by design.
 
-The model's own `Verification status:` line is not used for the decision
-once a `Concerns:` section is present. `BLOCKING` means the reported facts met the blocking rule;
+Otherwise the model's own `Verification status:` line is not used for the
+decision once a `Concerns:` section is present: it can only fail a
+`VERIFIED_FIXED` result closed, never raise a result. `BLOCKING` means the reported facts met the blocking rule;
 it does not mean a defect was independently verified. `VERIFIED_FIXED` means
 no concern met the blocking or unresolved rules; it does not mean the fix was
 proven.

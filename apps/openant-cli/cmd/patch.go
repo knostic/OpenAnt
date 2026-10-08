@@ -209,11 +209,17 @@ func runPatchFinding(args []string, budget contextBudgetFlags) {
 	// LLM provider/model selection and credential resolution are entirely
 	// OpenAnt's canonical LLM configuration, resolved by the Python Auto
 	// Patcher engine (utilities.autopatcher.llm_client) -- Go performs no
-	// preflight of its own here and forwards no extra env. The subprocess
-	// already inherits this process's own environment (os.Environ()) via
-	// python.Invoke, so an explicit LLM_PROVIDER=mock test/research
-	// override still reaches Python unchanged with nothing computed here.
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, "", nil)
+	// preflight of its own here (no requireAPIKey/resolvedAPIKey, no
+	// config.json read). The subprocess already inherits this process's own
+	// environment (os.Environ()) via python.Invoke, so an explicit
+	// LLM_PROVIDER=mock test/research override still reaches Python
+	// unchanged with nothing computed here. The one value Go forwards is an
+	// explicitly passed root --api-key, verbatim, which python.Invoke
+	// injects as ANTHROPIC_API_KEY -- the same "flag always wins" transport
+	// every sibling command applies (see resolveAPIKeyFor). Without the
+	// flag apiKeyFlag is "", so Invoke injects nothing and the subprocess
+	// env is exactly as before.
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, apiKeyFlag, nil)
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)
@@ -264,9 +270,10 @@ func runPatchCVE(args []string, budget contextBudgetFlags) {
 
 	pyArgs := appendPresentationArgs(buildPatchCVEPyArgs(patchCVE, repoRoot, outputDir, budget))
 
-	// Same deliberate omission as Finding mode -- see runPatchFinding's
-	// matching comment: no Go-side LLM preflight, no extra env forwarded.
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, "", nil)
+	// Same contract as Finding mode -- see runPatchFinding's matching
+	// comment: no Go-side LLM preflight; only an explicit --api-key is
+	// forwarded (as ANTHROPIC_API_KEY), and nothing when it is absent.
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, apiKeyFlag, nil)
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)
