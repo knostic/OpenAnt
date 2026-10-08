@@ -38,6 +38,36 @@ BRACE_IN_PROSE = [
     ),
 ]
 
+#: Replies the naive slice ALREADY parsed and the depth-0 scan does not, because
+#: a stray ``"`` in the prose inverts its string state: every balanced ``{}``
+#: inside a JSON string value is then reported as a depth-0 object, and the real
+#: object's braces are invisible.  LLM reasoning quotes code constantly
+#: (``catch (e) {}``, ``x = {}``), and every sibling reply schema carries a
+#: free-text field, so this is the same rarity class as the prose brace #673
+#: fixes — but it fails WORSE: a silent wrong object, not a visible drop.
+#:
+#: Both parity subclasses are here.  ODD-final (``ended_in_string`` is True) and
+#: EVEN-final (a second stray quote restores final parity while the state stays
+#: inverted across the object, so ``ended_in_string`` is False and cannot be the
+#: discriminator) — the even one is why this is a cross-check and not a flag.
+QUOTE_PARITY_IN_PROSE = [
+    pytest.param(
+        'Here is "the result: {"patch": "x = {}", "verdict": "VULNERABLE", '
+        '"finding": "vulnerable"}',
+        id="odd-stray-quote-then-a-braced-code-snippet",
+    ),
+    pytest.param(
+        'The fix is "simple: {"verdict": "VULNERABLE", "finding": "vulnerable", '
+        '"corrected_context": "catch (e) {}"}',
+        id="odd-stray-quote-brace-pair-last",
+    ),
+    pytest.param(
+        'The reply was "this: {"patch": "x = {}", "verdict": "VULNERABLE", '
+        '"finding": "vulnerable"} — ok"',
+        id="even-final-parity-still-inverted",
+    ),
+]
+
 #: Shapes the naive slice already handled.  They must keep working — a
 #: robustness fix that drops a reply which parses today is a regression.
 ALREADY_WORKING = [
@@ -162,6 +192,30 @@ def test_the_nine_sibling_extractors_keep_what_already_parsed(reply, monkeypatch
     assert not failed, f"regression — {len(failed)} of 9 sites stopped parsing: {failed}"
 
 
+@pytest.mark.parametrize("reply", QUOTE_PARITY_IN_PROSE)
+def test_the_nine_sibling_extractors_survive_a_stray_prose_quote(reply, monkeypatch):
+    """The regression half of the quote-parity blind spot, at every call site.
+
+    The naive slice these nine sites shipped at the base recovers each of these
+    replies; a depth-0 scan that trusts its own string state does not.  With the
+    paid corrector closed, each site must still produce VULNERABLE — returning
+    ``{}`` (the empty object the inverted scan finds inside a string value) is a
+    silent wrong answer handed to a ``.get()`` chain, which is worse than the
+    drop #673 set out to fix.
+    """
+    _no_paid_corrector(monkeypatch)
+    failed = {}
+    for site_id, fn in _sites():
+        got = _verdict_of(site_id, fn, reply)
+        if got != "VULNERABLE":
+            failed[site_id] = got
+    assert not failed, (
+        f"regression vs the naive slice — {len(failed)} of 9 sites lost a reply "
+        f"that parsed at the base (a stray prose quote inverted the scan's "
+        f"string state): {failed}"
+    )
+
+
 def test_no_sibling_module_still_ships_the_naive_slice():
     """The propagation guard, so a tenth copy is visible on sight.
 
@@ -197,6 +251,39 @@ def test_the_shared_extractor_refuses_to_guess_between_competing_objects():
     assert extract_json_object(two) is None
     # neither could the naive slice: its span covers both objects
     assert json.loads is not None
+
+
+def test_a_string_value_brace_pair_is_not_mistaken_for_the_object():
+    """The helper-level form, with the exact values rather than a verdict.
+
+    Executed at 2595e7c6 before the fix: row 1 returned ``None`` (a DROP — the
+    #673 defect reintroduced), rows 2-4 returned ``{}`` (the WRONG object,
+    silently).  Row 4 carries even final parity, so ``ended_in_string`` is False
+    there: the discriminator cannot be that flag.
+    """
+    from utilities.json_extract import extract_json_object, scan_depth0_spans
+
+    cases = [
+        ('Here is "the result: {"k": "{}", "m": "{}"}', {"k": "{}", "m": "{}"}),
+        ('Here is "the result: {"patch": "x = {}", "verdict": "VULNERABLE"}',
+         {"patch": "x = {}", "verdict": "VULNERABLE"}),
+        ('The fix is "simple: {"corrected_context": "catch (e) {}", "confidence": 0.9}',
+         {"corrected_context": "catch (e) {}", "confidence": 0.9}),
+        ('a"b {"a":"{}"} "', {"a": "{}"}),
+        ('" {"a":"x {} y","b":"{}"} "', {"a": "x {} y", "b": "{}"}),
+    ]
+    wrong = {}
+    for text, expected in cases:
+        got = extract_json_object(text)
+        if got != expected:
+            wrong[text] = got
+    assert not wrong, f"a brace pair inside a string value won: {wrong}"
+
+    # the even-final-parity rows prove the flag is not the discriminator
+    assert scan_depth0_spans('a"b {"a":"{}"} "')[1] is False
+    assert scan_depth0_spans('" {"a":"x {} y","b":"{}"} "')[1] is False
+    # control: no stray quote, nothing to recover from
+    assert extract_json_object('Here is the result: {"a": "{}"}') == {"a": "{}"}
 
 
 def test_the_shared_extractor_is_a_strict_superset_of_the_naive_slice():
@@ -245,7 +332,12 @@ def test_the_shared_extractor_is_a_strict_superset_of_the_naive_slice():
     for _ in range(20000):
         check("".join(rng.choice(alphabet) for _ in range(rng.randint(0, 28))))
     # structured prose/object/prose
-    objs = ['{"a":1}', _OBJ, '{"a":{"b":2}}', '{"a":"}"}', '{"a":"\\""}']
+    objs = ['{"a":1}', _OBJ, '{"a":{"b":2}}', '{"a":"}"}', '{"a":"\\""}',
+            # a BALANCED brace pair inside a string value: the shape that makes
+            # an inverted scan report a string's interior as a depth-0 object.
+            # Absent from the original corpus, which is why 456k inputs missed it.
+            '{"a":"{}"}', '{"a":"x {} y","b":"{}"}',
+            '{"p":"catch (e) {}","verdict":"VULNERABLE"}']
     for obj in objs:
         for pre in ("", "pre ", "{x} ", '" ', '"q" ', "see foo() { ", 'a"b ', "}} "):
             for post in ("", " post", " {y}", ' "', ' "z"', " } ", ' {"c":3}'):
