@@ -1203,6 +1203,14 @@ class TestRecommendationV1:
         assert rec["decision"] != "Deploy After Validation"
         assert rec["decision"] == "Manual Review Required"
 
+    @pytest.mark.parametrize("integrity", ["Minor Issues", "Not Verified", "Some Future Value"])
+    def test_deploy_with_caution_never_fires_without_positive_integrity(self, integrity):
+        """Mirror of the Deploy After Validation rule above (PR #763 review):
+        Deploy With Caution is also top-tier, so an integrity value that is
+        merely not blocking must not reach it."""
+        rec = _build_recommendation_v1(_signals_for(integrity=integrity, improvement="Low", safety="Low Risk"))
+        assert rec["decision"] == "Manual Review Required"
+
     def test_deploy_with_caution_low_improvement_low_risk(self):
         rec = _build_recommendation_v1(_signals_for(improvement="Low", safety="Low Risk"))
         assert rec["decision"] == "Deploy With Caution"

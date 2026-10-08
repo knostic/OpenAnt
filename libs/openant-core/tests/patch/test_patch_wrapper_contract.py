@@ -203,6 +203,36 @@ def test_run_patch_happy_path(tmp_path, monkeypatch):
     assert result.trust_report_path == str(tmp_path / "patch" / "F-001-trust-report.md")
 
 
+@pytest.mark.parametrize("kind", ["missing", "file"])
+def test_run_patch_rejects_a_repo_root_that_is_not_a_directory(tmp_path, monkeypatch, kind):
+    """PR #763 review: Finding mode used to exit 0 with a full "not a git
+    repository" report for a mistyped --repo-root. Like run_patch_cve, it
+    must fail before any engine work."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    po_path = _write_pipeline_output(tmp_path, [FIXTURE_FINDING_ELIGIBLE])
+    bad = tmp_path / "does-not-exist"
+    if kind == "file":
+        bad.write_text("x")
+
+    from utilities.autopatcher import pipeline as _pipeline_module
+    with mock.patch.object(_pipeline_module, "run") as engine:
+        with pytest.raises(ValueError, match="--repo-root does not exist"):
+            run_patch(po_path, "F-001", str(tmp_path), repo_root=str(bad))
+    engine.assert_not_called()
+    assert not (tmp_path / "patch" / "F-001-trust-report.md").exists()
+
+
+def test_run_patch_accepts_an_existing_repo_root_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    po_path = _write_pipeline_output(tmp_path, [FIXTURE_FINDING_ELIGIBLE])
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    result = run_patch(po_path, "F-001", str(tmp_path / "out"), repo_root=str(repo))
+
+    assert os.path.exists(result.trust_report_path)
+
+
 def test_run_patch_without_repo_root_never_scans_process_cwd(tmp_path, monkeypatch):
     """F-01: this module's own docstring calls these tests "hermetic ...
     no real repo" -- that was only true of the *inputs*. Before the fix,

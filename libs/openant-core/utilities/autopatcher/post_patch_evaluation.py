@@ -272,6 +272,7 @@ def _evaluate_sink_match(anchor: Anchor) -> AnchorObservation:
 def evaluate_anchors(
     anchors: list[Anchor],
     post_patch_context: "InvestigationContext | None",
+    unavailable_reason: "str | None" = None,
 ) -> list[AnchorObservation]:
     """Re-evaluate each Anchor against an already-built InvestigationContext
     for the patched repository copy.
@@ -283,6 +284,8 @@ def evaluate_anchors(
     honestly, rather than raising. Returns exactly one AnchorObservation
     per input Anchor, in the same order -- never reordered, never
     deduplicated (Phase 2 already deduplicated the anchors themselves).
+    `unavailable_reason`, when given, names why there is no context (e.g. the
+    patch did not apply to the isolated copy) in place of the generic note.
     """
     observations: list[AnchorObservation] = []
 
@@ -294,7 +297,7 @@ def evaluate_anchors(
         if post_patch_context is None:
             observations.append(_observation(
                 anchor, "evaluation_error", None,
-                "no investigation context available for the patched copy",
+                unavailable_reason or "no investigation context available for the patched copy",
                 "candidate_enrichment.build_investigation_context",
             ))
             continue

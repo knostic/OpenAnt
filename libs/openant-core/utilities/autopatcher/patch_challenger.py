@@ -458,6 +458,74 @@ def _normalize_for_provenance(text: str) -> str:
 
 
 _MIN_CITATION_CHARS = 3
+# A citation must quote code, not diff punctuation: `+++`, `---`, `@@ -1,4`
+# contain no identifier character and occur in every patch.
+_CITATION_CONTENT_RE = re.compile(r"[A-Za-z_]")
+_WORD_CHAR = r"[A-Za-z0-9_]"
+
+# Diff lines that are never file content: a quote matching only these (or
+# only lines the patch REMOVES) cannot evidence the post-change state.
+_DIFF_FILE_HEADER_RE = re.compile(
+    r"^(?:diff --git |index [0-9a-f]+\.\.|--- (?:a/|/dev/null)|\+\+\+ (?:b/|/dev/null)|"
+    r"(?:new|deleted) file mode |similarity index |rename (?:from|to) |old mode |new mode |Binary files )"
+)
+_DIFF_METADATA_LINE_RE = re.compile(
+    r"^(?:diff --git |index [0-9a-f]+\.\.[0-9a-f]+|--- (?:a/|/dev/null)|\+\+\+ (?:b/|/dev/null)|@@ -\d)"
+)
+
+
+def _patch_citation_view(patch: str) -> "Tuple[str, set]":
+    """The post-change side of `patch` as a citation haystack: context and
+    added lines only. File headers and removed (`-`) lines are dropped, and
+    each `@@ ... @@` header is reduced to a bare `@@ @@` separator (it keeps
+    the per-hunk ordering units of `_ordering_blocks` but carries nothing
+    citable). Also returns the text of every line the patch removes and
+    does not keep or re-add, so a pre-change copy of it elsewhere in the
+    evidence can be excluded too (see `_without_removed_lines`)."""
+    out: "List[str]" = []
+    removed: set = set()
+    kept: set = set()
+    for line in (patch or "").splitlines():
+        if _DIFF_FILE_HEADER_RE.match(line):
+            continue
+        if line.startswith("@@"):
+            out.append("@@ @@")
+            continue
+        if line.startswith("-"):
+            removed.add(line[1:].strip())
+            continue
+        if line.startswith("\\"):
+            continue  # "\ No newline at end of file"
+        kept.add(line[1:].strip() if line[:1] in ("+", " ") else line.strip())
+        out.append(line)
+    return "\n".join(out), {r for r in removed - kept if r}
+
+
+def _without_removed_lines(corpus: str, removed_only: set) -> str:
+    """`corpus` minus diff metadata lines and minus every line whose text
+    the patch removes (a pre-change copy of the target, or a `-`-prefixed
+    rendering of it): such a line can never ground a post-change fact."""
+    out: "List[str]" = []
+    for line in (corpus or "").splitlines():
+        stripped = line.strip()
+        if _DIFF_METADATA_LINE_RE.match(stripped):
+            continue
+        if stripped in removed_only or (stripped[:1] in "+-" and stripped[1:].strip() in removed_only):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _find_citation(haystack: str, quote: str) -> int:
+    """Offset of `quote` in `haystack` on token boundaries (never a
+    mid-identifier substring such as `ete` inside `delete`), or -1."""
+    pattern = re.escape(quote)
+    if re.match(_WORD_CHAR, quote[0]):
+        pattern = rf"(?<!{_WORD_CHAR})" + pattern
+    if re.match(_WORD_CHAR, quote[-1]):
+        pattern += rf"(?!{_WORD_CHAR})"
+    match = re.search(pattern, haystack)
+    return match.start() if match else -1
 
 
 def _point_citation_valid(raw: "Optional[str]", *sources: str) -> bool:
@@ -478,14 +546,21 @@ def _point_citation_valid(raw: "Optional[str]", *sources: str) -> bool:
 
     A quote shorter than _MIN_CITATION_CHARS non-whitespace characters is
     never a citation: a single letter or a two-character keyword occurs in
-    almost any corpus, so its containment proves nothing about provenance."""
+    almost any corpus, so its containment proves nothing about provenance.
+    Nor is a quote with no identifier character (diff punctuation such as
+    `+++` or `@@ -1,4`), or one that only matches inside a longer token."""
     quoted = _strip_quote_wrapping(raw)
     if not quoted or quoted.lower() in ("none", "n/a", "unknown"):
         return False
     normalized_quote = _normalize_for_provenance(quoted)
     if len(re.sub(r"\s", "", normalized_quote)) < _MIN_CITATION_CHARS:
         return False
-    return any(normalized_quote in _normalize_for_provenance(source) for source in sources if source)
+    if not _CITATION_CONTENT_RE.search(normalized_quote):
+        return False
+    return any(
+        _find_citation(_normalize_for_provenance(source), normalized_quote) != -1
+        for source in sources if source
+    )
 
 
 def _whole_document_marker_valid(raw: "Optional[str]") -> bool:
@@ -626,8 +701,8 @@ def _citation_precedes_within_one_block(
     for source in sources:
         for unit in _ordering_blocks(source):
             normalized_unit = _normalize_for_provenance(unit)
-            off_earlier = normalized_unit.find(earlier)
-            off_later = normalized_unit.find(later)
+            off_earlier = _find_citation(normalized_unit, earlier)
+            off_later = _find_citation(normalized_unit, later)
             if off_earlier != -1 and off_later != -1 and off_earlier < off_later:
                 return True
     return False
@@ -1485,7 +1560,14 @@ def challenge_patch(
     if sections.get("concerns") is not None:
         concerns_body = sections["concerns"]
         citation_corpus = code_context if provenance_context is None else provenance_context
-        concerns = _parse_concerns(concerns_body, citation_corpus, patch, vulnerability_text)
+        # Citations ground facts about the PATCHED code: only the diff's
+        # post-change side, and evidence minus the lines the patch removes
+        # (a removed guard must never read as a present one).
+        citation_patch, removed_only = _patch_citation_view(patch)
+        concerns = _parse_concerns(
+            concerns_body, _without_removed_lines(citation_corpus, removed_only),
+            citation_patch, vulnerability_text,
+        )
         # A bare placeholder (see _PLACEHOLDER_VALUES) is the prompt's own
         # documented way to leave a legacy section empty -- it must count
         # as empty here too, never as real, unstructured content that

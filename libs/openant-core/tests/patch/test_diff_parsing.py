@@ -256,3 +256,34 @@ class TestSemanticDeltaPreserved:
         # unguarded_files=None (the default) checks every file.
         candidate = "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n line1\n-old_a\n+new_a\n"
         assert semantic_delta_preserved(self._ORIGINAL, candidate) is False
+
+
+# ---------------------------------------------------------------------------
+# F-14: "-- x" / "++ x" hunk body lines (raw "--- x" / "+++ x")
+# ---------------------------------------------------------------------------
+
+def test_removed_dashdash_line_stays_in_its_hunk():
+    diff = (
+        "--- a/s.sql\n+++ b/s.sql\n@@ -1,3 +1,2 @@\n"
+        " SELECT 1;\n--- legacy comment\n SELECT 2;\n"
+    )
+    _, file_hunks = parse_diff(diff)
+    assert file_hunks["s.sql"][0].lines == [" SELECT 1;", "--- legacy comment", " SELECT 2;"]
+
+
+def test_adjacent_dashdash_plusplus_body_pair_is_not_a_file_header():
+    diff = (
+        "--- a/s.sql\n+++ b/s.sql\n@@ -1,3 +1,3 @@\n"
+        " SELECT 1;\n--- old\n+++ b/new\n SELECT 2;\n"
+    )
+    changed_files, file_hunks = parse_diff(diff)
+    assert changed_files == ["s.sql"]
+    assert file_hunks["s.sql"][0].lines == [" SELECT 1;", "--- old", "+++ b/new", " SELECT 2;"]
+    assert semantic_delta(diff) == {"s.sql": (["+++ b/new"], ["--- old"])}
+
+
+def test_crlf_diff_lines_have_no_trailing_carriage_return():
+    diff = "--- a/a.py\r\n+++ b/a.py\r\n@@ -1,1 +1,1 @@\r\n-old\r\n+new\r\n"
+    changed_files, file_hunks = parse_diff(diff)
+    assert changed_files == ["a.py"]
+    assert file_hunks["a.py"][0].lines == ["-old", "+new"]

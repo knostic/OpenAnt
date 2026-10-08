@@ -42,6 +42,21 @@ import pytest
 from utilities.autopatcher import progress
 
 
+@pytest.fixture(autouse=True)
+def _progress_module_identity_guard():
+    """This module binds `progress` at collection time, but the code under
+    test (pipeline.py, core/step_report.py's lazy import) resolves it via
+    sys.modules at run time. If an earlier test evicted utilities.* without
+    restoring it, configure() below would mutate an orphan and the
+    verbose/quiet assertions would fail confusingly -- fail clearly instead."""
+    import sys
+
+    assert progress is sys.modules["utilities.autopatcher.progress"], (
+        "utilities.autopatcher.progress was re-imported after this module bound it -- "
+        "a test evicted utilities.* from sys.modules without restoring it"
+    )
+
+
 # ---------------------------------------------------------------------------
 # progress.py in isolation
 # ---------------------------------------------------------------------------

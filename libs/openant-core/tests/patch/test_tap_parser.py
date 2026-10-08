@@ -509,3 +509,50 @@ class TestExactMinimistCapturedOutput:
         assert parsed.failed == 2
         assert "one should equal two (intentional fail)" in parsed.failed_test_ids
         assert "/tmp/minimist_check/tapfixture/fail.js" in parsed.failed_test_ids
+
+
+class TestPr763FailuresMustNotBeHidden:
+    """PR #763 review: a failure that the parser drops or reads as skipped
+    makes a NEW failure look pre-existing (PRE_EXISTING_FAILURES_ONLY)."""
+
+    def test_failing_rollup_with_all_passing_children_is_a_failure(self):
+        text = (
+            "TAP version 13\n"
+            "# Subtest: suite\n"
+            "    ok 1 - a\n"
+            "    ok 2 - b\n"
+            "    1..2\n"
+            "not ok 1 - suite\n"
+            "  ---\n  failureType: 'hookFailed'\n  ...\n"
+            "1..1\n"
+        )
+        parsed = parse_tap(text)
+        assert parsed is not None
+        assert parsed.passed == 2
+        assert parsed.failed == 1
+        assert parsed.failed_test_ids == ["suite"]
+
+    def test_parent_only_failure_is_new_against_an_unrelated_baseline_failure(self):
+        baseline = parse_tap("TAP version 13\nnot ok 1 - old_bug\n1..1\n")
+        patched = parse_tap(
+            "TAP version 13\nnot ok 1 - old_bug\n"
+            "# Subtest: suite\n    ok 1 - a\n    1..1\nnot ok 2 - suite\n1..2\n"
+        )
+        assert set(patched.failed_test_ids) - set(baseline.failed_test_ids) == {"suite"}
+
+    def test_failing_child_still_counts_once_control(self):
+        parsed = parse_tap(TestNestedSubtests._TEXT)
+        assert parsed.failed == 1
+        assert parsed.failed_test_ids == ["test/parse.js > parses negative numbers"]
+
+    def test_escaped_hash_is_not_a_directive(self):
+        for directive in ("TODO", "SKIP"):
+            parsed = parse_tap(f"TAP version 13\n1..1\nnot ok 1 - foo \\# {directive} later\n")
+            assert parsed is not None
+            assert parsed.failed == 1, directive
+            assert parsed.skipped == 0, directive
+
+    def test_unescaped_directive_still_skips_control(self):
+        parsed = parse_tap("TAP version 13\n1..1\nnot ok 1 - foo # TODO later\n")
+        assert parsed.failed == 0
+        assert parsed.skipped == 1

@@ -615,6 +615,74 @@ class TestFromJsonable:
 
 
 # ---------------------------------------------------------------------------
+# Multi-member Unions: AnchorObservation.anchor_key/before_value/after_value
+# are typed AnchorKey/AnchorValue -- five-member Unions with no type tag in
+# the serialized form. Reconstruction used to take the FIRST member for every
+# value, so every non-resolved_function observation crashed (TypeError) the
+# report_generation replay of any run whose patch applied.
+# ---------------------------------------------------------------------------
+
+def _anchor_observation_cases():
+    from utilities.autopatcher.post_patch_investigation import (
+        CallEdgeKey, ConstantValueKey, ConstantValueValue, ReachabilityKey, ReachabilityValue,
+        ResolvedFunctionKey, ResolvedFunctionValue, SinkMatchKey, SinkMatchValue,
+    )
+    return {
+        "resolved_function": (ResolvedFunctionKey("app/auth.py:authenticate", "authenticate", None, "function"),
+                              ResolvedFunctionValue(42, 45), ResolvedFunctionValue(42, 47)),
+        "call_edge": (CallEdgeKey("app/auth.py:login", "app/auth.py:authenticate"), True, True),
+        "reachability": (ReachabilityKey("app/auth.py:authenticate"),
+                         ReachabilityValue(True, ("app/views.py:login",)), ReachabilityValue(None, None)),
+        "sink_match": (SinkMatchKey("app/auth.py", "authenticate"), SinkMatchValue(43, "db.execute(query)"), None),
+        "constant_value": (ConstantValueKey("app/cfg.py:DEBUG", "DEBUG", None),
+                           ConstantValueValue("bool", True), ConstantValueValue("bool", False)),
+    }
+
+
+class TestFromJsonableMultiMemberUnion:
+    @pytest.mark.parametrize(
+        "kind", ["resolved_function", "call_edge", "reachability", "sink_match", "constant_value"],
+    )
+    def test_anchor_observation_round_trips_every_union_member(self, kind):
+        """resolved_function (the Union's first member) is the positive
+        control -- it round-tripped before the fix too; the other four are
+        the regression."""
+        from utilities.autopatcher.post_patch_evaluation import AnchorObservation
+
+        key, before, after = _anchor_observation_cases()[kind]
+        original = AnchorObservation(
+            anchor_kind=kind, anchor_key=key, candidate_path="app/auth.py", status="changed",
+            before_value=before, after_value=after, details=None, source="candidate_enrichment",
+            evaluated_via="repository_index", origin="pre_patch",
+        )
+        rebuilt = from_jsonable(AnchorObservation, json.loads(json.dumps(to_jsonable(original))))
+        assert rebuilt == original
+        assert type(rebuilt.anchor_key) is type(key)
+        assert type(rebuilt.before_value) is type(before)
+
+    def test_dict_matching_no_member_fails_closed(self):
+        """Never silently falls back to the first member."""
+        from utilities.autopatcher.post_patch_investigation import AnchorKey, ResolvedFunctionKey
+        from utilities.autopatcher.execution_recorder import _from_jsonable_value
+
+        with pytest.raises(ExecutionRecorderError, match="0 of"):
+            _from_jsonable_value({"func_id": "f", "unexpected": 1}, AnchorKey)
+        # Positive control: an exact field-name match still reconstructs.
+        rebuilt = _from_jsonable_value(
+            {"func_id": "f", "name": None, "class_name": None, "unit_type": None}, AnchorKey,
+        )
+        assert rebuilt == ResolvedFunctionKey("f", None, None, None)
+
+    def test_scalar_matching_no_member_fails_closed(self):
+        from utilities.autopatcher.post_patch_investigation import AnchorValue
+        from utilities.autopatcher.execution_recorder import _from_jsonable_value
+
+        assert _from_jsonable_value(True, AnchorValue) is True
+        with pytest.raises(ExecutionRecorderError):
+            _from_jsonable_value("not-a-bool", AnchorValue)
+
+
+# ---------------------------------------------------------------------------
 # Correction 1: LLM ownership validated against stage_registry.
 # STAGE_OWNED_LLM_TAGS -- cursor/slice remains the attribution mechanism;
 # this only proves the bracket and canonical ownership agree.

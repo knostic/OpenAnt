@@ -144,13 +144,29 @@ def repair_hunk_headers(patch: str, repo_root: "Path | str | None" = None) -> tu
 # Internal
 # ---------------------------------------------------------------------------
 
+def _split_lf(text: str, keepends: bool = False) -> list[str]:
+    r"""Split on "\n" only -- the sole line terminator git and unified diffs
+    recognize. ``str.splitlines()`` also splits on \f, \x1c-\x1e, \x85 and
+    U+2028/U+2029, which turns one diff/source line containing such a
+    character into several and corrupts every recomputed @@ count."""
+    parts = text.split("\n")
+    if keepends:
+        out = [part + "\n" for part in parts[:-1]]
+        if parts[-1]:
+            out.append(parts[-1])
+        return out
+    if parts and parts[-1] == "":
+        parts.pop()
+    return parts
+
+
 def _strip_md_fences(patch: str) -> tuple[str, str, str]:
     """Extract markdown code fences surrounding a patch string.
 
     Returns (open_fence, clean_patch, close_fence).
     Concatenating the three parts always reconstructs the original string.
     """
-    lines = patch.splitlines(keepends=True)
+    lines = _split_lf(patch, keepends=True)
     open_fence = ""
     close_fence = ""
     if lines and _FENCE_OPEN_RE.match(lines[0]):
@@ -184,7 +200,7 @@ class _FileSection:
 
 
 def _repair(patch: str, meta: RepairResult, repo_root: "Path | None" = None) -> tuple[str, RepairResult]:
-    lines = patch.splitlines(keepends=True)
+    lines = _split_lf(patch, keepends=True)
 
     # Lazily-loaded, per-file cache of the CURRENT (pre-patch) target file's
     # lines, keyed the same way `sections`/`file_delta` are keyed below (the
@@ -208,7 +224,7 @@ def _repair(patch: str, meta: RepairResult, repo_root: "Path | None" = None) -> 
                 candidate = (resolved_root / key).resolve()
                 candidate.relative_to(resolved_root)
                 if candidate.is_file():
-                    result = candidate.read_text(encoding="utf-8", errors="ignore").splitlines()
+                    result = _split_lf(candidate.read_text(encoding="utf-8", errors="ignore"))
             except Exception:
                 result = None
         _file_lines_cache[key] = result
@@ -366,11 +382,15 @@ def _repair(patch: str, meta: RepairResult, repo_root: "Path | None" = None) -> 
         # produces the raw line "--- foo" / "+++ foo" too. Requiring the
         # very next line to complete the pair is what tells apart a genuine
         # file boundary from coincidental body content: two unrelated body
-        # lines almost never line up to form both halves of the pair.
+        # lines almost never line up to form both halves of the pair. Inside
+        # a hunk that is not enough (a removed "-- x" line followed by an
+        # added "++ y" line forms the same pair), so there a genuine header
+        # pair must also be followed by its own "@@" line.
         if (
             stripped.startswith("--- ")
             and i + 1 < n
             and lines[i + 1].rstrip("\n").startswith("+++ ")
+            and (not in_hunk or (i + 2 < n and lines[i + 2].startswith("@@")))
         ):
             flush_hunk()
             a_line, b_line = line, lines[i + 1]
@@ -446,9 +466,12 @@ def _count_body(body: list[str]) -> tuple[int, int]:
         if line.startswith("\\"):
             # \\ No newline at end of file — metadata marker, not a content line
             continue
-        if line.startswith("-") and not line.startswith("---"):
+        # Every body line is hunk content (file headers never reach here),
+        # so a removed "-- x" / added "++ x" line (raw "--- x"/"+++ x") is
+        # still a removal/addition, never context (F-14).
+        if line.startswith("-"):
             old_count += 1
-        elif line.startswith("+") and not line.startswith("+++"):
+        elif line.startswith("+"):
             new_count += 1
         else:
             # Context: leading space, empty line, or any other non-marker content
@@ -578,7 +601,7 @@ def _parse_repaired_sections(patch: str) -> "list[_RSection] | None":
     whose own text happens to start with "-- "/"++ " must never be mistaken
     for a real file-header line.
     """
-    lines = patch.splitlines(keepends=True)
+    lines = _split_lf(patch, keepends=True)
     sections: "list[_RSection]" = []
     seen_keys: set = set()
     current: "_RSection | None" = None
@@ -633,6 +656,7 @@ def _parse_repaired_sections(patch: str) -> "list[_RSection] | None":
             stripped.startswith("--- ")
             and i + 1 < n
             and lines[i + 1].rstrip("\n").startswith("+++ ")
+            and (not in_hunk or (i + 2 < n and lines[i + 2].startswith("@@")))
         ):
             if not flush_hunk():
                 return None
@@ -775,7 +799,7 @@ def _load_raw_file_lines(repo_root: Path, key: str) -> "list[str] | None":
         candidate.relative_to(resolved_root)
         if not candidate.is_file():
             return None
-        return candidate.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
+        return _split_lf(candidate.read_text(encoding="utf-8", errors="ignore"), keepends=True)
     except Exception:
         return None
 

@@ -14,16 +14,20 @@ Covers:
   - Non-diff / empty input passthrough
   - New-file hunk (--- /dev/null) handled
   - RepairResult metadata reflects actual changes
+  - Real `git apply` round trips: "-- x"/"++ x" body lines (F-14) and
+    \f / \x1c / \x85 / U+2028 inside a line (splitlines over-split)
 """
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
-
+import pytest
 
 from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers, strip_empty_hunks, RepairResult
+from utilities.autopatcher.diff_parsing import parse_diff, semantic_delta
 
 
 # ---------------------------------------------------------------------------
@@ -1258,3 +1262,110 @@ class TestStripEmptyHunks:
         assert removed == 2
         assert "mod_a.py" not in result
         assert "new_b" in result
+
+
+# ---------------------------------------------------------------------------
+# Real `git apply` round trips: "-- x"/"++ x" body lines (F-14) and
+# non-"\n" line-break characters inside a line (str.splitlines over-split)
+# ---------------------------------------------------------------------------
+
+def _git_diff_roundtrip(tmp_path: Path, name: str, before: str, after: str) -> "tuple[Path, str]":
+    """Commit `before` as `name` in a fresh repo, return (repo, `git diff`
+    of before -> after) with the working tree restored to `before`."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, capture_output=True)
+    (repo / name).write_bytes(before.encode("utf-8"))
+    subprocess.run(["git", "add", name], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, capture_output=True, check=True)
+    (repo / name).write_bytes(after.encode("utf-8"))
+    diff = subprocess.run(["git", "diff"], cwd=repo, capture_output=True, check=True).stdout.decode("utf-8")
+    (repo / name).write_bytes(before.encode("utf-8"))
+    return repo, diff
+
+
+def _git_apply_check_utf8(repo: Path, patch: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "apply", "--check", "-"], cwd=repo, input=patch.encode("utf-8"), capture_output=True,
+    )
+
+
+_SQL = "SELECT 1;\n-- legacy comment\nSELECT 2;\nSELECT 3;\n++ marker\nSELECT 4;\n"
+
+_SQL_CASES = {
+    "control_no_marker_lines": _SQL.replace("SELECT 2;\n", "SELECT 2 ;\n"),
+    "remove_sql_comment": _SQL.replace("-- legacy comment\n", ""),
+    "add_plus_plus_line": _SQL.replace("SELECT 4;\n", "++ new\nSELECT 4;\n"),
+    "adjacent_removed_dashdash_added_plusplus": _SQL.replace("-- legacy comment\n", "++ replaced\n"),
+}
+
+
+class TestDashDashPlusPlusBodyLinesGitApply:
+    """F-14: a removed "-- x" line (raw "--- x") or an added "++ x" line
+    (raw "+++ x") is hunk content. It must be counted as a removal/addition
+    and never taken for a file header -- even as an adjacent "--- "/"+++ "
+    pair -- or the repaired patch is corrupt (git apply exit 128)."""
+
+    @pytest.mark.parametrize("case", sorted(_SQL_CASES))
+    def test_repaired_patch_still_applies(self, tmp_path, case):
+        repo, diff = _git_diff_roundtrip(tmp_path, "schema.sql", _SQL, _SQL_CASES[case])
+        assert _git_apply_check_utf8(repo, diff).returncode == 0  # ground truth
+        repaired, _ = repair_hunk_headers(diff, repo_root=repo)
+        result = _git_apply_check_utf8(repo, repaired)
+        assert result.returncode == 0, (repaired, result.stderr)
+        assert [l for l in repaired.splitlines() if l.startswith("@@")] == [
+            l for l in diff.splitlines() if l.startswith("@@")
+        ]
+
+    @pytest.mark.parametrize("case", sorted(_SQL_CASES))
+    def test_semantic_delta_reports_every_change(self, tmp_path, case):
+        _, diff = _git_diff_roundtrip(tmp_path, "schema.sql", _SQL, _SQL_CASES[case])
+        added = [l for l in diff.splitlines()[4:] if l.startswith("+")]
+        removed = [l for l in diff.splitlines()[4:] if l.startswith("-")]
+        assert semantic_delta(diff) == {"schema.sql": (added, removed)}
+
+    def test_real_second_file_header_after_hunk_is_still_a_header(self):
+        patch = (
+            "--- a/x.sql\n+++ b/x.sql\n@@ -1,2 +1,2 @@\n a\n--- b\n+c\n"
+            "--- a/y.sql\n+++ b/y.sql\n@@ -1,1 +1,1 @@\n-p\n+q\n"
+        )
+        repaired, meta = repair_hunk_headers(patch)
+        assert repaired == patch
+        assert meta.hunks_rewritten == 0
+        assert parse_diff(patch)[0] == ["x.sql", "y.sql"]
+
+
+_PY = "import os\n\n{sep}\ndef f(p):\n    return open(p)\n\n\ndef g():\n    return 1\n"
+
+_LINE_BREAK_CASES = {
+    "control_ascii": "# plain",
+    "form_feed_line": "\x0c",
+    "form_feed_in_comment": "# a\x0cb",
+    "u2028_in_string": "S = 'a b'",
+    "x1c_in_comment": "# a\x1cb",
+    "nel_x85_in_comment": "# a\x85b",
+}
+
+
+class TestNonNewlineLineBreakCharactersGitApply:
+    """str.splitlines() also splits on \\f, \\x1c, \\x85, U+2028...; git does
+    not. A diff/source line containing one must stay one line, or every
+    recomputed @@ count is off and the repaired patch no longer applies."""
+
+    @pytest.mark.parametrize("wrong_counts", [False, True], ids=["git_counts", "llm_wrong_counts"])
+    @pytest.mark.parametrize("case", sorted(_LINE_BREAK_CASES))
+    def test_repaired_patch_still_applies(self, tmp_path, case, wrong_counts):
+        before = _PY.format(sep=_LINE_BREAK_CASES[case])
+        after = before.replace("    return open(p)\n", "    return open(os.path.basename(p))\n")
+        repo, diff = _git_diff_roundtrip(tmp_path, "m.py", before, after)
+        assert _git_apply_check_utf8(repo, diff).returncode == 0  # ground truth
+        raw = re.sub(r"@@ -(\d+),\d+ \+(\d+),\d+ @@", r"@@ -\1,99 +\2,99 @@", diff) if wrong_counts else diff
+        repaired, _ = repair_hunk_headers(raw, repo_root=repo)
+        result = _git_apply_check_utf8(repo, repaired)
+        assert result.returncode == 0, (repaired, result.stderr)
+
+    def test_parse_diff_keeps_u2028_line_whole(self):
+        diff = "--- a/m.py\n+++ b/m.py\n@@ -1,1 +1,1 @@\n-S = 'x'\n+S = 'a b'\n"
+        assert semantic_delta(diff) == {"m.py": (["+S = 'a b'"], ["-S = 'x'"])}

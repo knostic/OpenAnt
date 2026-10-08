@@ -1099,6 +1099,76 @@ class TestTapEndToEndComparison:
         assert r.pre_existing_failures == ["old"]
 
 
+class TestPr763TapNewFailureNotHiddenAsPreExisting:
+    """PR #763 regression: with a pre-existing failure on both sides (both
+    exit non-zero), compare_runs' exit-code cross-check cannot fire, so a
+    new TAP failure the parser dropped would read as
+    PRE_EXISTING_FAILURES_ONLY. Covers a failing subtest rollup whose
+    children all passed, and a "\\#"-escaped (literal, non-directive)
+    TODO."""
+
+    _BASELINE = (
+        "TAP version 14\n"
+        "not ok 1 - old_bug\n"
+        "# Subtest: suite\n"
+        "    1..2\n"
+        "    ok 1 - a\n"
+        "    ok 2 - b\n"
+        "ok 2 - suite\n"
+        "ok 3 - foo\n"
+        "1..3\n"
+    )
+
+    def _tap_run(self, stdout, exit_code):
+        raw = _exec_result(stdout=stdout, exit_code=exit_code)
+        return etr._to_test_run_result(_TAP_PLAN, raw)
+
+    def _compare(self, patched_stdout):
+        baseline = self._tap_run(self._BASELINE, exit_code=1)
+        patched = self._tap_run(patched_stdout, exit_code=1)
+        return etr.compare_runs(_TAP_PLAN.test_command, baseline, patched)
+
+    def test_failing_rollup_with_all_passing_children_is_a_new_failure(self):
+        patched = self._BASELINE.replace(
+            "ok 2 - suite\n",
+            "not ok 2 - suite\n  ---\n  failureType: 'hookFailed'\n  ...\n",
+        )
+        r = self._compare(patched)
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.newly_failing_tests == ["suite"]
+        assert r.pre_existing_failures == ["old_bug"]
+
+    def test_failing_rollup_with_unfulfilled_child_plan_is_a_new_failure(self):
+        patched = self._BASELINE.replace("    1..2\n", "    1..3\n").replace(
+            "ok 2 - suite\n", "not ok 2 - suite\n",
+        )
+        r = self._compare(patched)
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.newly_failing_tests == ["suite"]
+
+    def test_escaped_hash_todo_is_a_new_failure(self):
+        r = self._compare(self._BASELINE.replace("ok 3 - foo\n", "not ok 3 - foo \\# TODO\n"))
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert len(r.newly_failing_tests) == 1
+        assert r.newly_failing_tests[0].startswith("foo")
+
+    def test_control_failing_child_is_the_only_new_failure(self):
+        """A failing child already explains the rollup -- no extra
+        subtest-level id is added on top of it."""
+        patched = self._BASELINE.replace("    ok 2 - b\n", "    not ok 2 - b\n").replace(
+            "ok 2 - suite\n", "not ok 2 - suite\n",
+        )
+        r = self._compare(patched)
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.newly_failing_tests == ["suite > b"]
+
+    def test_control_unescaped_todo_is_not_a_failure(self):
+        r = self._compare(self._BASELINE.replace("ok 3 - foo\n", "not ok 3 - foo # TODO\n"))
+        assert r.status == etr.STATUS_PRE_EXISTING_FAILURES_ONLY
+        assert r.newly_failing_tests == []
+        assert r.pre_existing_failures == ["old_bug"]
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------

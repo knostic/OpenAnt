@@ -36,6 +36,11 @@ from typing import List, Dict, Tuple, Optional
 
 from .diff_parsing import DiffHunk, parse_diff
 
+
+def _decorated_start(node: ast.AST) -> int:
+    """First line of a def/class including its decorators."""
+    return min([d.lineno for d in getattr(node, "decorator_list", [])] + [node.lineno])
+
 # A file deleted by the diff -- never reported by parse_diff (RB-3).
 _DELETED_FILE_HEADER_RE = re.compile(r"^\+\+\+ /dev/null\s*$", re.MULTILINE)
 # A complete single-line Python import statement (RB-3: such a hunk has no
@@ -181,7 +186,7 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         # Unique symbols
         changed_symbols = list(dict.fromkeys(changed_symbols))
 
-        usage_matches = self._search_usages(changed_symbols, repo_context=repo_context)
+        usage_matches = self._search_usages(changed_symbols, repo_context=repo_context, unscanned=unattributed)
 
         # Exclude test files and also exclude the changed files themselves
         affected_files = sorted({m.file for m in usage_matches if not self._is_test_path(m.file) and m.file not in changed_files})
@@ -315,11 +320,14 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     end = getattr(child, "end_lineno", None) or child.lineno
-                    index.append((child.lineno, end, child.name, "function"))
+                    # Decorators belong to the decorated symbol: `lineno` is
+                    # the `def` line, so a decorator-only change would
+                    # otherwise resolve to the enclosing class (or nothing).
+                    index.append((_decorated_start(child), end, child.name, "function"))
                     walk(child)
                 elif isinstance(child, ast.ClassDef):
                     end = getattr(child, "end_lineno", None) or child.lineno
-                    index.append((child.lineno, end, child.name, "class"))
+                    index.append((_decorated_start(child), end, child.name, "class"))
                     walk(child)
                 elif isinstance(child, (ast.Assign, ast.AnnAssign)) and isinstance(node, (ast.Module, ast.ClassDef)):
                     # Only direct module-level/class-level assignments count
@@ -383,7 +391,10 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
                 record(f"{file_path}: unreadable")
             return symbols
 
-        file_lines = text.splitlines()
+        # Split on "\n" only: str.splitlines() also breaks on \f, \x1c,
+        # U+2028 etc., which ast does not count as line breaks, shifting every
+        # later line number onto the wrong symbol.
+        file_lines = text.split("\n")
         symbol_index = self._build_symbol_index(text)
         if symbol_index is None:
             record(f"{file_path}: does not parse")
@@ -488,7 +499,7 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
             abstained.extend(abstained_runs)
         return resolved_symbols
 
-    def _search_usages(self, symbols: List[str], repo_context=None) -> List[UsageMatch]:
+    def _search_usages(self, symbols: List[str], repo_context=None, unscanned: "List[str] | None" = None) -> List[UsageMatch]:
         """Greedy repo scan for symbol usage. Returns UsageMatch list.
 
         This keeps the existing traversal logic (Path.rglob) when no
@@ -517,27 +528,33 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
             try:
                 if p.is_dir():
                     continue
-                # skip ignored dirs
-                parts = [part for part in p.parts]
-                if any(ign in parts for ign in self.IGNORED_DIRS):
-                    continue
                 # Canonical "/"-separated repo path on every host OS: it is
                 # compared against parse_diff()'s changed_files (always "/"),
                 # so a native "app\\x.py" on Windows would count a changed
                 # file as its own external caller.
                 rel = p.relative_to(repo_root).as_posix()
+                # skip ignored dirs -- inside the repo only; the checkout's
+                # own parent directories (e.g. /build/repo) must not match.
+                if any(ign in rel.split("/") for ign in self.IGNORED_DIRS):
+                    continue
                 # skip tests
                 if self._is_test_path(rel):
                     continue
                 # only scan Python source files for symbol usages
                 if p.suffix not in {".py", ".pyi"}:
                     continue
-                # read file text
+            except Exception:
+                continue
+            try:
                 if repo_context is not None:
                     text = repo_context.read_file(rel)
                 else:
                     text = p.read_text(encoding="utf-8", errors="ignore")
             except Exception:
+                # An unscanned caller must not read as "no caller": dropping
+                # it silently under-rates impact (fail-open toward Low Risk).
+                if unscanned is not None:
+                    unscanned.append(f"{rel}: caller file unreadable")
                 continue
 
             for i, line in enumerate(text.splitlines(), start=1):

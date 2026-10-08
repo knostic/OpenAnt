@@ -157,14 +157,23 @@ number of `additional` concerns. Each concern states a fixed set of facts
 (whether the operation is present in the evidence, whether a guard precedes it,
 the guard's default state and effect, whether re-entry preserves state,
 whether a non-default action is required, and whether the advisory's scope
-covers that action). Each fact must carry a short verbatim quote. Code then
-does the following:
+covers that action). Each positive fact must carry a short verbatim quote.
+Absence answers are not quote-checked: `false` (no non-default action
+required), `not_applicable` re-entry, and the `silent` and `absent` markers,
+which take a whole-document or whole-function marker instead. `false` only
+matters after a fully cited `blocked` chain. Code then does the following:
 
 1. **Checks citations.** A quote counts only if it appears in the
-   repository-derived context the Challenger was actually shown, in the diff,
-   or (for scope facts) in the vulnerability report. Planner and Strategy prose
-   is not citation authority. A fact with an ungrounded citation is treated as
-   `unresolved`.
+   repository-derived context the Challenger was actually shown, in the
+   post-change side of the diff (context and added lines, never removed lines
+   or diff headers), or (for scope facts) in the vulnerability report. Context
+   lines that the patch removes are excluded too, so a removed guard can never
+   be cited as present. A quote must contain an identifier character, be at
+   least 3 non-whitespace characters, and match on token boundaries (not
+   inside a longer identifier). Planner and Strategy prose is not citation
+   authority. A fact with an ungrounded citation is treated as `unresolved`.
+   The check proves a quote is real and comes from the patched code, not that
+   it supports the fact; that remains the model's judgment.
 2. **Assigns each concern a consequence**: `BLOCKING`, `UNRESOLVED`, or
    `NON_BLOCKING` (`_concern_consequence`). A missing, invalid or ungrounded
    fact can never lead to `NON_BLOCKING`; a malformed concern is
@@ -458,10 +467,11 @@ change the decision:
   These are displayed only. `test_availability` feeds only the evidence caveat.
 - **Behavior Summary and Repository Context.** These are explanatory
   sections, or inputs to the Validation Actions list.
-- **Deterministic static signals.** These render only when the optional
-  `scripts.constraint_signals` / `scripts.remediation_signals` modules can be
-  imported. Neither ships in this repository, so the section is normally
-  absent.
+- **Deterministic static signals.** The section is never rendered. The
+  `scripts.constraint_signals` / `scripts.remediation_signals` modules it
+  depended on never shipped, and importing them could only resolve to a
+  `scripts/` directory in the current directory (possibly the analyzed
+  repository), so the import was removed.
 - **The advisory itself.** For a CVE input, the report states that advisory
   claims (description, CWE, severity) are not repository-verified and that the
   recommendation does not depend on the advisory's CVSS score.

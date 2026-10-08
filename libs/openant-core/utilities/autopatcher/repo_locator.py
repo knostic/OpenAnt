@@ -298,7 +298,7 @@ class RepositoryPathResolver:
             self._files = [
                 p for p in sorted(self._repo_root.rglob("*"))
                 if p.is_file()
-                and not any(part in _IGNORED_DIRS for part in p.parts)
+                and not any(part in _IGNORED_DIRS for part in p.relative_to(self._repo_root).parts)
                 and _safe_under(p, resolved_root)
             ]
         return self._files
@@ -1019,7 +1019,7 @@ def _grep_repo(
     for p in sorted(repo_root.rglob("*")):
         if p.is_dir():
             continue
-        if any(part in _IGNORED_DIRS for part in p.parts):
+        if any(part in _IGNORED_DIRS for part in p.relative_to(repo_root).parts):
             continue
         if p.suffix not in _SOURCE_EXTENSIONS:
             continue
@@ -1112,7 +1112,7 @@ def _find_symbol_definitions(
     # than re-resolving repo_root for each file.
     resolved_root = repo_root.resolve()
     for p in sorted(repo_root.rglob("*.py")):
-        if any(part in _IGNORED_DIRS for part in p.parts):
+        if any(part in _IGNORED_DIRS for part in p.relative_to(repo_root).parts):
             continue
         if _is_test_file(p):
             continue

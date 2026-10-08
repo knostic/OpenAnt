@@ -583,3 +583,169 @@ class TestMultipleHunks:
         report = LightweightImpactAnalyzer().analyze(diff, repo_context=TargetRepoContext(repo))
         assert set(report.changed_symbols) == {"DEFAULT_REMOVE_HEADERS", "build_url"}
         assert set(report.changed_files) == {"retry.py", "helpers.py"}
+
+
+# --- PR #763 review: impact must not be under-rated (Low Risk is a positive
+# deployment-safety axis, so an understated level can unlock Deploy). ---
+
+_DECORATED_VIEWS = (
+    "def csrf_exempt(f):\n    return f\n\n"
+    "def require_role(r):\n    return lambda f: f\n\n"
+    "class Views:\n"
+    "    @csrf_exempt\n"
+    "    @require_role(\"user\")\n"
+    "    def delete_user(self, uid):\n"
+    "        return uid\n"
+)
+
+
+def _three_callers_repo(tmp_path, *, parent="ok", mode="normal"):
+    repo = tmp_path / parent / "repo"
+    write_file(repo / "app" / "views.py", _DECORATED_VIEWS)
+    outside = tmp_path / "outside"
+    for i in range(3):
+        body = f"from app.views import Views\nViews().delete_user({i})\n"
+        f = repo / "svc" / f"c{i}.py"
+        if mode == "symlink_outside":
+            write_file(outside / f"c{i}.py", body)
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.symlink_to(outside / f"c{i}.py")
+        else:
+            write_file(f, body)
+    return repo
+
+
+class TestDecoratorOnlyChanges:
+    def _analyze(self, repo, diff):
+        return LightweightImpactAnalyzer().analyze(
+            diff, repo_context=TargetRepoContext(repo), repo_language="python"
+        )
+
+    def test_decorator_removal_attributes_the_decorated_method(self, tmp_path):
+        repo = _three_callers_repo(tmp_path)
+        diff = (
+            "--- a/app/views.py\n+++ b/app/views.py\n@@ -8,5 +8,4 @@ class Views:\n"
+            "-    @csrf_exempt\n"
+            "     @require_role(\"user\")\n"
+            "     def delete_user(self, uid):\n"
+            "         return uid\n"
+        )
+        report = self._analyze(repo, diff)
+        assert report.changed_symbols == ["delete_user"]
+        assert report.impact_level == "high"
+
+    def test_decorator_argument_change_attributes_the_decorated_method(self, tmp_path):
+        repo = _three_callers_repo(tmp_path)
+        diff = (
+            "--- a/app/views.py\n+++ b/app/views.py\n@@ -8,4 +8,4 @@ class Views:\n"
+            "     @csrf_exempt\n"
+            "-    @require_role(\"user\")\n"
+            "+    @require_role(\"admin\")\n"
+            "     def delete_user(self, uid):\n"
+            "         return uid\n"
+        )
+        report = self._analyze(repo, diff)
+        assert report.changed_symbols == ["delete_user"]
+        assert report.impact_level == "high"
+
+    def test_body_change_control(self, tmp_path):
+        repo = _three_callers_repo(tmp_path)
+        diff = (
+            "--- a/app/views.py\n+++ b/app/views.py\n@@ -10,2 +10,2 @@ class Views:\n"
+            "     def delete_user(self, uid):\n"
+            "-        return uid\n"
+            "+        return int(uid)\n"
+        )
+        report = self._analyze(repo, diff)
+        assert report.changed_symbols == ["delete_user"]
+        assert report.impact_level == "high"
+
+
+class TestNonNewlineLineSeparators:
+    # \f and U+2028 are line breaks to str.splitlines() but not to ast.
+    def _repo(self, tmp_path, filler):
+        repo = tmp_path / "repo"
+        write_file(
+            repo / "lib" / "util.py",
+            f"{filler}"
+            "def helper(x):\n    return x\n\n"
+            "def other(y):\n    return y\n",
+        )
+        for i in range(3):
+            write_file(repo / "lib" / f"c{i}.py", f"from lib.util import helper\nhelper({i})\n")
+        return repo
+
+    def _diff(self, start):
+        return (
+            f"--- a/lib/util.py\n+++ b/lib/util.py\n@@ -{start},2 +{start},2 @@\n"
+            " def helper(x):\n-    return x\n+    return int(x)\n"
+        )
+
+    def test_form_feed_lines_do_not_shift_attribution(self, tmp_path):
+        repo = self._repo(tmp_path, "\f\n\f\n\f\n")
+        report = LightweightImpactAnalyzer().analyze(
+            self._diff(4), repo_context=TargetRepoContext(repo), repo_language="python"
+        )
+        assert report.changed_symbols == ["helper"]
+        assert report.impact_level == "high"
+
+    def test_unicode_line_separator_in_comment_does_not_shift_attribution(self, tmp_path):
+        repo = self._repo(tmp_path, "# a b\n# c d\n")
+        report = LightweightImpactAnalyzer().analyze(
+            self._diff(3), repo_context=TargetRepoContext(repo), repo_language="python"
+        )
+        assert report.changed_symbols == ["helper"]
+        assert report.impact_level == "high"
+
+    def test_ascii_control(self, tmp_path):
+        repo = self._repo(tmp_path, "")
+        report = LightweightImpactAnalyzer().analyze(
+            self._diff(1), repo_context=TargetRepoContext(repo), repo_language="python"
+        )
+        assert report.changed_symbols == ["helper"]
+        assert report.impact_level == "high"
+
+
+_BODY_DIFF = (
+    "--- a/app/views.py\n+++ b/app/views.py\n@@ -10,2 +10,2 @@ class Views:\n"
+    "     def delete_user(self, uid):\n"
+    "-        return uid\n"
+    "+        return int(uid)\n"
+)
+
+
+class TestCallerScanFailClosed:
+    def test_unreadable_caller_makes_impact_unavailable_not_low(self, tmp_path):
+        repo = _three_callers_repo(tmp_path, mode="symlink_outside")
+        report = LightweightImpactAnalyzer().analyze(
+            _BODY_DIFF, repo_context=TargetRepoContext(repo), repo_language="python"
+        )
+        assert report.impact_level == "unavailable"
+        assert "caller file unreadable" in report.impact_summary
+
+    def test_readable_callers_control(self, tmp_path):
+        repo = _three_callers_repo(tmp_path)
+        report = LightweightImpactAnalyzer().analyze(
+            _BODY_DIFF, repo_context=TargetRepoContext(repo), repo_language="python"
+        )
+        assert report.impact_level == "high"
+
+
+class TestIgnoredDirsAreRepoRelative:
+    def test_checkout_under_an_ignored_dir_name_still_finds_callers(self, tmp_path):
+        for parent in ("node_modules", ".venv"):
+            repo = _three_callers_repo(tmp_path / parent, parent=parent)
+            report = LightweightImpactAnalyzer().analyze(
+                _BODY_DIFF, repo_context=TargetRepoContext(repo), repo_language="python"
+            )
+            assert report.impact_level == "high", parent
+            assert len(report.affected_files) == 3, parent
+
+    def test_ignored_dir_inside_the_repo_is_still_skipped(self, tmp_path):
+        repo = tmp_path / "repo"
+        write_file(repo / "app" / "views.py", _DECORATED_VIEWS)
+        write_file(repo / "node_modules" / "c0.py", "from app.views import Views\nViews().delete_user(1)\n")
+        report = LightweightImpactAnalyzer().analyze(
+            _BODY_DIFF, repo_context=TargetRepoContext(repo), repo_language="python"
+        )
+        assert report.affected_files == []

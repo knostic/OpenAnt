@@ -894,12 +894,17 @@ def test_interrupt_then_resume(env):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     try:
-        deadline = time.monotonic() + 60
+        # Generous load-tolerance margins (passing runs return in ~1 s; both
+        # waits end as soon as their condition holds). Under a saturated full
+        # local suite, runner startup (git work-tree fingerprint) alone took
+        # >60 s, and shutdown waits up to SHUTDOWN_GRACE_SECONDS for the
+        # children before SIGKILL, then writes the summary.
+        deadline = time.monotonic() + 180
         while len(env.invocations()) < 2 and time.monotonic() < deadline:
             time.sleep(0.2)
         assert len(env.invocations()) == 2, "both cases should be running"
         proc.send_signal(signal.SIGINT)
-        output, _ = proc.communicate(timeout=60)
+        output, _ = proc.communicate(timeout=rcb.SHUTDOWN_GRACE_SECONDS + 160)
     finally:
         if proc.poll() is None:
             proc.kill()

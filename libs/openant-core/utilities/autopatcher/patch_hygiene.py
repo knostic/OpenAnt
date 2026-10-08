@@ -6,16 +6,23 @@ library, no external dependencies.
 Checks:
   A. empty_hunk          — file appears in diff but has no changed lines
   B. duplicate_assignment — ALL_CAPS constant added without removing existing one
-  C. unused_import        — import added but imported name unused in changed lines
+  C. unused_import        — Python import added but imported name unused in
+                           the visible diff (or the pre-patch file, when a
+                           repo_root is given)
 
 Returns a list of finding dicts: {severity, check, detail}.
-Never raises — callers may rely on it returning [] on any error.
+Never raises. An internal error is reported as a MEDIUM `hygiene_check_failed`
+finding, never as [] -- an empty list means "checked and clean", so it must
+not also stand for "could not check" (it would read as integrity=Clean).
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
+
+from utilities.file_io import read_repo_file
 
 
 # ---------------------------------------------------------------------------
@@ -191,29 +198,65 @@ def _imported_names(line: str) -> list[str]:
     m = _IMPORT_RE.match(line.strip())
     if not m:
         return []
-    if m.group(1):
-        # `import a.b.c` — local name is the first component
-        return [m.group(1).split(".")[0]]
-    # `from X import Y, Z as W` — local names are aliases or last identifiers
+    # `import a.b as c, d.e` — local names are aliases or FIRST components;
+    # `from X import Y, Z as W` — local names are aliases or LAST identifiers
+    is_from = not m.group(1)
+    body = m.group(2) if is_from else line.strip().split(None, 1)[1]
     names = []
-    for part in m.group(2).split(","):
+    for part in body.strip().strip("()\\").split(","):
         part = part.strip()
         if " as " in part:
             names.append(part.split(" as ")[-1].strip())
         else:
-            names.append(part.split(".")[-1].strip())
+            names.append(part.split(".")[-1 if is_from else 0].strip())
     return [n for n in names if n and re.match(r"^[A-Za-z_]\w*$", n)]
 
 
-def _check_unused_imports(fps: list[_FilePatch]) -> list[dict]:
+_PYTHON_SUFFIXES = (".py", ".pyi")
+
+
+def _pre_patch_lines(repo_root, filename: str) -> list[str]:
+    """The pre-patch file's lines, as extra usage evidence -- or [] when it
+    cannot be read safely (outside repo_root, symlink, FIFO, oversize,
+    missing, undecodable). [] only means "no extra evidence": the caller
+    then falls back to the diff-only check, which still flags."""
+    if repo_root is None:
+        return []
+    try:
+        root = Path(repo_root).resolve()
+        path = (root / filename).resolve()
+        if not path.is_relative_to(root):
+            return []
+        text = read_repo_file(path, oversize="truncate")
+    except Exception:  # noqa: BLE001 -- unsafe/unreadable file: no extra evidence
+        return []
+    return text.splitlines() if text else []
+
+
+def _check_unused_imports(fps: list[_FilePatch], repo_root=None) -> list[dict]:
     findings = []
     for fp in fps:
-        # Collect non-import added lines for usage lookup
+        # The import grammar below is Python's; other languages' import
+        # lines (`import { x } from`, `import "fmt"`) are not checked.
+        if not fp.filename.endswith(_PYTHON_SUFFIXES):
+            continue
+        # Usage lookup: every non-import line visible in the diff (added AND
+        # unchanged context), plus the pre-patch file when it is readable.
+        removed = {r.strip() for r in fp.removed_lines}
+        visible = fp.added_lines + fp.context_lines
+        if not fp.is_new_file:
+            # Lines the patch removes are not usage after the patch.
+            visible = visible + [
+                line for line in _pre_patch_lines(repo_root, fp.filename)
+                if line.strip() not in removed
+            ]
         non_import_added = "\n".join(
-            line for line in fp.added_lines
+            line for line in visible
             if not _IMPORT_RE.match(line.strip())
         )
         for line in fp.added_lines:
+            if line.strip() in removed:
+                continue  # a moved/re-added import, not a newly added one
             names = _imported_names(line)
             if not names:
                 continue
@@ -224,7 +267,7 @@ def _check_unused_imports(fps: list[_FilePatch]) -> list[dict]:
                         "check": "unused_import",
                         "detail": (
                             f"`{fp.filename}`: `{line.strip()}` — "
-                            f"`{name}` is not used in any other changed line"
+                            f"`{name}` is not used in any other line of the diff or file"
                         ),
                     })
     return findings
@@ -234,12 +277,23 @@ def _check_unused_imports(fps: list[_FilePatch]) -> list[dict]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def check_patch(patch: str) -> list[dict]:
+HYGIENE_CHECK_FAILED = {
+    "severity": "MEDIUM",
+    "check": "hygiene_check_failed",
+    "detail": "The hygiene check failed internally; patch hygiene was not verified",
+}
+
+
+def check_patch(patch: str, repo_root=None) -> list[dict]:
     """Run all hygiene checks on a unified diff string.
 
     Returns a list of finding dicts with keys: severity, check, detail.
-    Returns an empty list if the patch is empty or unparseable.
-    Never raises.
+    Returns an empty list if the patch is empty or has no file sections.
+    `repo_root`, when given, lets the unused-import check also look for a
+    usage in the pre-patch file (read via read_repo_file, confined to
+    repo_root). Never raises: an internal error returns
+    [HYGIENE_CHECK_FAILED] (MEDIUM -> integrity "Minor Issues", never
+    "Clean").
     """
     if not patch or not patch.strip():
         return []
@@ -250,7 +304,7 @@ def check_patch(patch: str) -> list[dict]:
         findings: list[dict] = []
         findings.extend(_check_empty_hunks(fps))
         findings.extend(_check_duplicate_assignments(fps))
-        findings.extend(_check_unused_imports(fps))
+        findings.extend(_check_unused_imports(fps, repo_root))
         return findings
-    except Exception:
-        return []
+    except Exception:  # noqa: BLE001 -- fail closed, never "clean"
+        return [dict(HYGIENE_CHECK_FAILED)]

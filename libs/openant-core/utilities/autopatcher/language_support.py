@@ -60,7 +60,9 @@ def detect_language(repo_root: "Path | str | None") -> str:
         for p in root.rglob("*"):
             if p.is_dir():
                 continue
-            if any(part in _IGNORED_DIRS for part in p.parts):
+            # Repo-relative: a checkout under e.g. /build/repo must not have
+            # every file ignored by its own parent directory's name.
+            if any(part in _IGNORED_DIRS for part in p.relative_to(root).parts):
                 continue
             lang = _EXTENSION_LANGUAGE.get(p.suffix.lower())
             if lang:

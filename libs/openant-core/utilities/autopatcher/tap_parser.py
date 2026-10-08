@@ -22,8 +22,9 @@ baseline-vs-patched diffing), not the full TAP14 specification:
     a subtest's own child lines are the real per-test identities; its
     trailing rollup line (the parent-level "ok"/"not ok N - NAME" line
     that summarizes the whole subtest) is NOT counted as a second,
-    independent failure on top of its children -- see
-    _drain_open_subtest. Nesting deeper than one level is conservatively
+    independent failure on top of a failing child -- but a failing
+    rollup whose children all passed IS recorded as the subtest's own
+    failure -- see _drain_open_subtest. Nesting deeper than one level is conservatively
     treated as unsupported (fail closed), not guessed at.
   - YAML diagnostic blocks (``---`` ... ``...``) are skipped as opaque
     text, never mined for fake test identities.
@@ -83,7 +84,9 @@ _SUBTEST_RE = re.compile(r"^#\s*Subtest:\s*(.*)$", re.IGNORECASE)
 _YAML_OPEN_RE = re.compile(r"^-{3}\s*$")
 _YAML_CLOSE_RE = re.compile(r"^\.{3}\s*$")
 _TEST_LINE_RE = re.compile(r"^(?P<not>not\s+)?ok\b(?:\s+(?P<num>\d+))?(?P<rest>.*)$")
-_DIRECTIVE_RE = re.compile(r"#\s*(SKIP|TODO)\b", re.IGNORECASE)
+# A backslash-escaped "\#" is a literal hash in the description (TAP14),
+# never a directive -- `not ok 3 - a \# TODO` is a failure.
+_DIRECTIVE_RE = re.compile(r"(?<!\\)#\s*(SKIP|TODO)\b", re.IGNORECASE)
 
 # Deterministic, conservative bound -- TAP is a text protocol with no
 # inherent size limit; without this a pathological input could make this
@@ -345,7 +348,10 @@ def _drain_open_subtest(
     hierarchical identity ("group > child"). If the subtest had no
     recorded children at all (e.g. an empty subtest, or one whose only
     content was diagnostics), the rollup line itself is the best
-    available identity and is used as a single leaf result instead.
+    available identity and is used as a single leaf result instead. A
+    FAILING rollup whose recorded children all passed is also recorded
+    under the subtest's own name: that failure belongs to the subtest
+    itself (a hook, an unfulfilled child plan) and must not vanish.
 
     Returns the list of (id, status) entries appended, in order -- so a
     caller tracking "the most recently recorded result" (for diagnostic
@@ -358,6 +364,11 @@ def _drain_open_subtest(
     if children:
         for child_id, status in children:
             appended.append((f"{name} > {child_id}", status))
+        if rollup_status == "fail" and not any(status == "fail" for _, status in children):
+            # The subtest itself failed (e.g. a hook, or a child plan its
+            # children did not fulfil) and no child failure explains it:
+            # that failure must not vanish behind the passing children.
+            appended.append((name, "fail"))
     else:
         appended.append((name, rollup_status))
     top_level.extend(appended)

@@ -211,7 +211,7 @@ def _from_jsonable_value(value, type_hint):
         non_none = [a for a in args if a is not type(None)]
         if value is None or not non_none:
             return value
-        return _from_jsonable_value(value, non_none[0])
+        return _from_jsonable_value(value, _select_union_member(value, non_none))
     if origin in (list, tuple):
         elem_type = args[0] if args else None
         items = [_from_jsonable_value(v, elem_type) if elem_type else v for v in (value or [])]
@@ -219,6 +219,44 @@ def _from_jsonable_value(value, type_hint):
     if isinstance(type_hint, type) and (dataclasses.is_dataclass(type_hint) or hasattr(type_hint, "_fields")):
         return from_jsonable(type_hint, value)
     return value
+
+
+def _structured_field_names(type_hint) -> "set[str] | None":
+    if isinstance(type_hint, type) and dataclasses.is_dataclass(type_hint):
+        return {f.name for f in dataclasses.fields(type_hint)}
+    if isinstance(type_hint, type) and hasattr(type_hint, "_fields"):
+        return set(type_hint._fields)
+    return None
+
+
+def _select_union_member(value, non_none: list):
+    """Which member of a multi-member Union `value` was serialized from.
+
+    to_jsonable() records no type tag, so a Union of several structured
+    shapes (e.g. post_patch_investigation.AnchorKey/AnchorValue, five
+    NamedTuples each -- plus a bare `bool` in AnchorValue) can only be told
+    apart by content: a dict matches the ONE member whose field names are
+    exactly its keys; a scalar matches the one non-structured member it is
+    an instance of. FAILS CLOSED on zero or several matches -- never
+    silently picks the first member (which reconstructed every
+    non-resolved_function anchor as a ResolvedFunctionKey and crashed
+    report_generation replay for any run whose patch applied)."""
+    if len(non_none) == 1:
+        return non_none[0]
+    if isinstance(value, dict):
+        matches = [t for t in non_none if _structured_field_names(t) == set(value)]
+    else:
+        matches = [
+            t for t in non_none
+            if _structured_field_names(t) is None and isinstance(t, type) and isinstance(value, t)
+        ]
+    if len(matches) != 1:
+        raise ExecutionRecorderError(
+            f"from_jsonable() cannot reconstruct a Union member from {value!r}: "
+            f"{len(matches)} of {[getattr(t, '__name__', t) for t in non_none]} match "
+            f"(exactly one is required)."
+        )
+    return matches[0]
 
 
 def _strip_call_record(call: dict) -> dict:

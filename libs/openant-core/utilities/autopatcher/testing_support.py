@@ -21,9 +21,11 @@ def discover_tests(root: Path) -> List[Path]:
     excluded_parts = {".venv", "venv", "site-packages", "dist-packages", "__pycache__", "build"}
 
     def _is_excluded(p: Path) -> bool:
-        # Check path parts for common virtualenv/site-package folders
+        # Check path parts for common virtualenv/site-package folders --
+        # repo-relative, so a checkout under e.g. /build/repo is not itself
+        # excluded by its own parent directory's name.
         try:
-            parts = set(p.parts)
+            parts = set(p.relative_to(root).parts)
         except Exception:
             parts = set(str(p).split("/"))
         return any(part in parts for part in excluded_parts)

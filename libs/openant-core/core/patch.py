@@ -504,8 +504,12 @@ def run_patch(
         RuntimeError: if no LLM provider can be resolved (see
             _require_llm_provider).
         FileNotFoundError: if pipeline_output_path doesn't exist.
-        ValueError: if finding_id is unknown or ineligible.
+        ValueError: if finding_id is unknown or ineligible, or if repo_root
+            is given but is not an existing directory (checked first, as in
+            run_patch_cve).
     """
+    if repo_root and not os.path.isdir(repo_root):
+        raise ValueError(f"--repo-root does not exist: {repo_root!r}")
     _require_test_comparison_environment(compare_existing_tests)
     _require_llm_provider()
 

@@ -1299,3 +1299,17 @@ class TestPreamblePatchTouchedProvenance:
         assert "after the patch was generated" in rendered
         assert "Repository Context" in rendered
         assert "before the patch existed" in rendered
+
+
+def test_unavailable_reason_replaces_the_generic_no_context_note():
+    """PR #763 review: an apply failure must be named as the reason, not
+    reported as "no investigation context available"."""
+    from utilities.autopatcher.post_patch_evaluation import evaluate_anchors
+
+    anchor = _resolved_function_anchor("app/auth.py:authenticate", candidate_path="app/auth.py")
+    reason = "the patch did not apply to the isolated copy (apply_rejected)"
+    obs = evaluate_anchors([anchor], None, unavailable_reason=reason)[0]
+    assert obs.status == "evaluation_error"
+    assert obs.details == reason
+    generic = evaluate_anchors([anchor], None)[0]
+    assert generic.details == "no investigation context available for the patched copy"

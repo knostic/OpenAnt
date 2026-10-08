@@ -43,7 +43,21 @@ def parse_diff(diff: str) -> Tuple[List[str], Dict[str, List[DiffHunk]]]:
             file_hunks[cur_file].append(cur_hunk)
         cur_hunk = None
 
-    for line in diff.splitlines():
+    # Split on "\n" only (dropping a CRLF's "\r"): str.splitlines() also
+    # breaks on \f, \x85, U+2028 etc., cutting one diff line in two.
+    lines = [l[:-1] if l.endswith("\r") else l for l in diff.split("\n")]
+    for i, line in enumerate(lines):
+        # Inside a hunk, a removed "-- x" / added "++ x" body line has the
+        # raw form "--- x" / "+++ x" too (F-14). There, a line is only a
+        # file header when its header pair is followed by its own "@@" line.
+        if cur_hunk is not None and line.startswith(("--- ", "+++ ")):
+            nxt = 2 if line.startswith("--- ") else 1
+            is_header = i + nxt < len(lines) and lines[i + nxt].startswith("@@") and (
+                nxt == 1 or lines[i + 1].startswith("+++ ")
+            )
+            if not is_header:
+                cur_hunk.lines.append(line)
+                continue
         if line.startswith("--- "):
             flush()
             continue
@@ -84,21 +98,15 @@ def semantic_delta(patch: str) -> Dict[str, Tuple[List[str], List[str]]]:
     invariant proving deterministic context reconstruction never touches a
     semantic addition/removal.
 
-    Safe against parse_diff's own "+++ "/"--- " body-line ambiguity (see
-    that function's F-36/F-41/F-45-style edge case) for this specific use:
-    that ambiguity only ever arises for an ADDED/REMOVED line whose own
-    content starts with "++ "/"-- " (marker + content forms "+++ "/"--- ");
-    a CONTEXT line's leading ' ' marker always shifts any such content one
-    character to the right, so it can never collide with that prefix check.
-    Since context reconstruction only ever inserts context lines, it can
-    never introduce this ambiguity — only pre-existing +/- lines could, and
-    this function reports them identically before and after either way.
+    parse_diff keeps an added/removed body line whose own content starts
+    with "++ "/"-- " (raw "+++ "/"--- ") inside its hunk (F-14), so every
+    '+'/'-' hunk line here is real content and is reported as such.
     """
     _, file_hunks = parse_diff(patch)
     return {
         f: (
-            [l for h in hunks for l in h.lines if l.startswith("+") and not l.startswith("+++")],
-            [l for h in hunks for l in h.lines if l.startswith("-") and not l.startswith("---")],
+            [l for h in hunks for l in h.lines if l.startswith("+")],
+            [l for h in hunks for l in h.lines if l.startswith("-")],
         )
         for f, hunks in file_hunks.items()
     }

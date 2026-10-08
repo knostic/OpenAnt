@@ -386,6 +386,147 @@ class TestUnusedImportCheck:
         assert any("re" in f["detail"] for f in imps)
 
 
+def _py_diff(added_import: str, body_old: str = "    return x", body_new: str = "    return x",
+             filename: str = "app.py") -> str:
+    return (
+        f"--- a/{filename}\n+++ b/{filename}\n@@ -1,3 +1,4 @@\n"
+        f" import os\n+{added_import}\n def f(x):\n-{body_old}\n+{body_new}\n"
+    )
+
+
+def _unused(findings: list) -> list:
+    return [f for f in findings if f["check"] == "unused_import"]
+
+
+class TestUnusedImportFalsePositives:
+    """C1: a correct patch must not be demoted (Deploy -> Manual Review) by a
+    spurious unused_import; a genuinely unused added import must still be
+    flagged, and missing file evidence never suppresses a diff-proven one."""
+
+    def test_aliased_import_used_via_alias_not_flagged(self):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        diff = _py_diff("import numpy as np", body_new="    return np.clip(float(x), 0, 1)")
+        assert _unused(check_patch(diff)) == []
+
+    def test_dotted_aliased_import_used_via_alias_not_flagged(self):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        diff = _py_diff("import xml.etree.ElementTree as ET", body_new="    return ET.fromstring(x)")
+        assert _unused(check_patch(diff)) == []
+
+    def test_comma_list_import_each_name_checked(self):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        diff = _py_diff("import shlex, subprocess", body_new="    return shlex.split(x)")
+        unused = _unused(check_patch(diff))
+        assert len(unused) == 1 and "`subprocess`" in unused[0]["detail"]
+
+    def test_moved_import_used_in_context_not_flagged(self):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        diff = (
+            "--- a/app.py\n+++ b/app.py\n@@ -1,5 +1,5 @@\n"
+            "-import numpy as np\n import os\n+import numpy as np\n def f(x):\n     return np.asarray(x)\n"
+        )
+        assert _unused(check_patch(diff)) == []
+
+    def test_usage_in_context_line_not_flagged(self):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        diff = (
+            "--- a/app.py\n+++ b/app.py\n@@ -1,3 +1,4 @@\n"
+            " import os\n+from html import escape\n def f(x):\n     return escape(x)\n"
+        )
+        assert _unused(check_patch(diff)) == []
+
+    def test_usage_elsewhere_in_pre_patch_file_not_flagged_with_repo_root(self, tmp_path):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        (tmp_path / "app.py").write_text("import os\n\n\ndef g(s):\n    return escape(s)\n", encoding="utf-8")
+        diff = "--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,3 @@\n import os\n+from html import escape\n \n"
+        assert len(_unused(check_patch(diff))) == 1  # diff alone cannot prove the usage
+        assert _unused(check_patch(diff, repo_root=tmp_path)) == []
+
+    def test_usage_only_on_a_removed_line_is_not_evidence(self, tmp_path):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        (tmp_path / "app.py").write_text("def g(s):\n    return escape(s)\n", encoding="utf-8")
+        diff = (
+            "--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,3 @@\n"
+            "+from html import escape\n def g(s):\n-    return escape(s)\n+    return s\n"
+        )
+        assert len(_unused(check_patch(diff, repo_root=tmp_path))) == 1
+
+    def test_non_python_imports_not_checked(self):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        js = _py_diff("import { escape } from 'html-escaper';", body_new="    res.send(escape(q));", filename="a.js")
+        go = _py_diff('import "html"', body_new="    w.Write(html.EscapeString(q))", filename="a.go")
+        assert _unused(check_patch(js)) == []
+        assert _unused(check_patch(go)) == []
+
+    # --- positive controls: a truly unused added import is still flagged ---
+
+    def test_truly_unused_import_still_flagged(self):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        diff = _py_diff("import subprocess", body_new="    return int(x)")
+        assert len(_unused(check_patch(diff))) == 1
+
+    def test_aliased_but_unused_import_still_flagged(self):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        diff = _py_diff("import numpy as np", body_new="    return numpy_like(x)")
+        unused = _unused(check_patch(diff))
+        assert len(unused) == 1 and "`np`" in unused[0]["detail"]
+
+    def test_truly_unused_import_still_flagged_with_repo_root(self, tmp_path):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        (tmp_path / "app.py").write_text("import os\ndef f(x):\n    return x\n", encoding="utf-8")
+        diff = _py_diff("import subprocess", body_new="    return int(x)")
+        assert len(_unused(check_patch(diff, repo_root=tmp_path))) == 1
+
+    # --- missing/unsafe file evidence never suppresses a diff-proven finding ---
+
+    def test_symlinked_file_is_not_read_as_evidence(self, tmp_path):
+        import pytest
+        from utilities.autopatcher.patch_hygiene import check_patch
+        outside = tmp_path / "outside.py"
+        outside.write_text("subprocess.run(x)\n", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        try:
+            (repo / "app.py").symlink_to(outside)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks unavailable on this platform")
+        diff = _py_diff("import subprocess", body_new="    return int(x)")
+        assert len(_unused(check_patch(diff, repo_root=repo))) == 1
+
+    def test_path_outside_repo_root_is_not_read_as_evidence(self, tmp_path):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        (tmp_path / "app.py").write_text("subprocess.run(x)\n", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        diff = _py_diff("import subprocess", body_new="    return int(x)", filename="../app.py")
+        assert len(_unused(check_patch(diff, repo_root=repo))) == 1
+
+    def test_missing_file_falls_back_to_diff_only(self, tmp_path):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        diff = _py_diff("import subprocess", body_new="    return int(x)")
+        assert len(_unused(check_patch(diff, repo_root=tmp_path))) == 1
+
+
+class TestHygieneCheckFailsClosed:
+    """C2: an internal checker error must never read as "no hygiene issues"
+    (integrity=Clean -> Deploy After Validation)."""
+
+    def test_internal_error_returns_failure_finding_not_empty(self, monkeypatch):
+        from utilities.autopatcher import patch_hygiene
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("injected")
+
+        monkeypatch.setattr(patch_hygiene, "_check_empty_hunks", _boom)
+        findings = patch_hygiene.check_patch(_CLEAN_PATCH)
+        assert [f["check"] for f in findings] == ["hygiene_check_failed"]
+        assert findings[0]["severity"] == "MEDIUM"
+
+    def test_clean_patch_still_returns_empty(self):
+        from utilities.autopatcher.patch_hygiene import check_patch
+        assert check_patch(_CLEAN_PATCH) == []
+
+
 # ---------------------------------------------------------------------------
 # Composite: dirty patch triggers all three checks
 # ---------------------------------------------------------------------------

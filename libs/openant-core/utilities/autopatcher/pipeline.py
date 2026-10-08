@@ -56,15 +56,16 @@ from .existing_test_regression import (
     test_execution_error_result as _existing_test_comparison_execution_error,
 )
 
-# Static patch signals
-try:
-    from scripts.constraint_signals import run_constraint_signals as _run_constraint_signals
-    from scripts.remediation_signals import run_remediation_signals as _run_remediation_signals
-    _STATIC_SIGNALS_AVAILABLE = True
-except ImportError:
-    _STATIC_SIGNALS_AVAILABLE = False
-    def _run_constraint_signals(*a, **k): return []  # type: ignore
-    def _run_remediation_signals(*a, **k): return []  # type: ignore
+# Static patch signals. The `scripts.constraint_signals` /
+# `scripts.remediation_signals` modules never shipped with OpenAnt, so a
+# top-level `import scripts.*` could only ever resolve against a `scripts/`
+# directory on sys.path -- e.g. the analyzed repository when `python -m
+# openant` runs with the CWD inside it -- executing untrusted code
+# in-process. Never import them; the no-op stubs keep the (display-only)
+# consumers and replay_engine's imports working.
+_STATIC_SIGNALS_AVAILABLE = False
+def _run_constraint_signals(*a, **k): return []  # type: ignore
+def _run_remediation_signals(*a, **k): return []  # type: ignore
 
 
 # Minimal TargetRepoContext for routing repo-relative file reads.
@@ -2758,7 +2759,9 @@ def _build_recommendation_v1(
     # the same evidence I3 itself already checked. Presentation only: never
     # affects which branch below fires.
     unmet = _describe_unmet_gates(signals)
-    if improvement == "Low" and safety == "Low Risk":
+    # Top-tier too: like I3, it needs positive integrity evidence -- not
+    # being blocked is not the same claim as being positive evidence.
+    if integrity in _POSITIVE_INTEGRITY and improvement == "Low" and safety == "Low Risk":
         reason = "Patch provides limited or uncertain security improvement. Manual security review recommended."
         if unmet:
             reason += f" {unmet}"
@@ -6732,6 +6735,7 @@ def _run_patch_generation_and_investigation(
     _post_patch_observations: list | None = None
     _post_patch_coverage: "CoverageResult | None" = None
     _post_patch_ctx = ""
+    _post_patch_context = None
     _investigated_patch: str | None = None
     # No candidate patch -- there is no "post-patch" state to investigate;
     # skip entirely rather than evaluate an isolated copy against an empty
@@ -6799,7 +6803,17 @@ def _run_patch_generation_and_investigation(
                         # re-announces itself in default-mode terminal output.
                         with suppress_summary_announcement():
                             _post_patch_context = build_investigation_context(_workspace_root, _investigation_output_dir)
-                    _post_patch_observations = evaluate_anchors(_all_anchors, _post_patch_context)
+                    _post_patch_unavailable_reason = None
+                    if not _apply_result.applied:
+                        _post_patch_unavailable_reason = (
+                            f"the patch did not apply to the isolated copy ({_apply_result.error_kind})"
+                        )
+                        progress.warning(
+                            "Post-patch analysis unavailable — the patch did not apply to the isolated copy"
+                        )
+                    _post_patch_observations = evaluate_anchors(
+                        _all_anchors, _post_patch_context, unavailable_reason=_post_patch_unavailable_reason,
+                    )
                     # Coverage Analysis reuses the PRE-patch InvestigationContext (the
                     # diff's context/removed lines describe that state) and the same
                     # repo_root -- unrelated to the isolated post-patch workspace above,
@@ -6855,7 +6869,7 @@ def _run_patch_generation_and_investigation(
                             _post_patch_observations, _post_patch_context,
                             max_chars=max(0, _post_patch_ctx_ceiling - len(_post_patch_ctx)),
                         )
-            if _post_patch_ctx:
+            if _post_patch_ctx and _post_patch_context is not None:
                 progress.success("Post-patch analysis completed")
                 progress.verbose(
                     f"[pipeline] Post-Patch Investigation rendered "

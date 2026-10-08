@@ -219,6 +219,25 @@ class TestIndependentReplay:
         assert "Trust Report" in report or "#" in report  # a real Markdown report was rendered
         assert (tmp_path / "replay-s12" / "report.md").exists()
 
+    def test_report_generation_replays_when_patch_applied(self, run_traced, tmp_path, monkeypatch):
+        """The test above uses a target the mock patch does NOT apply to, so
+        S4 records no post_patch_observations at all. With an applicable
+        target S4 persists real AnchorObservations whose anchor_key/
+        before_value are multi-member Unions -- report_generation replay
+        must reconstruct every kind, not just resolved_function."""
+        from utilities.autopatcher.replay_engine import replay_stage
+        repo_root, full_run = _full_run(run_traced, tmp_path, monkeypatch, compare_existing_tests=True)
+        s4 = [e for e in _manifest(full_run)["executions"]
+              if e["canonical_stage"] == "patch_generation_and_post_patch_investigation"][-1]
+        observations = json.loads(Path(s4["artifact_path"]).read_text())["post_patch_observations"]
+        assert any(o["anchor_kind"] != "resolved_function" for o in observations), observations
+
+        result = replay_stage(
+            source_run=full_run, stage_name="report_generation",
+            output_dir=tmp_path / "replay-s12", repo_root_override=str(repo_root),
+        )
+        assert result.outcome == "settled"
+
     def test_report_generation_missing_dependency_fails_cleanly(self, run_traced, tmp_path, monkeypatch):
         """report_generation depends on patch_review (among others) -- if a
         source lineage never produced one, resolution must fail BEFORE any

@@ -54,6 +54,14 @@ from dataclasses import dataclass
 # of these functions already does.
 from .diff_hunk_repair import ContextExpansionResult, RepairResult, repair_hunk_headers
 
+# Mirrors patch_hygiene.HYGIENE_CHECK_FAILED, defined here too because it is
+# used exactly when importing/calling patch_hygiene.check_patch itself failed.
+_HYGIENE_CHECK_FAILED = {
+    "severity": "MEDIUM",
+    "check": "hygiene_check_failed",
+    "detail": "The hygiene check failed internally; patch hygiene was not verified",
+}
+
 
 @dataclass
 class ProcessedPatch:
@@ -132,9 +140,10 @@ def process_generated_patch(
 
     try:
         from .patch_hygiene import check_patch
-        hygiene_findings = check_patch(patch)
+        hygiene_findings = check_patch(patch, repo_root=repo_root)
     except Exception:  # noqa: BLE001
-        hygiene_findings = []
+        # Fail closed: [] would read as "checked and clean" (integrity=Clean).
+        hygiene_findings = [dict(_HYGIENE_CHECK_FAILED)]
 
     try:
         from .patch_applicability import check_applicability
@@ -157,9 +166,10 @@ def process_generated_patch(
                 applicability_result = _check_applicability_after_strip(patch, repo_root)
                 try:
                     from .patch_hygiene import check_patch as _check_patch_after_strip
-                    hygiene_findings = _check_patch_after_strip(patch)
+                    hygiene_findings = _check_patch_after_strip(patch, repo_root=repo_root)
                 except Exception:  # noqa: BLE001
-                    pass
+                    # The pre-strip findings describe a different patch.
+                    hygiene_findings = [dict(_HYGIENE_CHECK_FAILED)]
         except Exception:  # noqa: BLE001
             empty_hunks_removed = 0
 
