@@ -109,13 +109,16 @@ def scan_depth0_spans(text: str) -> "tuple[list[tuple[str, Any]], bool]":
 def _naive_span_object(text: str) -> Optional[dict]:
     """The pre-#242 extractor: first ``{`` to last ``}``, decoded.
 
-    Retained deliberately, as the *last* resort rather than the first.  The
-    depth-0 scan has one blind spot the naive slice does not: an odd number of
-    ``"`` in the surrounding prose shifts quote parity, and the scan then sees
-    no depth-0 object at all.  Falling back keeps
-    :func:`extract_json_object` a strict superset of what every call site
-    already recovered -- a robustness fix must not drop a reply that parses
-    before it.
+    Retained deliberately, and it is load-bearing rather than vestigial: it is
+    the depth-0 scan's *parity cross-check*.  The scan assumes it starts
+    outside a JSON string, so a stray ``"`` in the model's prose inverts its
+    string state -- and an inverted scan both misses the real object's braces
+    and reports balanced ``{}`` *inside* a string value as a depth-0 object.
+
+    This slice cannot make that mistake, because it never interprets quotes.
+    When it decodes, ``text[first-{ : last-} ]`` is one complete, valid JSON
+    object, and that is a strictly wider and unambiguous reading of the text --
+    see :func:`extract_json_object` for why it therefore wins any disagreement.
     """
     start = text.find("{")
     end = text.rfind("}") + 1
@@ -140,16 +143,44 @@ def extract_json_object(text: str) -> Optional[dict]:
     overriding a real ``{VULNERABLE}``), and every call site already treats
     ``None`` as "could not parse" and has its own fallback.
 
+    The naive slice is consulted as a **cross-check on quote parity**, not as a
+    mere last resort.  :func:`scan_depth0_spans` assumes it begins outside a
+    JSON string; one stray ``"`` in the prose inverts that, and the scan then
+    reports a balanced ``{}`` sitting inside a string VALUE as the depth-0
+    object -- ``{}`` instead of the reply (a silent wrong answer), or two such
+    artefacts and therefore ``None`` (a drop).  Gating on the scan's own
+    ``ended_in_string`` flag does not cover it: a second stray quote restores
+    final parity while the state stays inverted across the object, so the flag
+    reads False on exactly the shapes that need rescuing.
+
+    So: if the naive slice decodes to a dict and the scan disagrees, the scan's
+    string state was corrupted and the slice wins.  That is sound, not a
+    heuristic.  If the slice decodes, its span is ONE valid JSON object; any
+    differing scan span must then lie strictly inside that span, and under
+    correct parity a depth-0 object cannot sit strictly inside another depth-0
+    object's extent (two sibling depth-0 objects would leave the slice invalid
+    JSON).  Disagreement therefore *implies* inverted parity.
+
+    #236 survives it: the slice yields a dict only when the whole span is a
+    single valid JSON document, which cannot hold two competing top-level
+    objects -- so this can never blind-pick one of them.
+
     Does **not** strip markdown fences or try a whole-text ``json.loads``
     first: call sites differ in both and keep their own.  This replaces only
     their naive-slice fallback.
+
+    Residual, disclosed: when parity is inverted AND two objects genuinely
+    compete, the slice covers both, fails to decode, and cannot arbitrate -- the
+    scan's corrupted single span is returned.  ``parse_response`` has behaved
+    that way since #242; it is pre-existing, not introduced here.
     """
     if not text:
         return None
     spans, _ended_in_string = scan_depth0_spans(text)
     decoded = [value for _span, value in spans if isinstance(value, dict)]
+    naive = _naive_span_object(text)
+    if naive is not None and (len(decoded) != 1 or decoded[0] != naive):
+        return naive
     if len(decoded) == 1:
         return decoded[0]
-    if not decoded:
-        return _naive_span_object(text)
     return None
