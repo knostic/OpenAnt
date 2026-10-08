@@ -23,6 +23,7 @@ from typing import List, Optional
 
 from core.verdict_taxonomy import STAGE1_PROMPT_FINDINGS
 from .llm import PhaseBinding, simple_text
+from .json_extract import extract_json_object
 
 
 # Default (Stage-1 vocabulary) schema — #623: the enum renders from
@@ -191,15 +192,10 @@ def _parse_json_response(response: str) -> Optional[dict]:
     try:
         return json.loads(response)
     except json.JSONDecodeError:
-        # Try to find JSON in the response
-        start = response.find("{")
-        end = response.rfind("}") + 1
-        if start >= 0 and end > start:
-            try:
-                return json.loads(response[start:end])
-            except json.JSONDecodeError:
-                pass
-    return None
+        # #673: the shared depth-0 scanner, not a first-{/last-} slice. This
+        # site is the corrector parsing its OWN reply -- the last line of
+        # defense for every other site's paid fallback.
+        return extract_json_object(response)
 
 
 class JSONCorrector:

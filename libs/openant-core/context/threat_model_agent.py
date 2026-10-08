@@ -19,10 +19,10 @@ validation is an error, not a file — writing an invalid document would poison
 every later scan, and the loader is deliberately strict about malformed input.
 """
 
-import json
 from pathlib import Path
 
 from utilities.file_io import read_repo_file, repo_path_state, write_repo_file
+from utilities.json_extract import extract_json_object
 from utilities.llm import simple_text
 
 from context.repo_explorer import explore_repository
@@ -192,17 +192,18 @@ def _extract_json(text: str) -> dict:
         # Strip a fenced block, tolerating a ```json info-string.
         lines = [ln for ln in stripped.splitlines() if not ln.startswith("```")]
         stripped = "\n".join(lines)
-    start, end = stripped.find("{"), stripped.rfind("}")
-    if start == -1 or end == -1:
+    if "{" not in stripped or "}" not in stripped:
         raise ThreatModelGenerationError(
             f"model response contained no JSON object: {text[:200]!r}"
         )
-    try:
-        return json.loads(stripped[start:end + 1])
-    except json.JSONDecodeError as exc:
+    # #673: the shared depth-0 scanner, not a first-{/last-} slice -- a brace
+    # anywhere in the surrounding prose invalidated that span and raised.
+    recovered = extract_json_object(stripped)
+    if recovered is None:
         raise ThreatModelGenerationError(
-            f"model response was not valid JSON: {exc}"
-        ) from exc
+            f"model response was not valid JSON: {stripped[:200]!r}"
+        )
+    return recovered
 
 
 def generate_threat_model(
