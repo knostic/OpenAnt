@@ -54,6 +54,7 @@ from typing import Union, Any, Callable, Dict, List, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from utilities.llm import PhaseBinding
     from context.application_context import ApplicationContext  # noqa: F401
+from utilities.json_extract import extract_json_object
 from utilities.rate_limiter import is_budget_exhausted_error
 
 
@@ -266,16 +267,10 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     except json.JSONDecodeError:
         pass
 
-    # Fall back to the first balanced JSON object in the response.
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end > start:
-        snippet = cleaned[start : end + 1]
-        try:
-            return json.loads(snippet)
-        except json.JSONDecodeError:
-            return None
-    return None
+    # #673: fall back to the shared depth-0 scanner, not a first-{/last-}
+    # slice -- a brace anywhere in the surrounding prose invalidated that
+    # span and dropped the whole batch.
+    return extract_json_object(cleaned)
 
 
 def parse_response(

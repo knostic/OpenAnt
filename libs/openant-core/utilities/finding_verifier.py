@@ -54,6 +54,7 @@ from .llm import (
 # simple_text's default — a private 4096 here is how PR #242's raise never
 # reached verify on any route.
 from .llm.helpers import DEFAULT_MAX_TOKENS
+from .json_extract import extract_json_object
 
 # Null logger that discards all messages (used when no logger provided)
 _null_logger = logging.getLogger("null_verifier")
@@ -1646,13 +1647,12 @@ class FindingVerifier:
 
     def _parse_json_from_text(self, text: str) -> Optional[dict]:
         """Extract JSON object from text, with LLM correction fallback."""
-        try:
-            start = text.find('{')
-            end = text.rfind('}') + 1
-            if start >= 0 and end > start:
-                return json.loads(text[start:end])
-        except json.JSONDecodeError:
-            pass
+        # #673: the shared depth-0 scanner, not a first-{/last-} slice -- a
+        # brace anywhere in the surrounding prose invalidated that span and
+        # sent a perfectly-extractable verification to the paid corrector.
+        recovered = extract_json_object(text)
+        if recovered is not None:
+            return recovered
 
         # Fallback: use LLM to correct malformed JSON. Pass the verifier's
         # `finish` schema so the corrector recovers verifier shape (no verdict)
