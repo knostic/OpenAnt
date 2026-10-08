@@ -293,11 +293,11 @@ class TestStillExploitableDetector:
         "Nothing remains exploitable once the guard raises.",
         # real recorded primary-concern text (release-regression batches)
         "Whether a server-supplied Content-Disposition filename with path separators or `../` can still "
-        "make file_path escape temp_dir.",
+        + "make file_path escape temp_dir.",
         "In PoolManager.urlopen, with 'Cookie' now in the default set, the cross-origin strip loop removes "
-        "the Cookie header before re-invoking, closing this path.",
+        + "the Cookie header before re-invoking, closing this path.",
         "Whether an attacker-supplied oversized range segment still reaches the backtracking-prone trimming "
-        "regexes in parseRange.",
+        + "regexes in parseRange.",
     ])
     def test_non_assertions(self, text):
         from utilities.autopatcher.patch_challenger import _asserts_still_exploitable

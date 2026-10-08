@@ -24,8 +24,6 @@ import pytest
 from utilities.autopatcher import cve_converter as cve_converter_module
 from utilities.autopatcher import investigation_adapters as adapters_module
 import utilities.autopatcher.pipeline as pipeline_module
-from utilities.autopatcher.cve_converter import cve_to_vuln_text as REAL_CVE_TO_VULN_TEXT
-from utilities.autopatcher.investigation_adapters import case_from_vulnerability_text
 from utilities.autopatcher.tools.blind_evaluation import (
     DIRECT_REMEDIATION_COMMIT,
     DIRECT_REMEDIATION_COMPARE,
@@ -41,6 +39,8 @@ from utilities.autopatcher.tools.blind_evaluation import (
 )
 
 REAL_PIPELINE_RUN = pipeline_module.run
+REAL_CVE_TO_VULN_TEXT = cve_converter_module.cve_to_vuln_text
+case_from_vulnerability_text = adapters_module.case_from_vulnerability_text
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parent.parent.parent

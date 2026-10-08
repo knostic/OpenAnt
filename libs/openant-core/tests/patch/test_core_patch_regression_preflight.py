@@ -23,8 +23,11 @@ from unittest import mock
 import pytest
 
 from core import patch as core_patch
-from core.patch import TestComparisonEnvironmentError, run_patch, run_patch_cve
 from utilities.autopatcher.test_execution_models import ExecutorPreflightResult
+
+TestComparisonEnvironmentError = core_patch.TestComparisonEnvironmentError
+run_patch = core_patch.run_patch
+run_patch_cve = core_patch.run_patch_cve
 
 FIXTURE_CVE = {
     "id": "CVE-2021-12345",

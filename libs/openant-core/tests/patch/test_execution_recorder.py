@@ -10,6 +10,7 @@ for end-to-end proof through the real pipeline/run_traced.py.
 
 from __future__ import annotations
 
+import importlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -155,7 +156,7 @@ class TestLLMCallAttribution:
         LLMCallCapture (or anything from llm_call_tracing) at all -- it has
         no business owning a capture/monkeypatch mechanism (Final
         Correction 2)."""
-        from utilities.autopatcher import execution_recorder as er_module
+        er_module = importlib.import_module(ExecutionRecorder.__module__)
         assert "LLMCallCapture" not in dir(er_module)
         assert not hasattr(er_module, "llm_call_tracing")
 
