@@ -163,12 +163,12 @@ def extract_json_object(text: str) -> Optional[dict]:
 
     #236 survives it: the slice yields a dict only when the whole span is a
     single valid JSON document, which cannot hold two competing top-level
-    objects. THE None-PRESERVATION RESIDUAL (declared, F1c/F1d): under
-    INVERTED quote parity (a stray quote before the object) a competing pick
-    or a {}-in-string value may be returned where the naive slice returned
-    None -- the superset property ("whenever the slice decodes to a dict,
-    return that same dict") is unconditional; the None-preservation is NOT
-    objects -- so this can never blind-pick one of them.
+    objects -- so this can never blind-pick one of them. THE None-PRESERVATION
+    RESIDUAL (declared, F1c/F1d): under INVERTED quote parity (a stray quote
+    before the object) a competing pick or a {}-in-string value may be
+    returned where the naive slice returned None -- the superset property
+    ("whenever the slice decodes to a dict, return that same dict") is
+    unconditional; the None-preservation is NOT.
 
     Does **not** strip markdown fences or try a whole-text ``json.loads``
     first: call sites differ in both and keep their own.  This replaces only
