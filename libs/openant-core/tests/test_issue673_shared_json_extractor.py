@@ -309,11 +309,43 @@ def test_the_shared_extractor_is_a_strict_superset_of_the_naive_slice():
                 return value
         return None
 
+    wrong_base_none = []   # F1d: a base-None row that returns a WRONG pick
     dropped, changed, covered = [], [], 0
-    def check(s):
+
+    def check(s, intended=None):
         nonlocal covered
         old = naive(s)
         if old is None:
+            # the base-None rows: head may return a dict (the declared F1c/F1d
+            # residual under inverted parity). Fable's minimum, scoped to the
+            # rows where the intended object is KNOWN (the structured corpus):
+            # the pick is the intended object, the {} placeholder, or a
+            # COMPETING object that genuinely appears in the text (the F1c
+            # class -- pre-existing since #242, declared for the PR body --
+            # never a fabricated or third-party object). The exhaustive/random
+            # rows have no intended and no competitors declared -- recorded
+            # but not asserted.
+            h = extract_json_object(s)
+            if h is not None and h != {} and intended is not None and h != intended:
+                # the F1c bound: the pick must decode from SOME contiguous
+                # span of the text itself (a genuine competing object) --
+                # never a fabricated or third-party value
+                spans = [i for i, c in enumerate(s) if c == "{"] \
+                    + [len(s)]
+                decoded_spans = []
+                for i in range(len(s)):
+                    if s[i] != "{":
+                        continue
+                    for j in range(i + 1, len(s) + 1):
+                        if j > 0 and s[j - 1] == "}":
+                            try:
+                                v = json.loads(s[i:j])
+                                if isinstance(v, dict):
+                                    decoded_spans.append(v)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+                if h not in decoded_spans:
+                    wrong_base_none.append((s, h))
             return
         covered += 1
         new = extract_json_object(s)
@@ -339,11 +371,17 @@ def test_the_shared_extractor_is_a_strict_superset_of_the_naive_slice():
             '{"a":"{}"}', '{"a":"x {} y","b":"{}"}',
             '{"p":"catch (e) {}","verdict":"VULNERABLE"}']
     for obj in objs:
+        intended = json.loads(obj)
         for pre in ("", "pre ", "{x} ", '" ', '"q" ', "see foo() { ", 'a"b ', "}} "):
             for post in ("", " post", " {y}", ' "', ' "z"', " } ", ' {"c":3}'):
-                check(pre + obj + post)
+                check(pre + obj + post, intended=intended)
 
     assert covered > 1000, f"the corpus barely exercised the old path ({covered})"
+    assert not wrong_base_none, (
+        'base-None rows returning dicts that are neither the intended object, '
+        'the {} placeholder, nor a competing object present in the text '
+        '(F1d unbounded -- the residual leaked past the declared F1c class): '
+        '%r' % wrong_base_none[:5])
     assert not dropped, f"{len(dropped)} input(s) parsed before and not now, e.g. {dropped[:3]}"
     assert not changed, f"{len(changed)} input(s) now decode differently, e.g. {changed[:3]}"
 
