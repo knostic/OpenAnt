@@ -26,3 +26,13 @@ paths = [
 regexes = [
   '''(1234567890|LEAKED|EXAMPLE|FAKE)''',
 ]
+
+[[allowlists]]
+description = "Fake credential in curl CVE-2022-27774 fixture (curl-auth-user; historical commit fb1a038, since replaced)"
+condition = "AND"
+paths = [
+  '''libs/openant-core/tests/patch/fixtures/examples/curl-cve-2022-27774\.md''',
+]
+regexes = [
+  '''alice:s3cr3t''',
+]

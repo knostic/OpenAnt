@@ -380,6 +380,27 @@ func PrintDynamicTestSummary(data map[string]any) {
 	fmt.Println()
 }
 
+// PrintPatchSummary outputs a formatted summary of a patch-trust run.
+func PrintPatchSummary(data map[string]any) {
+	PrintHeader("Patch Trust Report")
+
+	// finding_id holds either a Finding id or a CVE id (backward-compatible
+	// field reuse -- see core/patch.py's PatchStepResult); input_type
+	// discriminates which, so the label printed here matches what's
+	// actually in it instead of always saying "Finding".
+	label := "Finding"
+	if inputType, ok := data["input_type"].(string); ok && inputType == "cve" {
+		label = "CVE"
+	}
+	if id, ok := data["finding_id"].(string); ok {
+		PrintKeyValue(label, id)
+	}
+	if path, ok := data["trust_report_path"].(string); ok {
+		PrintKeyValue("Report", path)
+	}
+	fmt.Println()
+}
+
 // PrintBuildOutputSummary outputs a formatted summary of pipeline output generation.
 func PrintBuildOutputSummary(data map[string]any) {
 	PrintHeader("Pipeline Output")

@@ -52,6 +52,17 @@ def _core_on_syspath():
     inserted = root not in sys.path
     if inserted:
         sys.path.insert(0, root)
+    # Put the original module objects BACK afterwards: a test module collected
+    # earlier that bound `utilities.X` at import time (e.g. tests/patch/
+    # test_progress_presentation.py's module-global `progress`) would
+    # otherwise configure an orphan while the code under test re-imports a
+    # fresh copy -- the same leak test_F3_verdict_taxonomy_shared_constant.py
+    # fixes for `core.*`.
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "utilities" or name.startswith("utilities.")
+    }
     # Drop any cached target modules so a fresh ROOT is honored.
     for name in list(sys.modules):
         if name == "utilities" or name.startswith("utilities."):
@@ -59,6 +70,10 @@ def _core_on_syspath():
     try:
         yield
     finally:
+        for name in list(sys.modules):
+            if name == "utilities" or name.startswith("utilities."):
+                del sys.modules[name]
+        sys.modules.update(saved_modules)
         if inserted and root in sys.path:
             sys.path.remove(root)
 

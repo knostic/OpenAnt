@@ -364,7 +364,7 @@ func runScan(cmd *cobra.Command, args []string) {
 		pyArgs = append(pyArgs, "--commit-sha", commitSHA)
 	}
 
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey(), nil)
 	if err != nil {
 		finalizeScanMetaIfProject(ctx, config.ScanStatusFailed)
 		output.PrintError(err.Error())

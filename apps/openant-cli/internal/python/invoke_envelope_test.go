@@ -71,7 +71,7 @@ exit 0
 	r, w, _ := os.Pipe()
 	old := os.Stderr
 	os.Stderr = w
-	res, err := Invoke(s, []string{"analyze", "."}, "", false, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", false, "", nil)
 	os.Stderr = old
 	w.Close()
 	b, _ := io.ReadAll(r)
@@ -102,7 +102,7 @@ sleep 60 &
 exec >&-
 exit 1
 `)
-	res, err := Invoke(s, []string{"analyze", "."}, "", true, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "", nil)
 	if el := time.Since(start); el > 45*time.Second {
 		t.Fatalf("the deadline must fire (~30s); took %v — the envelope 'recovery' would be vacuous", el)
 	}
@@ -125,7 +125,7 @@ sleep 60 >&- &
 exec >&-
 exit 0
 `)
-	res, err := Invoke(s, []string{"analyze", "."}, "", true, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "", nil)
 	if el := time.Since(start); el > 45*time.Second {
 		t.Fatalf("the deadline must fire (~30s); took %v — the envelope 'recovery' would be vacuous", el)
 	}
@@ -149,7 +149,7 @@ func TestInvoke_DeadlineDiagnosis_HintGatedBySubcommand(t *testing.T) {
 	t.Setenv("OPENANT_INVOKE_TIMEOUT", "1s")
 	s := writeScript(t, "sleep 3\n")
 	// parse: no checkpoint clause
-	_, err := Invoke(s, []string{"parse", "."}, "", true, "")
+	_, err := Invoke(s, []string{"parse", "."}, "", true, "", nil)
 	if err == nil {
 		t.Fatal("want the deadline diagnosis for a no-output hang")
 	}
@@ -163,7 +163,7 @@ func TestInvoke_DeadlineDiagnosis_HintGatedBySubcommand(t *testing.T) {
 		t.Fatalf("the override hint must always be present: %v", err)
 	}
 	// analyze: the checkpoint clause is true
-	_, err = Invoke(s, []string{"analyze", "."}, "", true, "")
+	_, err = Invoke(s, []string{"analyze", "."}, "", true, "", nil)
 	if err == nil {
 		t.Fatal("want the deadline diagnosis for a no-output hang")
 	}
@@ -190,7 +190,7 @@ func TestInvoke_InvalidOverrideWarnsOnce(t *testing.T) {
 	r, w, _ := os.Pipe()
 	old := os.Stderr
 	os.Stderr = w
-	_, _ = Invoke(s, []string{"parse", "."}, "", true, "")
+	_, _ = Invoke(s, []string{"parse", "."}, "", true, "", nil)
 	os.Stderr = old
 	w.Close()
 	b, _ := io.ReadAll(r)

@@ -1,0 +1,55 @@
+"""Shared fixtures for Auto Patcher tests.
+
+Auto Patcher's live-provider resolution (utilities.autopatcher.llm_client)
+never silently falls back to mock: for a real provider, it always resolves
+OpenAnt's canonical default_llm/analyze binding (falling back to the
+built-in "openant-default" exactly like every other OpenAnt command), and
+LLM_PROVIDER is recognized only as the literal value "mock" -- any other
+non-empty value is a hard failure, not a selector.
+
+Without this fixture, EVERY test in this directory that constructs a real
+LLMClient()/calls .complete() without an explicit LLM_PROVIDER=mock would
+depend on whatever is actually configured on the machine running the
+suite: raising an error (nothing configured) or -- on a machine that has
+run `openant setup llm` / `openant set-api-key` -- attempting a REAL,
+BILLED API call, instead of the deterministic mock response the test
+actually wants.
+
+This fixture makes mock the test suite's explicit, deterministic default
+and isolates every test from the real config.json on disk. Individual
+tests that want to exercise a real (adapter-mocked) provider or a specific
+config.json shape override both via their own monkeypatch calls inside the
+test body, which run after this fixture's setup and therefore win.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _default_to_mock_and_isolated_config(monkeypatch):
+    import utilities.autopatcher.llm_client as llm_client
+    from utilities.autopatcher import progress
+    from utilities.llm import empty_config
+
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    # Git >= 2.47 may detach auto-maintenance after commit, leaving
+    # .git/objects/maintenance.lock alive briefly after `git commit` returns;
+    # tests that immediately copy the repository can race with that
+    # disappearing lock. Run auto-maintenance synchronously instead.
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "maintenance.autoDetach")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "false")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: empty_config())
+    monkeypatch.setattr(llm_client, "_cached_provider", None)
+    monkeypatch.setattr(llm_client, "_cached_model", {})
+    monkeypatch.setattr(llm_client, "_cached_adapters", {})
+    monkeypatch.setattr(llm_client, "_call_metadata", {})
+    monkeypatch.setattr(llm_client, "_call_history", {})
+    # progress.py's verbosity/model-announcement state is process-global by
+    # design (mirrors llm_client's own _cached_provider/_cached_model
+    # pattern) -- reset it per test too, or a test that ran earlier in this
+    # same pytest process could leave a later test's "Model" announcement
+    # (or a non-default verbosity level) silently suppressed/altered.
+    progress.reset_for_tests()

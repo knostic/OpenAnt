@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -84,17 +85,25 @@ type InvokeResult struct {
 
 // Invoke runs `python -m openant <args>` and returns the parsed JSON result.
 //
-// - stderr is streamed to the terminal in real-time (progress messages)
-// - stdout is captured and parsed as JSON
-// - Working directory is set to the openant-core lib directory if provided
-// - If apiKey is non-empty, it is injected as ANTHROPIC_API_KEY in the subprocess
-func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey string) (*InvokeResult, error) {
+//   - stderr is streamed to the terminal in real-time (progress messages)
+//   - stdout is captured and parsed as JSON
+//   - Working directory is set to the openant-core lib directory if provided
+//   - If apiKey is non-empty, it is injected as ANTHROPIC_API_KEY in the subprocess
+//   - extraEnv overrides/adds arbitrary env vars in the subprocess ONLY -- it is
+//     merged into a copy of this process's environment and never mutates the
+//     calling process's own os.Environ() (no os.Setenv is ever called here)
+//   - stdin is NOT connected (the subprocess reads EOF): Python-side prompts
+//     detect the non-TTY stdin and take their non-interactive path (e.g.
+//     `report`'s dynamic-test prompt); stderr is line-buffered, so a
+//     newline-less Python prompt would otherwise block invisibly
+func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey string, extraEnv map[string]string) (*InvokeResult, error) {
 	// -P keeps the process working directory off sys.path. `-m openant` otherwise
 	// prepends the CWD, and this engine inherits the user's shell CWD — which in the
 	// standard `git clone X && cd X && openant ...` flow is inside the scanned,
 	// untrusted repository. A hostile `openant/` package there would shadow the real
-	// one and execute on import. -P closes that; it also propagates via the
-	// environment to the report subprocesses the engine spawns.
+	// one and execute on import. -P closes that for this process only (it is a
+	// flag, not an environment setting): the report subprocesses the engine
+	// spawns pass -P themselves (core/reporter.py).
 	cmdArgs := append([]string{"-P", "-m", "openant"}, args...)
 
 	// Bound the subprocess with an automatic deadline so a hung parser
@@ -126,13 +135,18 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 		cmd.Dir = workDir
 	}
 
-	// Pass through environment (Python needs ANTHROPIC_API_KEY, etc.)
-	// If an API key is provided via flag or config, inject it into the
-	// subprocess environment so Python picks it up regardless of .env files.
-	cmd.Env = os.Environ()
+	// Pass through environment (Python needs ANTHROPIC_API_KEY, etc.), then
+	// overlay any explicit overrides on top of a COPY of it -- mergeEnv never
+	// touches os.Environ() itself, so other subcommands and this process's
+	// own environment are never mutated by a single Invoke call.
+	overrides := map[string]string{}
 	if apiKey != "" {
-		cmd.Env = setEnv(cmd.Env, "ANTHROPIC_API_KEY", apiKey)
+		overrides["ANTHROPIC_API_KEY"] = apiKey
 	}
+	for k, v := range extraEnv {
+		overrides[k] = v
+	}
+	cmd.Env = mergeEnv(os.Environ(), overrides)
 
 	// #431: route stdout/stderr through MANAGED writers (invoke_ctx.go's
 	// pattern) instead of StdoutPipe/StderrPipe + this function's own copy
@@ -489,6 +503,38 @@ func normalizeExit(code int, isError bool) int {
 		return 2
 	}
 	return code
+}
+
+// mergeEnv returns a NEW env slice (os.Environ() format, "KEY=VALUE" pairs)
+// combining base with overrides layered on top -- a key present in
+// overrides always wins over the same key in base, deterministically.
+// Never mutates base or any input; the caller's own environment (and this
+// process's os.Environ()) is left untouched, only the returned slice is
+// meant for cmd.Env.
+func mergeEnv(base []string, overrides map[string]string) []string {
+	if len(overrides) == 0 {
+		return base
+	}
+	out := make([]string, 0, len(base)+len(overrides))
+	for _, kv := range base {
+		key := kv
+		if idx := strings.IndexByte(kv, '='); idx >= 0 {
+			key = kv[:idx]
+		}
+		if _, replaced := overrides[key]; replaced {
+			continue
+		}
+		out = append(out, kv)
+	}
+	keys := make([]string, 0, len(overrides))
+	for k := range overrides {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // deterministic order, independent of map iteration
+	for _, k := range keys {
+		out = append(out, k+"="+overrides[k])
+	}
+	return out
 }
 
 // setEnv sets or replaces an environment variable in a []string env slice.

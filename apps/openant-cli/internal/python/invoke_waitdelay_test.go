@@ -41,7 +41,7 @@ exit 0
 	t.Setenv("OPENANT_INVOKE_TIMEOUT", "20s")
 
 	start := time.Now()
-	res, err := Invoke(fake, []string{"scan", "x"}, "", true, "")
+	res, err := Invoke(fake, []string{"scan", "x"}, "", true, "", nil)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -71,7 +71,7 @@ exit 0
 	t.Setenv("OPENANT_INVOKE_TIMEOUT", "20s")
 
 	start := time.Now()
-	res, err := Invoke(fake, []string{"scan", "x"}, "", false, "")
+	res, err := Invoke(fake, []string{"scan", "x"}, "", false, "", nil)
 	if err != nil {
 		t.Fatalf("Invoke errored: %v", err)
 	}

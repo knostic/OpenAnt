@@ -1,0 +1,10371 @@
+"""
+Pipeline orchestrator.
+
+Ties together the patch_generator, patch_reviewer, patch_challenger, and
+confidence_scorer stages and produces a formatted Markdown report.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+from . import progress
+from .confidence_scorer import score_confidence
+from .finding_calibration import calibrate_findings
+from .llm_client import LLMClient, ModelUnavailableError
+from .patch_challenger import challenge_patch
+from .patch_generator import (
+    generate_patch, generate_patch_raw, classify_patch_response,
+    compute_patch_generation_capacity, fit_patch_generation_context,
+    PATCH_GENERATION_REQUIRED_LABEL,
+)
+from .patch_reviewer import review_patch
+from .testing_support import discover_tests, tests_for_file, score_test_support
+from .test_suggester import extract_findings, suggest_tests
+from .impact_surface import LightweightImpactAnalyzer
+from .behavior_summary import BehaviorAnalyzer
+from .language_support import detect_language
+from pathlib import Path as _Path
+from .evidence_fusion import RepositoryUnderstanding
+from .repository_grounding_models import RepositoryCandidate, RepositoryGroundingResult
+from .post_patch_evaluation import AnchorObservation, CoverageResult, render_post_patch_investigation
+from .execution_recorder import to_jsonable
+from .stage_registry import (
+    CHALLENGER as _S_CHALLENGER,
+    CONFIDENCE_SCORING as _S_CONFIDENCE_SCORING,
+    EXISTING_TEST_COMPARISON as _S_EXISTING_TEST_COMPARISON,
+    GUIDED_CONTEXT_ACQUISITION as _S_GUIDED_CONTEXT_ACQUISITION,
+    IMPACT_AND_BEHAVIOR_ANALYSIS as _S_IMPACT_AND_BEHAVIOR_ANALYSIS,
+    PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION as _S_PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
+    PATCH_REPAIR_AND_CALIBRATION as _S_PATCH_REPAIR_AND_CALIBRATION,
+    PATCH_REVIEW as _S_PATCH_REVIEW,
+    REMEDIATION_STRATEGY as _S_REMEDIATION_STRATEGY,
+    REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING as _S_REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING,
+    TEST_ANALYSIS_AND_PLAN as _S_TEST_ANALYSIS_AND_PLAN,
+)
+from .existing_test_amendment import evaluate_existing_test_comparison_with_amendment
+from .existing_test_regression import (
+    ExistingTestComparisonResult,
+    classify_existing_test_comparison_signal,
+    discover_test_plan_for_comparison,
+    not_verified_result as _existing_test_comparison_not_verified,
+    render_existing_test_comparison,
+    test_execution_error_result as _existing_test_comparison_execution_error,
+)
+
+# Static patch signals. The `scripts.constraint_signals` /
+# `scripts.remediation_signals` modules never shipped with OpenAnt, so a
+# top-level `import scripts.*` could only ever resolve against a `scripts/`
+# directory on sys.path -- e.g. the analyzed repository when `python -m
+# openant` runs with the CWD inside it -- executing untrusted code
+# in-process. Never import them; the no-op stubs keep the (display-only)
+# consumers and replay_engine's imports working.
+_STATIC_SIGNALS_AVAILABLE = False
+def _run_constraint_signals(*a, **k): return []  # type: ignore
+def _run_remediation_signals(*a, **k): return []  # type: ignore
+
+
+# Minimal TargetRepoContext for routing repo-relative file reads.
+# Keep this intentionally small: resolve, read_file, exists only.
+class TargetRepoContext:
+    def __init__(self, repo_root: _Path):
+        self.repo_root = _Path(repo_root).resolve()
+
+    def resolve(self, relative_path: str) -> _Path:
+        rel = str(relative_path).lstrip("/")
+        candidate = (self.repo_root / rel).resolve(strict=False)
+        # Use is_relative_to when available, fallback to string containment
+        if hasattr(candidate, "is_relative_to"):
+            if not candidate.is_relative_to(self.repo_root):
+                raise ValueError("path outside repo root")
+        else:
+            if str(self.repo_root) not in str(candidate):
+                raise ValueError("path outside repo root")
+        return candidate
+
+    def read_file(self, relative_path: str) -> str:
+        p = self.resolve(relative_path)
+        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+
+    def exists(self, relative_path: str) -> bool:
+        try:
+            return self.resolve(relative_path).exists()
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Data container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PipelineResult:
+    vulnerability_text: str
+    patch: str
+    review: str
+    score_text: str
+    challenger: dict
+    impact: dict | None = None
+    final_score: float | None = None
+    behavior: dict | None = None
+    repo_root: _Path | None = None
+    hygiene: list | None = None
+    applicability: dict | None = None
+    orig_score: float | None = None
+    original_patch: str = ""
+    retry_patch: str | None = None
+    retry_attempted: bool = False
+    retry_succeeded: bool = False
+    retry_failed_file: str | None = None
+    retry_error_before: str | None = None
+    # Challenger-driven repair (Phase C)
+    repair_attempted: bool = False
+    repair_succeeded: bool = False
+    repair_patch: str | None = None
+    repair_challenger: dict | None = None
+    repair_defect_count: int = 0
+    repair_rechallenged: bool = False
+    original_challenger_defect_count: int = 0
+    # Additive (post-review correction to run-4 Architecture B):
+    # `repair_defect_count`/`original_challenger_defect_count` above are
+    # confirmed_defect-ONLY, exactly as their names have always meant --
+    # never widened to also count behavioral_defect findings, even though
+    # both categories can now trigger repair (see should_auto_repair).
+    # These two fields carry the SEPARATE "how many repair-eligible
+    # findings existed" concept (confirmed_defect + behavioral_defect) that
+    # _render_repair_notice actually needs to avoid a self-contradictory
+    # notice ("Original patch had 0 confirmed defect(s)... A repair was
+    # generated") when a behavioral_defect alone authorized the repair.
+    # Never read by Trust Signals/Recommendation Policy -- those derive
+    # their own calibrated defect count from _build_known_findings'
+    # confirmed_defect-only `potential_remaining_risks` bucket, unaffected
+    # by these fields' existence.
+    original_challenger_repair_eligible_count: int = 0
+    repair_eligible_defect_count: int = 0
+    # Deterministic static signals (Phase I)
+    constraint_signals: list[dict] | None = None
+    remediation_signals: list[dict] | None = None
+    # Language guardrail: dominant detected language of repo_root, used to
+    # gate Python-only signals (Test Support, Impact Surface, sink scanning).
+    detected_language: str = "python"
+    # Finding calibration (evidence-quality pass): one entry per
+    # plausible_risk/generic classified finding — {"original", "group",
+    # "reworded"}. None when calibration wasn't run at all (e.g. no
+    # findings to calibrate); _build_known_findings falls back to the
+    # uncalibrated classifier text when this is None or empty, so a
+    # calibration failure never loses a finding.
+    finding_calibration: list[dict] | None = None
+    # Repository Grounding (surfaced in the report as "Repository Context").
+    grounding: RepositoryGroundingResult | None = None
+    # Deterministic Repository Understanding (candidate selection + enrichment
+    # + fusion) -- retained for later reporting work; not yet surfaced in the
+    # Trust Report. None when investigation didn't run or found nothing to
+    # select (see CandidateSelection.used_fallback).
+    repository_understanding: RepositoryUnderstanding | None = None
+    # Post-Patch Vulnerability Investigation (Phase 4): deterministic
+    # re-evaluation of pre-patch Anchors against an isolated, patched copy
+    # of repo_root. None when the investigation didn't run (no repo_root,
+    # no anchors, or an internal failure -- see stderr). Whatever patch
+    # string the observations actually describe is recorded in
+    # post_patch_investigated_patch; if it no longer equals `patch` above
+    # (the repair loop replaced it), the evidence is stale and
+    # _build_report must not render it as current.
+    post_patch_observations: list[AnchorObservation] | None = None
+    post_patch_investigated_patch: str | None = None
+    # Deterministic Coverage Analysis (see post_patch_evaluation.compute_coverage):
+    # how much of `patch`'s diff is tracked by at least one pre-patch Anchor.
+    # Computed alongside post_patch_observations, from the same patch and
+    # anchors, so it shares that field's staleness gate -- no separate
+    # "coverage_investigated_patch" field exists or is needed.
+    post_patch_coverage: "CoverageResult | None" = None
+    # Candidate 1 relocation telemetry (observability only -- see
+    # relocation_telemetry.py). Never read by _compute_trust_signals,
+    # _build_recommendation_v1, or any other decision logic; not currently
+    # rendered into the Markdown Trust Report either. None whenever there
+    # was no repo_root/patch to measure, or the telemetry probe failed.
+    relocation_telemetry: "object | None" = None
+    # Evidence Sufficiency Gate (Phase 1) -- see source_verification.py.
+    # A Trust-signal-shaped dict ({"value", "label", "notes"}), derived from
+    # RepairResult.relocations for whichever repair pass produced the FINAL
+    # `patch` above. _build_report merges this into the Trust Signals dict
+    # (as a NEW key, "source_verification") so it is surfaced in the Trust
+    # Report and made available to Recommendation Policy's inputs --
+    # deliberately NOT read by _build_recommendation_v1 today; that is an
+    # explicit, separate, later decision. None when unavailable (no
+    # repo_root, no patch, or the classification itself failed) -- callers
+    # must fall back to "Not Verified", never infer "Confirmed".
+    source_verification: "dict | None" = None
+    # Existing Test Comparison -- see existing_test_regression.py. Opt-in
+    # (see pipeline.run()'s compare_existing_tests parameter; default
+    # False). None whenever the flag was off, no repo_root/patch was
+    # available, or the feature never ran for any other reason -- callers
+    # (_compute_trust_signals' merge site, the report renderer) must treat
+    # None identically to an explicit NOT_VERIFIED result: never a
+    # positive inference ("no evidence" is not "passed"). Observability
+    # only in this slice -- deliberately NOT read by
+    # _build_recommendation_v1, not fed back into Challenger or the repair
+    # loop. That is an explicit, separate, later decision.
+    existing_test_comparison: "ExistingTestComparisonResult | None" = None
+    # Edit Readiness Gate (Slice 1) -- see remediation_planner.EditReadinessResult
+    # / check_edit_readiness. Observability + the actual gating signal
+    # _skip_patch_generation was set from; never read by
+    # _compute_trust_signals/_build_recommendation_v1 -- no Recommendation
+    # Policy change. None when Final Strategy never ran, named no targets,
+    # or the Slice/Gate computation itself failed (best-effort, same as
+    # every other optional pipeline section). When Slice 2 and/or Slice 3
+    # acquisition ran (see edit_acquisition/guided_acquisition below), this
+    # is the FINAL, RECALCULATED readiness after both -- still the same
+    # final gating signal, just possibly improved by newly-acquired source.
+    edit_readiness: "object | None" = None
+    # Slice 2 (Deterministic Pre-Patch Retrieval) -- see
+    # remediation_planner.AcquisitionResult / run_deterministic_
+    # acquisition. Observability only, same as edit_readiness above:
+    # never read by _compute_trust_signals/_build_recommendation_v1. None
+    # whenever acquisition never ran at all (initial readiness was
+    # already complete, or the Edit Readiness Gate itself never ran).
+    edit_acquisition: "object | None" = None
+    # Slice 3 (Bounded LLM-guided pre-patch context retrieval) -- see
+    # remediation_planner.GuidedAcquisitionResult / run_guided_
+    # acquisition. Observability only, same as edit_acquisition above:
+    # never read by _compute_trust_signals/_build_recommendation_v1. None
+    # whenever guided acquisition never ran at all (Slice 2 already made
+    # readiness complete, or the Edit Readiness Gate itself never ran).
+    guided_acquisition: "object | None" = None
+    # Slice 4 (Post-Patch Target Conformance and Recovery) -- see
+    # remediation_planner.PatchConformanceReport/PostPatchRecoveryResult.
+    # Observability only, same as every earlier slice's own field: never
+    # read by _compute_trust_signals/_build_recommendation_v1. patch_
+    # target_conformance is None only when Patch Generation produced no
+    # patch at all, or ran with no Edit Readiness context to compare
+    # against (no Final Strategy). post_patch_recovery is None whenever
+    # recovery never triggered (conformance was already fine, or
+    # conformance/recovery itself never ran).
+    patch_target_conformance: "object | None" = None
+    post_patch_recovery: "object | None" = None
+    # Report Polish Batch B (post-review fix): the Final Remediation
+    # Strategy's own `security_invariant` field (see remediation_planner.
+    # RemediationStrategyResult) -- the model's own one-sentence statement
+    # of the security property this specific fix restores, produced from
+    # the already-verified repository/Planner evidence given to that call.
+    # This is LLM-derived remediation guidance, NOT deterministic evidence
+    # -- it is reused here from a call the pipeline already makes (when it
+    # makes one at all), so reading it adds no new LLM call, but the value
+    # itself carries the same LLM-authorship caveats as every other
+    # reviewer-LLM-derived report text (Explanation, Reviewer Notes, etc.).
+    # None whenever the Final Strategy never ran (no verified Planner
+    # evidence to reason over), failed, or the model left the field null/
+    # omitted it. Read only by build_validation_plan's behavior-driven
+    # action for report PRESENTATION -- never by _compute_trust_signals or
+    # _build_recommendation_v1; not a Recommendation Policy signal, matching
+    # every other observability-only field in this dataclass.
+    security_invariant: "str | None" = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _extract_score(score_text: str) -> str:
+    """Pull the numeric score out of the scorer's response."""
+    match = re.search(r"confidence score[^0-9]*([0-9]+(?:\.[0-9]+)?)", score_text, re.IGNORECASE)
+    return match.group(1) if match else "N/A"
+
+
+_VULN_DESCRIPTION_HEADING_RE = re.compile(r"^##[ \t]+Vulnerability description[ \t]*$", re.MULTILINE)
+_NEXT_HEADING_RE = re.compile(r"^#{1,6}[ \t]", re.MULTILINE)
+# "**Advisory:** X" / "- **Finding ID:** X" metadata lines (cve_converter /
+# core.patch.render_vulnerability_markdown), not description prose.
+_VULN_METADATA_LINE_RE = re.compile(r"^(?:[-*][ \t]+)?\*\*[^*\n]+:\*\*")
+_SUMMARY_MAX_CHARS = 1000
+
+
+def _extract_summary(vulnerability_text: str) -> str:
+    """Return the report's Vulnerability summary (display only -- the
+    vulnerability text itself, the LLM input, is never modified).
+
+    Release polish: prefers the first prose paragraph under
+    "## Vulnerability description", skipping metadata lines. The title line
+    (the former summary) is only the description's first sentence, cut off
+    by the converter -- for many advisories just a product blurb such as
+    "urllib3 is a user-friendly HTTP client library for Python." Falls back
+    to that first non-empty line when there is no such paragraph (e.g. a
+    hand-written vulnerability file).
+    """
+    heading = _VULN_DESCRIPTION_HEADING_RE.search(vulnerability_text)
+    if heading:
+        body = vulnerability_text[heading.end():]
+        next_heading = _NEXT_HEADING_RE.search(body)
+        if next_heading:
+            body = body[:next_heading.start()]
+        for paragraph in re.split(r"\n[ \t]*\n", body):
+            prose = " ".join(
+                line.strip() for line in paragraph.splitlines()
+                if line.strip() and not _VULN_METADATA_LINE_RE.match(line.strip())
+            )
+            if prose:
+                if len(prose) <= _SUMMARY_MAX_CHARS:
+                    return prose
+                return _truncate_reason(prose, _SUMMARY_MAX_CHARS, ellipsis="…")
+    for line in vulnerability_text.splitlines():
+        line = line.strip().lstrip("#").strip()
+        if line:
+            return line
+    return "No summary available."
+
+
+# Matches ONLY a line that consists entirely of one of the three expected
+# reviewer section headers (Markdown heading form `### Explanation` or bold
+# form `**Explanation**` / `**Explanation:**` / `**Explanation**:`), anchored
+# to the start and end of the line. Anchoring to a whole line means a header
+# word appearing inside ordinary prose (e.g. "...see Validation notes
+# above...") is never mistaken for a new section boundary, and the header
+# match itself consumes any trailing colon/closing "**" decoration, so
+# nothing from the header leaks into (and has to be stripped back out of)
+# the section body that follows -- which is what previously ate the opening
+# "**" of a legitimate bold subheading in the body.
+_REVIEW_SECTION_HEADER_RE = re.compile(
+    r"^[ \t]*(?:#{1,3}[ \t]*|\*\*[ \t]*)"
+    r"(Explanation|Affected areas|Validation notes)"
+    r"[ \t]*:?[ \t]*(?:\*\*)?[ \t]*:?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+_HR_LINE_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$")
+
+
+def _strip_trailing_hr(body: str) -> str:
+    """Strip a trailing standalone Markdown horizontal-rule line from a
+    parsed reviewer section body (see `_split_review`).
+
+    Report Polish Batch C: the reviewer LLM sometimes ends a section with
+    its own "---" divider before the next section header in its raw
+    response. `_split_review`'s header-based split has no way to tell that
+    divider apart from real body text, so it becomes the trailing line of
+    that section's body -- and the report's own template then renders ITS
+    OWN "---" immediately before the next heading, producing a visible
+    duplicate ("---\n\n---\n\n## Validation Actions").
+
+    Only ever removes a line that is EXCLUSIVELY "-"/"*"/"_" characters
+    (CommonMark's thematic-break syntax) -- never a Markdown table
+    separator row (contains "|"), never a fenced code block's closing
+    ```` ``` ```` (backticks, not dashes) -- and only when it is the
+    section's own TRAILING line (working backward from the end, stopping
+    at the first line that isn't blank and isn't a bare rule). A rule
+    appearing mid-body, or inside a still-open code block that isn't the
+    literal last line, is never touched.
+    """
+    lines = body.splitlines()
+    while lines and (lines[-1].strip() == "" or _HR_LINE_RE.match(lines[-1])):
+        lines.pop()
+    return "\n".join(lines)
+
+
+def _split_review(review: str) -> dict[str, str]:
+    """
+    Split the review text into its three expected sections.
+
+    Returns a dict with keys: explanation, affected_areas, validation_notes.
+    Falls back to the full review text for each key if parsing fails.
+    """
+    sections: dict[str, str] = {
+        "explanation": "",
+        "affected_areas": "",
+        "validation_notes": "",
+    }
+
+    parts = _REVIEW_SECTION_HEADER_RE.split(review)
+
+    # parts = [pre_text, header1, body1, header2, body2, ...]
+    i = 1
+    while i < len(parts) - 1:
+        header = parts[i].lower().replace(" ", "_")
+        body = _strip_trailing_hr(parts[i + 1].strip())
+        if "explanation" in header:
+            sections["explanation"] = body
+        elif "affected" in header:
+            sections["affected_areas"] = body
+        elif "validation" in header:
+            sections["validation_notes"] = body
+        i += 2
+
+    # If parsing failed, populate all sections with the full review
+    if not any(sections.values()):
+        full = review.strip()
+        sections = {k: full for k in sections}
+
+    return sections
+
+
+def _truncate_reason(text: str, limit: int = 120, *, ellipsis: str = "...") -> str:
+    """Cap `text` at `limit` characters without cutting a word in half.
+
+    Returns the (punctuation-trimmed) text unchanged if it already fits.
+    When truncation is needed, backs off to the last word boundary within
+    the budget, then -- if that still leaves an unmatched opening Markdown
+    delimiter (a lone backtick or `**`) -- backs off further to before that
+    delimiter, and appends `ellipsis` so the reader can tell content was
+    omitted.
+    """
+    trimmed = (text or "").rstrip("., ")
+    if len(trimmed) <= limit:
+        return trimmed
+    budget = max(limit - len(ellipsis), 0)
+    cut = trimmed[:budget]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    cut = cut.rstrip("., ")
+    for delim in ("`", "**"):
+        if cut.count(delim) % 2:
+            cut = cut.rsplit(delim, 1)[0].rstrip("., ")
+    if not cut:
+        cut = trimmed[:budget].rstrip("., ")
+    return cut + ellipsis
+
+
+# Abbreviations whose trailing "." must not be mistaken for a sentence end
+# when picking a compact reason sentence out of a longer finding string
+# (see short_reason() below) -- e.g. "dirpath ... (e.g. 'collection')"
+# must not be cut at "(e.g." just because that period happens to be
+# followed by whitespace.
+_REASON_ABBREVIATIONS = ("e.g.", "i.e.", "etc.", "vs.", "cf.", "approx.")
+
+
+def _find_reason_sentence_end(text: str) -> "re.Match[str] | None":
+    """Find the first period/!/? that ends a real sentence in `text`: one
+    followed by whitespace or end-of-string, and that isn't the trailing
+    period of a known abbreviation. Returns None if no such boundary
+    exists (the caller then falls back to the whole text)."""
+    for m in re.finditer(r"[.!?](?=\s|$)", text):
+        prefix = text[: m.end()].lower()
+        if any(prefix.endswith(abbr) for abbr in _REASON_ABBREVIATIONS):
+            continue
+        return m
+    return None
+
+
+def short_reason(text: str) -> str:
+    """Compact a raw finding/reason string down to one short sentence.
+
+    A period/!/? only ends the sentence when followed by whitespace or
+    end-of-string AND isn't the trailing period of a known abbreviation
+    (see _find_reason_sentence_end) -- so a literal "." inside a path,
+    backtick span, or abbreviation (e.g. `.git`, "e.g.") is not mistaken
+    for the end of the sentence. The previous naive
+    `text.split(".", 1)[0]` cut on the first literal period anywhere,
+    which is what produced truncations like "Symlinks inside `" (cut
+    inside `` `.git/refs` ``) and "dirpath without leading '/' (e" (cut
+    inside "e.g.").
+    """
+    if not text:
+        return ""
+    stripped = text.strip()
+    match = _find_reason_sentence_end(stripped)
+    s = stripped[: match.end()] if match else stripped
+    s = re.sub(r"\s+", " ", s).strip()
+    return _truncate_reason(s, 120)
+
+
+# Word-boundary-matched keyword groups used by normalize_title_from_text()'s
+# coarse title guess below. Word-boundary (not plain substring) matching so
+# a fragment inside an unrelated word/plural can't trigger the wrong
+# domain -- e.g. "version tokens" must not match "token" the way a bare
+# `"token" in text` check would, and "author"/"database" must not match
+# "auth"/"db".
+_TITLE_DB_KEYWORDS_RE = re.compile(r"\b(?:db|driver|placeholder)\b", re.IGNORECASE)
+_TITLE_ENCODING_KEYWORDS_RE = re.compile(r"\b(?:unicode|encoding|binary)\b", re.IGNORECASE)
+_TITLE_AUTH_KEYWORDS_RE = re.compile(
+    r"\b(?:auth|authenticate|login|token|access|permission)\b", re.IGNORECASE
+)
+
+# Report Polish Batch B: a bare identifier with no natural-language spaces --
+# e.g. a generated test-function slug like "test_nested_paths_like_a_
+# constructor" -- carries no reader-facing meaning as a title. Word-shaped
+# (letters/digits joined by underscores only); a genuine finding sentence
+# always has at least one space, so this can never false-match real prose.
+_TITLE_SLUG_LIKE_RE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)+$", re.IGNORECASE)
+
+# Leading label noise sometimes present on a raw finding/topic string before
+# it reaches title-building (e.g. from a heading-scoped extraction) -- strip
+# it so it doesn't become part of the title itself.
+_TITLE_NOISE_PREFIX_RE = re.compile(
+    r"^(?:edge case|potential issue|finding|issue|note|observation)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+
+# A finding sentence that already reads as an instruction (starts with one of
+# these) is used as-is rather than wrapped in another "Verify ...".
+_TITLE_IMPERATIVE_LEAD_RE = re.compile(
+    r"^(?:verify|check|confirm|validate|ensure|review|add|test|investigate)\b",
+    re.IGNORECASE,
+)
+
+_TITLE_GENERIC_FALLBACK = "Add targeted validation for the identified behavior"
+
+
+def _build_generic_sentence_title(raw: str) -> str:
+    """Build a concise imperative validation title directly from `raw`'s own
+    human-readable sentence (via `short_reason`), with no domain keyword
+    classification -- the tail end of `normalize_title_from_text` (used
+    after its keyword groups miss).
+
+    A slug-shaped or otherwise unusable input falls back to
+    `_TITLE_GENERIC_FALLBACK` rather than ever surfacing that identifier
+    verbatim.
+    """
+    cleaned = _TITLE_NOISE_PREFIX_RE.sub("", raw).strip()
+    if not cleaned or _TITLE_SLUG_LIKE_RE.match(cleaned):
+        return _TITLE_GENERIC_FALLBACK
+
+    sentence = short_reason(cleaned)
+    if not sentence or _TITLE_SLUG_LIKE_RE.match(sentence):
+        return _TITLE_GENERIC_FALLBACK
+
+    if _TITLE_IMPERATIVE_LEAD_RE.match(sentence):
+        title = sentence
+    else:
+        # Lowercase only a genuine sentence-initial capital, not an
+        # acronym/all-caps lead word -- same rule _describe_unmet_gates
+        # already uses, reused here rather than reinvented.
+        first_word = sentence.split(" ", 1)[0]
+        is_acronym_lead = len(first_word) > 1 and first_word.isupper()
+        if sentence[:1].isupper() and not is_acronym_lead:
+            body = sentence[0].lower() + sentence[1:]
+        else:
+            body = sentence
+        title = f"Verify {body}"
+
+    return _truncate_reason(title, 90)
+
+
+def normalize_title_from_text(t: str) -> str:
+    """Guess a short, human-facing action title from a raw finding string.
+
+    This is a coarse, deterministic guess, not a semantic classifier: no LLM
+    call, no embeddings. When none of the keyword groups below match, it
+    builds a concise imperative validation label from the finding's own
+    human-readable sentence (via `_build_generic_sentence_title`) instead of
+    the old "Add targeted tests for <first 3 words>" template -- that
+    template produced "Add targeted tests for test_nested_paths_like_a_
+    constructor" whenever the caller passed a generated test-function slug
+    (no spaces, so "first 3 words" was the whole slug).
+    """
+    raw = (t or "").strip()
+    lt = raw.lower()
+    if _TITLE_DB_KEYWORDS_RE.search(lt):
+        return "Verify database driver compatibility"
+    if _TITLE_ENCODING_KEYWORDS_RE.search(lt):
+        return "Validate input handling edge cases"
+    if _TITLE_AUTH_KEYWORDS_RE.search(lt):
+        return "Review authentication flow"
+    return _build_generic_sentence_title(raw)
+
+
+# Fixed title for the security-invariant-derived Validation Action (see
+# build_validation_plan's behavior-driven action block). The invariant text
+# itself is rendered once, in full, beneath it (action["security_property"]).
+# Never derived from the invariant: normalize_title_from_text's domain
+# keyword classification turned a filesystem-containment invariant into
+# "Review authentication flow" (its auth keywords include the generic
+# "access"/"permission"/"token"), and a sentence-derived title could only
+# repeat the property truncated.
+_SECURITY_PROPERTY_ACTION_TITLE = "Verify the security property this patch must restore"
+
+
+def _legacy_action_bucket_for_finding(text: str) -> str:
+    """The PRE-Batch-B Validation Action cap bucket that `text` would have
+    produced, reproduced WITHOUT depending on today's (Batch B) display
+    title -- so `build_validation_plan`'s per-type cap stays legacy-
+    equivalent even as `normalize_title_from_text`'s own wording keeps
+    improving.
+
+    Before Batch B, a finding's cap bucket was whatever
+    `action_type_from_title(normalize_title_from_text(text))` produced.
+    `normalize_title_from_text`'s three keyword branches (db/encoding/auth)
+    are unchanged by Batch B, so their bucket is reproduced directly here
+    from the same regexes, on the same raw `text`, rather than re-deriving
+    it from a title string:
+      - db keyword    -> old title "Verify database driver compatibility"
+                         -> old bucket "verify" (contains "verify")
+      - encoding kw    -> old title "Validate input handling edge cases"
+                         -> old bucket "verify" (contains "validate")
+      - auth keyword   -> old title "Review authentication flow"
+                         -> old bucket "review" (contains "review")
+    Any other text fell to the OLD generic fallback -- literally
+    `"Add targeted tests for " + " ".join(parts[:3])` -- which
+    unconditionally contained "tests" regardless of what `text` actually
+    was (including empty/slug-shaped text). That unconditional case is
+    reproduced as the `"test"` default below. This is not a new
+    taxonomy -- it is the same four-bucket vocabulary
+    `action_type_from_title` already used, computed from evidence instead
+    of from a rendered string.
+    """
+    lt = (text or "").lower()
+    if _TITLE_DB_KEYWORDS_RE.search(lt) or _TITLE_ENCODING_KEYWORDS_RE.search(lt):
+        return "verify"
+    if _TITLE_AUTH_KEYWORDS_RE.search(lt):
+        return "review"
+    return "test"
+
+
+def enhance_findings_with_impact(challenger: dict, impact_report: dict | None) -> None:
+    """Apply deterministic textual augmentation to adversarial challenger notes
+
+    This helper does not alter impact analysis results — it only appends
+    human-readable sentences into the challenger dict under
+    'impact_annotations' so the report can surface them.
+
+    Rules (deterministic):
+      - high -> append propagation sentence
+      - medium -> append validation sentence
+      - low -> append nothing
+    """
+    if not impact_report:
+        return
+    level = (impact_report.get("impact_level") or "").lower()
+    ann = challenger.get("impact_annotations") or []
+    if level == "high":
+        ann.append("This issue may propagate across multiple flows due to widespread usage of the affected function.")
+    elif level == "medium":
+        ann.append("This issue affects multiple components and should be validated across flows.")
+    # low -> do nothing
+    if ann:
+        challenger["impact_annotations"] = ann
+
+
+def build_recommendation(challenger: dict, final_score: float | None, rating: str, impact: dict | None) -> dict:
+    """Deterministic recommendation builder.
+
+    Returns a dict: {"decision": str, "reason": str}
+    Decision is one of: "Safe to deploy", "Deploy with caution", "Do not deploy yet".
+    The reason is a single human-readable sentence (<=120 chars) that focuses on
+    adversarial findings, impact, and test support. It must NOT mention numeric
+    confidence or raw labels like "impact: MEDIUM".
+    """
+    # Normalize inputs
+    impact_level = (impact.get("impact_level") if impact else "low") or "low"
+    impact_level = impact_level.lower()
+    rating_norm = (rating or "None").strip()
+
+    still = bool(challenger and challenger.get("still_vulnerable"))
+    edge_cases = (challenger.get("edge_cases") or []) if challenger else []
+    potential = (challenger.get("potential_issues") or []) if challenger else []
+    adv_exist = bool(edge_cases or potential)
+
+    # Rule: Do not deploy yet (evaluate first)
+    if still:
+        decision = "Do not deploy yet"
+    elif final_score is not None and isinstance(final_score, (int, float)) and final_score < 0.5:
+        decision = "Do not deploy yet"
+    elif impact_level == "high" and rating_norm.lower() == "none":
+        # Explicit override: high impact + no tests -> do not mark safe
+        decision = "Do not deploy yet"
+    else:
+        # Deploy with caution conditions
+        if adv_exist or impact_level in ("medium", "high") or rating_norm == "None" or (
+            final_score is not None and final_score < 0.75
+        ):
+            decision = "Deploy with caution"
+        else:
+            # Safe to deploy only when clear of adversarial findings, good tests, high score, and low impact
+            if (not adv_exist) and final_score is not None and final_score >= 0.75 and rating_norm in ("Some", "Good") and impact_level == "low":
+                decision = "Safe to deploy"
+            else:
+                decision = "Deploy with caution"
+
+    # Build reason fragments (do NOT mention numeric score)
+    phrases: list[str] = []
+    if adv_exist:
+        phrases.append("adversarial findings remain")
+    if impact_level == "high":
+        phrases.append("impact is high")
+    elif impact_level == "medium":
+        phrases.append("impact is medium")
+    # Test support phrasing
+    if rating_norm == "None":
+        phrases.append("direct test coverage is missing")
+    elif rating_norm == "Some":
+        phrases.append("direct test coverage is limited")
+
+    # If no focused phrase, provide a minimal neutral reason
+    if not phrases:
+        if decision == "Safe to deploy":
+            reason = "No adversarial findings, impact is low, and direct tests provide reasonable coverage."
+        else:
+            reason = "No adversarial findings, but please verify impact and test coverage before deploying."
+    else:
+        # Compose a single natural sentence
+        # Join with commas and a final conjunction if appropriate
+        if len(phrases) == 1:
+            reason_core = phrases[0]
+        elif len(phrases) == 2:
+            reason_core = f"{phrases[0]} and {phrases[1]}"
+        else:
+            reason_core = ", ".join(phrases[:-1]) + ", and " + phrases[-1]
+        reason = reason_core[0].upper() + reason_core[1:] + "."
+
+    # Enforce single sentence, <=120 chars, no bullets
+    reason = re.sub(r"\s+", " ", reason).strip()
+    if len(reason) > 120:
+        # Truncate safely at word boundary
+        cut = reason[:120]
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        reason = cut.rstrip("., ") + "."
+
+    # Ensure no bullet characters
+    reason = reason.replace("-", "").replace("*", "")
+
+    return {"decision": decision, "reason": reason}
+
+
+# ---------------------------------------------------------------------------
+# Trust Package V1 helpers
+# ---------------------------------------------------------------------------
+
+# Explicit exploitability patterns — always Confirmed Defect regardless of context.
+# These assert the CURRENT STATE of exploitability of the primary vulnerability and
+# are unambiguous: no scope qualifier can make "still vulnerable" a limitation.
+_EXPLICIT_DEFECT_RE = re.compile(
+    r"\b(still\s+(vulnerable|exploitable)"
+    r"|attack\s+(still|remains|continues)"
+    r"|(can|could)\s+(be\s+)?bypass\w*"  # active exploit: can bypass, can be bypassed
+    r"|allow\w*\s+(be\s+)?bypass\w*"     # active exploit: allows bypass
+    r"|can\s+still\s+be\s+(exploited|attacked)"
+    r"|attack\s+vector\s+remains"
+    r"|remain[s]?\s+exploitable)\b",
+    re.IGNORECASE,
+)
+
+# "does not fix/address/prevent/close" — CONTEXTUAL pattern.
+# Primary fix failure if no scope marker is present; scope limitation otherwise.
+_DOES_NOT_RE = re.compile(
+    r"\bdoes\s+not\s+(fix|address|prevent|close)\b",
+    re.IGNORECASE,
+)
+
+# Version markers — version numbers, legacy/older release references.
+# Presence alongside _DOES_NOT_RE indicates a scope limitation, not a primary failure.
+_VERSION_MARKER_RE = re.compile(
+    r"v?\d+\.\d+[\.\d]*\b"                  # v1.26.x, 2.0.6, v1.x (numeric major.minor)
+    r"|\d+\.x\b"                             # 1.x, 26.x (wildcard minor)
+    r"|\bversion\s+\d"                       # version 1, version 2
+    r"|\bolder\s+(versions?|releases?)\b"
+    r"|\blegacy\s+(versions?|branch|releases?)\b"
+    r"|\bprevious\s+(versions?|releases?)\b"
+    r"|\bv\d+\s+(branch|releases?)\b",        # v1 branch
+    re.IGNORECASE,
+)
+
+# User/configuration/scope markers — conditional, optional, or orthogonal scope.
+# Presence alongside _DOES_NOT_RE indicates a scope limitation, not a primary failure.
+_SCOPE_MARKER_RE = re.compile(
+    r"\bif\s+users?\b"
+    r"|\busers?\s+who\b"                                         # "users who configure/override"
+    r"|\bfor\s+users?\s+(who|running|using|with|on)\b"          # "for users running 1.26.x"
+    r"|\bwhen\s+(configured|enabled|disabled|set|using)\b"
+    r"|\bunless\b"
+    r"|\bonly\s+(when|if|for|with)\b"
+    r"|\ba\s+separate\s+(fix|patch|commit)\b"
+    r"|\b(in\s+addition|additionally)\s+(needs?|requires?|should)\b"
+    r"|\bout(\s*-?\s*)of\s+scope\b"
+    r"|\bnot\s+in\s+scope\b",
+    re.IGNORECASE,
+)
+
+_VALIDATION_GAP_RE = re.compile(
+    r"\b(cannot\s+(verify|confirm|test|validate)|without\s+(running|testing|executing)"
+    r"|can'?t\s+(verify|confirm|test)|needs?\s+(test|verif|validat)"
+    r"|no\s+tests?\s+(run|executed)|should\s+be\s+tested|unverified|untested"
+    r"|requires?\s+(testing|validation)|unable\s+to\s+(verify|confirm))\b",
+    re.IGNORECASE,
+)
+
+# Evidence-supply validation gap -- a SIBLING idiom to _VALIDATION_GAP_RE's
+# testing-coverage phrasing ("cannot verify/confirm/test", "unverified",
+# "untested"): the Challenger instead says evidence NEEDED to establish
+# whether the remediation mechanism works was not supplied to it at all
+# ("not shown", "omitted", "not traced", "not established"), rather than
+# saying it could not run a verification step. Both represent the same
+# underlying epistemic category (a self-reported inability to confirm
+# something) -- see _classify_finding's own "Validation gap" step, which
+# checks this alongside _VALIDATION_GAP_RE, never as a separate category.
+#
+# Deliberately a COMBINATION of two independent signals, never a single
+# broad "not shown"/"omitted"/"not included" keyword alone -- mirrors
+# _has_behavioral_defect_signal's own two-signal design, for the same
+# reason: an absence marker alone is equally at home describing an
+# optional/non-blocking detail ("an optional alternative implementation
+# was not shown" must NOT become a validation gap), and a necessity marker
+# alone says nothing about missing evidence. Both must be present:
+#   1. a NECESSITY marker -- this finding is about something the
+#      remediation mechanism's correctness is required by/relies on/
+#      depends on/is consistent with -- not merely optional, hypothetical,
+#      or a testing/hardening nice-to-have.
+#   2. an EVIDENCE-ABSENCE marker -- that same thing's own supporting
+#      evidence was not shown/traced/included/established.
+# Checked over the WHOLE finding text, not clause-scoped (contrast
+# _has_behavioral_defect_signal, which requires same-clause co-occurrence):
+# the natural phrasing here routinely links the two markers across a
+# "but"/"so" connective ("...was asserted BUT not traced from evidence
+# shown"), which a clause split would sever.
+_EVIDENCE_GAP_NECESSITY_RE = re.compile(
+    r"\brequire[sd]?\b|\bconsistency\b|\brelies?\s+on\b|\bdepends?\s+on\b"
+    r"|\bneeded?\s+to\s+(establish|verify|confirm)\b|\bnecessary\s+(for|to)\b|\bmust\s+be\b",
+    re.IGNORECASE,
+)
+_EVIDENCE_ABSENCE_RE = re.compile(
+    r"\bnot\s+shown\b|\bomitted\b|\bnot\s+traced\b|\bnot\s+included\b"
+    r"|(?:not|cannot\s+be)\s+established\b",
+    re.IGNORECASE,
+)
+
+
+def _has_evidence_gap_signal(text: str) -> bool:
+    """True when `text` states BOTH that something is required for/relied
+    on by/depended on by the remediation mechanism's correctness AND that
+    the evidence needed to confirm it was not supplied -- see
+    _EVIDENCE_GAP_NECESSITY_RE/_EVIDENCE_ABSENCE_RE's own comment for why
+    both are required together, never either alone."""
+    if not text:
+        return False
+    return bool(_EVIDENCE_GAP_NECESSITY_RE.search(text) and _EVIDENCE_ABSENCE_RE.search(text))
+
+
+_GENERIC_RE = re.compile(
+    r"\b(tests?\s+should|consider\s+(adding|using)|recommend|performance\s+impact"
+    r"|documentation|changelog|code\s+style|best\s+practice)\b",
+    re.IGNORECASE,
+)
+
+# Behavioral-defect patterns (Architecture B, run 4) -- a candidate patch
+# that itself removes, rejects, changes, or breaks behavior the repository
+# previously allowed, distinct from the vulnerable behavior being
+# intentionally removed. Generic across repositories/languages/vulnerability
+# classes: no key name, framework, or CVE is ever named here.
+#
+# Deliberately a COMBINATION of two independent signals, never a single
+# broad keyword -- "behavior"/"change"/"compatibility"/"risk" alone are far
+# too common in ordinary Challenger prose to mean anything on their own (see
+# _classify_finding's own test corpus, none of which uses these words to
+# describe an actual behavioral defect). A finding only qualifies when BOTH
+# an action verb that removes/changes something (_BEHAVIORAL_DEFECT_VERB_RE)
+# AND a description of something the repository previously allowed
+# (_BEHAVIORAL_DEFECT_OBJECT_RE) appear in the SAME clause -- never merely
+# anywhere in a longer, multi-clause finding, so an unrelated verb earlier
+# in a sentence cannot combine with a reassuring aside elsewhere in the same
+# sentence (e.g. "...and existing behavior for valid inputs remains
+# unaffected") to produce a false match.
+_BEHAVIORAL_DEFECT_VERB_RE = re.compile(
+    r"\b(break\w*|drop\w*|reject\w*|remov\w*|prevent\w*|alter\w*|chang\w*)\b",
+    re.IGNORECASE,
+)
+_BEHAVIORAL_DEFECT_OBJECT_RE = re.compile(
+    # Either shape names "something the repository previously allowed":
+    # a QUALIFIER (existing/previously-valid/legitimate/valid/unrelated)
+    # immediately preceding the noun ("legitimate keys", "existing
+    # behavior"), OR the noun immediately followed by an explicit
+    # out-of-scope marker ("behavior outside the intended security
+    # scope") -- the same "outside this advisory's scope" phrasing this
+    # module's OWN _SCOPE_MARKER_RE already recognizes for a different
+    # category, reused here as a second, equally concrete way to say
+    # "this is not the vulnerable behavior."
+    r"\b(existing|previously[\s-]+(?:valid|supported|accepted)|legit(?:imate)?|valid|unrelated)\b"
+    r"(?:\s+\S+){0,4}?\s*\b(behaviou?rs?|inputs?|configurations?|options?|keys?|values?|usages?"
+    r"|functionalit(?:y|ies))\b"
+    r"|\b(behaviou?rs?|inputs?|configurations?|options?|keys?|values?|usages?|functionalit(?:y|ies))\b"
+    r"(?:\s+\S+){0,4}?\s*\bout(?:side)?\s+(?:the\s+)?(?:intended\s+|security\s+)*scope\b",
+    re.IGNORECASE,
+)
+# Clause boundaries -- punctuation and contrast conjunctions a human would
+# read as separating one claim from another. Deterministic string
+# splitting only, never NLP/sentiment analysis -- clauses, not sentences,
+# since Challenger findings are short, often single-sentence bullet points
+# where a clause boundary is the only structural signal available to
+# separate independent claims.
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[,;()]|\b(?:but|and|while|though|although|however|whereas)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_behavioral_defect_signal(text: str) -> bool:
+    """True when some CLAUSE of `text` names both (a) an action that
+    removes/rejects/changes/breaks something and (b) something the
+    repository previously allowed (an existing/previously-valid/
+    previously-supported/previously-accepted/legitimate/valid/unrelated
+    behavior, input, configuration, option, key, value, usage, or piece of
+    functionality). Both signals must co-occur in the SAME clause -- see
+    _BEHAVIORAL_DEFECT_VERB_RE/_BEHAVIORAL_DEFECT_OBJECT_RE's own comment
+    for why a same-string-anywhere check is not used here, unlike this
+    module's other single-pattern classifiers (the run-4 real-world
+    positive spans "drop" and "keys" ~70 characters apart in the same
+    clause with no intervening punctuation, so a fixed character-distance
+    window was tried and rejected -- see the historical trace fixture this
+    module's tests regress against)."""
+    if not text:
+        return False
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        if _BEHAVIORAL_DEFECT_VERB_RE.search(clause) and _BEHAVIORAL_DEFECT_OBJECT_RE.search(clause):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Cross-section Challenger finding deduplication -- forensic finding: nothing
+# in the Challenger prompt/schema (see patch_challenger.md) or its parser
+# (patch_challenger.py) prevents the SAME substantive concern from being
+# restated, worded slightly differently, under BOTH the "Edge cases:" and
+# "Potential issues:" free-text sections. A real CVE-2023-43804 run (V7)
+# produced exactly this: one "Edge cases" bullet literally cross-referenced
+# the other ("... (see Potential issues)"), and the fuller "Potential issues"
+# bullet described the identical underlying concern. Left undeduplicated,
+# the SAME concern was flattened into two independent findings -- wasting a
+# Finding Calibration "slot" and creating duplicate noise in the human-
+# facing report.
+#
+# This is a single, pure, deterministic normalization layer shared by every
+# downstream consumer of the two raw lists (currently: _classify_challenger
+# below, and the Suggested Tests early-hoist block in _build_report). It is
+# intentionally CONSERVATIVE -- a missed merge (two real duplicates left
+# unmerged) is far cheaper than a false merge (two genuinely distinct
+# concerns collapsed into one, silently losing a finding). Exact-string
+# equality alone is insufficient (the real V7 case was near-duplicate
+# wording, not identical strings), so two additional deterministic signals
+# are combined:
+#
+#   1. Shared backtick-quoted identifiers/symbols, normalized by stripping
+#      trailing call-parens/args (`foo(x=True)` -> `foo`) and matched on
+#      dotted-suffix (`a.b.c` matches a peer identifier `c` or `b.c`).
+#   2. Bag-of-significant-words Jaccard overlap (words of length >= 4,
+#      backtick-quoted spans and a small stopword list excluded).
+#
+# Two findings are judged duplicates only when EITHER:
+#   - the texts are identical (case/space-insensitive), or
+#   - they share at least one normalized identifier AND clear significant-
+#     word overlap (>= _MIN_WORD_JACCARD), or
+#   - one finding explicitly self-references the other section (e.g.
+#     "(see Potential issues)") AND they share at least modest identifier
+#     or word overlap (the self-reference alone is not proof; some shared
+#     substance is still required so an unrelated finding that happens to
+#     mention "(see Edge cases)" in passing is never merged on that phrase
+#     alone).
+#
+# No embeddings, no additional LLM call, no nondeterministic clustering --
+# every input in this module is a plain list of already-parsed strings, and
+# the same input always produces the same output in the same order.
+# ---------------------------------------------------------------------------
+
+_CHALLENGER_SELF_REFERENCE_RE = re.compile(
+    r"\(\s*see\s+(?:the\s+)?(?:edge\s+cases?|potential\s+issues?)\s*\)",
+    re.IGNORECASE,
+)
+
+_CHALLENGER_BACKTICK_RE = re.compile(r"`([^`]+)`")
+
+# Deliberately small and generic (ordinary English function words plus the
+# handful of section-header/domain-filler words this module's own findings
+# tend to repeat) -- never CVE- or vulnerability-specific vocabulary, so the
+# same stopword list works for any Challenger response.
+_CHALLENGER_DEDUP_STOPWORDS = frozenset({
+    "this", "that", "with", "from", "have", "does", "will", "would",
+    "could", "should", "there", "their", "which", "these", "those",
+    "when", "where", "while", "still", "into", "over", "under", "than",
+    "then", "also", "been", "being", "were", "your", "some", "such",
+    "only", "each", "both", "same", "about", "after", "before",
+    "because", "edge", "cases", "case", "potential", "issue", "issues",
+    "finding", "findings", "concern", "concerns",
+})
+
+_CHALLENGER_MIN_SHARED_IDENTIFIERS = 1
+_CHALLENGER_MIN_WORD_JACCARD = 0.35
+_CHALLENGER_MIN_WORD_JACCARD_WITH_SELF_REFERENCE = 0.15
+
+
+def _normalize_challenger_identifier(raw: str) -> str:
+    """Strip trailing call-parens/args from a backtick-quoted span, e.g.
+    `foo(x=True)` -> `foo`, `bar()` -> `bar`. Leaves a bare identifier
+    (no parens) unchanged."""
+    ident = raw.strip()
+    ident = re.sub(r"\(.*$", "", ident).strip()
+    return ident
+
+
+def _challenger_identifier_suffix_forms(ident: str) -> "set[str]":
+    """All dotted-suffix forms of `ident`, so `a.b.c` yields
+    {"a.b.c", "b.c", "c"} -- lets a fully-qualified mention in one finding
+    match a shorter/relative mention of the same symbol in another."""
+    parts = [p for p in ident.split(".") if p]
+    if not parts:
+        return set()
+    return {".".join(parts[i:]) for i in range(len(parts))}
+
+
+def _extract_challenger_identifiers(text: str) -> "list[str]":
+    idents = []
+    for raw in _CHALLENGER_BACKTICK_RE.findall(text or ""):
+        norm = _normalize_challenger_identifier(raw)
+        if norm:
+            idents.append(norm)
+    return idents
+
+
+def _challenger_significant_words(text: str) -> "set[str]":
+    """Bag of significant words for Jaccard comparison: backtick-quoted
+    spans are excluded (identifiers are compared separately, via
+    `_extract_challenger_identifiers`, so they are not double-counted
+    here), words shorter than 4 characters are dropped, and a small
+    generic stopword list is excluded."""
+    stripped = _CHALLENGER_BACKTICK_RE.sub(" ", text or "")
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_]*", stripped.lower())
+    return {w for w in words if len(w) >= 4 and w not in _CHALLENGER_DEDUP_STOPWORDS}
+
+
+def _challenger_shared_identifiers(idents_a: "list[str]", idents_b: "list[str]") -> "list[str]":
+    """Identifiers from `idents_a` that dotted-suffix-match some identifier
+    in `idents_b`. List order follows `idents_a`'s own order (deterministic,
+    never set-iteration-order-dependent)."""
+    if not idents_a or not idents_b:
+        return []
+    suffixes_b = [_challenger_identifier_suffix_forms(i) for i in idents_b]
+    shared = []
+    for ident in idents_a:
+        suffixes_a = _challenger_identifier_suffix_forms(ident)
+        if any(suffixes_a & sb for sb in suffixes_b):
+            shared.append(ident)
+    return shared
+
+
+def _challenger_findings_duplicate_match(text_a: str, text_b: str) -> "dict | None":
+    """Judge whether two Challenger finding strings describe the SAME
+    underlying concern. Returns a match-info dict (`reason`,
+    `shared_identifiers`, `word_jaccard`) when they are judged duplicates,
+    or `None` otherwise. See the module-level comment above this function
+    for the full decision rule and its conservative-bias rationale."""
+    a = (text_a or "").strip()
+    b = (text_b or "").strip()
+    if not a or not b:
+        return None
+
+    if a.casefold() == b.casefold():
+        return {"reason": "exact_match", "shared_identifiers": [], "word_jaccard": 1.0}
+
+    idents_a = _extract_challenger_identifiers(a)
+    idents_b = _extract_challenger_identifiers(b)
+    shared_identifiers = _challenger_shared_identifiers(idents_a, idents_b)
+
+    words_a = _challenger_significant_words(a)
+    words_b = _challenger_significant_words(b)
+    union = words_a | words_b
+    jaccard = (len(words_a & words_b) / len(union)) if union else 0.0
+
+    self_reference = bool(
+        _CHALLENGER_SELF_REFERENCE_RE.search(a) or _CHALLENGER_SELF_REFERENCE_RE.search(b)
+    )
+
+    if self_reference and (
+        len(shared_identifiers) >= _CHALLENGER_MIN_SHARED_IDENTIFIERS
+        or jaccard >= _CHALLENGER_MIN_WORD_JACCARD_WITH_SELF_REFERENCE
+    ):
+        return {"reason": "self_reference", "shared_identifiers": shared_identifiers, "word_jaccard": jaccard}
+
+    if (
+        len(shared_identifiers) >= _CHALLENGER_MIN_SHARED_IDENTIFIERS
+        and jaccard >= _CHALLENGER_MIN_WORD_JACCARD
+    ):
+        return {
+            "reason": "identifier_and_word_overlap",
+            "shared_identifiers": shared_identifiers,
+            "word_jaccard": jaccard,
+        }
+
+    return None
+
+
+# How strongly each `_classify_finding` category bears on the decision --
+# used only to decide which of two duplicate findings survives dedup.
+_FINDING_CATEGORY_STRENGTH = {
+    "confirmed_defect": 4, "behavioral_defect": 3, "validation_gap": 2, "plausible_risk": 1, "generic": 0,
+}
+
+
+def _dedupe_challenger_findings(
+    edge_cases: "list[str]", potential_issues: "list[str]"
+) -> "tuple[list[str], list[str], list[dict]]":
+    """Deterministically remove cross-section duplicates between a raw
+    Challenger response's `edge_cases` and `potential_issues` lists.
+
+    Only CROSS-section duplication is considered -- two items within the
+    same list are never compared against each other, keeping this change
+    narrowly scoped to the confirmed defect (the same concern restated
+    across the two sections), not a general dedup pass.
+
+    For each duplicate pair found, the item with the STRONGER
+    `_classify_finding` category is kept (confirmed_defect >
+    behavioral_defect > validation_gap > plausible_risk > generic), so a
+    weaker restatement can never displace a stronger finding. Between equal
+    categories the SHORTER text is dropped and the LONGER (more informative)
+    text is kept -- equal lengths keep the `potential_issues` item. Nothing
+    is silently discarded: every drop is recorded in the
+    returned `dedup_record` list as
+    `{"reason", "shared_identifiers", "word_jaccard", "kept_section",
+    "kept_text", "dropped_section", "dropped_text"}`, so the removed text
+    remains retrievable.
+
+    Deterministic and order-preserving: iterates the two input lists in
+    their own given order and never relies on set/dict iteration order for
+    anything in the returned lists -- calling this twice on identical input
+    always yields byte-identical output.
+    """
+    edge_cases = list(edge_cases or [])
+    potential_issues = list(potential_issues or [])
+
+    dropped_edge_indices: "set[int]" = set()
+    dropped_potential_indices: "set[int]" = set()
+    dedup_record: "list[dict]" = []
+
+    for pi, p_text in enumerate(potential_issues):
+        for ei, e_text in enumerate(edge_cases):
+            if ei in dropped_edge_indices:
+                continue
+            match = _challenger_findings_duplicate_match(e_text, p_text)
+            if match is None:
+                continue
+            p_strength = _FINDING_CATEGORY_STRENGTH[_classify_finding(p_text)]
+            e_strength = _FINDING_CATEGORY_STRENGTH[_classify_finding(e_text)]
+            if p_strength != e_strength:
+                keep_potential = p_strength > e_strength
+            else:
+                keep_potential = len((p_text or "").strip()) >= len((e_text or "").strip())
+            if keep_potential:
+                dropped_edge_indices.add(ei)
+                kept_section, kept_text = "potential_issues", p_text
+                dropped_section, dropped_text = "edge_cases", e_text
+            else:
+                dropped_potential_indices.add(pi)
+                kept_section, kept_text = "edge_cases", e_text
+                dropped_section, dropped_text = "potential_issues", p_text
+            dedup_record.append({
+                "reason": match["reason"],
+                "shared_identifiers": match["shared_identifiers"],
+                "word_jaccard": match["word_jaccard"],
+                "kept_section": kept_section,
+                "kept_text": kept_text,
+                "dropped_section": dropped_section,
+                "dropped_text": dropped_text,
+            })
+            break  # each potential_issues item matches at most one edge_cases item
+
+    deduped_edge = [t for i, t in enumerate(edge_cases) if i not in dropped_edge_indices]
+    deduped_potential = [t for i, t in enumerate(potential_issues) if i not in dropped_potential_indices]
+    return deduped_edge, deduped_potential, dedup_record
+
+
+def _classify_finding(text: str) -> str:
+    """Classify a single challenger finding into one of five categories.
+
+    Returns: 'confirmed_defect' | 'behavioral_defect' | 'plausible_risk'
+             | 'validation_gap' | 'generic'
+
+    Priority order:
+    1. Explicit exploitability patterns (still vulnerable, bypass, attack vector remains…)
+       → always confirmed_defect; scope markers do not override these.
+    2. "does not fix/address/prevent/close" WITH a version or scope marker
+       → plausible_risk (scope limitation, not a primary fix failure).
+    3. "does not fix/address/prevent/close" WITHOUT any scope marker
+       → confirmed_defect (the primary fix is being claimed as non-functional).
+    4. Concrete behavioral-defect language (the candidate patch itself
+       removes/rejects/changes/breaks previously-allowed behavior) →
+       behavioral_defect. Deliberately placed AFTER steps 1-3: explicit
+       current-exploitability language, and an unqualified "does not
+       fix/address/prevent/close", both describe the PRIMARY vulnerability
+       itself and must never be downgraded to a secondary behavioral
+       concern merely because the same finding also happens to use
+       behavioral-sounding wording (run-4 evidence never showed this
+       collision, but the ordering makes it impossible regardless).
+    5. Validation gap patterns → validation_gap. Two independent idioms,
+       either sufficient on its own: the existing testing-coverage phrasing
+       (_VALIDATION_GAP_RE: "cannot verify/confirm/test", "unverified",
+       "untested"...), OR the evidence-supply idiom (_has_evidence_gap_signal:
+       something the mechanism's correctness is required by/relies on/
+       depends on, WHOSE OWN evidence was not shown/traced/included/
+       established) -- never merely a bare "not shown"/"omitted" on its
+       own, which is equally at home describing an optional/non-blocking
+       detail.
+    6. Generic observation patterns → generic.
+    7. Default → plausible_risk (conservative).
+    """
+    if not text:
+        return "generic"
+    # Step 1: explicit current-exploitability language — unambiguous confirmed defect.
+    if _EXPLICIT_DEFECT_RE.search(text):
+        return "confirmed_defect"
+    # Step 2: "does not fix/address/prevent/close" — contextual two-step check.
+    if _DOES_NOT_RE.search(text):
+        if _VERSION_MARKER_RE.search(text) or _SCOPE_MARKER_RE.search(text):
+            return "plausible_risk"   # finding describes a scope / version limitation
+        return "confirmed_defect"     # no scope qualifier → primary fix failure
+    # Step 3: concrete behavioral-defect language (run-4 Architecture B).
+    if _has_behavioral_defect_signal(text):
+        return "behavioral_defect"
+    # Step 4: validation gap — testing-coverage idiom OR evidence-supply idiom.
+    if _VALIDATION_GAP_RE.search(text) or _has_evidence_gap_signal(text):
+        return "validation_gap"
+    # Step 5: generic observation.
+    if _GENERIC_RE.search(text):
+        return "generic"
+    return "plausible_risk"
+
+
+_CHALLENGER_PROVENANCE_SECTION_LABELS = frozenset({
+    "repository_grounding",
+    "repository_understanding",
+    "planner_evidence",
+    PATCH_GENERATION_REQUIRED_LABEL,
+})
+"""Patch Generation context sections (labels assigned where `code_context`
+is assembled, in `_patch_gen_sections`) whose text is repository-derived
+and may therefore validate a Challenger repository/diff citation:
+repository grounding source, deterministic Repository Understanding,
+Planner-Proposed Candidate Evidence (verified structural facts + verified
+source excerpts), and the Final-Target Remediation Slice (verbatim
+repository source). Deliberately excluded, because they are authored text
+rather than repository evidence: `phase_e_plan` (hand-authored),
+`vulnerability_pattern_context` (guidance templates), `remediation_plan`,
+`verified_authoritative_semantics`, `remediation_strategy` (LLM-authored
+Planner/Strategy narrative), and `coverage_warning` (pipeline meta-text).
+The post-patch investigation context (deterministic observations) is
+added separately by the callers that show it to the Challenger."""
+
+
+def _challenger_provenance_context(authoritative_parts, shown_context: str) -> str:
+    """The Challenger citation-authority corpus for one call: every
+    repository-derived part (see `_CHALLENGER_PROVENANCE_SECTION_LABELS`)
+    that the Challenger was actually SHOWN, i.e. that occurs verbatim in
+    `shown_context`. A part omitted upstream (technical capacity, a
+    superseded slice, an empty section) is never shown and so never
+    included, preserving `_point_citation_valid`'s existing guarantee that
+    a citation of content the model never received cannot validate.
+    Fails closed: no parts -> empty corpus (only the patch itself can
+    then validate a repository/diff citation)."""
+    return "\n\n".join(
+        part for part in (authoritative_parts or ())
+        if part and part.strip() and part in (shown_context or "")
+    )
+
+
+def _classify_challenger(challenger: dict) -> dict:
+    """Return an augmented challenger dict with per-finding classifications and counts.
+
+    `result = dict(challenger)` is a full shallow copy, so `verification_status`
+    (patch_challenger.challenge_patch's authoritative tri-state signal, added
+    alongside the pre-existing `still_vulnerable` projection) rides through
+    into the returned dict unchanged, with no dedicated handling needed here.
+    """
+    result = dict(challenger) if challenger else {}
+
+    # Cross-section dedup runs FIRST, before any per-finding classification --
+    # see _dedupe_challenger_findings's own docstring. `challenger_dedup_
+    # record` is attached (only when non-empty) purely so the dropped text
+    # remains retrievable; nothing downstream currently reads it back.
+    _deduped_edge, _deduped_potential, _dedup_record = _dedupe_challenger_findings(
+        (challenger or {}).get("edge_cases") or [],
+        (challenger or {}).get("potential_issues") or [],
+    )
+    if _dedup_record:
+        result["challenger_dedup_record"] = _dedup_record
+
+    classified_edge: list[dict] = []
+    for finding in _deduped_edge:
+        classified_edge.append({"text": finding, "category": _classify_finding(finding)})
+    result["classified_edge_cases"] = classified_edge
+
+    classified_issues: list[dict] = []
+    for finding in _deduped_potential:
+        classified_issues.append({"text": finding, "category": _classify_finding(finding)})
+    result["classified_potential_issues"] = classified_issues
+
+    all_classified = classified_edge + classified_issues
+    result["confirmed_defect_count"] = sum(1 for f in all_classified if f["category"] == "confirmed_defect")
+    result["plausible_risk_count"] = sum(1 for f in all_classified if f["category"] == "plausible_risk")
+    result["validation_gap_count"] = sum(1 for f in all_classified if f["category"] == "validation_gap")
+    # Additive (run-4 Architecture B): a fifth, distinctly-tracked category
+    # for concrete, patch-caused behavior changes -- never folded into
+    # confirmed_defect_count (which _compute_trust_signals/
+    # _build_recommendation_v1 read; both remain untouched by this addition)
+    # and never removed from plausible_risk_count's own semantics -- a
+    # finding that now classifies behavioral_defect simply no longer also
+    # counts as plausible_risk, exactly as adding validation_gap once
+    # narrowed plausible_risk_count's population without changing what
+    # plausible_risk itself means for findings that still land there.
+    result["behavioral_defect_count"] = sum(1 for f in all_classified if f["category"] == "behavioral_defect")
+
+    # NOTE: a VERIFIED_FIXED + validation_gap_count>0 consistency
+    # reconciliation used to live here, keyed purely on the raw lexical
+    # validation_gap count. It has been REPLACED, not merely supplemented,
+    # by `_reconcile_verification_status_with_calibration` (below in this
+    # module), which is run later -- after finding_calibration is
+    # finalized -- and decides this exact case using the semantic
+    # "Remediation impact" calibration axis instead of the raw lexical
+    # category alone. This function must no longer perform that narrowing
+    # itself: a demonstrated regression showed a validation_gap-worded and
+    # a plausible_risk-worded finding stating the SAME unresolved factual
+    # dependency received different authority purely because of which
+    # wording `_classify_finding`'s regex happened to match -- see
+    # `_reconcile_verification_status_with_calibration`'s own docstring.
+
+    # Symmetric reconciliation (a second, generically-shaped regression: a
+    # raw Challenger response asserted verification_status=
+    # "RESIDUAL_VULNERABILITY" while its OWN structured findings contained
+    # zero confirmed_defect and zero behavioral_defect -- i.e. no finding
+    # the classifier recognizes as a demonstrated defect actually supports
+    # that residual claim; every finding was plausible_risk/validation_gap/
+    # generic: a hypothesis, an unverified concern, or a hardening note).
+    # RESIDUAL_VULNERABILITY is a claim that the supplied evidence
+    # affirmatively demonstrates a specific remaining bypass; an unsupported
+    # claim like that overstates the evidence in exactly the same
+    # structural way the VERIFIED_FIXED branch above already corrects for --
+    # this is that branch's mirror image, not a new policy.
+    #
+    # Gated on the ABSENCE of confirmed_defect_count AND
+    # behavioral_defect_count (never validation_gap_count/plausible_risk_count
+    # directly, and never finding text itself): a response may legitimately
+    # report a genuine, demonstrated residual defect ALONGSIDE additional
+    # validation gaps or hypotheses -- in that case RESIDUAL_VULNERABILITY
+    # must remain authoritative, so at least one demonstrated/confirmed
+    # defect of either kind always short-circuits this branch regardless of
+    # how many uncertainty-class findings coexist with it.
+    #
+    # Never promotes to VERIFIED_FIXED -- only ever settles on
+    # INSUFFICIENT_EVIDENCE, the strictly weaker of the two remaining
+    # tri-state values. still_vulnerable is reasserted True here (both
+    # RESIDUAL_VULNERABILITY and INSUFFICIENT_EVIDENCE already project it,
+    # so this is a no-op in practice) for the same explicit fail-closed
+    # clarity as the branch above.
+    #
+    # Not applied to a structured `Concerns:` response (`schema_version`
+    # concerns_v1/concerns_v2): there, RESIDUAL_VULNERABILITY is never the
+    # model's self-asserted claim -- it is DERIVED deterministically by
+    # patch_challenger._derive_status_from_concerns from a provenance-gated
+    # BLOCKING concern -- while the lexical counts this branch reads come
+    # only from `Edge cases`/`Potential issues`, which that contract
+    # requires to be empty. Their absence is therefore not evidence that no
+    # residual was demonstrated, and must not erase the structured result.
+    if (
+        result.get("verification_status") == "RESIDUAL_VULNERABILITY"
+        and result.get("schema_version") not in ("concerns_v1", "concerns_v2")
+        and result["confirmed_defect_count"] == 0
+        and result["behavioral_defect_count"] == 0
+    ):
+        result["verification_status"] = "INSUFFICIENT_EVIDENCE"
+        result["still_vulnerable"] = True
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Semantic remediation-proof reconciliation -- sibling to _classify_challenger
+# above, but runs strictly LATER (after finding_calibration is finalized),
+# and decides remediation-proof blocking authority for an unresolved-evidence
+# finding using finding_calibration's semantic "Remediation impact" axis
+# (see finding_calibration.py) instead of the raw lexical category alone.
+#
+# Why this exists (forensic finding): a raw Challenger response can state the
+# SAME unresolved factual dependency twice, worded two different ways, and
+# _classify_finding's regex sorts one into `plausible_risk` and the other
+# into `validation_gap` purely on wording. The OLD reconciliation (removed
+# from _classify_challenger above) fired only on validation_gap_count > 0 --
+# so which of the two wordings a model happened to pick decided whether a
+# self-reported VERIFIED_FIXED verdict survived. This function replaces that
+# lexical-only trigger with a semantic one: a finding's own calibrated
+# "Remediation impact" (proof_required / validation_only / unclear) decides
+# blocking, regardless of which lexical bucket the same underlying
+# dependency happened to land in.
+#
+# Never inspects finding text itself -- only already-computed categories and
+# already-parsed calibration fields, exactly like _classify_challenger's own
+# two reconciliation branches. No new repository search, no new LLM call, no
+# regex synonym expansion.
+# ---------------------------------------------------------------------------
+
+# Categories this reconciliation ever consults. confirmed_defect/
+# behavioral_defect are deliberately excluded: their own blocking authority
+# (the Misaligned path in _build_recommendation_v1, and should_auto_repair/
+# accept_repair's own Observed-calibration gate) is untouched by this
+# function -- widening it here would change authority this task's own
+# constraints require left alone.
+_REMEDIATION_PROOF_LEXICAL_CATEGORIES = ("plausible_risk", "validation_gap", "generic")
+
+
+def _calibration_entry_failed(entry: dict) -> bool:
+    """True when `entry` carries no calibration answer: Finding Calibration
+    could not parse this finding's block (see finding_calibration.
+    _parse_response's `calibration_failed`). Entries persisted before that
+    marker existed are recognised by the only shape the parser's fail-closed
+    path ever produced -- unresolved=[] with impact "unclear" (a parsed
+    "Unresolved: none" is always normalized to "validation_only")."""
+    if "calibration_failed" in entry:
+        return bool(entry["calibration_failed"])
+    return not entry.get("unresolved_dependencies") and entry.get("remediation_impact") == "unclear"
+
+
+def _usable_calibration_entries(finding_calibration: "list[dict] | None") -> "list[dict]":
+    """Calibration entries that carry a real answer. A failed entry is
+    dropped, so every consumer sees exactly what it sees for a finding
+    calibration never ran on (recommendation-policy.md: a missing
+    calibration counts as a defect; an uncalibrated validation_gap blocks)
+    -- never "examined, nothing unresolved"."""
+    return [entry for entry in finding_calibration or [] if not _calibration_entry_failed(entry)]
+
+
+def _match_calibration_entries(finding_calibration: "list[dict] | None") -> "dict[str, dict | None]":
+    """Positive, text-exact association from a finding's own original text
+    to its calibration entry -- never fuzzy matching, never positional
+    borrowing (the Nth classified finding is NOT assumed to correspond to
+    the Nth calibration entry, since the two lists can diverge in order/
+    membership once repair regenerates a response -- see
+    _reconcile_verification_status_with_calibration's own docstring).
+
+    A duplicated original text mapping to two DISAGREEING calibration
+    entries is ambiguous -- there is no safe basis for picking one over the
+    other, so it maps to None (the same "no confident calibration signal"
+    fail-closed shape as a text with no entry at all), never to either
+    duplicate's value. Two entries sharing the same original text that
+    happen to agree are not ambiguous and resolve normally.
+    """
+    by_text: "dict[str, dict | None]" = {}
+    for entry in _usable_calibration_entries(finding_calibration):
+        text = entry.get("original")
+        if not text:
+            continue
+        if text in by_text and by_text[text] is not None and by_text[text] != entry:
+            by_text[text] = None  # ambiguous: disagreeing duplicate -- fail closed
+        elif text not in by_text:
+            by_text[text] = entry
+    return by_text
+
+
+def _finding_blocks_remediation_proof(finding: dict, calibration_entry: "dict | None") -> bool:
+    """Whether ONE classified finding (category in
+    _REMEDIATION_PROOF_LEXICAL_CATEGORIES) should block remediation-proof
+    authority for the CURRENT run -- i.e. count toward forcing a
+    self-reported VERIFIED_FIXED down to INSUFFICIENT_EVIDENCE.
+
+    Base presumption when no positively-matched calibration entry exists
+    for this exact finding text (calibration never ran, failed outright, or
+    this text has no entry): a `validation_gap` finding blocks, by its own
+    lexical definition (_classify_finding: "cannot verify/confirm..." / an
+    evidence-gap signal IS a claim that something is unresolved) -- exactly
+    the base rate the old, now-removed lexical-only branch always applied.
+    A `plausible_risk`/`generic` finding does NOT block by default -- that
+    bucket is `_classify_finding`'s own broad, "also covers entirely benign
+    observations" catch-all default, and never independently blocked
+    before this feature existed either. No calibration signal means no
+    change from that pre-existing behavior in either direction.
+
+    Calibration OVERRIDES the base presumption only when it positively
+    names an unresolved dependency for THIS finding (`unresolved_
+    dependencies` non-empty) -- otherwise nothing here promotes or demotes
+    the base presumption, so a plausible_risk/generic finding calibration
+    never even looked at still never manufactures a blocker, and a
+    validation_gap finding calibration never looked at still falls back to
+    its own base presumption (blocking) exactly as before.
+
+    Once a positively-matched, non-empty-`unresolved_dependencies` entry
+    exists:
+      - "proof_required"                    -> blocks.
+      - "validation_only"                   -> does NOT block -- this is
+                                                what stops the raw
+                                                validation_gap regex from
+                                                being independently
+                                                authoritative.
+      - "unclear"/missing/any other value    -> fails closed -> blocks.
+        (No uncertainty may silently become non-blocking.)
+    """
+    if calibration_entry is None:
+        return finding["category"] == "validation_gap"
+
+    unresolved = calibration_entry.get("unresolved_dependencies") or []
+    if not unresolved:
+        return False  # calibration examined this finding and found nothing unresolved
+
+    impact = calibration_entry.get("remediation_impact")
+    if impact == "validation_only":
+        return False
+    return True  # "proof_required", "unclear", missing, or any unrecognized value
+
+
+def _reconcile_verification_status_with_calibration(
+    classified_challenger: dict, finding_calibration: "list[dict] | None"
+) -> dict:
+    """Deterministic reconciliation layer, run AFTER finding_calibration is
+    finalized for the CURRENT (post-repair, if applicable) Challenger
+    result -- see _build_report, the sole caller, and STEP 5's own
+    docstring below for why it must always be the calibration/challenger
+    pair that actually correspond to each other.
+
+    Only ever narrows a `VERIFIED_FIXED` verdict -- a response already
+    classified `RESIDUAL_VULNERABILITY`/`INSUFFICIENT_EVIDENCE` is returned
+    completely unchanged, regardless of what any finding's calibration
+    says: an already-blocking verdict is never cleared by a
+    `validation_only` finding alongside it, and this function never
+    promotes anything to a WEAKER state than `_classify_challenger` already
+    produced. `confirmed_defect_count`/`behavioral_defect_count` and every
+    other key are passed through byte-identical -- this function only ever
+    rewrites `verification_status`/`still_vulnerable`, and only in the
+    narrowing direction.
+
+    `calibrate_findings` itself never decides this -- see
+    finding_calibration.py's own module docstring: it only characterizes a
+    finding's `unresolved_dependencies`/`remediation_impact`. This function
+    is the only place authorized to translate that characterization into
+    remediation-proof blocking authority.
+    """
+    if not classified_challenger:
+        return classified_challenger
+    result = dict(classified_challenger)
+    if result.get("verification_status") != "VERIFIED_FIXED":
+        return result
+
+    calibration_by_text = _match_calibration_entries(finding_calibration)
+    all_classified = (
+        (result.get("classified_edge_cases") or [])
+        + (result.get("classified_potential_issues") or [])
+    )
+    blocked = False
+    for finding in all_classified:
+        if finding["category"] not in _REMEDIATION_PROOF_LEXICAL_CATEGORIES:
+            continue  # confirmed_defect/behavioral_defect authority is untouched here
+        entry = calibration_by_text.get(finding["text"])
+        if _finding_blocks_remediation_proof(finding, entry):
+            blocked = True
+            break
+
+    if blocked:
+        result["verification_status"] = "INSUFFICIENT_EVIDENCE"
+        result["still_vulnerable"] = True
+    return result
+
+
+# Report Polish Batch B: deterministic tie-breaker for Validation Actions
+# that share the same HIGH/MEDIUM/LOW priority -- ranks the action that most
+# directly validates the vulnerability's own core security behavior ahead of
+# a speculative secondary edge case. Reuses two pieces of structured
+# evidence the pipeline already computes for other purposes -- finding
+# calibration's Observed/Hypothesis/Hardening group (see
+# finding_calibration.py, already read this way by _build_known_findings)
+# and _classify_finding's confirmed_defect/validation_gap/plausible_risk/
+# generic category -- rather than any new keyword-similarity guess. Neither
+# mapping is new classification logic: both are the exact groups/categories
+# those two existing, already-committed mechanisms already produce.
+#
+# Post-review note: a real-CVE regression once surfaced a genuine issue here
+# -- calibration's "observed" group is evidence CONFIDENCE ("this is a
+# confirmed fact"), not VALIDATION IMPORTANCE ("this still needs to be
+# checked"), and an already-resolved observed fact could outrank a
+# genuinely open "hypothesis" question for Top Action. A fix that globally
+# reordered this mapping (hypothesis above observed) was tried and reverted
+# -- that still used evidence-confidence classification as a proxy for
+# validation importance, just inverted, which is too broad a policy change
+# for this report-polish batch. The actual product requirement -- the
+# vulnerability's core security behavior must win Top Action -- is instead
+# met by `result.security_invariant` (see the behavior-driven action below):
+# when a concrete security invariant is available, it is unconditionally
+# prepended ahead of every action ranked here, including an "observed"-
+# calibrated one. This mapping's ONLY remaining job is secondary/tie-break
+# ordering among the actions that were never displaced by that primary
+# action; general observed-vs-hypothesis relevance/deduplication among
+# those secondary actions is deferred to a later batch.
+_DIRECTNESS_BY_CALIBRATION_GROUP = {"observed": 3, "hypothesis": 2, "hardening": 1}
+_DIRECTNESS_BY_CLASSIFIER_CATEGORY = {
+    "confirmed_defect": 3, "validation_gap": 3, "plausible_risk": 2, "generic": 1,
+}
+
+
+def _finding_directness_tier(text: str, calibration_by_original: dict) -> int:
+    """How directly `text` (a raw finding/topic string) validates the
+    vulnerability's core security behavior, as 3 (most direct) / 2
+    (contextual) / 1 (most speculative) -- used only to break ties between
+    Validation Actions that already share the same priority; never changes
+    priority, count, or content.
+
+    Prefers an existing finding_calibration verdict (an LLM classification
+    that already ran elsewhere in the pipeline, if it ran at all) when this
+    exact finding text has one -- calibration is evidence-quality-aware in a
+    way the coarser deterministic classifier alone is not. Falls back to
+    `_classify_finding`'s own category when there is no calibration entry
+    for this text (calibration didn't run, or this text isn't an exact match
+    for one of its inputs -- e.g. it came from a Suggested Test's re-derived
+    topic rather than the original challenger finding string verbatim).
+    """
+    entry = calibration_by_original.get(text)
+    if entry is not None:
+        return _DIRECTNESS_BY_CALIBRATION_GROUP.get(entry.get("group"), 2)
+    return _DIRECTNESS_BY_CLASSIFIER_CATEGORY.get(_classify_finding(text), 1)
+
+
+# ---------------------------------------------------------------------------
+# Primary Vulnerability References
+#
+# Presentation-only text extraction, not a new data source: ghsa_to_vuln_text
+# / cve_to_vuln_text (advisory_converter.py / cve_converter.py) already
+# render a "**Advisory:** <id>" line and a "## References" URL list into
+# vulnerability_text for both --ghsa and --cve input modes. This parses that
+# already-present text the same way _extract_summary parses other blocks —
+# no network call, no new fetch, no semantic classifier.
+# ---------------------------------------------------------------------------
+
+_ADVISORY_LINE_RE = re.compile(r"^\*\*Advisory:\*\*\s*(.+)$", re.MULTILINE)
+_GHSA_ID_RE = re.compile(r"GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}")
+_CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,}")
+
+
+def _extract_primary_references(vulnerability_text: str) -> dict:
+    """Extract GHSA/CVE identifiers already embedded in vulnerability_text.
+    Returns None for any field not found — file-mode input (a hand-written
+    vulnerability.md) has no guaranteed structure, so every field degrades
+    gracefully rather than assuming GHSA/CVE input.
+
+    'advisory_url' is constructed from the identifier using GitHub's/NVD's
+    well-known, stable URL convention — not fetched or independently
+    verified, and labeled as such by the caller.
+
+    Deliberately does not extract upstream fix/remediation references (e.g.
+    a "referenced commit" from the advisory's References list): those imply
+    the generated patch was informed by an existing upstream fix, which the
+    reviewer report must not suggest. That data has no place here at all —
+    not even computed-but-hidden — since nothing in this pipeline persists
+    it elsewhere; it belongs only in benchmark/evaluation artifacts, which
+    are produced and reviewed separately from this report.
+    """
+    text = vulnerability_text or ""
+
+    ghsa_id = None
+    cve_id = None
+    advisory_match = _ADVISORY_LINE_RE.search(text)
+    if advisory_match:
+        line = advisory_match.group(1)
+        m = _GHSA_ID_RE.search(line)
+        if m:
+            ghsa_id = m.group(0)
+        m = _CVE_ID_RE.search(line)
+        if m:
+            cve_id = m.group(0)
+    if not ghsa_id:
+        m = _GHSA_ID_RE.search(text)
+        if m:
+            ghsa_id = m.group(0)
+    if not cve_id:
+        m = _CVE_ID_RE.search(text)
+        if m:
+            cve_id = m.group(0)
+
+    advisory_url = None
+    if ghsa_id:
+        advisory_url = f"https://github.com/advisories/{ghsa_id}"
+    elif cve_id:
+        advisory_url = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
+
+    return {
+        "ghsa_id": ghsa_id,
+        "cve_id": cve_id,
+        "advisory_url": advisory_url,
+    }
+
+
+def _render_primary_references(refs: dict) -> str:
+    """Render the Vulnerability Sources section as a compact table (own
+    leading rule) — easier to scan than a bullet list.
+
+    Keeps only GHSA / CVE / Advisory URL, each linked where a URL is known.
+    Deliberately excludes any upstream fix/remediation reference — those
+    belong only in benchmark/evaluation artifacts, never in a reviewer
+    report, since showing them here could imply the generated patch was
+    copied from an existing upstream fix.
+
+    Degrades to a single line for file-mode input, where neither a GHSA nor
+    a CVE identifier is present in the vulnerability text at all.
+    """
+    ghsa_id = refs.get("ghsa_id")
+    cve_id = refs.get("cve_id")
+    advisory_url = refs.get("advisory_url")
+
+    lines: list[str] = ["---\n", "## Vulnerability Sources\n"]
+
+    if not ghsa_id and not cve_id:
+        lines.append("User-provided vulnerability description.\n")
+        return "\n".join(lines) + "\n"
+
+    ghsa_cell = f"[{ghsa_id}]({advisory_url})" if ghsa_id and advisory_url else (ghsa_id or "*(not applicable)*")
+    cve_url = advisory_url if (cve_id and not ghsa_id) else (f"https://nvd.nist.gov/vuln/detail/{cve_id}" if cve_id else None)
+    cve_cell = f"[{cve_id}]({cve_url})" if cve_id and cve_url else (cve_id or "*(not applicable / no associated CVE)*")
+    advisory_cell = f"[{advisory_url}]({advisory_url})" if advisory_url else "*(not stated in the advisory text)*"
+
+    lines.append("| Type | Value |")
+    lines.append("|---|---|")
+    lines.append(f"| GHSA | {ghsa_cell} |")
+    lines.append(f"| CVE | {cve_cell} |")
+    lines.append(f"| Advisory URL | {advisory_cell} |")
+    lines.append("")
+
+    if advisory_url:
+        lines.append("*Advisory URL is constructed from the identifier above, not independently fetched.*")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Repository Context (Repository Grounding, surfaced in the report)
+#
+# "Selected because" — one phrase per semantic reason kind. Literal lookup
+# only: does not change which reason kind a candidate carries.
+# ---------------------------------------------------------------------------
+_GROUNDING_REASON_PHRASES = {
+    "explicit_path": "Explicitly referenced in the security advisory",
+    "symbol_definition": "Defines the exact symbol named in the advisory",
+    "symbol_search": "References a symbol named in the advisory",
+    "cwe_keywords": "Contains terminology associated with this vulnerability type",
+}
+
+# "Used for" — one phrase per GroundingDecision.outcome. Literal lookup only:
+# does not change which outcome find_code_context() selects.
+_GROUNDING_USED_FOR_PHRASES = {
+    "primary_full_file": "Primary reference (full file)",
+    "primary_snippet": "Primary reference (excerpt)",
+    "secondary_snippet": "Supporting reference (excerpt)",
+}
+
+
+# ---------------------------------------------------------------------------
+# Adapter: the only place that understands Repository Grounding internals
+# (DiscoveryEvidence, best_tier, evidence ordering, tier matching, selection
+# mechanics). Everything downstream — the renderer included — sees only a
+# semantic reason kind (a key into _GROUNDING_REASON_PHRASES), never a
+# RepositoryCandidate's evidence list directly.
+# ---------------------------------------------------------------------------
+def _selected_reason_kind(candidate: "RepositoryCandidate | None") -> "str | None":
+    """Return the semantic reason kind that best explains why `candidate`
+    was selected: the DiscoveryEvidence.pass_name whose tier produced the
+    candidate's best_tier (the tier that actually drove ranking/selection).
+    Falls back to the first evidence entry's pass_name for class-definition-
+    supplement-only candidates, where best_tier is None by construction."""
+    if not candidate or not candidate.evidence:
+        return None
+    if candidate.best_tier is not None:
+        for e in candidate.evidence:
+            if e.tier == candidate.best_tier:
+                return e.pass_name
+    return candidate.evidence[0].pass_name
+
+
+def _render_repository_context_section(
+    grounding: "RepositoryGroundingResult | None", *, no_patch: bool = False,
+) -> str:
+    """Render the Repository Context section (own leading rule).
+
+    Shows only the repository locations find_code_context() actually
+    selected (decision.outcome != "rejected") — no candidate counts, no
+    rejected locations. None-safe: renders the zero-selection sentence when
+    grounding is None or nothing was selected. Preserves the order
+    grounding.decisions already comes in — no additional sorting.
+
+    `no_patch` (display only) swaps the intro sentence, which otherwise
+    refers to "the patch" and Post-Patch Investigation, for a NO PATCH
+    PRODUCED report.
+    """
+    lines: list[str] = ["---\n", "## Repository Context\n"]
+
+    selected = [d for d in (grounding.decisions if grounding else []) if d.outcome != "rejected"]
+    if not selected:
+        lines.append(
+            "No repository locations were identified to provide context for "
+            "this vulnerability.\n"
+        )
+        return "\n".join(lines) + "\n"
+
+    if no_patch:
+        lines.append(
+            "The following repository locations were selected to provide context "
+            "for remediation planning. No patch was produced from them.\n"
+        )
+    else:
+        lines.append(
+            "The following repository locations were selected to provide context "
+            "for patch generation and review. These locations were selected "
+            "**before** the patch was generated — for evidence gathered from the "
+            "final patch diff itself, see Post-Patch Investigation.\n"
+        )
+
+    candidates_by_path = {c.path: c for c in grounding.candidates}
+
+    entries = []
+    for dec in selected:
+        candidate = candidates_by_path.get(dec.path)
+        kind = _selected_reason_kind(candidate)
+        reason = _GROUNDING_REASON_PHRASES.get(kind, "Identified during repository grounding")
+        used_for = _GROUNDING_USED_FOR_PHRASES.get(dec.outcome, dec.outcome)
+        entries.append(
+            f"**`{dec.path}`**\n\nSelected because\n- {reason}\n\nUsed for\n- {used_for}"
+        )
+
+    lines.append("\n\n---\n\n".join(entries))
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _build_known_findings(classified_challenger: dict, finding_calibration: list[dict] | None = None) -> dict:
+    """Group already-classified challenger findings into report-facing
+    epistemic categories for the Known Findings section.
+
+    This reuses the five categories _classify_challenger already computes
+    (confirmed_defect / behavioral_defect / plausible_risk / validation_gap
+    / generic) — no new classification.
+
+      confirmed_defect  -> calibration-aware: stays in potential_remaining_
+                           risks only if calibration is missing (fail-closed
+                           default -- calibration didn't run, failed, or
+                           omitted this finding) or calibrated "Observed";
+                           a calibrated "Hypothesis" moves to
+                           validation_hypotheses and "Hardening" moves to
+                           future_hardening_ideas. This is the single
+                           authoritative post-calibration defect count: a
+                           finding calibration downgraded must not still
+                           read as a confirmed defect anywhere downstream
+                           (repair gate, Trust Signals, Recommendation) —
+                           see should_auto_repair/accept_repair below and
+                           _build_report's use of this function's output.
+                           `potential_remaining_risks`' LENGTH is read
+                           elsewhere as the authoritative, calibration-aware
+                           defect count Trust Signals/Recommendation Policy
+                           key off of -- confirmed_defect is the ONLY
+                           category that ever lands here; deliberately NOT
+                           widened to behavioral_defect (see below).
+      validation_gap    -> validation_gaps             ("things we did not verify")
+      plausible_risk,
+      generic,
+      behavioral_defect -> split three ways by the finding_calibration stage
+                           (evidence-quality pass): observed_implementation_notes,
+                           validation_hypotheses, future_hardening_ideas.
+                           behavioral_defect (run-4 Architecture B) is
+                           grouped with plausible_risk/generic here, NOT
+                           with confirmed_defect above -- it must be
+                           REPAIR-eligible (see should_auto_repair/
+                           accept_repair, which DO treat it identically to
+                           confirmed_defect) without also being counted
+                           toward `potential_remaining_risks`' length,
+                           which Trust Signals/Recommendation Policy read
+                           and which this feature is explicitly scoped to
+                           leave untouched. An uncalibrated behavioral_defect
+                           defaults to the SAME "hypothesis" bucket
+                           plausible_risk defaults to (not generic's
+                           "hardening" default) -- a concrete, unhedged
+                           behavior-change finding is closer in severity to
+                           an unverified risk than to an unrelated
+                           suggestion.
+
+    finding_calibration is the (optional) output of
+    finding_calibration.calibrate_findings — a list of {"original", "group",
+    "reworded"} dicts. Historically this covered only the plausible_risk/
+    generic findings; it may now also cover confirmed_defect findings (see
+    pipeline.run()'s repair loop). When a finding has no matching
+    calibration entry (calibration wasn't run, or failed, or omitted this
+    specific finding), it falls back to a conservative default rather than
+    being dropped: confirmed_defect stays a confirmed defect (fail-closed —
+    uncertainty must never look like clearance), plausible_risk and
+    behavioral_defect -> Validation Hypotheses (already a hedge), generic ->
+    Future Hardening Ideas (already a suggestion) — the same mapping this
+    project used before calibration existed, so a calibration failure
+    degrades to prior behavior rather than losing information.
+
+    Returns a plain dict of five lists so the renderer (and tests) can
+    address each category directly. Rendering/suppression decisions (e.g.
+    whether an empty category renders at all) belong to the caller, not here.
+    """
+    all_findings = (
+        list(classified_challenger.get("classified_edge_cases") or [])
+        + list(classified_challenger.get("classified_potential_issues") or [])
+    )
+
+    calibration_by_original = {
+        entry.get("original"): entry for entry in _usable_calibration_entries(finding_calibration)
+    }
+
+    potential_remaining_risks: list[str] = []
+    validation_gaps: list[str] = []
+    observed_implementation_notes: list[str] = []
+    validation_hypotheses: list[str] = []
+    future_hardening_ideas: list[str] = []
+
+    for f in all_findings:
+        if f["category"] == "validation_gap":
+            if len(validation_gaps) < 3:
+                validation_gaps.append(f["text"])
+            continue
+
+        if f["category"] == "confirmed_defect":
+            # This is the report-facing (caution-biased) fail-closed default:
+            # a confirmed_defect finding with NO calibration entry stays
+            # displayed as a confirmed defect, since we cannot say it was
+            # cleared. This is intentionally NOT the same threshold
+            # should_auto_repair/accept_repair use to authorize a mutation
+            # (they require an *explicit* "observed" entry, and treat a
+            # missing entry as insufficient to act on) -- reporting caution
+            # and mutation permission are different questions with
+            # different safe defaults; see the "Deterministic repair gate"
+            # section below for that distinction spelled out.
+            entry = calibration_by_original.get(f["text"])
+            if entry is None:
+                potential_remaining_risks.append(f["text"])
+                continue
+            group = entry.get("group")
+            text = entry.get("reworded") or f["text"]
+            if group == "observed":
+                potential_remaining_risks.append(text)
+            elif group == "hardening":
+                future_hardening_ideas.append(text)
+            else:
+                # "hypothesis", or any unparseable/unexpected group value --
+                # calibrate_findings itself already defaults an unparseable
+                # group to "hypothesis" (its own most epistemically humble
+                # fallback), so this mirrors that choice rather than
+                # inventing a new one.
+                validation_hypotheses.append(text)
+            continue
+
+        if f["category"] not in ("plausible_risk", "generic", "behavioral_defect"):
+            continue
+        entry = calibration_by_original.get(f["text"])
+        if entry and entry.get("reworded"):
+            group = entry.get("group")
+            text = entry["reworded"]
+        else:
+            # behavioral_defect (run-4 Architecture B) defaults to the SAME
+            # "hypothesis" bucket plausible_risk defaults to -- see this
+            # function's own docstring for why it is grouped here with
+            # plausible_risk/generic rather than with confirmed_defect
+            # above, and why an uncalibrated one leans toward "needs
+            # verification" rather than generic's "unrelated suggestion".
+            group = "hypothesis" if f["category"] in ("plausible_risk", "behavioral_defect") else "hardening"
+            text = f["text"]
+
+        if group == "observed":
+            observed_implementation_notes.append(text)
+        elif group == "hardening":
+            future_hardening_ideas.append(text)
+        else:
+            validation_hypotheses.append(text)
+
+    return {
+        "potential_remaining_risks": potential_remaining_risks,
+        "validation_gaps": validation_gaps,
+        "observed_implementation_notes": observed_implementation_notes,
+        "validation_hypotheses": validation_hypotheses,
+        "future_hardening_ideas": future_hardening_ideas,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Deterministic repair gate
+#
+# should_auto_repair / accept_repair are pure functions: no LLM calls, no
+# prose inspection, structured input only (already-computed classification +
+# calibration dicts). This is deterministic *policy evaluation* over that
+# input, not deterministic *end-to-end authorization* -- one of the inputs
+# (Finding Calibration's group label) is itself LLM-derived, so the overall
+# authorization outcome can still vary across otherwise-identical runs if
+# Calibration returns a different group for the same finding. What these
+# functions guarantee is narrower and still real: given fixed classification
+# + calibration input, the decision is always the same.
+#
+# Note this uses a DIFFERENT, stricter threshold than _build_known_findings'
+# report-facing "potential_remaining_risks" bucket. _build_known_findings
+# fails closed toward caution for the reader: a confirmed_defect finding
+# with no calibration entry stays displayed as a defect, since silently
+# clearing it would be worse than over-flagging it. The gates below fail
+# closed toward inaction for mutation: a confirmed_defect finding with no
+# calibration entry must NOT authorize (or accept) a mutation, since acting
+# on unverified evidence is worse than not acting. Both defaults are
+# "uncertainty never helps the riskier outcome" -- they just disagree on
+# which outcome (flag it / mutate it) is the riskier one for their own
+# question, so they intentionally use two different thresholds over the
+# same underlying calibration data rather than one shared one.
+# ---------------------------------------------------------------------------
+
+
+_REPAIR_ELIGIBLE_CATEGORIES = ("confirmed_defect", "behavioral_defect")
+"""The only two _classify_finding categories should_auto_repair/
+accept_repair ever consider. `behavioral_defect` (run-4 Architecture B) is
+held to the EXACT SAME epistemic bar as `confirmed_defect` -- both require
+an explicit Finding Calibration "observed" entry before authorizing/
+accepting a mutation; a behavioral_defect finding calibrated Hypothesis or
+Hardening never authorizes repair, identically to a confirmed_defect
+finding calibrated that way. `plausible_risk`, `validation_gap`, and
+`generic` remain entirely outside this mechanism, unchanged -- adding
+`behavioral_defect` narrows which findings can land in those three
+categories (see _classify_finding's own priority ordering) but does not
+change what happens to a finding that still lands in one of them."""
+
+
+def _repair_eligible_calibration_entries(
+    classified_challenger: dict, finding_calibration: list[dict] | None,
+) -> list[tuple[str, dict | None]]:
+    """(finding_text, calibration_entry_or_None) for every raw finding in
+    classified_challenger whose category is in _REPAIR_ELIGIBLE_CATEGORIES.
+
+    The single lookup should_auto_repair and accept_repair both key off of,
+    so "which calibration entry belongs to which repair-eligible finding"
+    is decided in exactly one place. Renamed from
+    `_confirmed_defect_calibration_entries` when `behavioral_defect` was
+    added as a second repair-eligible category -- identical shape and
+    semantics, just no longer confirmed_defect-only.
+    """
+    calibration_by_original = {
+        entry.get("original"): entry for entry in _usable_calibration_entries(finding_calibration)
+    }
+    all_findings = (
+        list(classified_challenger.get("classified_edge_cases") or [])
+        + list(classified_challenger.get("classified_potential_issues") or [])
+    )
+    return [
+        (f["text"], calibration_by_original.get(f["text"]))
+        for f in all_findings
+        if f["category"] in _REPAIR_ELIGIBLE_CATEGORIES
+    ]
+
+
+def should_auto_repair(
+    classified_challenger: dict,
+    finding_calibration: list[dict] | None,
+    applicable: bool,
+) -> bool:
+    """v1 repair-authorization gate.
+
+    Automatic repair is allowed only when ALL of:
+      1. the current patch applies
+      2. at least one finding is raw-classified confirmed_defect OR
+         behavioral_defect (see _REPAIR_ELIGIBLE_CATEGORIES)
+      3. that SAME finding has an explicit Finding Calibration entry whose
+         group is "observed"
+
+    Anything else must NOT authorize a mutation: a finding calibrated
+    Hypothesis or Hardening, a plausible_risk/validation_gap/generic
+    finding (never considered here at all), a repair-eligible finding
+    calibration produced no entry for (missing calibration for that
+    finding), or calibration failing outright (finding_calibration is
+    None/empty) -- none of these satisfy condition 3, so none authorize
+    repair. Uncertainty may increase report caution (see
+    _build_known_findings) but must never increase permission to mutate
+    code. behavioral_defect (run-4 Architecture B) shares this exact gate
+    with confirmed_defect rather than having its own, separate threshold --
+    a concrete, patch-caused behavior change is held to the identical
+    "observed, not merely hypothesized" bar before it can trigger a
+    mutation.
+    """
+    if not applicable or not finding_calibration:
+        return False
+    for _text, entry in _repair_eligible_calibration_entries(classified_challenger, finding_calibration):
+        if entry is not None and entry.get("group") == "observed":
+            return True
+    return False
+
+
+def accept_repair(
+    classified_challenger_v2: dict,
+    finding_calibration_v2: list[dict] | None,
+    applicable: bool,
+    *,
+    original_still_vulnerable: bool = False,
+) -> bool:
+    """v2 acceptance gate -- symmetric with should_auto_repair, applied to
+    the repaired patch's own (freshly re-challenged, freshly calibrated)
+    finding state instead of the pre-repair state.
+
+    v2 replaces v1 only when v2 applies AND, for every raw repair-eligible
+    (confirmed_defect OR behavioral_defect) finding v2's own Challenger
+    raised, calibration explicitly places it outside "observed" (Hypothesis
+    or Hardening). If v2 has no raw repair-eligible finding at all, there
+    is nothing to gate on and v2 is accepted on applicability alone
+    (unchanged from the pre-calibration zero-tolerance check this
+    replaces). Anything else -- v2 does not apply, a repair-eligible
+    finding has no calibration entry at all (cannot verify it was
+    cleared), or a repair-eligible finding explicitly calibrates "observed"
+    -- rejects v2 and leaves v1 in place: fail closed, preserving the
+    safer prior state, at most once, never a second repair attempt.
+
+    Critically symmetric across categories: v2 is NOT accepted merely
+    because the ORIGINAL confirmed_defect (or behavioral_defect) finding
+    that triggered should_auto_repair disappeared, if v2's own Challenger
+    raises a DIFFERENT concrete confirmed_defect or behavioral_defect
+    finding that still calibrates "observed" -- `entries` here is v2's own,
+    freshly-computed finding set, never the v1 finding that triggered the
+    repair, so a patch that fixes one repair-eligible finding while
+    introducing (or leaving behind) another one of either category is
+    still rejected.
+
+    `original_still_vulnerable`: v1's own Challenger `still_vulnerable`
+    verdict, checked directly -- never routed through classification/
+    calibration, because it is already a structured Challenger result, not
+    a free-text finding needing that interpretation layer. Monotonicity
+    gate, applied BEFORE the calibration-based logic above: if v1 was
+    `still_vulnerable=False` and v2's own Challenger says
+    `still_vulnerable=True`, v2 is rejected outright regardless of what its
+    classified/calibrated findings say -- a repair must never trade
+    security completeness for behavioral preservation. This is
+    deliberately NOT an unconditional "reject any still_vulnerable=True
+    v2": when v1 was ALSO `still_vulnerable=True`, v2 may still represent
+    a genuine improvement, so this check does not fire and the existing
+    calibration-based logic decides alone, exactly as before this
+    parameter existed. `original_still_vulnerable=False` (the default)
+    preserves prior behavior for any caller that hasn't been updated to
+    pass it.
+    """
+    if not applicable:
+        return False
+    if classified_challenger_v2.get("still_vulnerable") and not original_still_vulnerable:
+        return False
+    entries = _repair_eligible_calibration_entries(classified_challenger_v2, finding_calibration_v2)
+    if not entries:
+        return True
+    for _text, entry in entries:
+        if entry is None or entry.get("group") == "observed":
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Recommendation Policy Invariants
+#
+# _compute_trust_signals and _build_recommendation_v1 below implement these
+# invariants. Every branch in both functions must be traceable to one of
+# them by its inline `# In` tag — a branch with no tag, or one that
+# contradicts its tag, is a policy bug. Do not add a fallthrough branch
+# that isn't justified here first.
+#
+# State model
+#   applicability        ∈ {APPLIES, REJECTED, UNAVAILABLE}
+#     UNAVAILABLE = applicable is None. Subsumes pre-flight skip (no repo,
+#     no .git, empty diff, git missing), subprocess timeout, and unexpected
+#     exception — these are policy-equivalent (only their notes/reason text
+#     differs); none may be distinguished from another when deciding a
+#     signal value.
+#   impact_level          ∈ {low, medium, high, not_applicable, unavailable}
+#     unavailable = impact analysis raised and was swallowed (result.impact
+#     is None) — distinct from, and never conflated with, a genuine "low"
+#     result.
+#   patch_integrity        ∈ {Clean, Minor Issues, Not Verified,
+#                              Does Not Apply, Critical Issues}
+#   security_improvement   ∈ {None, Unknown, Low, Medium, High}
+#   deployment_safety       ∈ {Low Risk, Medium Risk, High Risk, Not Verified}
+#
+# I1 — No positive inference from missing applicability evidence.
+#      UNAVAILABLE applicability maps to patch_integrity=Not Verified and
+#      security_improvement=Unknown — never to Clean/Does Not Apply, and
+#      never to Low/Medium/High. Holds identically for skip, timeout, and
+#      exception.
+#
+# I2 — No positive inference from missing impact evidence.
+#      impact_level ∈ {not_applicable, unavailable} maps to
+#      deployment_safety=Not Verified — never to Low Risk.
+#
+# I3 — Deploy After Validation requires positive evidence on every
+#      mandatory gate, expressed as an explicit whitelist, never as a
+#      "not-the-bad-value" blacklist, and never inferred from "didn't hit
+#      the hard-block gate" — absence of a block is not evidence of a
+#      verified-clean state. It requires ALL of:
+#        integrity              == Clean          (exactly — see below)
+#        alignment               != Misaligned
+#        NOT (still_vulnerable AND defect_count == 0)
+#        security_improvement   IN {High, Medium}
+#        deployment_safety       IN {Low Risk, Medium Risk}
+#      "Minor Issues" is deliberately excluded from the integrity allowlist:
+#      it reports an actual observed hygiene defect in the patch (currently
+#      only "unused_import" — a real, if low-severity, code-quality problem,
+#      not a missing-evidence placeholder), and the report itself already
+#      renders it as "⚠️ Needs review", never "✅ Good" — so treating it as
+#      verified-positive here would contradict what the system already tells
+#      the reader. Every condition above must be spelled out as an explicit
+#      membership test against known-good values. A condition shaped as
+#      `x != BAD_VALUE` is a policy bug by construction — it silently admits
+#      Unknown/Not Verified/any future value. New signal values default to
+#      Manual Review Required until explicitly added to a whitelist here.
+#
+# I4 — Do Not Apply requires explicit, deterministic negative evidence only
+#      (git-apply / hygiene via patch_integrity) — never from heuristic
+#      challenger findings alone.
+#
+# I5 — Inconclusive evidence defaults to Manual Review Required. Any state
+#      not explicitly covered by I3 or I4 — including Unknown, Not
+#      Verified, still_vulnerable-with-no-confirmed-defect, and
+#      Misaligned — resolves to Manual Review Required. No silent default
+#      resolves to a stronger decision than the evidence supports.
+#
+# I6 — Never communicate more certainty than the evidence supports.
+#      Not Verified / Unknown / None are always weaker than their positive
+#      counterparts and never appear in a positive whitelist.
+# ---------------------------------------------------------------------------
+
+
+def _applicability_unavailable_reason(applicability: dict) -> str | None:
+    """Returns a human-readable reason when applicability is UNAVAILABLE
+    (applicable is None — covers skip, timeout, and unexpected exception
+    identically per I1), else None.
+    """
+    if applicability.get("applicable") is not None:
+        return None
+    return (
+        applicability.get("skipped_reason")
+        or applicability.get("error")
+        or "applicability check did not complete"
+    )
+
+
+def _resolve_impact_level(impact: dict | None) -> str:
+    """Map a (possibly absent) impact-analysis result to an impact_level
+    string. `impact is None` means the analysis raised and was swallowed
+    (see pipeline.run()'s impact-analysis try/except) — that is distinct
+    from, and must never be read as, a genuine "low" result (I2).
+    """
+    if impact is None:
+        return "unavailable"
+    # RB-3: a result without a level established nothing -- never "low".
+    return impact.get("impact_level") or "unavailable"
+
+
+# Structured Challenger (`Concerns:` schema) report semantics. Display only:
+# these helpers read the already-computed, deterministic per-concern
+# `consequence` that patch_challenger attached to each concern -- they never
+# re-derive a consequence, never read a concern's free text, and are never
+# read by any `*_val` signal value, the I1-I6 gates, or a decision branch.
+# Under this schema BLOCKING means only that a concern's citation-checked,
+# model-reported facts met the deterministic blocking rule; the facts' own
+# semantic correctness is model judgment and is never independently
+# verified, so nothing derived from these helpers may describe it as a
+# verified defect or bypass.
+_STRUCTURED_CHALLENGER_SCHEMAS = ("concerns_v1", "concerns_v2")
+
+
+def _is_structured_challenger(challenger: dict | None) -> bool:
+    return (challenger or {}).get("schema_version") in _STRUCTURED_CHALLENGER_SCHEMAS
+
+
+def _structured_concern_counts(challenger: dict | None) -> dict:
+    """Count structured concerns by deterministic consequence. An absent or
+    unrecognized consequence counts as UNRESOLVED (fail closed, matching
+    patch_challenger's own malformed-concern default)."""
+    counts = {"BLOCKING": 0, "UNRESOLVED": 0, "NON_BLOCKING": 0}
+    for concern in (challenger or {}).get("concerns") or []:
+        consequence = (concern or {}).get("consequence")
+        counts[consequence if consequence in counts else "UNRESOLVED"] += 1
+    return counts
+
+
+def _describe_structured_concern_counts(counts: dict) -> str:
+    total = sum(counts.values())
+    return (
+        f"{counts['BLOCKING']} blocking · {counts['UNRESOLVED']} unresolved · "
+        f"{counts['NON_BLOCKING']} non-blocking of {total} structured Challenger concern(s)"
+    )
+
+
+# Notes text (display only) for the "adversarial review did not leave the
+# vulnerability open" branch of security_improvement/remediation_alignment.
+# Release polish: an LLM adversarial review can fail to find a problem; it
+# cannot confirm a fix, so this states what was observed and its epistemic
+# status rather than "confirms fix approach".
+_NO_OPEN_ADVERSARIAL_CONCERN_NOTES = (
+    "No blocking or unresolved adversarial concern "
+    "(heuristic review; not independent verification)"
+)
+
+
+def _challenger_still_vulnerable(challenger: "dict | None") -> bool:
+    """Only an explicit `still_vulnerable is False` reads as "not still
+    vulnerable" -- a missing or non-boolean value (an older persisted
+    artifact, a hand-built dict) is never the favorable reading."""
+    return (challenger or {}).get("still_vulnerable") is not False
+
+
+def _compute_trust_signals(
+    hygiene: list | None,
+    applicability: dict | None,
+    classified_challenger: dict,
+    testing_rating: str,
+    impact_level: str,
+) -> dict:
+    """Compute the six Trust Package signals from existing deterministic pipeline outputs.
+
+    Returns a dict mapping signal keys to {value, label, notes} dicts.
+    All logic is deterministic — no LLM score is used. See the Recommendation
+    Policy Invariants block above; each branch below is tagged with the
+    invariant it exists to satisfy.
+    """
+    hygiene = hygiene or []
+    applicability = applicability or {}
+    impact_level = (impact_level or "unavailable").lower()  # RB-3: absent is not "low"
+
+    high_hygiene = [h for h in hygiene if h.get("severity") == "HIGH"]
+    med_hygiene = [h for h in hygiene if h.get("severity") == "MEDIUM"]
+
+    defect_count = classified_challenger.get("confirmed_defect_count", 0)
+    risk_count = classified_challenger.get("plausible_risk_count", 0)
+    gap_count = classified_challenger.get("validation_gap_count", 0)
+    still_vulnerable = _challenger_still_vulnerable(classified_challenger)
+    # Authoritative tri-state signal (patch_challenger.VERIFICATION_STATUSES),
+    # or None for a pre-existing/legacy/unclassified challenger dict -- used
+    # ONLY to pick accurate notes text below (never int_val/imp_val/aln_val,
+    # and never any I1-I6-tagged branch condition), so a dict that predates
+    # this field, or one where the model's answer couldn't be classified,
+    # renders EXACTLY the same notes text as before this field existed.
+    verification_status = (classified_challenger or {}).get("verification_status")
+    # Structured (`Concerns:` schema) responses: per-consequence counts, used
+    # ONLY to pick notes text and coverage_confidence's display value below
+    # -- never int_val/imp_val/aln_val or any I1-I6-tagged condition. A
+    # legacy dict (no `schema_version`) takes exactly the pre-existing text.
+    structured = _is_structured_challenger(classified_challenger)
+    concern_counts = _structured_concern_counts(classified_challenger) if structured else None
+    if structured:
+        structured_residual_notes = (
+            f"{concern_counts['BLOCKING']} of {sum(concern_counts.values())} structured "
+            "Challenger concern(s) met the deterministic blocking rule from citation-checked, "
+            "model-reported facts; not independently verified"
+        )
+
+    # --- Patch Integrity ---
+    _unavailable_reason = _applicability_unavailable_reason(applicability)
+    if high_hygiene:
+        int_val = "Critical Issues"  # I4: deterministic negative evidence
+        int_notes = f"HIGH: {high_hygiene[0].get('detail', '')[:80]}"
+    elif applicability.get("applicable") is False:
+        int_val = "Does Not Apply"  # I4: deterministic negative evidence
+        stderr = (applicability.get("stderr") or "").replace("\n", " ")[:60]
+        int_notes = stderr if stderr else "rejected by git apply"
+    elif _unavailable_reason is not None:
+        int_val = "Not Verified"  # I1: UNAVAILABLE never reads as positive
+        int_notes = _unavailable_reason
+    elif med_hygiene:
+        int_val = "Minor Issues"
+        int_notes = f"MEDIUM: {med_hygiene[0].get('detail', '')[:80]}"
+    else:
+        int_val = "Clean"
+        int_notes = "Applies cleanly · no hygiene issues"
+
+    # --- Security Improvement (fully deterministic, no LLM score) ---
+    if applicability.get("applicable") is False:
+        imp_val = "None"
+        imp_notes = "Patch does not apply to repository"
+    elif _unavailable_reason is not None:
+        imp_val = "Unknown"  # I1: UNAVAILABLE never reads as High/Medium/Low
+        imp_notes = _unavailable_reason
+    elif high_hygiene:
+        imp_val = "Low"
+        imp_notes = "Critical hygiene issue — patch may be a no-op"
+    elif defect_count > 0:
+        imp_val = "Low"
+        imp_notes = f"{defect_count} review finding(s) flagged as high-confidence heuristic risk"
+    elif not still_vulnerable:
+        imp_val = "High"
+        imp_notes = _NO_OPEN_ADVERSARIAL_CONCERN_NOTES
+    elif still_vulnerable and risk_count == 0:
+        # still_vulnerable=True but only due to validation gaps, not high-confidence findings
+        imp_val = "High"
+        if verification_status == "RESIDUAL_VULNERABILITY" and structured:
+            imp_notes = structured_residual_notes
+        elif verification_status == "RESIDUAL_VULNERABILITY":
+            imp_notes = "Adversarial review identified a concrete residual vulnerability; not corroborated by a separately confirmed defect"
+        elif verification_status == "INSUFFICIENT_EVIDENCE":
+            imp_notes = "Available evidence is insufficient to verify the fix; no residual vulnerability has been demonstrated"
+        else:  # None (pre-existing/legacy/unclassified) -- exact pre-change text
+            imp_notes = f"No high-confidence heuristic risk identified · {gap_count} verification gap(s)"
+    else:
+        imp_val = "Medium"
+        total = risk_count + gap_count
+        imp_notes = f"No high-confidence heuristic risk identified · {total} review finding(s) remain open"
+
+    # --- Remediation Alignment ---
+    if defect_count > 0:
+        aln_val = "Misaligned"
+        aln_notes = "Confirmed alternate exploit path identified"
+    elif not still_vulnerable:
+        aln_val = "Aligned"
+        aln_notes = _NO_OPEN_ADVERSARIAL_CONCERN_NOTES
+    elif still_vulnerable and risk_count == 0:
+        aln_val = "Likely Aligned"
+        if verification_status == "RESIDUAL_VULNERABILITY" and structured:
+            aln_notes = structured_residual_notes
+        elif verification_status == "RESIDUAL_VULNERABILITY":
+            aln_notes = "Adversarial review identified a concrete residual vulnerability; not corroborated by a separately confirmed defect"
+        elif verification_status == "INSUFFICIENT_EVIDENCE":
+            aln_notes = "Available evidence is insufficient to verify the fix; no residual vulnerability has been demonstrated"
+        else:  # None (pre-existing/legacy/unclassified) -- exact pre-change text
+            aln_notes = "Correct mechanism · runtime verification pending"
+    else:
+        aln_val = "Partial"
+        aln_notes = f"still_vulnerable flag set · {risk_count} plausible risk(s)"
+
+    # --- Coverage Confidence ---
+    if defect_count > 0:
+        cov_val = "Low"
+        cov_notes = f"{defect_count} review finding(s) flagged as high-confidence heuristic risk"
+    elif structured:
+        # Structured responses carry no legacy lexical findings, so the
+        # lexical counts below are always 0 for them and would read "No gaps
+        # identified" over BLOCKING/UNRESOLVED concerns. Use the already-
+        # computed per-concern consequences instead. BLOCKING renders as
+        # "Medium" (⚠️ Needs review), never "Low" (❌ Blocked): it is a
+        # deterministic classification of model-reported facts, not a
+        # verified defect. Display only -- no gate reads coverage_confidence.
+        total_concerns = sum(concern_counts.values())
+        if concern_counts["BLOCKING"] or concern_counts["UNRESOLVED"]:
+            cov_val = "Medium"
+            cov_notes = (
+                f"{_describe_structured_concern_counts(concern_counts)}; consequences are "
+                "deterministic classifications of citation-checked, model-reported facts, "
+                "not independent verification"
+            )
+        elif total_concerns and verification_status == "VERIFIED_FIXED":
+            cov_val = "High"
+            cov_notes = f"All {total_concerns} structured Challenger concern(s) classified non-blocking"
+        elif total_concerns and classified_challenger.get("verdict_conflict"):
+            # All NON_BLOCKING, but the response contradicted itself (see
+            # patch_challenger._self_contradiction) and failed closed.
+            cov_val = "Medium"
+            cov_notes = (
+                f"All {total_concerns} structured Challenger concern(s) classified non-blocking, "
+                f"but {classified_challenger['verdict_conflict']}, so the review failed closed"
+            )
+        elif total_concerns:
+            # All NON_BLOCKING, but the run-level structural gates failed
+            # closed (see patch_challenger._derive_status_from_concerns).
+            cov_val = "Medium"
+            cov_notes = (
+                f"All {total_concerns} structured Challenger concern(s) classified non-blocking, "
+                "but the structured response failed a structural check and the review failed closed"
+            )
+        else:
+            cov_val = "Medium"
+            cov_notes = "No structured Challenger concern was reported; the review failed closed"
+    elif risk_count > 0 or gap_count > 0:
+        total = risk_count + gap_count
+        cov_val = "Medium"
+        # Release-polish: labeled "before evidence calibration" because this
+        # total (plausible_risk_count + validation_gap_count) is the raw
+        # Challenger classification — some of these same findings are later
+        # split by finding_calibration into Observed/Hypothesis/Hardening
+        # for Review Results, so this number and the calibrated
+        # decision-relevant count shown in Recommendation legitimately
+        # differ; see _describe_decision_relevant_findings.
+        cov_notes = (
+            f"{total} raw review concern(s) recorded before evidence calibration — "
+            "no deterministic blocker identified; none rose to a confirmed, "
+            "high-confidence defect during adversarial review"
+        )
+    else:
+        cov_val = "High"
+        cov_notes = "No gaps identified by adversarial analysis"
+
+    # --- Test Availability (replaces Validation Evidence) ---
+    if testing_rating in ("Good", "Some"):
+        tst_val = "Tests Available"
+        tst_notes = f"{testing_rating} — related test files found by file name (not run; coverage not measured)"
+    elif testing_rating == "Not Applicable":
+        tst_val = "Not Verified"
+        tst_notes = "Test discovery is not supported for this language yet"
+    elif testing_rating == "Not Verified":
+        tst_val = "Not Verified"
+        tst_notes = "No repository root was provided"
+    else:
+        tst_val = "No Tests Found"
+        tst_notes = "No related test files found by file name"
+
+    # --- Deployment Safety ---
+    # I2: "Low Risk" is only reached for the explicit, genuine "low" value.
+    # Every other impact_level — including "not_applicable" (language
+    # guardrail skipped symbol/usage analysis) and "unavailable" (impact
+    # analysis raised and was swallowed), and any unrecognized/malformed
+    # value — falls to the final "Not Verified" branch rather than to a
+    # reassuring default. Whitelist, not blacklist: only genuinely observed
+    # levels earn a Low/Medium/High Risk label.
+    if impact_level == "high" or high_hygiene:
+        saf_val = "High Risk"
+        saf_notes = f"{impact_level.upper()} impact surface"
+    elif impact_level == "medium":
+        saf_val = "Medium Risk"
+        saf_notes = "Moderate impact surface"
+    elif impact_level == "low":
+        saf_val = "Low Risk"
+        saf_notes = "Localized change · small static impact surface"
+    elif impact_level == "not_applicable":
+        saf_val = "Not Verified"  # I2
+        saf_notes = "Impact analysis is not supported for this language yet"
+    else:
+        saf_val = "Not Verified"  # I2: covers "unavailable" and any unrecognized value
+        saf_notes = "Impact analysis did not complete or returned an unrecognized result"
+
+    # Icon mapping
+    _icons = {
+        "Clean": "✓", "High": "✓", "Aligned": "✓", "Low Risk": "✓",
+        "Likely Aligned": "◑", "Medium": "◑", "Partial": "◑",
+        "Medium Risk": "◑", "Tests Available": "◑", "Minor Issues": "⚠",
+        "Low": "⚠", "No Tests Found": "○",
+        "Critical Issues": "✗", "Does Not Apply": "✗", "Misaligned": "✗",
+        "High Risk": "✗", "None": "✗", "Unknown": "?", "Not Verified": "?",
+    }
+
+    def _label(val: str) -> str:
+        return f"{_icons.get(val, '')} {val}".strip()
+
+    return {
+        "patch_integrity":       {"value": int_val, "label": _label(int_val), "notes": int_notes},
+        "security_improvement":  {"value": imp_val, "label": _label(imp_val), "notes": imp_notes},
+        "remediation_alignment": {"value": aln_val, "label": _label(aln_val), "notes": aln_notes},
+        "coverage_confidence":   {"value": cov_val, "label": _label(cov_val), "notes": cov_notes},
+        "test_availability":     {"value": tst_val, "label": _label(tst_val), "notes": tst_notes},
+        "deployment_safety":     {"value": saf_val, "label": _label(saf_val), "notes": saf_notes},
+    }
+
+
+# I3: the only signal values a mandatory gate may treat as positive
+# evidence. Named and centralized so each gate is a membership test against
+# a whitelist, never a `!= BAD_VALUE` blacklist that silently admits
+# Unknown/Not Verified/any future value.
+#
+# _POSITIVE_INTEGRITY is deliberately {"Clean"} only — "Minor Issues" means
+# _compute_trust_signals found a real hygiene defect (currently only
+# "unused_import"), not a verified-clean patch; it is excluded even though
+# it does not hard-block via _BLOCKING_INTEGRITY. Not-blocked is not the
+# same claim as positive-evidence; see I3 above _compute_trust_signals.
+_POSITIVE_INTEGRITY = frozenset({"Clean"})
+_POSITIVE_IMPROVEMENT = frozenset({"High", "Medium"})
+_POSITIVE_SAFETY = frozenset({"Low Risk", "Medium Risk"})
+_BLOCKING_INTEGRITY = frozenset({"Does Not Apply", "Critical Issues"})
+
+# Release-polish (report explainability): human-readable label for each of
+# I3's three positive-whitelist axes, and that axis's own whitelist, keyed
+# identically. Used only to name — in the Recommendation `reason` — which
+# already-computed Trust Signal(s) failed I3, and to quote that signal's own
+# `notes`. Never changes which axis is checked (these ARE the exact three
+# frozensets I3 itself tests, not new ones) and never reads Review Results.
+_GATE_AXIS_LABELS = {
+    "patch_integrity": "Patch integrity",
+    "security_improvement": "Security improvement",
+    "deployment_safety": "Deployment risk",
+}
+_POSITIVE_SETS_BY_AXIS = {
+    "patch_integrity": _POSITIVE_INTEGRITY,
+    "security_improvement": _POSITIVE_IMPROVEMENT,
+    "deployment_safety": _POSITIVE_SAFETY,
+}
+# Presentation only: (axis, value) pairs that mean the pipeline assessed the
+# axis and the result was adverse, as opposed to not establishing it at all
+# (Not Verified/Unknown keep the "could not be verified" wording).
+_GATE_ASSESSED_ADVERSE_PHRASES = {
+    ("patch_integrity", "Minor Issues"): "Patch integrity has minor hygiene issues",
+    ("security_improvement", "Low"): "Security improvement was assessed as low",
+    ("security_improvement", "None"): "No security improvement was established",
+    ("deployment_safety", "High Risk"): "Deployment risk was assessed as high",
+}
+
+
+def _describe_unmet_gates(signals: dict) -> str:
+    """One sentence per I3 axis whose current value is not in that axis's
+    own positive whitelist, reusing that axis's already-computed `notes`.
+
+    Deterministic and mechanical: iterates the exact three axes I3 checks,
+    in a fixed order, and does nothing beyond a membership test against the
+    same frozensets I3 itself uses — it never inspects Review Results, never
+    picks "the most important finding", and never introduces a new signal
+    or heuristic. Returns "" when every I3 axis is already positive (not
+    expected for a non-Green decision, but never raises if it happens).
+    """
+    sentences: list[str] = []
+    for axis in ("patch_integrity", "security_improvement", "deployment_safety"):
+        value = signals[axis]["value"]
+        if value in _POSITIVE_SETS_BY_AXIS[axis]:
+            continue
+        label = _GATE_AXIS_LABELS[axis]
+        notes = (signals[axis].get("notes") or "").strip().rstrip(".")
+        # Release polish: a value the pipeline actually assessed as adverse
+        # (e.g. deployment_safety="High Risk" from a HIGH impact surface)
+        # was verified, just not favorably -- "could not be verified" is
+        # reserved for values that genuinely were not established.
+        assessed = _GATE_ASSESSED_ADVERSE_PHRASES.get((axis, value))
+        if assessed:
+            sentences.append(f"{assessed} ({notes})." if notes else f"{assessed}.")
+        elif notes:
+            # Lowercase only a genuine sentence-initial capital, not an
+            # acronym/all-caps lead word (e.g. "HIGH impact surface" or
+            # "MEDIUM: unused_import" must stay as-is).
+            first_word = notes.split(" ", 1)[0]
+            is_acronym_lead = len(first_word) > 1 and first_word.isupper()
+            if notes[:1].isupper() and not is_acronym_lead:
+                notes_lc = notes[0].lower() + notes[1:]
+            else:
+                notes_lc = notes
+            sentences.append(f"{label} could not be verified because {notes_lc}.")
+        else:
+            sentences.append(f"{label} could not be verified.")
+    return " ".join(sentences)
+
+
+def _build_recommendation_v1(
+    signals: dict,
+    still_vulnerable: bool = False,
+    defect_count: int = 0,
+    verification_status: "str | None" = None,
+    *,
+    structured_challenger: bool = False,
+) -> dict:
+    """Produce a Trust Package recommendation from the six trust signals.
+
+    Returns {decision: str, reason: str}.  Decisions use the new V1 vocabulary:
+    'Deploy After Validation' | 'Deploy With Caution' | 'Manual Review Required'
+    | 'Do Not Apply'
+
+    Implements the Recommendation Policy Invariants (I1-I6) documented above
+    _compute_trust_signals. Each branch below is tagged with the invariant
+    it satisfies:
+      I4 → Do Not Apply requires deterministic integrity failure only; pure
+           heuristic evidence (challenger findings, incl. alignment=
+           Misaligned) must never produce Do Not Apply on its own.
+      I5 → still_vulnerable=True with defect_count==0, OR alignment=
+           Misaligned (confirmed_defect_count > 0) — both heuristic-only —
+           land at Manual Review Required, never Do Not Apply, never higher.
+      I3 → Deploy After Validation only when integrity, improvement, AND
+           safety are each explicitly in their own positive whitelist (not
+           merely "not the one excluded bad value", and not merely "did not
+           hit the Do Not Apply gate above" — integrity=Minor Issues clears
+           that gate but is still excluded here, since it is not the same
+           claim as verified-clean).
+      I5 → everything else (including Unknown/Not Verified on either axis)
+           falls through to Manual Review Required.
+
+    `verification_status` (patch_challenger.VERIFICATION_STATUSES, or None)
+    is read ONLY inside the I5 `still_vulnerable and defect_count == 0`
+    branch, to make that branch's `reason`/`why` text name which of two
+    materially different situations occurred — an affirmative residual-
+    vulnerability finding, or evidence that was merely insufficient to
+    verify the fix — WITHOUT changing the `decision` value itself (still
+    always "Manual Review Required" here) or any other branch's condition.
+    Omitting it (the default, `None`) preserves the exact behavior of every
+    pre-existing caller: it renders identically to the "unknown/unclassified"
+    wording, since a caller that has no richer signal to offer must not be
+    read as implying one.
+
+    Release-polish (report explainability): every branch reached after the
+    I3 check appends one sentence naming whichever of I3's three axes were
+    not positive, via `_describe_unmet_gates`. The Misaligned/
+    still_vulnerable branches do NOT re-quote `remediation_alignment`'s
+    notes: the Trust Signals table already shows them. This only changes
+    `reason` text — `decision` is computed identically to before this note.
+
+    Report Polish Batch B: every branch that returns "Manual Review
+    Required" also sets a `"why"` key -- one short, already-derived phrase
+    naming the SAME signal that branch itself just used to decide, for the
+    report's "Why manual review" line (see `_render_why_manual_review_line`).
+    This is presentation only: computed inline, in the exact branch that
+    already fired, from the exact `signals`/`unmet` values that branch
+    already reads -- never a second, independent inference, and never read
+    by any other branch or by `decision` itself. Branches that return a
+    different decision do not set `"why"` (that renderer only ever looks at
+    it for "Manual Review Required" and would ignore it regardless).
+
+    `structured_challenger` (display only, keyword-only, default False) is
+    True when the Challenger response used the structured `Concerns:`
+    schema. Like `verification_status`, it is read ONLY inside the I5
+    `still_vulnerable and defect_count == 0` branch, to pick text: the
+    structured RESIDUAL wording states only what that schema establishes
+    (a concern met the deterministic blocking rule from citation-checked,
+    model-reported facts, not independently verified), and the pointer names
+    the "Challenger concerns" section the report renders for that schema
+    instead of Review Results, which structured responses do not populate.
+    `decision` never depends on it; omitting it keeps every legacy string.
+    """
+    integrity = signals["patch_integrity"]["value"]
+    improvement = signals["security_improvement"]["value"]
+    alignment = signals["remediation_alignment"]["value"]
+    safety = signals["deployment_safety"]["value"]
+
+    if integrity in _BLOCKING_INTEGRITY:  # I4
+        reason = "Patch has critical issues or does not apply to the target repository."
+        notes = (signals["patch_integrity"].get("notes") or "").strip().rstrip(".")
+        if notes:
+            reason += f" Patch integrity: {notes}."
+        return {"decision": "Do Not Apply", "reason": reason}
+    if alignment == "Misaligned":  # I5
+        reason = (
+            "Adversarial review flagged findings classified as high-confidence risk "
+            "indicators; this is unresolved heuristic evidence, not a verified exploit — "
+            "manual review is required before deployment."
+        )
+        # Release polish: remediation_alignment's own notes are not appended
+        # here -- the Trust Signals table already shows them, and repeating
+        # them in reason AND why made the same sentence appear 3-4 times.
+        why = "adversarial review flagged high-confidence risk indicators that remain unresolved"
+        return {"decision": "Manual Review Required", "reason": reason, "why": why}
+    if still_vulnerable and defect_count == 0:  # I5
+        detail_section = "Challenger concerns" if structured_challenger else "Review Results"
+        if verification_status == "RESIDUAL_VULNERABILITY" and structured_challenger:
+            reason = (
+                "A structured adversarial-review concern met the deterministic blocking rule, "
+                "based on citation-checked, model-reported facts; the underlying issue has not "
+                "been independently verified. See Challenger concerns below before deploying."
+            )
+            why = (
+                "a structured adversarial-review concern met the deterministic blocking rule; "
+                "the underlying issue has not been independently verified"
+            )
+        elif verification_status == "RESIDUAL_VULNERABILITY":
+            reason = (
+                "Adversarial review found affirmative evidence the vulnerability may remain "
+                "exploitable (a concrete bypass or ineffective mechanism); see Review Results "
+                "below before deploying."
+            )
+            why = "affirmative evidence indicates the vulnerability may still be present"
+        elif verification_status == "INSUFFICIENT_EVIDENCE":
+            reason = (
+                "The available evidence was insufficient to verify the fix is effective; "
+                f"see {detail_section} below before deploying."
+            )
+            why = "the fix could not be sufficiently verified from the available evidence"
+        else:  # None — unknown/legacy/malformed; never treated as either real state
+            reason = (
+                "The Challenger's verification status is unavailable or unclassified for this "
+                f"patch; stronger confidence is not justified. See {detail_section} below before "
+                "deploying."
+            )
+            why = "the Challenger's verification status could not be established for this patch"
+        # Release polish: remediation_alignment's notes are already in the
+        # Trust Signals table -- not repeated in reason/why (see the
+        # Misaligned branch above).
+        return {"decision": "Manual Review Required", "reason": reason, "why": why}
+    if (
+        integrity in _POSITIVE_INTEGRITY
+        and improvement in _POSITIVE_IMPROVEMENT
+        and safety in _POSITIVE_SAFETY
+    ):  # I3
+        # Release polish: states the evidence I3 actually checked, never that
+        # the vulnerability is fixed. Reaching I3 requires still_vulnerable
+        # to be False (both still_vulnerable branches above return first), a
+        # Clean patch_integrity, and a Low/Medium Risk deployment_safety.
+        return {
+            "decision": "Deploy After Validation",
+            "reason": (
+                "The patch applies cleanly with no hygiene issues, the available adversarial "
+                "review raised no blocking or unresolved concern, and static analysis found a "
+                "low or moderate impact surface. This is an evidence-based recommendation, not "
+                "proof that the vulnerability is fixed: complete any validation actions listed "
+                "below before deployment."
+            ),
+        }
+    # Every branch below is reached only because the I3 whitelist above
+    # failed on at least one axis — name exactly which one(s) fired it, from
+    # the same evidence I3 itself already checked. Presentation only: never
+    # affects which branch below fires.
+    unmet = _describe_unmet_gates(signals)
+    # Top-tier too: like I3, it needs positive integrity evidence -- not
+    # being blocked is not the same claim as being positive evidence.
+    if integrity in _POSITIVE_INTEGRITY and improvement == "Low" and safety == "Low Risk":
+        reason = "Patch provides limited or uncertain security improvement. Manual security review recommended."
+        if unmet:
+            reason += f" {unmet}"
+        return {"decision": "Deploy With Caution", "reason": reason}
+    if safety == "High Risk":  # I5
+        reason = "Change has high deployment risk; regression testing across affected callers required."
+        if unmet:
+            reason += f" {unmet}"
+        saf_notes = (signals["deployment_safety"].get("notes") or "").strip().rstrip(".")
+        why = "the change affects a high-impact surface; regression validation across affected callers is required"
+        if saf_notes:
+            why += f" ({saf_notes})"
+        return {"decision": "Manual Review Required", "reason": reason, "why": why}
+    reason = "Patch requires manual security review before deployment."  # I5 / I6 catch-all
+    if unmet:
+        reason += f" {unmet}"
+    # `unmet` already names exactly which already-computed signal(s) are not
+    # positive (e.g. "Deployment risk could not be verified because impact
+    # analysis is not supported for this language yet.") -- reused verbatim
+    # as the dominant reason rather than re-derived, so a language-support
+    # gap (or any other unmet axis) reads the same way here as it already
+    # does in `reason` above.
+    why = unmet if unmet else "the available deterministic signals were insufficient to support a confident recommendation"
+    return {"decision": "Manual Review Required", "reason": reason, "why": why}
+
+
+# ---------------------------------------------------------------------------
+# Slice 1 — Decision Consistency
+#
+# Goal: a confident-sounding recommendation must never sit beside evidence,
+# already displayed elsewhere in the same report, that undercuts it without
+# saying so. This function only reads signals that are already computed and
+# already rendered in the Trust Signals table — it adds no new evidence and
+# never changes `decision`.
+# ---------------------------------------------------------------------------
+
+# Decisions that read as confident enough to require this check. The other
+# two decisions (Manual Review Required, Do Not Apply) already read as
+# cautious and do not need further hedging here.
+_TOP_TIER_DECISIONS = frozenset({"Deploy After Validation", "Deploy With Caution"})
+
+
+def _build_consistency_caveat(lead: str, notes: str) -> str:
+    """Compose one caveat sentence from a lead-in and an existing signal's notes.
+
+    Reuses the notes text already shown in the Trust Signals table rather
+    than inventing new wording, so the caveat is traceable to evidence the
+    reader has already seen.
+    """
+    notes = (notes or "").strip()
+    if not notes:
+        return f"{lead}."
+    if notes[-1] not in ".!?":
+        notes += "."
+    return f"{lead} — {notes}"
+
+
+def _decision_relevant_finding_count(known_findings: dict) -> int:
+    """Count Known Findings entries that bear on deployment confidence.
+
+    Coverage Confidence answers "how thoroughly did we explore the solution
+    space?" — Future Hardening Ideas are genuine evidence of that and must
+    keep counting there (see _compute_trust_signals, unchanged). This
+    function answers a different, narrower question — "should this
+    recommendation itself be discounted?" — so it deliberately excludes
+    future_hardening_ideas: those are explicitly out of the current
+    advisory's scope and are not reasons to distrust this deployment
+    recommendation, even though they're real findings worth knowing about.
+    """
+    return len(
+        known_findings.get("potential_remaining_risks", [])
+        + known_findings.get("validation_gaps", [])
+        + known_findings.get("observed_implementation_notes", [])
+        + known_findings.get("validation_hypotheses", [])
+    )
+
+
+# Release-polish: category label (singular noun) for each key
+# _decision_relevant_finding_count sums, in the same fixed order used
+# everywhere this aggregate is described. "Observed fact" is deliberately
+# a certainty label, not a severity one — Observed Facts entries may be
+# reassuring, neutral, or concerning (see _render_known_findings) — so this
+# breakdown never says "open" or "remaining" and never implies every counted
+# item is an unresolved defect.
+_DECISION_RELEVANT_CATEGORY_LABELS = [
+    ("potential_remaining_risks", "flagged risk"),
+    ("validation_gaps", "validation gap"),
+    ("observed_implementation_notes", "observed fact"),
+    ("validation_hypotheses", "validation question"),
+]
+
+
+def _describe_decision_relevant_findings(known_findings: dict) -> str:
+    """Category-labeled description of the same aggregate
+    `_decision_relevant_finding_count` counts (identical four keys,
+    identical exclusion of future_hardening_ideas — see that function's own
+    docstring for why). Presentation only: does not change the aggregate
+    count, only how it is described, and reclassifies nothing. Reads as a
+    neutral inventory ("N item(s) to weigh: ...") with a breakdown, not as a
+    defect count, since some categories (e.g. observed facts) are evidence
+    of certainty, not of an unresolved problem. Returns "" when the
+    aggregate is zero.
+    """
+    parts: list[str] = []
+    total = 0
+    for key, noun in _DECISION_RELEVANT_CATEGORY_LABELS:
+        count = len(known_findings.get(key) or [])
+        if count:
+            parts.append(f"{count} {noun}" + ("s" if count != 1 else ""))
+            total += count
+    if not parts:
+        return ""
+    item_noun = "item" if total == 1 else "items"
+    return f"{total} {item_noun} to weigh: " + " · ".join(parts)
+
+
+def _check_recommendation_consistency(signals: dict, decision: str, known_findings: dict) -> list[str]:
+    """Surface already-displayed evidence that a top-tier recommendation does
+    not acknowledge on its own.
+
+    Deterministic; no LLM calls beyond what finding_calibration already ran.
+    Never alters `decision`. Returns an empty list when the decision is not
+    top-tier, or when neither weak-evidence condition applies.
+
+    "Not Verified" (the language-guardrail state for `test_availability`) is
+    intentionally excluded from the "No Tests Found" check — it means the
+    check could not run for this repository's language, not that tests are
+    confirmed absent. Treating the two as equivalent would recreate, inside
+    this fix, the exact kind of misleading conflation this fix exists to
+    remove.
+
+    The second caveat is intentionally NOT driven by coverage_confidence's
+    own value/notes (unlike before) — Coverage Confidence answers "how much
+    did we look" and legitimately includes Future Hardening Ideas; this
+    caveat answers "should this recommendation be discounted" and must not,
+    so it computes its own decision-relevant count from `known_findings`
+    instead of reusing the Trust Signal's broader one.
+    """
+    if decision not in _TOP_TIER_DECISIONS:
+        return []
+
+    caveats: list[str] = []
+
+    test_sig = signals.get("test_availability") or {}
+    if test_sig.get("value") == "No Tests Found":
+        caveats.append(
+            _build_consistency_caveat(
+                "This recommendation is not backed by any discovered existing test",
+                test_sig.get("notes", ""),
+            )
+        )
+
+    decision_relevant_summary = _describe_decision_relevant_findings(known_findings)
+    if decision_relevant_summary:
+        caveats.append(
+            _build_consistency_caveat(
+                "This recommendation's adversarial coverage is heuristic, not deterministically "
+                "confirmed — see Review Results below for the validation questions and remaining "
+                "uncertainties",
+                decision_relevant_summary,
+            )
+        )
+
+    return caveats
+
+
+# Presentation-only: the same rank convention build_validation_plan's own
+# local `rank_map` already uses (HIGH=3, MEDIUM=2, LOW=1) — reused here, not
+# reintroduced, purely to pick which already-computed item to echo.
+_ACTION_PRIORITY_RANK = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+
+
+def _select_top_action(validation_actions: list[dict] | None) -> "dict | None":
+    """Return the Top Action from `validation_actions`, or None when the
+    list is empty.
+
+    Presentation only — does not reorder, filter, or recompute
+    `validation_actions` itself (build_validation_plan's own order,
+    priority, and count are untouched).
+
+    Top Action answers a different question than priority does: "what
+    should the reviewer validate first to prove the patch addresses the
+    vulnerability?" -- not "how important is this concern?". When
+    build_validation_plan successfully built a security-invariant-derived
+    action (tagged `is_security_invariant_action` at construction -- see
+    that block), it IS that answer by definition and is returned directly,
+    regardless of its own (unchanged, still MEDIUM) priority. This is an
+    explicit reference to an action build_validation_plan itself already
+    marked, never a rediscovery via title text or any other fuzzy match.
+
+    Otherwise, falls back to the original selection: the highest-priority
+    item, ties going to whichever appears first. This exists because index
+    [0] is not reliably the highest-priority entry: build_validation_plan
+    unconditionally prepends its behavior-driven action ahead of any
+    HIGH-priority item already present, so a naive `validation_actions[0]`
+    can under-represent the true top priority. `max()` returns the first
+    item on a tie, so display order for same-priority items still matches
+    the list's own existing order.
+    """
+    if not validation_actions:
+        return None
+    for action in validation_actions:
+        if action.get("is_security_invariant_action"):
+            return action
+    return max(validation_actions, key=lambda a: _ACTION_PRIORITY_RANK.get(a.get("priority"), 0))
+
+
+def _render_top_action_line(validation_actions: list[dict] | None) -> str:
+    """Render a single "Top action" line for display immediately under
+    Recommendation — the concise title only, never the action's reason or
+    next_step (those already render in full, once, in Validation Actions
+    below); this line exists only so a reader isn't required to scroll past
+    Explanation to see the single most important next step. Returns ""
+    when there is no meaningful action to show.
+    """
+    top = _select_top_action(validation_actions)
+    if not top or not top.get("title"):
+        return ""
+    return f"\n**Top action:** {top['title']} — see Validation Actions below for the full list.\n"
+
+
+def _render_manual_review_scope_note(decision: str, known_findings: dict) -> str:
+    """Presentation-only scope note for Manual Review Required: surfaces the
+    same decision-relevant finding breakdown `_check_recommendation_consistency`
+    already computes for the top two decisions (see
+    `_describe_decision_relevant_findings`), so a reader triaging Manual
+    Review Required doesn't have to scroll to Review Results just to learn
+    what's behind the count.
+
+    Deliberately NOT the "Evidence check" caveat mechanism, and deliberately
+    different wording from it: that mechanism exists to flag that a
+    CONFIDENT-sounding recommendation may be undercut by evidence the reader
+    hasn't seen yet. Manual Review Required already reads as cautious — this
+    is scope information, not a warning. It describes the aggregate with a
+    category breakdown rather than a single "N remain open" number, since
+    some categories (observed facts) are evidence of certainty, not
+    necessarily of an unresolved defect. Returns "" when the decision isn't
+    Manual Review Required or when the aggregate is zero (nothing to add
+    beyond the reason already shown).
+    """
+    if decision != "Manual Review Required":
+        return ""
+    summary = _describe_decision_relevant_findings(known_findings)
+    if not summary:
+        return ""
+    return f"\n{summary} — see Review Results below for details.\n"
+
+
+def _render_why_manual_review_line(recommendation: dict) -> str:
+    """Render a concise "Why manual review" line for Manual Review Required
+    only. Returns "" for every other decision (Deploy After Validation,
+    Deploy With Caution, Do Not Apply) -- those already read as either
+    confident or unambiguously blocked, and Do Not Apply's own `reason` is
+    already the single deterministic blocker with nothing left to
+    disambiguate.
+
+    Report Polish Batch B: `recommendation["why"]` is set only by
+    `_build_recommendation_v1`'s own Manual Review Required branches, each
+    inline in the exact branch that already decided the outcome (see that
+    function's docstring) -- this renderer adds no inference of its own,
+    only formatting and safe truncation (reusing `_truncate_reason`, the
+    same Batch A helper the rest of this module already uses for this).
+    """
+    if recommendation.get("decision") != "Manual Review Required":
+        return ""
+    why = (recommendation.get("why") or "").strip()
+    if not why:
+        return ""
+    return f"\n**Why manual review:** {_truncate_reason(why, 220)}.\n"
+
+
+def _render_recommendation_block(
+    recommendation: dict,
+    caveats: list[str] | None = None,
+    scope_note: str = "",
+    top_action_line: str = "",
+    why_line: str = "",
+) -> str:
+    """Render just the Recommendation section (no leading rule — the caller's
+    preceding block is expected to end with one, matching prior layout)."""
+    lines: list[str] = []
+    lines.append("## Recommendation\n")
+    # Same icon as the decision card at the top (_DECISION_CARD_EMOJI).
+    lines.append(f"{_DECISION_CARD_EMOJI.get(recommendation['decision'], '⚪')} **{recommendation['decision']}**\n")
+    lines.append(f"{recommendation['reason']}\n")
+
+    if why_line:
+        lines.append(why_line)
+
+    if top_action_line:
+        lines.append(top_action_line)
+
+    if scope_note:
+        lines.append(scope_note)
+
+    if caveats:
+        for c in caveats:
+            lines.append(f"> **Evidence check:** {c}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+def _render_known_findings(findings: dict) -> str:
+    """Render the Review Results section (includes its own leading rule).
+
+    Five subsections, one per epistemic category from _build_known_findings.
+    Only populated categories render; the whole section is omitted when all
+    five are empty. Each subsection carries a one-line disclaimer stating its
+    certainty level explicitly, so a reviewer never has to guess whether a
+    bullet is a confirmed fact, a repository-backed observation, an unvalidated
+    hypothesis, or an out-of-scope suggestion.
+    """
+    risks = findings.get("potential_remaining_risks") or []
+    gaps = findings.get("validation_gaps") or []
+    observed = findings.get("observed_implementation_notes") or []
+    hypotheses = findings.get("validation_hypotheses") or []
+    hardening = findings.get("future_hardening_ideas") or []
+
+    if not (risks or gaps or observed or hypotheses or hardening):
+        return ""
+
+    lines: list[str] = ["---\n", "## Review Results\n"]
+    lines.append(
+        "*The bullet count below is not a count of confirmed defects — it "
+        "reflects how many observations the review produced. Confirmed "
+        "Observations, Validation Questions, and Future Improvements below "
+        "carry different confidence levels; see each subsection's own note.*\n"
+    )
+
+    if risks:
+        lines.append("### Potential Remaining Risks\n")
+        lines.append(
+            "*Flagged by heuristic adversarial review — not independently "
+            "reproduced or deterministically confirmed.*\n"
+        )
+        for r in risks:
+            lines.append(f"- {r}")
+        lines.append("")
+
+    if gaps:
+        lines.append("### Validation Gaps\n")
+        lines.append(
+            "*Behaviors the challenger flagged as not yet verified — independent "
+            "of whether the repository already has pre-existing tests for this "
+            "module (see Trust Signals above; both can be true at once).*\n"
+        )
+        for g in gaps:
+            lines.append(f"- {g}")
+        lines.append("")
+
+    if observed:
+        # Release-polish rename: "Observed" is an evidence-status axis
+        # (directly backed by repository/diff evidence vs. inferred), not a
+        # severity or polarity axis — an observed fact can be reassuring,
+        # neutral, or concerning. "Confirmed Observations" read, to a
+        # skimmer, like a list of confirmed problems; nothing here is
+        # reclassified, only relabeled.
+        lines.append("### Observed Facts\n")
+        lines.append(
+            "*Directly backed by the repository evidence or patch diff shown "
+            "to the reviewer — not merely inferred. This describes evidence "
+            "status, not severity: an observed fact may be reassuring, "
+            "neutral, or concerning — read each one in context.*\n"
+        )
+        for o in observed:
+            lines.append(f"- {o}")
+        lines.append("")
+
+    if hypotheses:
+        lines.append("### Validation Questions\n")
+        lines.append(
+            "*Plausible behaviors inferred from analysis, not directly observed "
+            "in the evidence shown to the reviewer — these describe conditions "
+            "under which something could happen, not confirmed outcomes, and "
+            "should be validated.*\n"
+        )
+        for h in hypotheses:
+            lines.append(f"- {h}")
+        lines.append("")
+
+    if hardening:
+        lines.append("### Future Improvements\n")
+        lines.append(
+            "*Unrelated to the current advisory — these do not reduce confidence "
+            "in the recommendation above.*\n"
+        )
+        for h in hardening:
+            lines.append(f"- {h}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+_CONCERN_ROLE_LABELS = {"primary": "Primary", "additional": "Additional"}
+
+
+def _render_challenger_concerns(classified_challenger: dict | None) -> str:
+    """Render the Challenger concerns section for a structured (`Concerns:`
+    schema) response; "" for a legacy response, whose findings render under
+    Review Results instead.
+
+    Mechanical: one row per already-parsed concern, in response order, with
+    its role, its already-computed deterministic `consequence`, and its
+    description verbatim (only table-cell escaping). The description is
+    model-authored and is labeled as such; nothing here interprets,
+    summarizes, or re-scores it.
+    """
+    if not _is_structured_challenger(classified_challenger):
+        return ""
+    concerns = classified_challenger.get("concerns") or []
+    lines: list[str] = ["---\n", "## Challenger concerns\n"]
+    lines.append(
+        "*Structured adversarial review. Each consequence is the deterministic policy's "
+        "classification of that concern's citation-checked, model-reported facts — "
+        "BLOCKING means those facts met the blocking rule, not that a defect was "
+        "independently verified. Descriptions are model-authored and shown verbatim.*\n"
+    )
+    if not concerns:
+        lines.append("No structured concern was reported.\n")
+        return "\n".join(lines) + "\n"
+    lines.append(f"{_describe_structured_concern_counts(_structured_concern_counts(classified_challenger))}.\n")
+    if classified_challenger.get("verdict_conflict"):
+        lines.append(
+            f"**Failed closed:** {classified_challenger['verdict_conflict']}, contradicting "
+            "its non-blocking concern facts, so the review is not read as verified.\n"
+        )
+    lines.append("| # | Role | Consequence | Model-authored description |")
+    lines.append("|---|---|---|---|")
+    for index, concern in enumerate(concerns, 1):
+        concern = concern or {}
+        role = _CONCERN_ROLE_LABELS.get(concern.get("concern_role"), "Malformed" if concern.get("malformed") else "—")
+        consequence = concern.get("consequence") or "UNRESOLVED"
+        description = " ".join((concern.get("description") or "").split()).replace("|", "\\|")
+        if not description:
+            description = "*(no description parsed)*"
+        lines.append(f"| {index} | {role} | {consequence} | {description} |")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+# Trust Signals v2 — question-style rows with one consistent status
+# vocabulary (✅/⚠️/❌/?), replacing the old six-row table where "good"
+# pointed in different directions per row (High vs. Low Risk) and three
+# rows (security_improvement, remediation_alignment, coverage_confidence)
+# were peer-displayed duplicates of the same underlying challenger counts.
+#
+# Display only: _compute_trust_signals still computes all six keys exactly
+# as before (including security_improvement, which _build_recommendation_v1
+# still reads directly) — this only changes which keys get their own row
+# and how each value's status is worded.
+# Fourth element per row: the section that holds this row's detail, or
+# None when there isn't one. Only referenced when status isn't good — a row
+# that's already fine has nothing further to send the reader to.
+_TRUST_SIGNALS_V2_ROWS = [
+    ("Does the patch apply?", "patch_integrity", {
+        "Clean": "✅ Good",
+        "Minor Issues": "⚠️ Needs review",
+        "Critical Issues": "❌ Blocked",
+        "Does Not Apply": "❌ Blocked",
+        "Not Verified": "? Not verified",
+    }, "Patch Applicability"),
+    ("Does it address the vulnerability?", "remediation_alignment", {
+        "Aligned": "✅ Good",
+        "Likely Aligned": "⚠️ Needs review",
+        "Partial": "⚠️ Needs review",
+        # Release polish: "❌ Concern", not "❌ Blocked" -- Misaligned lands
+        # at Manual Review Required (I5), never Do Not Apply. Only
+        # patch_integrity's ❌ values actually block (I4).
+        "Misaligned": "❌ Concern",
+    }, "Review Results"),
+    ("Are there unresolved concerns?", "coverage_confidence", {
+        "High": "✅ Good",
+        "Medium": "⚠️ Needs review",
+        "Low": "❌ Concern",
+    }, "Review Results"),
+    ("Do relevant tests already exist?", "test_availability", {
+        "Tests Available": "✅ Good",
+        "No Tests Found": "⚠️ Needs review",
+        "Not Verified": "? Not verified",
+    }, "Test Support"),
+    ("Is deployment risk low?", "deployment_safety", {
+        "Low Risk": "✅ Good",
+        "Medium Risk": "⚠️ Needs review",
+        "High Risk": "❌ Concern",  # Manual Review Required (I5), not a block
+        "Not Verified": "? Not verified",
+    }, "Impact Surface"),
+    # Evidence Sufficiency Gate (Phase 1, source_verification.py). Display
+    # only, same as every other row here -- deliberately does NOT use "❌
+    # Blocked" wording for "Unverified": unlike patch_integrity/
+    # remediation_alignment, this signal does not yet drive
+    # _build_recommendation_v1 (explicit product decision, see
+    # source_verification.py's module docstring), so its status wording
+    # describes what was observed rather than implying a policy consequence
+    # that doesn't exist yet. No target_section: there is no dedicated
+    # report section with hunk-level detail today, so this row's `notes`
+    # (built in classify_source_verification) carry the detail inline
+    # instead of pointing elsewhere.
+    ("Was the edited content verified against the repository?", "source_verification", {
+        "Confirmed": "✅ Good",
+        "Position Unconfirmed": "⚠️ Needs review",
+        "Unverified": "❌ Content not found",
+        "Not Verified": "? Not verified",
+    }, None),
+    # Existing Test Comparison (opt-in; see existing_test_regression.py).
+    # Display only, same rationale as source_verification above -- this
+    # signal does not yet drive _build_recommendation_v1 (explicit
+    # product decision for this first slice). target_section points at
+    # the dedicated "Existing Test Comparison" section this feature adds
+    # to the report, which carries the baseline/patched counts and any
+    # newly-failing test names. Question/status wording is deliberately
+    # factual ("new failures", never "regression") -- see
+    # existing_test_regression.py's module docstring: this is a
+    # deterministic before/after delta, not a judgment about whether a
+    # newly-failing test is an unintended regression or an intended
+    # behavior change.
+    ("Were there new test failures after the patch?", "existing_test_comparison", {
+        "PASS": "✅ Good",
+        "PRE_EXISTING_FAILURES_ONLY": "✅ Good",
+        "NEW_FAILURES_DETECTED": "❌ New failures",
+        "TEST_EXECUTION_ERROR": "? Inconclusive",
+        "NOT_VERIFIED": "? Not verified",
+    }, "Existing Test Comparison"),
+]
+
+# Report Polish Batch C: the "N raw review concern(s) recorded before
+# evidence calibration" clause is internal pipeline detail (the raw,
+# pre-calibration Challenger count) that overstates risk when it sits in
+# the PRIMARY Trust Signals table next to five other rows that are all
+# decision-relevant summaries. `_compute_trust_signals`'s own computation
+# of this text -- and therefore `signals["coverage_confidence"]["notes"]`
+# itself, unchanged, still readable by tests/other callers that want the
+# raw count -- is left byte-for-byte alone; only this table's rendered
+# cell drops the leading clause, keeping the calibration-relevant
+# remainder ("no deterministic blocker identified; ..."). No new storage:
+# the full count is still exactly where it always was, just not restated
+# in the primary table's Notes cell.
+_RAW_REVIEW_CONCERN_PREFIX_RE = re.compile(
+    r"^\d+ raw review concern\(s\) recorded before evidence calibration — "
+)
+
+
+def _render_trust_signals_table(
+    signals: dict,
+    known_findings_rendered: bool = True,
+    challenger_concerns_rendered: bool = False,
+) -> str:
+    """Render the Trust Signals table (includes its own leading rule).
+
+    Every row whose status is not "✅ Good" gets an explicit pointer to the
+    existing section heading that holds its detail, so "see below" always
+    names a real destination. A row that's already good gets no pointer —
+    there's nothing further to send the reader to.
+
+    known_findings_rendered must reflect whether the Review Results section
+    will actually render (see _build_known_findings) — remediation_alignment
+    can still be non-good even when no finding list is populated (e.g.
+    "Likely Aligned"), so the pointer to Review Results is suppressed for
+    that row rather than risk a reference to a section that isn't there.
+
+    The "Do relevant tests already exist?" row always carries a fixed bridge
+    note, regardless of status: it answers only whether the repository
+    already has related tests (Existing Test Coverage) — a separate question
+    from whether the new patched behavior itself is validated (see Review
+    Results -> Validation Gaps). Without this, "✅ Good" here can visually
+    contradict a "no test validates this behavior" finding elsewhere, even
+    though both are true and answer different questions.
+
+    challenger_concerns_rendered must reflect whether the Challenger
+    concerns section will render (structured `Concerns:` responses only; see
+    _render_challenger_concerns). When it does, remediation_alignment and
+    coverage_confidence -- derived from those concerns for that schema --
+    point there, and any other Review Results pointer falls back to it when
+    Review Results itself will not render. When it doesn't (every legacy
+    response), every pointer is exactly as before.
+    """
+    lines: list[str] = []
+    lines.append("---\n")
+    lines.append("## Trust Signals\n")
+    lines.append("| Question | Status | Notes |")
+    lines.append("|---|---|---|")
+    for question, key, status_map, target_section in _TRUST_SIGNALS_V2_ROWS:
+        sig = signals[key]
+        value = sig["value"]
+        status = status_map.get(value, "? Not verified")
+        notes = sig["notes"].rstrip()
+        if key == "coverage_confidence":
+            de_emphasized = _RAW_REVIEW_CONCERN_PREFIX_RE.sub("", notes)
+            if de_emphasized != notes and de_emphasized:
+                de_emphasized = de_emphasized[0].upper() + de_emphasized[1:]
+            notes = de_emphasized
+        effective_target = target_section
+        if target_section == "Review Results" and challenger_concerns_rendered and key in (
+            "remediation_alignment", "coverage_confidence",
+        ):
+            effective_target = "Challenger concerns"
+        elif target_section == "Review Results" and not known_findings_rendered:
+            effective_target = None
+        if key == "test_availability":
+            # Points at "Review Results" as a whole, not specifically its
+            # Validation Gaps subsection: the challenger's own phrasing
+            # determines which Review Results category a given "this isn't
+            # validated" observation lands in (e.g. "no test appears to be
+            # added validating X" classifies as a Behavior Note today, not a
+            # Validation Gap) — verified against a real live challenger run,
+            # not assumed. Naming a specific subsection here would risk
+            # pointing at one that's empty while the relevant content sits
+            # in another.
+            review_section = (
+                "Challenger concerns"
+                if challenger_concerns_rendered and not known_findings_rendered
+                else "Review Results"
+            )
+            bridge = f"existing repository tests only — new-behavior validation is tracked separately, see {review_section} below"
+            if status != "✅ Good" and effective_target:
+                bridge += f"; see {effective_target} section below for existing test detail"
+            notes = f"{notes} ({bridge})" if notes else bridge.capitalize()
+        elif status != "✅ Good" and effective_target:
+            notes = f"{notes} — see {effective_target} section below" if notes else \
+                f"See {effective_target} section below"
+        lines.append(f"| {question} | {status} | {notes} |")
+    lines.append("")
+    lines.append(_render_trust_signals_guide())
+
+    return "\n".join(lines) + "\n"
+
+
+# Status key for the Trust Signals table: every status a row can render
+# (the values of _TRUST_SIGNALS_V2_ROWS' status maps, plus the renderer's
+# "? Not verified" fallback), in display order.
+_TRUST_SIGNAL_STATUS_KEY = (
+    ("✅ Good", "Favorable result for this question"),
+    ("⚠️ Needs review", "Partial or uncertain result — see the row's notes"),
+    ("❌ Blocked", "The check blocks this patch"),
+    ("❌ Concern", "An adverse finding that requires review"),
+    ("❌ Content not found", "Some edited content could not be found in the repository"),
+    ("❌ New failures", "The patched run shows test failures the unpatched run did not"),
+    ("? Inconclusive", "The existing-test run could not be completed — no conclusion either way"),
+    ("? Not verified", "The check did not run or is unsupported — never positive evidence"),
+)
+
+# How each Trust Signals row is established: (evidence, row keys, what it is
+# -- and is not). Row questions are taken from _TRUST_SIGNALS_V2_ROWS itself.
+_TRUST_SIGNAL_PROVENANCE = (
+    ("Deterministic repository checks", ("patch_integrity", "source_verification"),
+     "Mechanical checks against the repository"),
+    ("Adversarial review (Challenger)", ("remediation_alignment", "coverage_confidence"),
+     "A heuristic LLM review whose citations are checked by code — not independent verification"),
+    ("Static heuristics", ("test_availability", "deployment_safety"),
+     "Test-file name matching and symbol-name usage analysis — nothing is executed"),
+    ("Existing Test Comparison", ("existing_test_comparison",),
+     "Existing tests are run only when Existing Test Comparison was requested"),
+)
+
+
+def _render_trust_signals_guide() -> str:
+    """Static guide rendered BELOW the Trust Signals table: a status key and
+    a map of how each row is established. Documentation for reading the
+    table -- never findings from the current run."""
+    question_by_key = {key: question for question, key, _status_map, _target in _TRUST_SIGNALS_V2_ROWS}
+    lines = [
+        "### How to read the Trust Signals\n",
+        "*A guide to the table above — what each status and row means, not findings from this run.*\n",
+        "**Status key**\n",
+        "| Status | Meaning |",
+        "|---|---|",
+    ]
+    lines += [f"| {status} | {meaning} |" for status, meaning in _TRUST_SIGNAL_STATUS_KEY]
+    lines += [
+        "",
+        "**How the signals are established**\n",
+        "| Evidence | Questions | What it is — and is not |",
+        "|---|---|---|",
+    ]
+    for evidence, keys, caveat in _TRUST_SIGNAL_PROVENANCE:
+        questions = " · ".join(question_by_key[key] for key in keys)
+        lines.append(f"| {evidence} | {questions} | {caveat} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_validation_actions_section(validation_actions: list[dict], decision: str = "") -> str:
+    """Render Validation Actions (includes its own leading rule). Empty string
+    when there are no actions, same as before the split.
+
+    This is now the single, canonical checklist section — it includes each
+    action's Reason as well as its Next step. A separate "Validation Plan"
+    section used to repeat these same (already-capped-at-3) items lower in
+    the report with Reason added; verified there was no other unique data
+    in it, so it was removed rather than kept as a second name for the same
+    checklist.
+
+    `decision` only changes a leading note's wording (added when "Do Not
+    Apply") — it does not change which actions are computed, their order,
+    priority, or count.
+    """
+    if not validation_actions:
+        return ""
+
+    lines: list[str] = []
+    lines.append("---\n")
+    lines.append("## Validation Actions\n")
+    if decision == "Do Not Apply":
+        lines.append(
+            "*This patch is not recommended for deployment. The items below "
+            "apply only if a corrected patch is produced — not to this one.*\n"
+        )
+    for i, action in enumerate(validation_actions[:3], start=1):
+        priority = action.get("priority", "")
+        title = action.get("title", "")
+        reason = action.get("reason", "")
+        next_step = action.get("next_step", "")
+        security_property = (action.get("security_property") or "").strip()
+        lines.append(f"{i}. **[{priority}]** {title}  ")
+        if security_property:
+            lines.append(f"   Security property: {security_property}  ")
+        if reason:
+            lines.append(f"   Reason: {reason}  ")
+        if next_step:
+            lines.append(f"   Next step: {next_step}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Decision Card (Report Structure v2, Phase 1) — first-screen summary
+#
+# Renders only values already computed elsewhere (trust_rec, patch_integrity
+# signal, validation_actions count, files_changed count). Adds no new
+# analysis, no new signals, and does not alter recommendation policy,
+# trust signal computation, or classification.
+# ---------------------------------------------------------------------------
+
+_DECISION_CARD_EMOJI = {
+    "Deploy After Validation": "🟢",
+    "Deploy With Caution": "🟡",
+    "Manual Review Required": "🟠",
+    "Do Not Apply": "🔴",
+}
+
+# Composed as "Patch {label}." — lowercase, verb-first, so it reads as a
+# grammatical sentence in the Hero Banner (this is the "existing patch
+# applicability label", reused, not a new signal).
+_DECISION_CARD_PATCH_LABEL = {
+    "Clean": "applies cleanly",
+    "Minor Issues": "applies, with minor hygiene issues",
+    "Critical Issues": "has critical issues",
+    "Does Not Apply": "does not apply",
+    "Not Verified": "was not verified",
+}
+
+
+def _render_decision_card(
+    recommendation: dict,
+    signals: dict,
+    validation_actions: list[dict],
+    files_changed: list[str],
+) -> str:
+    """Render the Decision Card as a first-screen Hero Banner.
+
+    The large decision line (emoji + decision, as a heading) is the first
+    visible content after the report title — it doubles as the anchor for
+    tests/tooling, so no separate "## Decision Card" label is needed. Every
+    field below it is read from a value the pipeline already computed
+    elsewhere in this module — no new evidence gathering, no new signal
+    derivation, no independent "confidence" judgment.
+    """
+    decision = recommendation["decision"]
+    emoji = _DECISION_CARD_EMOJI.get(decision, "⚪")
+
+    patch_value = signals["patch_integrity"]["value"]
+    patch_label = _DECISION_CARD_PATCH_LABEL.get(patch_value, patch_value.lower())
+
+    # Wording deliberately does not name a section — the Hero Banner must
+    # stay valid even if section names or positions change elsewhere in the
+    # report (they already have, more than once).
+    action_count = len(validation_actions or [])
+    if decision == "Do Not Apply":
+        # "Before deployment" is actively misleading here — there is no
+        # deployment to validate toward. These are the same already-computed
+        # validation_actions, just described as applying to a future,
+        # corrected patch rather than this one.
+        if action_count == 0:
+            validation_line = "This patch should not be deployed."
+        elif action_count == 1:
+            validation_line = (
+                "This patch should not be deployed. "
+                "The item below applies only to a corrected patch, not this one."
+            )
+        else:
+            validation_line = (
+                "This patch should not be deployed. "
+                "The items below apply only to a corrected patch, not this one."
+            )
+    elif decision == "Manual Review Required":
+        # Reviewer-experience fix: this previously fell through to the same
+        # "before deployment" phrasing as Deploy After Validation / Deploy
+        # With Caution, differing only by the headline word above — a
+        # skim-only reader could easily read this banner as a near-green-
+        # light. Manual Review Required means the policy could not
+        # determine deployability from the evidence collected; deployment
+        # is explicitly not the next step regardless of action_count.
+        validation_line = (
+            "This is not a signal to deploy — a human reviewer must "
+            "resolve the open questions below first."
+        )
+    elif action_count == 0:
+        validation_line = "No additional validation actions identified."
+    elif action_count == 1:
+        validation_line = "Complete the recommended validation check before deployment."
+    else:
+        validation_line = "Complete the recommended validation checks before deployment."
+
+    lines = [
+        f"## {emoji} {decision.upper()}\n",
+        f"Patch {patch_label}.  ",
+        f"{validation_line}  ",
+        f"Files changed: {len(files_changed)}",
+        "",
+        "---",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+_NOT_APPLICABLE_NO_PATCH = "*Not applicable — no patch was produced.*"
+
+# Terminal closing block (release polish). Each entry restates what the
+# decision already means -- the same meaning _render_decision_card states in
+# the report -- never a new judgment.
+_TERMINAL_NEXT_STEP = {
+    "Deploy After Validation": "Complete the validation actions in the Trust Report before deploying.",
+    "Deploy With Caution": (
+        "Complete a manual security review and the validation actions in the Trust Report "
+        "before deploying."
+    ),
+    "Manual Review Required": (
+        "A human reviewer must resolve the open questions in the Trust Report before any "
+        "deployment."
+    ),
+    "Do Not Apply": "Do not deploy this patch; see the Trust Report for the failed check.",
+}
+# Deploy After Validation has no `why`; this restates exactly what I3
+# required (see _build_recommendation_v1's I3 branch).
+_TERMINAL_GREEN_REASON = (
+    "The patch applies cleanly, adversarial review raised no blocking or unresolved concern, "
+    "and the static impact surface is low or moderate. Not proof that the vulnerability is fixed."
+)
+
+
+def _as_sentence(text: str) -> str:
+    text = (text or "").strip().rstrip(".")
+    return f"{text[:1].upper()}{text[1:]}." if text else ""
+
+
+def _terminal_decision_summary(
+    no_patch: bool,
+    trust_rec: dict,
+    classified_challenger: "dict | None",
+    no_patch_reason: "str | None",
+) -> list[str]:
+    """Lines printed under the terminal's closing decision line: the
+    reason, the structured Challenger concern counts (when any), and the
+    next step. Presentation only -- every value is one the report already
+    renders (trust_rec's why/reason, the Challenger concerns table's counts,
+    the no-patch card's reason); nothing here is recomputed or new.
+    """
+    if no_patch:
+        lines = ["Run completed without a final candidate patch."]
+        if no_patch_reason:
+            lines.append(f"Reason    {no_patch_reason}")
+        lines.append("Next      No patch to review or deploy; see the Trust Report for details.")
+        return lines
+
+    decision = trust_rec["decision"]
+    if decision == "Deploy After Validation":
+        reason = _TERMINAL_GREEN_REASON
+    else:
+        reason = _as_sentence(trust_rec.get("why") or trust_rec.get("reason") or "")
+    lines = [f"Reason    {reason}"] if reason else []
+    if _is_structured_challenger(classified_challenger):
+        counts = _structured_concern_counts(classified_challenger)
+        if sum(counts.values()):
+            lines.append(
+                f"Concerns  {counts['BLOCKING']} blocking · {counts['UNRESOLVED']} unresolved · "
+                f"{counts['NON_BLOCKING']} non-blocking Challenger concern(s)"
+            )
+    next_step = _TERMINAL_NEXT_STEP.get(decision)
+    if next_step:
+        lines.append(f"Next      {next_step}")
+    return lines
+
+
+# Applicability skip reasons that, when the FINAL patch is empty, only mean
+# "the applicability check found nothing to check" -- never why there is no
+# patch. A real skipped-generation reason reaches applicability verbatim
+# instead (see _patch_validation_skip_reason); these three arise only when
+# patch generation ran and the final candidate ended up empty.
+_EMPTY_FINAL_PATCH_SKIP_REASONS = frozenset({
+    "empty diff after stripping fences",
+    "not a git repository",
+    "no repo_root provided",
+})
+_CAPACITY_NUMBERS_RE = re.compile(r"\((\d+) chars needed, (\d+) chars available\)")
+
+
+def _describe_no_patch_reason(raw_reason: "str | None") -> "str | None":
+    """Plain-language reason for NO PATCH PRODUCED, from the reason the run
+    already recorded (the applicability skip reason). Presentation only:
+    each phrase restates what its source string already says; an
+    unrecognized reason is shown verbatim rather than guessed at.
+
+    The empty-final-patch case is deliberately a disjunction: the pipeline
+    does not record which of the two happened (the model returned no diff,
+    or the conformance-recovery block withdrew a candidate that did not
+    conform to the approved edit targets), so the report must not pick one.
+    """
+    raw = (raw_reason or "").strip().rstrip(".")
+    if not raw:
+        return None
+    if raw in _EMPTY_FINAL_PATCH_SKIP_REASONS:
+        return (
+            "No usable candidate patch remained after patch generation: either the "
+            "model's output contained no diff, or the generated patch was withdrawn "
+            "because it did not conform to the approved edit targets."
+        )
+    if raw.startswith("planning_ungrounded"):
+        return "The remediation plan could not be grounded in repository evidence."
+    if raw.startswith("Planner Claim Verifier"):
+        return (
+            "A verification check found a contradiction in the remediation plan's claims "
+            "that was not resolved."
+        )
+    if "target_authority_unresolved" in raw:
+        return (
+            "The remediation strategy named a target, but repository evidence was not "
+            "sufficient to justify editing it."
+        )
+    if "omission_reason=technical_capacity" in raw:
+        numbers = _CAPACITY_NUMBERS_RE.search(raw)
+        detail = (
+            f" ({numbers.group(1)} chars needed, {numbers.group(2)} available)" if numbers else ""
+        )
+        return (
+            "The verified target source needed for patch generation does not fit within "
+            f"the model's context capacity{detail}."
+        )
+    if raw == "no verified final-target source":
+        return "The run did not establish verified, patch-ready source for the remediation target."
+    if raw.startswith("Patch Generator response invalid"):
+        return "The patch generator's response was still invalid after one bounded regeneration."
+    return f"Reason recorded by the run: {raw}."
+
+
+def _render_no_patch_card(files_changed: list[str], reason: "str | None" = None) -> str:
+    """First-screen execution-outcome card for a run that produced no
+    final candidate patch. Deliberately NOT a Recommendation Policy
+    decision (see _build_recommendation_v1, left untouched) -- a report
+    stating there is nothing to deploy, review, or validate must never
+    reuse _render_decision_card's signals-driven wording, which would
+    otherwise render a misleading "Patch was not verified." line for a
+    patch that does not exist.
+
+    `reason` is `_describe_no_patch_reason`'s plain-language text, or None
+    when the run recorded no reason. The opening line is deliberately
+    neutral: the no-patch causes differ (ungrounded plan, context capacity,
+    a withdrawn candidate, ...), so it asserts only what is true of all.
+    """
+    lines = [
+        "## ⚫ NO PATCH PRODUCED\n",
+        "Run completed without a final candidate patch.  ",
+    ]
+    if reason:
+        lines.append(f"Reason: {reason}  ")
+    lines += [
+        "No patch is available for deployment or review.  ",
+        f"Files changed: {len(files_changed)}",
+        "",
+        "---",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _render_deterministic_signals(
+    constraint_signals: list[dict] | None,
+    remediation_signals: list[dict] | None,
+) -> str:
+    """Render Deterministic Signals section as a Markdown string.
+
+    Returns empty string when both signal lists are absent or empty.
+    """
+    all_signals = list(constraint_signals or []) + list(remediation_signals or [])
+    if not all_signals:
+        return ""
+
+    _STATUS_ICON = {
+        "green": "✓",
+        "red": "✗",
+        "n/a": "—",
+        "yellow": "⚠",
+        "violations": "⚠",
+        "see evidence": "◑",
+        "unknown": "◑",
+    }
+
+    def _icon(status: str) -> str:
+        return _STATUS_ICON.get(status.lower().split()[0], "◑")
+
+    lines: list[str] = ["---\n", "## Deterministic Signals\n"]
+    lines.append("| Signal | Status |")
+    lines.append("|--------|--------|")
+    evidence_blocks: list[tuple[str, list[str]]] = []
+    for sig in all_signals:
+        name = sig.get("name", "")
+        status = sig.get("status", "")
+        icon = _icon(status)
+        lines.append(f"| {name} | {icon} {status} |")
+        # Collect evidence for RED / violation signals
+        if status.lower().startswith("red") or "violation" in status.lower():
+            ev = sig.get("evidence") or []
+            if ev:
+                evidence_blocks.append((name, ev))
+    lines.append("")
+
+    for name, ev in evidence_blocks:
+        lines.append(f"**{name} — Evidence**\n")
+        for item in ev[:5]:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Report builder
+# ---------------------------------------------------------------------------
+
+
+def _render_repair_notice(result: PipelineResult) -> str:
+    """Return a short Markdown blockquote about the repair attempt, or empty string.
+
+    Renders only what was actually observed. `repair_eligible_defect_count`
+    is only a real, re-challenge-derived number when `repair_rechallenged`
+    is True — it is otherwise an untouched default and must never be
+    printed as if it were a finding.
+
+    Acceptance (repair_succeeded) is now decided by accept_repair against
+    calibration-aware findings, not by repair_eligible_defect_count == 0
+    alone — a repair can be accepted with a nonzero raw eligible count if
+    every such finding calibrated away from Observed. The success branch
+    below says "0 calibration-confirmed issue(s)", which is true by
+    construction whenever repair_succeeded is True, rather than a raw count
+    that could otherwise contradict the calibrated outcome.
+
+    Post-review correction (run-4 Architecture B): this notice reads
+    `original_challenger_repair_eligible_count`/`repair_eligible_defect_
+    count` -- the SEPARATE, additive fields that count confirmed_defect AND
+    behavioral_defect combined -- NEVER `original_challenger_defect_count`/
+    `repair_defect_count`, which remain confirmed_defect-ONLY (their
+    historical, public meaning; also read by execution-artifact/replay
+    consumers under keys literally named "confirmed_defect_count"). Using
+    the eligible fields here is what keeps a repair triggered ONLY by a
+    behavioral_defect finding (0 confirmed_defect, N behavioral_defect)
+    from reading as self-contradictory ("Original patch had 0 confirmed
+    issue(s)... A repair was generated") -- the wording says "issue(s)",
+    not "defect(s)", specifically because it may be reporting either
+    category or both.
+    """
+    if not result.repair_attempted:
+        return ""
+    if result.repair_succeeded:
+        return (
+            f"\n> **Auto-repaired:** Original patch had "
+            f"{result.original_challenger_repair_eligible_count} confirmed issue(s). "
+            f"A repair was generated and accepted — re-challenge found 0 "
+            f"calibration-confirmed issue(s).\n"
+        )
+    if result.repair_rechallenged:
+        return (
+            f"\n> **Repair attempted:** Challenger found "
+            f"{result.original_challenger_repair_eligible_count} confirmed issue(s). "
+            f"Repair patch still had {result.repair_eligible_defect_count} confirmed issue(s); "
+            f"original recommendation stands.\n"
+        )
+    return (
+        f"\n> **Repair attempted:** Challenger found "
+        f"{result.original_challenger_repair_eligible_count} confirmed issue(s). "
+        f"The repair patch did not reach re-challenge (it failed to apply, or the "
+        f"repair loop encountered an unexpected error) — no repair defect count is "
+        f"available; original recommendation stands.\n"
+    )
+
+
+def _render_retry_notice(result: PipelineResult) -> str:
+    """Return a short Markdown blockquote about the applicability-aware retry
+    attempt, or empty string when no retry occurred.
+
+    Renders only the already-computed retry_attempted/retry_succeeded fields —
+    does not re-derive, trigger, or otherwise affect retry behavior.
+    """
+    if not result.retry_attempted:
+        return ""
+    if result.retry_succeeded:
+        outcome = "Retry succeeded — patch now applies cleanly."
+    else:
+        outcome = "Retry failed to produce an applicable patch."
+    return (
+        "\n\n> **Applicability-aware retry**\n"
+        "> - Initial patch did not apply.\n"
+        "> - Applicability-aware retry was attempted.\n"
+        f"> - Outcome: {outcome}"
+    )
+
+
+def _relative_test_path(path_str: str, repo_root: "Path | None") -> str:
+    """Render a Test Support match path repository-relative when possible.
+
+    Report Polish Batch C: presentation only -- `testing_support.
+    tests_for_file` always returns an absolute path (`str(t.resolve())`);
+    this never mutates that stored value, it only changes what the report
+    prints for it. Falls back to the original absolute `path_str`
+    unchanged whenever `repo_root` is missing/invalid, or the path does
+    not actually resolve to something inside it (never invents a relative
+    path in that case -- reproducibility/debugging must still be able to
+    find the real file).
+    """
+    if not repo_root:
+        return path_str
+    try:
+        root = Path(repo_root).resolve()
+        p = Path(path_str)
+        if not p.is_absolute():
+            return path_str
+        rel = p.resolve().relative_to(root)
+        rel_str = rel.as_posix()
+        return rel_str if rel_str not in ("", ".") else "."
+    except Exception:
+        return path_str
+
+
+def _build_report(result: PipelineResult) -> str:
+    # === [A] Extract and prepare data ===
+    summary = _extract_summary(result.vulnerability_text)
+    review_sections = _split_review(result.review)
+    challenger = result.challenger or {}
+    behavior = result.behavior
+
+    # Files touched by the unified diff — used by the Hero Banner's "Files
+    # changed" count. "Impact Summary" and "Testing Notes" (which used to be
+    # built here as restatements of Explanation/Known Findings/Reviewer
+    # Notes) were removed as duplicated storytelling — each of their three-
+    # to-four subsections repeated content already shown elsewhere verbatim
+    # or near-verbatim.
+    files_changed = []
+    for line in (result.patch or "").splitlines():
+        if line.startswith("+++ b/"):
+            files_changed.append(line[6:].strip())
+
+    # Report-level execution outcome -- NOT a Recommendation Policy value
+    # (see _build_recommendation_v1, left untouched below). When the FINAL
+    # result.patch is empty, there is nothing to deploy, review, or
+    # validate, regardless of what the (still-computed) Recommendation
+    # Policy signals say.
+    no_patch = not (result.patch and result.patch.strip())
+
+    # Build Patch Hygiene section
+    hygiene_findings = result.hygiene or []
+    if hygiene_findings:
+        hygiene_lines = []
+        for f in hygiene_findings:
+            sev = f.get("severity", "?")
+            detail = f.get("detail", "")
+            hygiene_lines.append(f"- [{sev}] {detail}")
+        hygiene_section = "\n".join(hygiene_lines)
+    elif no_patch:
+        # Release polish: never call a nonexistent patch clean.
+        hygiene_section = _NOT_APPLICABLE_NO_PATCH
+    else:
+        hygiene_section = "No obvious hygiene issues detected."
+
+    # Build Patch Applicability section
+    app = result.applicability or {}
+    if not app or app.get("skipped"):
+        reason = (app.get("skipped_reason") or "applicability check did not run")
+        applicability_section = f"*(Skipped — {reason}.)*"
+    elif app.get("error"):
+        applicability_section = f"**Result:** ⚠ Error — {app['error']}"
+    elif app.get("applicable") is True:
+        applicability_section = "**Result:** ✓ Patch applies cleanly to the target repository."
+    elif app.get("applicable") is False:
+        stderr = (app.get("stderr") or "").strip()
+        applicability_section = "**Result:** ✗ Patch does not apply cleanly."
+        if stderr:
+            applicability_section += f"\n\n```\n{stderr}\n```"
+    else:
+        applicability_section = "*(Applicability unknown.)*"
+
+    # Plain-language NO PATCH PRODUCED reason for the decision card and the
+    # terminal summary -- the same recorded reason the Patch Applicability
+    # section shows verbatim (left unchanged: run_cve_batch.py parses it).
+    no_patch_reason = (
+        _describe_no_patch_reason(app.get("skipped_reason")) if no_patch and app.get("skipped") else None
+    )
+
+    # -----------------------
+    # Hoist: Suggested Tests + Test Support + Validation Actions
+    # (needed before Trust Package computation)
+    # -----------------------
+    adv_parts_early = []
+    if challenger:
+        # Same shared, deterministic cross-section dedup _classify_challenger
+        # uses below (see _dedupe_challenger_findings) -- this is a SECOND,
+        # independent consumer of the raw edge_cases/potential_issues lists
+        # (it runs before _classify_challenger is called later in this same
+        # function), so it must not read the raw lists directly or a
+        # duplicate concern would still reach suggest_tests() as two
+        # separate suggested tests.
+        _edge_cases_early, _potential_issues_early, _ = _dedupe_challenger_findings(
+            challenger.get("edge_cases") or [], challenger.get("potential_issues") or [],
+        )
+        for e in _edge_cases_early:
+            adv_parts_early.append(f"- {e}")
+        for p in _potential_issues_early:
+            adv_parts_early.append(f"- {p}")
+    adv_text_early = "\n".join(adv_parts_early).strip()
+    findings_early = extract_findings(adv_text_early) if adv_text_early else []
+    # Release-polish: behavior_summary's generic fallback ("application
+    # logic" / "normal flow" / "edge-case handling") carries no
+    # patch-specific signal — suppress ONLY the behavior-derived suggested
+    # tests it would otherwise generate (test_normal_flow /
+    # test_edge_case_handling) by not passing `behavior` through when
+    # `is_generic` is set. Challenger-finding-derived suggestions
+    # (`findings_early`) are untouched; specific (non-generic) behavior
+    # summaries are untouched.
+    _behavior_for_tests = None if (behavior or {}).get("is_generic") else behavior
+    suggestions = (
+        suggest_tests(findings_early, behavior=_behavior_for_tests)
+        if (findings_early or _behavior_for_tests) else []
+    )
+
+    # F-01: no Path.cwd() fallback — when no repository root was provided,
+    # this repository-dependent signal is skipped entirely rather than
+    # analyzing whatever directory the process happens to run in.
+    ts_root = result.repo_root
+    target_file_display = "unknown"
+    target_path_obj = None
+    m = re.search(r"^\+\+\+ b/(.+)$", result.patch or "", re.MULTILINE)
+    if m:
+        target_rel = m.group(1).strip()
+        target_file_display = target_rel
+        if ts_root is not None:
+            target_path_obj = ts_root / target_rel
+    _report_language = result.detected_language or "python"
+    matches: list = []
+    rating = "None"
+    delta = -0.15
+    metadata: dict = {}
+    total_tests_found = 0
+    if ts_root is not None:
+        all_tests = discover_tests(ts_root)
+        total_tests_found = len(all_tests)
+        if target_path_obj is not None:
+            matches = tests_for_file(ts_root, target_path_obj)
+        rating, delta, metadata = score_test_support(matches, language=_report_language)
+    else:
+        rating = "Not Verified"
+
+    # -----------------------
+    # Validation Actions (definition hoisted here)
+    # -----------------------
+    def build_validation_plan(challenger: dict, suggestions: list[dict], matches: list[dict], rating: str, impact: dict | None, behavior: dict | None = None) -> list[dict]:
+        """Build up to 3 deterministic validation actions.
+
+        Returns list of action dicts: {priority,title,reason,next_step}
+
+        Report Polish Batch B (post-review fix, round 2): every action dict
+        also carries an explicit `"cap_bucket"` -- one of "test"/"verify"/
+        "review"/"other" -- assigned at construction time, never inferred
+        from the action's human-readable `title`. This is what the per-type
+        cap a few lines down groups and dedups by.
+
+        Round 1 of this fix assigned `cap_bucket` from provenance alone
+        (Suggested Tests -> "test", adversarial -> "verify"), which
+        stopped titles from moving actions between buckets, but it was a
+        NEW bucket split -- pre-Batch-B, both loops could land in the same
+        bucket (their old titles were usually both "Add targeted tests for
+        ..."), so this changed which actions survived the cap in some
+        shapes (e.g. an extra "Increase targeted test coverage" could
+        newly appear in a single-finding, weak-test-coverage report). That
+        is a membership change and is out of scope for this batch.
+
+        Round 2 (this version) instead computes `cap_bucket` from
+        `_legacy_action_bucket_for_finding` -- the exact bucket
+        `action_type_from_title(normalize_title_from_text(text))` would
+        have produced on frozen pre-Batch-B `HEAD`, using each branch's own
+        historical input (the Suggested-Tests loop's old topic precedence
+        was `name` before `reason`; the adversarial loop always used the
+        raw finding text) -- so the cap is legacy-equivalent, not a new
+        taxonomy. The three fixed-title branches below (test-support
+        candidate, HIGH-impact fallback, behavior-driven action, no-anchor
+        fallback) keep their own hardcoded bucket, since Batch B never
+        touched those titles and their old bucket is simply whatever
+        `action_type_from_title` already produced for that unchanged
+        string.
+        """
+        actions: list[dict] = []
+
+        # short_reason() / normalize_title_from_text() are module-level
+        # helpers (see above) -- resolved here via normal enclosing-scope
+        # lookup, not redefined locally, so they stay independently
+        # unit-testable.
+
+        impact_level = (impact.get("impact_level") if impact else "low")
+        impact_level = (impact_level or "low").lower()
+
+        def compute_priority(base_medium=False) -> str:
+            if impact_level == "high":
+                return "HIGH"
+            if impact_level == "medium" or base_medium:
+                return "MEDIUM"
+            return "LOW"
+
+        # Report Polish Batch B: already-computed finding_calibration (LLM
+        # classification that already ran, if it ran at all -- see
+        # finding_calibration.py) keyed by its own raw finding text, exactly
+        # as _build_known_findings already does. Used below only to break
+        # ties between same-priority actions by how directly each one
+        # validates the vulnerability's core security behavior -- never to
+        # add, remove, or reprioritize an action, and never a second call
+        # into finding_calibration itself.
+        calibration_by_original = {
+            entry.get("original"): entry for entry in _usable_calibration_entries(result.finding_calibration)
+        }
+
+        # Suggested tests -> up to 2. `cap_bucket` reproduces the bucket the
+        # PRE-Batch-B topic (`name` preferred over `reason` -- the old
+        # precedence, kept here ONLY for this legacy-bucket lookup, not for
+        # `title` itself) would have produced. In practice this is always
+        # "test": a generated test-function slug (e.g. "test_the_auth_
+        # token_is_not_validated") never contains a `\b`-bounded keyword
+        # match (the whole slug is one underscore-joined word), so it always
+        # fell to the old generic "Add targeted tests for <slug>" fallback.
+        for s in (suggestions or [])[:2]:
+            topic = s.get("reason") or s.get("name") or ""
+            title = normalize_title_from_text(topic)
+            reason = short_reason(s.get("reason", "Suggested test")) or "Add targeted tests."
+            base_medium = False
+            if challenger and (challenger.get("edge_cases") or challenger.get("potential_issues")):
+                base_medium = True
+            if rating == "None":
+                base_medium = True
+            legacy_topic = s.get("name") or s.get("reason") or ""
+            actions.append({
+                "priority": compute_priority(base_medium), "title": title, "reason": reason,
+                "next_step": "Add targeted tests for the identified behavior.",
+                "_directness": _finding_directness_tier(s.get("reason") or "", calibration_by_original),
+                "cap_bucket": _legacy_action_bucket_for_finding(legacy_topic),
+            })
+
+        # Adversarial items -> up to 2. `cap_bucket` reproduces the bucket
+        # the PRE-Batch-B title (built from this same raw finding text)
+        # would have produced -- e.g. an auth-flavored finding legacy-
+        # buckets as "review" here, exactly as it did on HEAD, even though
+        # its Batch-B `title` is unrelated to that bucket.
+        adv_items = []
+        if challenger:
+            adv_items.extend(challenger.get("edge_cases", []) or [])
+            adv_items.extend(challenger.get("potential_issues", []) or [])
+        for item in adv_items[:2]:
+            title = normalize_title_from_text(item)
+            reason = short_reason(item) or "Adversarial finding requires validation."
+            actions.append({
+                "priority": compute_priority(True), "title": title, "reason": reason,
+                "next_step": "Validate the finding via focused unit tests or manual review.",
+                "_directness": _finding_directness_tier(item, calibration_by_original),
+                "cap_bucket": _legacy_action_bucket_for_finding(item),
+            })
+
+        # Test support candidate -> max 1. Not derived from a specific
+        # finding -- a general coverage gap, not a claim about the
+        # vulnerability's own behavior -- so it takes the lowest (most
+        # speculative) directness tier. `cap_bucket` is hardcoded to match
+        # exactly what action_type_from_title used to derive from each of
+        # these two fixed, Batch-B-untouched titles ("test" for the
+        # coverage-rating wording, "other" for the no-tests-found wording).
+        if rating != "Good":
+            if rating == "None":
+                reason = "No directly matching unit tests found for the patched module."
+                ts_title = "Improve validation coverage"
+                ts_cap_bucket = "other"
+            else:
+                reason = f"Test support rating: {rating}."
+                ts_title = "Increase targeted test coverage"
+                ts_cap_bucket = "test"
+            actions.append({
+                "priority": compute_priority(True if rating == "None" else False),
+                "title": ts_title,
+                "reason": short_reason(reason), "next_step": "Add targeted tests exercising the patched behavior.",
+                "_directness": 1,
+                "cap_bucket": ts_cap_bucket,
+            })
+
+        # Ensure a HIGH action exists for high impact. Concrete and
+        # deterministic (impact analysis already flagged this surface), so
+        # it ranks above generic/speculative items but below an action that
+        # directly validates the vulnerability's own core behavior.
+        # `cap_bucket` is hardcoded "review" to match what
+        # action_type_from_title used to derive from this fixed,
+        # Batch-B-untouched title.
+        if impact_level == "high" and not any(a["priority"] == "HIGH" for a in actions):
+            imp_sum = short_reason(impact.get("impact_summary", "")) if impact else "High-impact change."
+            title = "Review impacted flows"
+            reason = _truncate_reason("High-impact: " + imp_sum, 120)
+            actions.append({
+                "priority": "HIGH", "title": title, "reason": reason,
+                "next_step": "Perform a targeted code review of affected flows.",
+                "_directness": 2,
+                "cap_bucket": "review",
+            })
+
+        # Post-review fix (round 2): WHICH actions survive the per-type cap
+        # (membership) is decided using ONLY priority, in the same
+        # insertion order build_validation_plan has always used -- this is
+        # the exact ordering pre-Batch-B `HEAD` used before capping, now
+        # that `cap_bucket` is also legacy-equivalent (see docstring above).
+        # Directness must NOT influence this step: sorting the *candidates*
+        # by directness before capping would let two duplicate
+        # representations of the SAME (more direct) finding -- one from
+        # Suggested Tests, one from the adversarial loop, a pre-existing,
+        # out-of-scope-to-fix duplication -- crowd out a DIFFERENT finding's
+        # only representation, changing membership. Directness is applied
+        # below, only to reorder whichever actions already survived.
+        rank_map = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+        actions_sorted_for_cap = sorted(actions, key=lambda a: (-rank_map.get(a["priority"], 1),))
+
+        final: list[dict] = []
+        type_counts = {"test": 0, "verify": 0, "review": 0, "other": 0}
+
+        # The per-type cap reads each action's own explicit, legacy-
+        # equivalent `cap_bucket` (set at construction above), never
+        # derived from the display title. `.get(..., "other")` is a
+        # defensive default only -- every branch above already sets
+        # `cap_bucket` explicitly, so this never actually falls back in
+        # practice; it exists solely so a future construction site that
+        # forgets to set it degrades to the least-privileged bucket instead
+        # of raising.
+        for a in actions_sorted_for_cap:
+            if len(final) >= 3:
+                break
+            atype = a.get("cap_bucket", "other")
+            if type_counts.get(atype, 0) >= 2:
+                continue
+            final.append(a)
+            type_counts[atype] = type_counts.get(atype, 0) + 1
+
+        # Fallback only when no anchors
+        if not final:
+            no_suggestions = not (suggestions or [])
+            no_adversarial = not (challenger and (challenger.get("edge_cases") or challenger.get("potential_issues")))
+            if no_suggestions and no_adversarial and rating == "Good":
+                final = [{
+                    "priority": "LOW", "title": "Perform quick manual review",
+                    # Release polish: not "No automated anchors available" --
+                    # "anchor" means something else in Post-Patch
+                    # Investigation, and this fallback fires whenever no
+                    # specific validation item was generated.
+                    "reason": "No specific validation items were generated; brief manual inspection advised.",
+                    "next_step": "Manually review the changed logic and adjacent call sites.",
+                    "cap_bucket": "review",
+                }]
+
+        # Report Polish Batch B: NOW that membership is finalized (exactly
+        # legacy-equivalent, above), reorder the survivors -- and only the
+        # survivors -- so that within the same HIGH/MEDIUM/LOW priority
+        # tier, the action that most directly validates the vulnerability's
+        # core security behavior displays first (e.g. a direct confirmed/
+        # validation-gap finding, or a calibrated "observed" finding, ahead
+        # of a speculative edge case). `sorted` is stable, so ties (same
+        # priority AND same directness) keep whichever order the legacy cap
+        # selection above already produced. This changes DISPLAY order
+        # only -- it can never add, drop, or reprioritize an action, since
+        # it operates on the fixed-membership `final` list, not on `actions`.
+        final = sorted(
+            final,
+            key=lambda a: (-rank_map.get(a.get("priority"), 1), -a.get("_directness", 1)),
+        )
+
+        for a in final:
+            a["reason"] = short_reason(a.get("reason", ""))
+
+        # Map next_step to more specific actions for known titles
+        def specific_next_step(title: str, default: str) -> str:
+            lt = (title or "").lower()
+            if "database" in lt or "driver" in lt or "placeholder" in lt:
+                return "Confirm the database driver placeholder style and add a focused compatibility test if needed."
+            if "unicode" in lt or "encoding" in lt or "binary" in lt:
+                return "Add targeted tests for unicode and binary username inputs."
+            if title == "Improve validation coverage" or "validation coverage" in lt:
+                return "Add focused tests that exercise the patched function/module."
+            return default
+
+        for a in final:
+            a["next_step"] = specific_next_step(a.get("title"), a.get("next_step"))
+
+        # If a behavior summary is provided, OR the pipeline's own Final
+        # Remediation Strategy already identified a concrete security
+        # invariant, ensure a single behavior-driven validation action is
+        # prepended. Keep this minimal and deterministic.
+        #
+        # Release-polish: suppressed when behavior_summary reports its
+        # generic fallback (`is_generic`) — "Validate behavior: normal flow,
+        # edge-case handling" carries no patch-specific signal in that case.
+        # Specific (non-generic) behavior summaries are unaffected.
+        #
+        # Post-review fix (real-CVE regression): behavior_summary.py is a
+        # tiny file/function-name keyword classifier (auth/validate/db/api)
+        # that falls to its generic fallback for most real vulnerabilities
+        # -- none of a `Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT` constant
+        # change, a `setKey` traversal guard, or a `get_data_path` path
+        # check match its narrow keyword buckets -- so this action almost
+        # never fired where it mattered most, and Top Action defaulted to
+        # whichever adversarial/Suggested-Tests item happened to rank
+        # first: often a secondary edge case (header casing, a legitimate-
+        # key compatibility concern) rather than the vulnerability's own
+        # core security behavior. `result.security_invariant` -- the Final
+        # Remediation Strategy's own one-sentence statement of the security
+        # property this fix restores (see remediation_planner.
+        # RemediationStrategyResult) -- is LLM-derived remediation guidance
+        # produced from already-verified repository/Planner evidence, NOT
+        # deterministic evidence itself; it is reused here from a call the
+        # pipeline already makes when it makes one at all (no new LLM call,
+        # no re-analysis of the CVE), purely for report presentation, and
+        # is preferred here when present since it names the actual
+        # vulnerability-specific invariant instead of a coarse file/
+        # function-name keyword guess. Falls back to the existing behavior-
+        # summary path, unchanged, when no security invariant is available
+        # -- this never adds a second, independent action source; it is the
+        # same single "Validate behavior" slot, now with a better content
+        # source when one exists. Never consumed by _compute_trust_signals,
+        # _build_recommendation_v1, applicability, repair, or patch
+        # generation -- see PipelineResult.security_invariant's own comment.
+        _security_invariant = (result.security_invariant or "").strip()
+        if _security_invariant or (behavior and not behavior.get("is_generic")):
+            try:
+                if _security_invariant:
+                    # Release polish: the invariant is shown ONCE, in full,
+                    # under a fixed title (rendered by
+                    # _render_validation_actions_section) -- previously the
+                    # title, Reason and Next step each carried the same
+                    # sentence truncated mid-clause, and the full property
+                    # appeared nowhere in the report. A fixed title also
+                    # never runs the invariant through
+                    # normalize_title_from_text's domain keyword
+                    # classification (the "Review authentication flow"
+                    # false match).
+                    title = _SECURITY_PROPERTY_ACTION_TITLE
+                    beh_reason = ""
+                    next_step = (
+                        "Confirm the patched code upholds this property, with a targeted "
+                        "test or a manual review."
+                    )
+                else:
+                    pbs = behavior.get("primary_behaviors") or []
+                    # comma-separated first 4 primary behaviors
+                    next_step = "Verify: " + ", ".join(pbs[:4]) if pbs else "Verify: (behavior validation)"
+                    beh_reason = short_reason(behavior.get("summary", ""))
+                    title = "Validate behavior"
+                # Directness 3: this action is built directly from the
+                # patch's own extracted remediation behavior (or, when
+                # available, the Final Strategy's own security invariant)
+                # -- the most direct available validation of the
+                # vulnerability's core security behavior. Unused here (this
+                # action is prepended unconditionally, not sorted by
+                # _finding_directness_tier), kept only so its tier reads
+                # consistently alongside the other actions' tiers.
+                beh_action = {
+                    "priority": "MEDIUM", "title": title, "reason": beh_reason,
+                    "next_step": next_step, "_directness": 3, "cap_bucket": "verify",
+                }
+                if _security_invariant:
+                    # Post-review fix: Top Action ("what should the
+                    # reviewer validate first?") is a different question
+                    # from priority ("how important is this concern?").
+                    # This explicit marker -- set here, at the one place
+                    # that knows this action came from a concrete security
+                    # invariant -- is _select_top_action's sole source of
+                    # truth for overriding its priority-based selection.
+                    # Never inferred later from title text or any other
+                    # fuzzy match. Priority itself stays "MEDIUM", exactly
+                    # as computed above; this key affects Top Action
+                    # selection only, never ranking, membership, cap
+                    # behavior, reason, or next_step.
+                    beh_action["is_security_invariant_action"] = True
+                    # Display only: the full, untruncated invariant text.
+                    beh_action["security_property"] = _security_invariant
+                # Prepend but keep final limited to 3 actions by trimming the end
+                final = [beh_action] + final
+                if len(final) > 3:
+                    final = final[:3]
+            except Exception:
+                # Non-fatal: ignore behavior-driven action on errors
+                pass
+
+        return final
+
+    validation_actions = build_validation_plan(
+        challenger, suggestions, matches, rating, result.impact, behavior
+    )
+    if no_patch:
+        # Nothing to validate, deploy, or review for this outcome -- emptying
+        # here (rather than special-casing every renderer that consumes this
+        # list) means the existing "no validation actions" fallbacks already
+        # in this module -- no Top Action, no Validation Actions section --
+        # apply for free, with no changes to those renderers.
+        validation_actions = []
+
+    # -----------------------
+    # Trust Package computation (uses hoisted data above)
+    # -----------------------
+    classified_challenger = _classify_challenger(challenger)
+    # Semantic remediation-proof reconciliation -- MUST run against
+    # `result.challenger`/`result.finding_calibration` specifically (both
+    # read from the same `result`, so both already correspond to the same,
+    # CURRENT Challenger response: post-repair if repair succeeded, the
+    # original otherwise -- see PipelineResult's own field docs and
+    # _reconcile_verification_status_with_calibration's own docstring for
+    # why a stale calibration entry from an earlier, pre-repair response
+    # can never be applied here: association is by exact finding text, and
+    # a repair's fresh re-Challenger call produces fresh finding text that
+    # simply will not match anything from the superseded response).
+    classified_challenger = _reconcile_verification_status_with_calibration(
+        classified_challenger, result.finding_calibration,
+    )
+    impact_level_str = _resolve_impact_level(result.impact)  # I2
+    # Calibration-aware authoritative finding state, computed before Trust
+    # Signals/Recommendation so both read the SAME post-calibration defect
+    # count the report itself renders under "Potential Remaining Risks" —
+    # see _build_known_findings. A raw confirmed_defect finding that Finding
+    # Calibration downgraded to Hypothesis/Hardening must never still be
+    # counted as a confirmed defect here; only its calibration_by_original
+    # lookup (fail-closed if missing) decides that, not the raw classifier
+    # count alone.
+    known_findings = _build_known_findings(classified_challenger, result.finding_calibration)
+    calibrated_defect_count = len(known_findings["potential_remaining_risks"])
+    progress.stage(5, 5, "Decide")
+    signals = _compute_trust_signals(
+        result.hygiene,
+        result.applicability,
+        # Only confirmed_defect_count is overridden -- plausible_risk_count/
+        # validation_gap_count intentionally stay the raw, pre-calibration
+        # figures that already back coverage_confidence's separately
+        # labeled "before evidence calibration" count (release-polish
+        # decision; see that signal's own notes).
+        {**classified_challenger, "confirmed_defect_count": calibrated_defect_count},
+        rating,
+        impact_level_str,
+    )
+    # Evidence Sufficiency Gate (Phase 1) -- merged in as a NEW key, separate
+    # from _compute_trust_signals itself, so that function's own six-signal
+    # computation and its I1-I6 Recommendation Policy invariants are never
+    # touched by this addition. Falls back to a safe "Not Verified" default
+    # (never "Confirmed") when the field is absent -- e.g. a hand-built
+    # PipelineResult in a test, or a run with no repo_root.
+    signals["source_verification"] = result.source_verification or {
+        "value": "Not Verified", "label": "? Not Verified",
+        "notes": "No source-verification data available for this run",
+    }
+    # Existing Test Comparison -- merged in as a NEW key, same pattern as
+    # source_verification directly above: never touches
+    # _compute_trust_signals' own six-signal computation or its I1-I6
+    # invariants. classify_existing_test_comparison_signal(None) already
+    # returns a safe NOT_VERIFIED default (covers both "flag was off" and
+    # "no data available") -- never a positive inference.
+    signals["existing_test_comparison"] = classify_existing_test_comparison_signal(
+        result.existing_test_comparison
+    )
+    if no_patch:
+        # The report omits Trust Signals for this outcome (see below), so
+        # the terminal must not claim they were evaluated for it.
+        progress.skipped("Trust signals not applicable", reason="no candidate patch was produced")
+    else:
+        progress.success("Trust signals evaluated")
+    trust_rec = _build_recommendation_v1(
+        signals,
+        still_vulnerable=_challenger_still_vulnerable(classified_challenger),
+        defect_count=calibrated_defect_count,
+        verification_status=classified_challenger.get("verification_status"),
+        structured_challenger=_is_structured_challenger(classified_challenger),  # display only
+    )
+    # Demo polish: surface the already-computed decision on stdout the moment
+    # it's known. Reuses the existing decision->emoji mapping (Hero Banner) —
+    # no new value, no new classification. Gated on the SAME `no_patch`
+    # this function already uses, below, to choose between
+    # _render_no_patch_card/_render_decision_card -- the terminal (which
+    # just streams this stderr line verbatim) must never show a Manual
+    # Review Required / Deploy / Do Not Apply bottom line for a run that
+    # produced no final candidate patch, matching what the report itself
+    # already renders in that case.
+    #
+    # Presentation (release polish, round 2): the legacy "[pipeline]
+    # Recommendation:" prefix is intentionally gone from the default
+    # human-facing banner -- a bare bordered decision line is the whole
+    # point of the closing block, not a debug-log-style prefix. Decision
+    # text itself is unchanged (still `trust_rec['decision']`/"NO PATCH
+    # PRODUCED" verbatim, just uppercased for the banner -- a formatting
+    # choice, not a new value); the emoji->decision mapping is untouched.
+    # The old two-line "[pipeline] Recommendation:\n{emoji} {decision}"
+    # form still exists, verbose-only, for anyone grepping historical
+    # scripts/logs.
+    if no_patch:
+        _decision_line = "⚫ NO PATCH PRODUCED"
+    else:
+        _decision_line = f"{_DECISION_CARD_EMOJI.get(trust_rec['decision'], '⚪')} {trust_rec['decision'].upper()}"
+    # Release polish: the decision line stays first and unchanged; the lines
+    # after it only restate already-computed results (see
+    # _terminal_decision_summary).
+    progress.banner([_decision_line] + _terminal_decision_summary(
+        no_patch, trust_rec, classified_challenger, no_patch_reason,
+    ))
+    progress.verbose(
+        f"[pipeline] Recommendation:\n"
+        f"{'⚫ NO PATCH PRODUCED' if no_patch else _DECISION_CARD_EMOJI.get(trust_rec['decision'], '⚪') + ' ' + trust_rec['decision']}"
+    )
+    # known_findings already computed above (calibration-aware, feeds signals/trust_rec).
+    # Gate the Trust Signals table's forward pointer on the same finding
+    # categories that back remediation_alignment/coverage_confidence
+    # (risks/hypotheses/observed/gaps) — Future Hardening Ideas isn't
+    # relevant to either signal, so it doesn't justify pointing a reader there.
+    known_findings_relevant = bool(
+        known_findings["potential_remaining_risks"]
+        or known_findings["observed_implementation_notes"]
+        or known_findings["validation_hypotheses"]
+        or known_findings["validation_gaps"]
+    )
+    consistency_caveats = _check_recommendation_consistency(signals, trust_rec["decision"], known_findings)
+    manual_review_scope_note = _render_manual_review_scope_note(trust_rec["decision"], known_findings)
+    why_manual_review_line = _render_why_manual_review_line(trust_rec)
+    top_action_line = _render_top_action_line(validation_actions)
+    if no_patch:
+        # Execution outcome, not a Recommendation Policy presentation --
+        # _build_recommendation_v1's result (trust_rec, computed above) is
+        # intentionally not read here; the normal Manual Review Required /
+        # Deploy / Do Not Apply bottom line must never appear for an empty
+        # final patch.
+        decision_card = _render_no_patch_card(files_changed, reason=no_patch_reason)
+        recommendation_block = ""
+    else:
+        decision_card = _render_decision_card(trust_rec, signals, validation_actions, files_changed)
+        recommendation_block = _render_recommendation_block(
+            trust_rec,
+            caveats=consistency_caveats,
+            scope_note=manual_review_scope_note,
+            top_action_line=top_action_line,
+            why_line=why_manual_review_line,
+        )
+    if no_patch:
+        # Same execution-outcome rationale as decision_card/recommendation_
+        # block above: with no final candidate patch, `challenger` is {}
+        # (no Challenger call was ever made -- see the no-candidate-patch
+        # early stop in run()) and `signals`/`known_findings` above are
+        # therefore derived from that empty state, not from genuine
+        # adversarial review. Rendering them would show a misleadingly
+        # confident Trust Signals table (e.g. remediation_alignment=
+        # "Aligned" rendered as "✅ Good") and an
+        # empty "## Review Results" section that never ran. Neither
+        # section is meaningful without a patch to have reviewed.
+        trust_signals_block = ""
+        known_findings_block = ""
+        challenger_concerns_block = ""
+    else:
+        # Structured (`Concerns:` schema) responses only; "" for legacy.
+        challenger_concerns_block = _render_challenger_concerns(classified_challenger)
+        trust_signals_block = _render_trust_signals_table(
+            signals,
+            known_findings_rendered=known_findings_relevant,
+            challenger_concerns_rendered=bool(challenger_concerns_block),
+        )
+        known_findings_block = _render_known_findings(known_findings)
+    validation_actions_block = _render_validation_actions_section(validation_actions, trust_rec["decision"])
+    primary_refs_block = _render_primary_references(_extract_primary_references(result.vulnerability_text))
+
+    # -----------------------
+    # Assemble report
+    #
+    # Order (reviewer-experience redesign): Hero Banner, Vulnerability
+    # Summary, Primary Vulnerability References, Proposed Patch, Patch
+    # Hygiene, Patch Applicability, Trust Signals, Recommendation,
+    # Explanation, Validation Actions, Review Results, Repository Context,
+    # Impact Surface, Appendices. Run Metadata / Stage Stop Reasons are
+    # appended by main.py after this function returns — not rendered here.
+    #
+    # Repository Context answers "which repository locations informed this
+    # work, and why?" — deliberately independent of Trust Signals ("how much
+    # evidence supports trusting this patch?"). Placed immediately before
+    # Impact Surface, sourced from ground_repository(), not from the
+    # find_code_context() call already feeding LLM prompts.
+    #
+    # Rationale: a reviewer first wants to know what is broken and what
+    # patch is proposed — only then do Trust Signals become meaningful.
+    # Trust Signals moved after the patch instead of leading, reversing the
+    # previous redesign's placement. Patch Hygiene and Patch Applicability
+    # (the report's only two fully deterministic checks) were promoted from
+    # Appendices to sit directly beside the diff they describe — a reviewer
+    # who trusts deterministic evidence over LLM narrative should not have to
+    # scroll past Explanation/Validation Actions/Review Results to reach the
+    # actual git-apply result.
+    #
+    # "Impact Summary" and "Testing Notes" are gone entirely — both were
+    # restatements of Explanation / Review Results / Reviewer Notes, not
+    # unique content (verified against a real generated report: "Why it
+    # matters" was byte-identical to Explanation's own text). Reviewer Notes
+    # moved into Appendices — it is supplementary reviewer advice, not part
+    # of the core "understand this in 30 seconds" flow.
+    #
+    # This reorders, relabels, and removes duplicated content only: no
+    # change to how `patch`, `challenger`, `signals`, `trust_rec`, or
+    # `classified_challenger` are computed. `validation_actions` and the
+    # Hero Banner/Recommendation presentation are the two exceptions,
+    # overridden for the `no_patch` execution-outcome state above.
+    # -----------------------
+
+    # §1: Header + Hero Banner
+    report = f"""\
+# Auto Patcher — Security Patch Report
+
+{decision_card}
+"""
+
+    # §2: Vulnerability Summary
+    report += f"""## Vulnerability summary
+
+{summary}
+
+"""
+
+    # §3: Primary Vulnerability References
+    report += primary_refs_block
+
+    # §4: Proposed Patch
+    report += f"""## Proposed patch
+
+{"*No final candidate patch was produced.*" if no_patch else result.patch.strip()}
+
+"""
+
+    # §4b: Promoted deterministic evidence — Patch Hygiene and Patch
+    # Applicability (plus the retry/repair notices that describe attempts to
+    # fix applicability) are the only two fully deterministic checks in this
+    # report. Promoted here from Appendices so they sit next to the diff they
+    # describe, rather than after ~200 lines of heuristic narrative (Trust
+    # Signals' own "Does the patch apply?" row already points here).
+    report += f"""## Patch Hygiene
+
+{hygiene_section}
+
+## Patch Applicability
+
+{applicability_section}"""
+
+    # Applicability-aware retry notice — rendered only when a retry actually
+    # occurred; resolves to "" otherwise.
+    report += _render_retry_notice(result)
+    report += "\n"
+
+    # Repair notice (Phase C)
+    repair_notice = _render_repair_notice(result)
+    if repair_notice:
+        report += repair_notice
+    report += "\n"
+
+    # §5: Trust Signals
+    report += trust_signals_block
+
+    # §6: Recommendation
+    report += recommendation_block
+
+    # §7: Explanation — the reviewer text verbatim. (Release polish: the
+    # former "Security gain:" callout is gone -- it labeled whichever sentence
+    # matched an action verb as a gain, and on real runs that was often
+    # background, a heading, or a stated limitation such as "the fix is only
+    # partial".) A standing
+    # disclaimer states the epistemic status of this whole section once,
+    # rather than requiring per-sentence hedging of LLM-generated prose this
+    # pipeline cannot rewrite without a new semantic classifier.
+    #
+    # Suppressed entirely for no_patch: review_sections comes solely from
+    # result.review, which the Patch Reviewer never produced for this run
+    # (see the no-candidate-patch early stop in run()) -- rendering this
+    # heading with empty/fallback body text would still read as "patch-
+    # review prose" the reader might mistake for a real, if brief, review.
+    if not no_patch:
+        report += "---\n\n## Explanation\n\n"
+        report += (
+            "*This explanation reflects the reviewer LLM's analysis of the advisory, "
+            "diff, and any injected code context — not independent execution or "
+            "testing against the target repository. Any statement that a fix "
+            "\"matches\" or \"aligns with\" an upstream release reflects the "
+            "model's own prior knowledge, not a fetched or independently verified "
+            "upstream comparison.*\n\n"
+        )
+        explanation_text = review_sections["explanation"]
+        report += f"""{explanation_text}
+
+"""
+
+    # §8: Validation Actions
+    report += validation_actions_block
+
+    # §9: Challenger concerns (structured responses only), then Review Results
+    report += challenger_concerns_block
+    report += known_findings_block
+
+    # §9b: Repository Context (Repository Grounding)
+    if result.repo_root is None:
+        # F-01: grounding was never attempted here (no repo to search) --
+        # distinct from _render_repository_context_section(None)'s
+        # zero-selection sentence, which describes a search that ran and
+        # selected nothing. Reusing that sentence would read as if a
+        # repository search happened and came up empty.
+        report += (
+            "---\n\n## Repository Context\n\n"
+            "*Not evaluated — no repository root was provided.*\n\n"
+        )
+    else:
+        report += _render_repository_context_section(result.grounding, no_patch=no_patch)
+
+    # §9c: Post-Patch Investigation
+    if no_patch:
+        report += f"---\n\n## Post-Patch Investigation\n\n{_NOT_APPLICABLE_NO_PATCH}\n\n"
+    elif result.post_patch_observations is None:
+        # Distinct wording from the "no repository root was provided" guard
+        # above (F-01, §9b/§10/Test Support) -- reusing that exact string
+        # here would inflate its count in tests that assert on it, and it
+        # also isn't the only reason this section can be unevaluated (no
+        # anchors, or an internal failure, both also land here).
+        report += (
+            "---\n\n## Post-Patch Investigation\n\n"
+            "*Not evaluated for this run (no repository root, no anchors "
+            "to re-evaluate, or the investigation itself did not "
+            "complete).*\n\n"
+        )
+    elif result.patch != result.post_patch_investigated_patch:
+        report += (
+            "---\n\n## Post-Patch Investigation\n\n"
+            "*Not shown — the patch was revised after this evidence was "
+            "computed, and it no longer describes the reported patch.*\n\n"
+        )
+    else:
+        report += "---\n\n" + render_post_patch_investigation(
+            result.post_patch_observations,
+            result.post_patch_coverage,
+            language=_report_language,
+        ) + "\n"
+
+    # §9d: Existing Test Comparison (opt-in; see pipeline.run()'s
+    # compare_existing_tests parameter). Always rendered -- "not
+    # requested" and "not verified" are themselves meaningful,
+    # deterministic states, not gaps to hide (same F-01 rationale as
+    # every other section above).
+    report += render_existing_test_comparison(result.existing_test_comparison)
+
+    # §10: Impact Surface
+    if no_patch:
+        # Release polish: impact analysis of an empty diff ("Change appears
+        # localized to (local) — low operational risk") describes a patch
+        # that does not exist.
+        report += "---\n\n## Impact Surface\n\n"
+        report += f"{_NOT_APPLICABLE_NO_PATCH}\n\n"
+    elif result.impact:
+        try:
+            imp = result.impact
+            report += "---\n\n## Impact Surface\n\n"
+            report += (
+                "*Static, AST-based usage analysis — does not execute the code, and may not "
+                "fully represent dynamic dispatch, reflection, or other runtime-only behavior.*\n\n"
+            )
+            report += f"**Summary:** {imp.get('impact_summary', '')}\n\n"
+            report += f"- Changed files: {len(imp.get('changed_files', []))}\n"
+            report += f"- Affected files: {len(imp.get('affected_files', []))}\n"
+            report += f"- Impact level: {imp.get('impact_level', 'unknown').upper()}\n"
+            recs = imp.get('recommendations', [])
+            if recs:
+                report += f"- Recommendations: {', '.join(recs)}\n"
+            ums = imp.get('usage_matches', []) or []
+            if ums:
+                report += "\n**Top evidence:**\n"
+                for u in ums[:3]:
+                    report += f"- {u.get('symbol')} — {u.get('file')}:{u.get('line')} — {u.get('snippet')}\n"
+            report += "\n"
+        except Exception:
+            pass
+    elif result.repo_root is None:
+        # F-01: state the gap explicitly rather than silently omitting the
+        # section — a reader must not mistake "not shown" for "clean".
+        report += "---\n\n## Impact Surface\n\n"
+        report += "*Not evaluated — no repository root was provided.*\n\n"
+
+    # §11: Appendices — diagnostics, supplementary reviewer notes, and legacy
+    # sections, consolidated. Patch Hygiene and Patch Applicability (plus
+    # their retry/repair notices) moved out of here to sit next to the diff
+    # (§4b above) — they are deterministic evidence, not supplementary.
+    report += "---\n\n## Appendices\n\n"
+
+    # Deterministic signals section (Phase I)
+    det_section = _render_deterministic_signals(result.constraint_signals, result.remediation_signals)
+    if det_section:
+        report += "\n" + det_section
+
+    # Language Coverage — only rendered when a Python-only signal was skipped.
+    if _report_language != "python":
+        try:
+            from .vulnerability_patterns import classify_vuln_class, sink_scanning_supported
+
+            _gaps = [
+                "Test Support (test-file discovery only recognizes `test_*.py` / `*_test.py`)",
+                "Impact Surface (changed-symbol and usage-impact analysis only supports Python source)",
+            ]
+            if classify_vuln_class(result.vulnerability_text) and not sink_scanning_supported(_report_language):
+                _gaps.append(
+                    "Vulnerability-pattern sink-checklist scanning "
+                    "(only recognizes Python `def` syntax and `*.py` files)"
+                )
+            report += "\n### Language Coverage\n\n"
+            report += f"**Detected repository language:** {_report_language}\n\n"
+            report += (
+                "The following deterministic signals are Python-only and do not "
+                "yet support this language. They are marked Not Applicable in the "
+                "Test Support and Impact Surface sections below, and must not be "
+                "read as a clean or verified result:\n\n"
+            )
+            for _gap in _gaps:
+                report += f"- {_gap}\n"
+            report += "\n"
+        except Exception:
+            pass
+
+    # Test Support
+    if no_patch:
+        # Release polish: this section is keyed to the patched file
+        # ("Target file: unknown", "Rating: None" without a patch).
+        test_support_md = f"\n### Test Support\n\n{_NOT_APPLICABLE_NO_PATCH}\n\n"
+    elif result.repo_root is None:
+        # F-01: state the gap explicitly rather than silently omitting the
+        # section — a reader must not mistake "not shown" for "clean".
+        test_support_md = (
+            "\n### Test Support\n\n"
+            "*Not evaluated — no repository root was provided.*\n\n"
+        )
+    else:
+        if _report_language == "python":
+            counts_line = f"- Total test files found: {total_tests_found}\n"
+        else:
+            # total_tests_found comes from a Python-only `test_*.py` /
+            # `*_test.py` glob (see discover_tests()), unconditionally, so
+            # for a non-Python repo it reflects "how many files happen to
+            # match Python's test-naming convention" (typically 0), not
+            # "how many tests this repository has." Rendering that number
+            # here reads as an exhaustive search result; state plainly
+            # that discovery wasn't evaluated for this language instead
+            # (see Language Coverage below for the full explanation).
+            counts_line = (
+                "- Test discovery: not evaluated — detection only "
+                "recognizes Python's `test_*.py` / `*_test.py` "
+                f"convention; detected language: {_report_language}.\n"
+            )
+        test_support_md = (
+            "\n### Test Support\n\n"
+            "*This section reports existing repository tests, not behavioral "
+            "validation of the proposed patch.*\n\n"
+            f"- Target file: {target_file_display}\n"
+            + counts_line
+            + f"- Rating: {rating}\n"
+            "\n#### Matching tests\n"
+        )
+        if matches:
+            # Report Polish Batch C: same-file/same-module matches are the
+            # module's own direct evidence and always render in full,
+            # repository-relative. Generic `repo`-proximity matches (a
+            # match's own filesystem/content matching -- see testing_
+            # support.tests_for_file -- is untouched) are real evidence
+            # that broader tests exist, but individually listing dozens of
+            # them (observed: 64 for pip, 56 for pygeoapi) is noise, not
+            # signal -- collapsed to a single count instead. This only
+            # changes how the already-discovered `matches` list is
+            # grouped/rendered; discovery and scoring (`rating` above) are
+            # untouched.
+            direct_matches = [m for m in matches if m.get("proximity") in ("same-file", "same-module")]
+            broader_matches = [m for m in matches if m.get("proximity") not in ("same-file", "same-module")]
+            if not direct_matches:
+                test_support_md += "- No tests directly matched the patched file/module.\n"
+            for m in direct_matches:
+                rel_path = _relative_test_path(m['path'], ts_root)
+                test_support_md += f"- {rel_path} — {m['proximity']} — {m['reason']}\n"
+            if broader_matches:
+                test_support_md += (
+                    f"- Broader repository tests: {len(broader_matches)} additional "
+                    "test file(s) detected elsewhere in the repository (not directly "
+                    "related to the patched module; not listed individually).\n"
+                )
+        elif _report_language != "python":
+            test_support_md += "- Not evaluated — test discovery does not yet support this language.\n"
+        else:
+            test_support_md += "- No matching tests found.\n"
+    report += test_support_md
+
+    # Behavior Summary -- omitted for no_patch, like Affected areas/Reviewer
+    # Notes below: it describes the diff ("This patch likely affects
+    # application logic in unknown.").
+    if behavior and not no_patch:
+        try:
+            report += "\n### Behavior Summary\n\n"
+            # behavior["function"] is a regex-based `def` scan over the diff
+            # and is empty for non-function edits (e.g. a class-level
+            # constant). Fall back to the AST-resolved changed_symbols from
+            # Impact Surface — the same data already shown in that section —
+            # before omitting the sentence entirely.
+            func = behavior.get("function") or ""
+            if not func:
+                changed_symbols = (result.impact or {}).get("changed_symbols") or []
+                if changed_symbols:
+                    func = changed_symbols[0]
+            bfile = behavior.get("file") or ""
+            if func and bfile:
+                report += f"This patch appears to modify `{func}` in `{bfile}`.\n\n"
+            report += behavior.get("summary", "") + "\n\n"
+            # Report Polish Batch C: behavior_summary's generic fallback
+            # ("normal flow" / "edge-case handling", set only when no
+            # purpose keyword matched -- see behavior_summary.py's
+            # `is_generic`) carries no patch-specific signal. This flag is
+            # already used to suppress the equivalent Validation Actions /
+            # Suggested Tests behavior-driven items (see build_validation_
+            # plan and the `suggestions` hoist above); this applies the
+            # same gate here, where it was previously not read at all, so
+            # the fixed two-item list rendered unconditionally. The
+            # concrete `func`/`bfile` sentence and `summary` line above are
+            # untouched either way -- only this boilerplate bullet list is
+            # gated.
+            if not behavior.get("is_generic"):
+                pbs = behavior.get("primary_behaviors") or []
+                if pbs:
+                    report += "Primary behaviors to validate:\n"
+                    for p in pbs:
+                        report += f"- {p}\n"
+            report += "\n"
+        except Exception:
+            pass
+
+    # Affected areas — a distinct reviewer-LLM output field, not duplicated
+    # elsewhere in the report. Suppressed for no_patch -- same rationale as
+    # §7 Explanation above: review_sections has nothing genuine to show.
+    if not no_patch:
+        report += f"""
+### Affected areas
+
+{review_sections["affected_areas"]}
+"""
+
+        # Reviewer Notes — reviewer-specific advice not captured by Explanation,
+        # Validation Actions, or Known Findings. Moved into Appendices: it is
+        # supplementary, not part of the core "understand this in 30 seconds" flow.
+        report += f"""
+### Reviewer Notes
+
+*Reviewer-LLM guidance, not independently verified evidence. Any reference \
+to an upstream fix, release, or version number reflects the model's own \
+prior knowledge, not evidence this pipeline fetched or verified.*
+
+{review_sections["validation_notes"]}
+"""
+
+    # ("Validation Plan" stays removed — it repeated the same ≤3 items
+    # already shown in full, with Reason included, in the Validation
+    # Actions section near the top of the report.)
+
+    # Suggested Tests
+    adv_parts: list[str] = []
+    if challenger:
+        if challenger.get("edge_cases"):
+            adv_parts.append("Edge cases:")
+            for e in challenger.get("edge_cases", []):
+                adv_parts.append(f"- {e}")
+        if challenger.get("potential_issues"):
+            adv_parts.append("Potential issues:")
+            for p in challenger.get("potential_issues", []):
+                adv_parts.append(f"- {p}")
+
+    # Presentation-only: name, reason, and suggested filename only — the
+    # generated pytest skeleton bodies are not rendered here (still the same
+    # `suggestions` list; nothing about what's suggested or how many changed,
+    # only how much of each one is printed).
+    suggested_md = "\n### Suggested Tests\n\n"
+    suggested_md += "Generated from adversarial findings. Not automatically written to the repo.\n\n"
+    if no_patch:
+        # Release polish: no Challenger ran for this outcome -- omitted like
+        # Affected areas/Reviewer Notes, rather than "no findings found".
+        suggested_md = ""
+    elif not suggestions and challenger_concerns_block:
+        # Release polish: suggestions are derived only from the legacy
+        # free-text Challenger findings, which a structured response never
+        # populates -- "No actionable adversarial findings found" sat beside
+        # BLOCKING/UNRESOLVED concerns on real runs.
+        suggested_md += (
+            "- None generated: test suggestions are not derived from structured Challenger "
+            "concerns — see the Challenger concerns section above.\n"
+        )
+    elif not suggestions:
+        suggested_md += "- No actionable adversarial findings found.\n"
+    else:
+        for s in suggestions:
+            test_name = s.get("name")
+            s_reason = s.get("reason")
+            if _report_language == "python":
+                suggested_md += f"- **{test_name}** — tests/suggested/{test_name}.py\n"
+            else:
+                # The generated name/skeleton this suggestion is based on
+                # is Python-shaped regardless of repo language (see
+                # test_suggester.py) -- for a non-Python repo, rendering a
+                # fabricated `tests/suggested/<name>.py` path would claim
+                # a target file that has no relationship to this
+                # language's actual test layout. Show the concept/name and
+                # reason only; inventing an extension/path here would be
+                # fake precision, not a real suggestion.
+                suggested_md += (
+                    f"- **{test_name}** — no target path suggested "
+                    f"(test-file generation does not yet support "
+                    f"{_report_language})\n"
+                )
+            suggested_md += f"  Based on finding: \"{s_reason}\"\n"
+    report += suggested_md
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Applicability-aware retry helpers
+# ---------------------------------------------------------------------------
+
+_PATCH_FAILED_RE = re.compile(r"^error: patch failed: (.+?):\d+", re.MULTILINE)
+_DOES_NOT_APPLY_RE = re.compile(r"^error: (.+?): patch does not apply", re.MULTILINE)
+_PLUS_PLUS_RE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
+# Fix B: the applicability-aware retry's per-file content no longer has an
+# arbitrary hardcoded ceiling -- it is fit against the real Patch Generation
+# technical-capacity contract (see compute_patch_generation_capacity /
+# fit_patch_generation_context in patch_generator.py), computed fresh at the
+# retry call site because it must also account for that retry's own hint.
+_RETRY_STDERR_LINES = 6
+
+
+def _extract_failed_files(stderr: str) -> list[str]:
+    """Every file named in git-apply failure stderr, in stderr order,
+    de-duplicated (a file matched by both regexes appears once). Patch-failed
+    matches are collected before does-not-apply matches, so the priority
+    established by the old single-file `_extract_failed_file` is preserved.
+    """
+    stderr = stderr or ""
+    names = [m.group(1).strip() for m in _PATCH_FAILED_RE.finditer(stderr)]
+    names += [m.group(1).strip() for m in _DOES_NOT_APPLY_RE.finditer(stderr)]
+    return list(dict.fromkeys(names))
+
+
+def _extract_failed_file(stderr: str) -> str | None:
+    files = _extract_failed_files(stderr)
+    return files[0] if files else None
+
+
+def _extract_patch_target(patch: str) -> str | None:
+    lines = (patch or "").splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    m = _PLUS_PLUS_RE.search("\n".join(lines))
+    return m.group(1).strip() if m else None
+
+
+def _build_repair_hint(confirmed_texts: list[str]) -> str:
+    """Build a repair instruction for the patch generator from confirmed
+    defect texts -- reused unchanged for behavioral_defect findings (run-4
+    Architecture B): the instructions below (minimal diff, use verified
+    source as ground truth, wire every code path) are equally correct
+    advice whether the finding is a security gap or an unnecessary
+    behavior change, so no separate behavioral-repair hint was created.
+    The one word that WOULD misdescribe a behavioral_defect finding
+    ("security") was dropped from the intro sentence; the exact finding
+    text itself (passed through verbatim, never summarized or reworded
+    here) still tells the patch generator precisely what to address."""
+    items = "\n".join(f"- {t}" for t in confirmed_texts)
+    return (
+        "The previous patch has the following confirmed gap(s) identified "
+        "by adversarial review:\n\n"
+        f"{items}\n\n"
+        "Regenerate the patch to address these specific gaps.\n"
+        "Do not use a perimeter validation check (such as startswith or a normpath guard) "
+        "if the correct fix requires changing the dangerous operation itself.\n"
+        "If the vulnerability requires a helper function, the same patch must call that "
+        "helper from every vulnerable code path — not a subset of them.\n"
+        "Use the repository code context shown above as the ground truth for the code.\n"
+        "Keep the same minimal-diff approach: change only what is necessary."
+    )
+
+
+def _dispatch_narrower_mode(plan_result) -> str:
+    """Deterministically resolve which Planner Claim Verifier mode (if any)
+    applies to `plan_result`, from its OWN structural
+    `narrower_alternative_decision` -- never inferred from
+    `narrower_alternative_considered`'s prose. Returns `"REJECTED"`,
+    `"SELECTED"`, or `"NONE_IDENTIFIED"` -- reusing the Planner's own enum
+    values directly, so the mapping from decision to verifier mode is the
+    identity function for `"SELECTED"`/`"REJECTED"`, the two decisions that
+    always need a verifier call; the caller treats `"NONE_IDENTIFIED"` as
+    "make no verifier call."
+
+    `"NONE_IDENTIFIED"` is trusted as-is ONLY when it is schema-consistent:
+    prompts/remediation_planner.md's own field description requires
+    `narrower_alternative_considered` to be null/near-empty whenever
+    `"NONE_IDENTIFIED"` is genuinely the Planner's decision -- "say so
+    plainly... never because you are merely unsure whether a real
+    alternative would work." A response that pairs `"NONE_IDENTIFIED"` with
+    a substantive narrative already violates that contract (e.g. narrative
+    text asserting the narrower mechanism already exists in the code, which
+    is a claim about unseen source, not an empty search result) and is
+    evidence-conditioned identically to a missing/invalid decision below --
+    it is never given a free pass to skip verification merely because the
+    enum value itself parsed as one of the three valid strings.
+
+    Missing/invalid `narrower_alternative_decision` (a fresh response that
+    omitted it, or supplied something outside the three valid values) is
+    NEVER inferred from `narrower_alternative_considered`'s wording -- only
+    a fixed, conservative SUBSTITUTION applies: if there is a non-empty
+    narrative to check at all, default to `"REJECTED"` (Mode A) -- the more
+    scrutinized mode, never a silent authorization to skip verification --
+    because Mode A's own gate requires an explicit `true` commitment to
+    ever clear, so this default is safe regardless of what the Planner
+    actually meant. If there is no narrative at all either, there is
+    nothing to check under either mode, matching this architecture's
+    existing "nothing to verify" behavior exactly. This is now the SAME
+    rule a schema-inconsistent `"NONE_IDENTIFIED"` falls into -- one
+    substitution rule, not two.
+
+    Used both for the initial (v1) dispatch and, inside
+    `_run_planner_claim_verification`, to re-dispatch v2's mode from the
+    REVISED Planner result -- v2's decision may differ from v1's (e.g. a
+    Planner that rejected in v1 may select in v2), so this is always
+    re-evaluated, never carried over from v1."""
+    decision = plan_result.narrower_alternative_decision
+    if decision in ("SELECTED", "REJECTED"):
+        return decision
+    narrative = (plan_result.narrower_alternative_considered or "").strip()
+    return "REJECTED" if narrative else "NONE_IDENTIFIED"
+
+
+def _build_planner_verification_hint(verifier_result, mode: str) -> str:
+    """Build the ONE bounded revision instruction for the Planner, from the
+    Planner Claim Verifier's own CONTRADICTED result -- worded according to
+    which mode produced it, since the two modes' contradictions describe
+    entirely different problems (Mode A: a claimed rejection counterexample
+    didn't hold up; Mode B: the authoritative fields didn't match the
+    claimed selection) and reusing one mode-blind hint for both would
+    misdescribe whichever one didn't actually happen. Mirrors
+    `_build_repair_hint`'s shape exactly (a structured finding from an
+    independent check, turned into a narrowly-scoped correction
+    instruction) -- generic across vulnerability classes, repositories, and
+    languages: it names no CVE, no repository, no specific mechanism."""
+    finding = verifier_result.contradiction or verifier_result.reason
+    if mode == "REJECTED":
+        return (
+            "An independent verifier found a concrete contradiction in your prior "
+            "remediation decision: the reason you gave for rejecting the narrower "
+            "alternative does not hold up against the verified source once that "
+            "narrower alternative is hypothetically applied.\n\n"
+            f"Verifier finding: {finding}\n\n"
+            "Revise your remediation decision in light of this finding. Specifically "
+            "reconsider `narrower_alternative_decision`, `remediation_mechanism`, "
+            "`narrower_alternative_considered`, and `required_edits`. Do not blindly "
+            "keep the broader mechanism, and do not blindly switch to the narrower "
+            "one either -- re-evaluate which mechanism actually closes the security "
+            "invariant using the verified source semantics, not your prior reasoning. "
+            "If you now select the narrower alternative, `remediation_mechanism`/"
+            "`required_edits` must describe THAT alternative directly, not the "
+            "broader mechanism you are moving away from. Preserve your prior "
+            "evidence-backed target files and symbols unless this specific "
+            "contradiction requires changing them."
+        )
+    # mode == "SELECTED"
+    return (
+        "An independent verifier found a concrete contradiction in your prior "
+        "remediation decision: you recorded that you selected the narrower "
+        "alternative, but the authoritative `remediation_mechanism`/`required_edits` "
+        "you gave do not actually describe that same selected alternative -- they "
+        "describe a different (typically broader) scope.\n\n"
+        f"Verifier finding: {finding}\n\n"
+        "Revise your remediation decision so it is internally consistent. "
+        "Specifically reconsider `narrower_alternative_decision`, "
+        "`remediation_mechanism`, `narrower_alternative_considered`, and "
+        "`required_edits` together. If the narrower alternative is genuinely what "
+        "you are proposing, `remediation_mechanism`/`required_edits` must describe "
+        "it directly and completely, with nothing left over from a broader "
+        "mechanism. If, on reflection, the narrower alternative is not actually "
+        "sufficient, say so explicitly by setting `narrower_alternative_decision` "
+        "to \"REJECTED\" with a concrete, source-grounded counterexample -- do not "
+        "leave the decision and the authoritative fields describing two different "
+        "things. Preserve your prior evidence-backed target files and symbols "
+        "unless this specific contradiction requires changing them."
+    )
+
+
+def _run_planner_claim_verification(
+    *, vulnerability_text, llm, repo_root, investigation_context,
+    evidence_so_far, plan_result, planner_evidence_ctx, mode,
+):
+    """Planner Claim Verifier orchestration -- sits between S1's own
+    Planner call and S2 (Remediation Strategy), still inside S1's canonical
+    stage family (see stage_registry.STAGE_OWNED_LLM_TAGS). Structurally
+    bounded, exactly like `existing_test_amendment.py`'s R1 -> amend -> R2
+    orchestrator: at most two verifier calls and at most one Planner
+    revision call, EVER, per invocation -- there is only one call site for
+    each in this function's body, so a second revision is not merely
+    unlikely, it is impossible to reach without editing this function.
+
+    Trigger: this function assumes the caller already resolved `mode` via
+    `_dispatch_narrower_mode(plan_result)` and confirmed it is not
+    `"NONE_IDENTIFIED"` -- the ONLY trigger for this implementation (see
+    module-level callers). When it is `"NONE_IDENTIFIED"`, the caller never
+    calls this function at all: zero verifier calls, zero revision calls.
+
+    Mode-aware, not mode-blind: `mode` ("REJECTED" or "SELECTED") selects
+    which of the two Planner Claim Verifier questions v1 answers (see
+    remediation_verifier.py's module docstring). v2 (if a revision
+    happens) is NOT assumed to share v1's mode -- the revised Planner
+    result's OWN decision is re-dispatched via `_dispatch_narrower_mode`,
+    since a revision can legitimately flip REJECTED<->SELECTED.
+
+    Revision trigger -- deliberately narrow: ONLY `verifier_v1.status ==
+    "CONTRADICTED"` consumes the one bounded revision, in EITHER mode.
+    `_parse_response` (remediation_verifier.py) never returns
+    `status="CONTRADICTED"` for an infrastructure failure -- an ordinary
+    LLM-call error, timeout, or malformed/unparseable response always
+    degrades to `UNRESOLVED`/`failure_kind="infrastructure"` instead -- so
+    this check already, structurally, excludes ordinary infrastructure
+    noise from ever consuming the revision budget without needing a
+    separate `failure_kind` check here. A genuine semantic UNRESOLVED
+    (verifier actually reasoned about the claim and could not determine
+    support/contradiction) also does not trigger a revision -- ordinary
+    uncertainty must never destroy patch-generation coverage, exactly as
+    before this mode-aware change.
+
+    Fail-closed guarantee: once verifier v1 returns CONTRADICTED, this
+    function NEVER returns normally with `authoritative` still "v1" --
+    every path out of that point either reaches "v2" (only on a genuine v2
+    SUPPORTED) or "none" (forced_skip=True), including an unexpected
+    internal exception during the revision/rebuild/re-verify sequence
+    (caught by this function's own top-level try/except, never left for
+    the caller to default-open on), and including the specific case where
+    the revised Planner result's OWN decision re-dispatches to
+    "NONE_IDENTIFIED" -- see the dedicated check below. That case fails
+    closed WITHOUT a second verifier call: a Planner cannot escape an
+    already-established contradiction merely by changing its decision to
+    "no alternative was ever identified" on revision. Before v1 is known
+    CONTRADICTED, ordinary best-effort degradation applies exactly as
+    elsewhere in this module family -- nothing is converted to a hard skip
+    prematurely.
+
+    Returns a dict (not `locals()`, unlike this module's other `_run_*`
+    executors -- this one has few enough produced values that an explicit
+    dict is clearer than the exhaustive-return-signature problem those
+    other executors solve):
+      verifier_v1               -- VerifierResult from the first check.
+      verifier_v2                -- VerifierResult | None from the
+                                     post-revision re-check (None unless
+                                     v1 was CONTRADICTED and a second
+                                     verifier call was actually made -- see
+                                     the v2 NONE_IDENTIFIED case above,
+                                     which fails closed WITHOUT one).
+      mode_v1 / mode_v2          -- "REJECTED" | "SELECTED" (mode_v2 is
+                                     None unless a second verifier call was
+                                     actually made) -- purely observability,
+                                     mirroring which structured field each
+                                     VerifierResult actually gates on.
+      revision_attempted         -- bool, True iff a revision call was made.
+      revised_plan_result        -- RemediationPlanResult | None, the
+                                     revised Planner output (only set when
+                                     a revision was attempted AND produced
+                                     a result).
+      revised_plan_ctx           -- str, revised Target Discovery Plan
+                                     rendering (only when revised_plan_result
+                                     is set).
+      revised_planner_evidence_ctx -- str, revised Planner evidence bridge
+                                     (only when revised_plan_result is set
+                                     AND its re-dispatched mode was not
+                                     "NONE_IDENTIFIED" -- that case fails
+                                     closed before evidence is rebuilt).
+      authoritative              -- "v1" | "v2" | "none": which Planner
+                                     result (if any) may proceed to
+                                     Strategy. "none" means a contradiction
+                                     was never cleared (v1 CONTRADICTED ->
+                                     revision -> v2 not SUPPORTED, or v2's
+                                     re-dispatched mode was
+                                     "NONE_IDENTIFIED") -- see forced_skip
+                                     below.
+      forced_skip                -- bool, True only for the "none" case.
+      skip_reason                -- str | None, the specific reason to
+                                     surface through `_skip_patch_generation`
+                                     (see _run_patch_generation_and_investigation's
+                                     `_skip_patch_generation_reason`) when
+                                     forced_skip is True.
+      broadening_unresolved      -- bool, observability-only: True when v1
+                                     was UNRESOLVED (a rejection claim
+                                     existed) AND `mode == "REJECTED"` --
+                                     this signal is specifically about
+                                     whether BROADENING's necessity (Mode
+                                     A's own question) could not be
+                                     established; it is never set for a
+                                     Mode B ("SELECTED") UNRESOLVED, which
+                                     is a different, decision-coherence
+                                     ambiguity this field was never meant
+                                     to describe. Never gates Strategy or
+                                     Patch Generation on its own; see
+                                     PipelineResult/execution_recorder for
+                                     where this is surfaced.
+    """
+    from .remediation_planner import build_planner_evidence, generate_remediation_plan
+    from .remediation_verifier import verify_planner_claim
+
+    verifier_v1 = verify_planner_claim(
+        vulnerability_text,
+        plan_result.security_invariant,
+        plan_result.remediation_mechanism,
+        plan_result.narrower_alternative_considered,
+        plan_result.required_edits,
+        planner_evidence_ctx,
+        llm,
+        mode=mode,
+    )
+    progress.verbose(
+        f"[pipeline] Planner Claim Verifier (v1, mode={mode}): status={verifier_v1.status} "
+        f"failure_kind={verifier_v1.failure_kind}"
+    )
+
+    result = {
+        "verifier_v1": verifier_v1, "verifier_v2": None,
+        "mode_v1": mode, "mode_v2": None,
+        "revision_attempted": False, "revised_plan_result": None,
+        "revised_plan_ctx": "", "revised_planner_evidence_ctx": "",
+        "authoritative": "v1", "forced_skip": False, "skip_reason": None,
+        # Review fix: `failure_kind is None` excludes an infrastructure
+        # failure (network/timeout/malformed response) from this signal --
+        # an infrastructure failure establishes nothing about whether a
+        # broadening decision's necessity is unresolved (it may not even
+        # be a rejection claim at all; see remediation_verifier.
+        # VerifierResult's own docstring on failure_kind). Only a genuine
+        # semantic UNRESOLVED (the verifier actually reasoned about the
+        # claim and could not determine support/contradiction) IN MODE A
+        # sets this -- a Mode B UNRESOLVED is a decision-coherence
+        # ambiguity, not a broadening-necessity ambiguity, and must not be
+        # mislabeled under this name. Observability-only either way --
+        # never read by Strategy/Patch Generation/Recommendation Policy.
+        "broadening_unresolved": (
+            verifier_v1.status == "UNRESOLVED"
+            and verifier_v1.failure_kind is None
+            and mode == "REJECTED"
+        ),
+    }
+
+    if verifier_v1.status != "CONTRADICTED":
+        # SUPPORTED or UNRESOLVED (semantic or infrastructure), in EITHER
+        # mode, both proceed to Strategy with v1 unchanged -- ordinary
+        # uncertainty must never destroy patch-generation coverage (see
+        # remediation_verifier.md). No contradiction has been established
+        # yet, so nothing here needs to fail closed -- this is still
+        # ordinary best-effort degradation. `_parse_response` never emits
+        # CONTRADICTED for an infrastructure failure, so this branch also
+        # already excludes ordinary infrastructure noise from the revision
+        # trigger without a separate check.
+        return result
+
+    # From here on, verifier_v1 has established a concrete CONTRADICTED
+    # finding (in EITHER mode). Review fix: everything below (the revision
+    # call, rebuilding evidence, the second verification, and constructing
+    # the result) is wrapped in one fail-closed boundary. Before that fix,
+    # an unexpected exception anywhere in this block propagated to the
+    # caller's own generic `except Exception` in
+    # _run_repository_analysis_and_remediation_planning, which left
+    # `_verifier_forced_skip` at its default False and the ORIGINAL
+    # (contradicted) Planner evidence untouched -- silently reopening the
+    # door for an already-known-bad plan to reach Strategy. That is a
+    # fail-OPEN default on the single most safety-critical branch,
+    # inconsistent with this codebase's own established discipline
+    # elsewhere (see accept_repair's docstring: "fail closed, preserving
+    # the safer prior state"). Structurally still bounded: this is a
+    # try/except around the SAME linear, loop-free code that was already
+    # here -- it adds no retry, no second revision, no second attempt of
+    # anything; it only changes what happens if that existing code raises
+    # something unexpected.
+    try:
+        result["revision_attempted"] = True
+        _hint = _build_planner_verification_hint(verifier_v1, mode)
+        # Revision evidence parity: the one bounded revision call must not
+        # be asked to resolve a CONTRADICTED verdict with LESS repository
+        # evidence than verifier_v1 itself just used to raise it.
+        # `evidence_so_far` (pre-Planner grounding + pattern guidance) and
+        # `planner_evidence_ctx` (the verified Planner-proposed-candidate
+        # evidence verifier_v1 was actually given) are both already
+        # independently bounded by their own existing construction -- this
+        # only concatenates the two, exactly like `_evidence_so_far` itself
+        # is already built from multiple optional sections elsewhere in
+        # this module.
+        _revision_context = "\n\n".join(
+            p for p in [evidence_so_far, planner_evidence_ctx] if p and p.strip()
+        )
+        try:
+            revised_plan_result = generate_remediation_plan(
+                vulnerability_text, llm, code_context=_revision_context,
+                retry_hint=_hint, stage=_PLAN_REVISION_STAGE,
+            )
+        except ModelUnavailableError:
+            raise
+        except Exception as exc:
+            progress.verbose(f"[pipeline] Planner revision unavailable: {type(exc).__name__}: {exc}")
+            revised_plan_result = None
+
+        if revised_plan_result is None or not revised_plan_result.rendered:
+            # The revision call itself failed or produced nothing usable --
+            # the contradiction was never even attempted to be cleared.
+            # Fail closed exactly like an uncleared contradiction: never
+            # silently keep v1 as if the verifier's finding never happened.
+            result["forced_skip"] = True
+            result["authoritative"] = "none"
+            result["skip_reason"] = (
+                "Planner Claim Verifier: causal contradiction found, but the bounded "
+                "Planner revision attempt did not produce a usable result"
+            )
+            return result
+
+        result["revised_plan_result"] = revised_plan_result
+        result["revised_plan_ctx"] = revised_plan_result.rendered
+
+        # Re-dispatch mode from the REVISED result's own decision -- never
+        # assumed to be the same as v1's mode; a revision can legitimately
+        # flip REJECTED<->SELECTED. IMPORTANT correction (locked policy):
+        # if the revised decision re-dispatches to "NONE_IDENTIFIED", this
+        # must NOT be treated as "nothing to verify" the way it is for a
+        # fresh, never-contradicted v1 -- an already-established
+        # contradiction cannot be cleared by the Planner simply declaring,
+        # on its one bounded revision, that no alternative was ever
+        # identified. Fail closed immediately, WITHOUT a second verifier
+        # call (no new LLM call is spent discovering what is already
+        # certain: there is nothing left for a second call to check, and
+        # the contradiction from v1 was never positively cleared).
+        _v2_mode = _dispatch_narrower_mode(revised_plan_result)
+        if _v2_mode == "NONE_IDENTIFIED":
+            result["authoritative"] = "none"
+            result["forced_skip"] = True
+            result["skip_reason"] = (
+                "Planner Claim Verifier: causal contradiction not cleared after one "
+                "bounded revision (revised decision was NONE_IDENTIFIED, which cannot "
+                "clear an already-established contradiction)"
+            )
+            return result
+        result["mode_v2"] = _v2_mode
+
+        try:
+            revised_evidence_ctx = build_planner_evidence(
+                revised_plan_result, repo_root, vulnerability_text, investigation_context,
+            )
+        except Exception as exc:
+            progress.verbose(f"[pipeline] Revised Planner evidence unavailable: {type(exc).__name__}: {exc}")
+            revised_evidence_ctx = ""
+        result["revised_planner_evidence_ctx"] = revised_evidence_ctx
+
+        verifier_v2 = verify_planner_claim(
+            vulnerability_text,
+            revised_plan_result.security_invariant,
+            revised_plan_result.remediation_mechanism,
+            revised_plan_result.narrower_alternative_considered,
+            revised_plan_result.required_edits,
+            revised_evidence_ctx,
+            llm,
+            mode=_v2_mode,
+            stage=_PLAN_REVERIFICATION_STAGE,
+        )
+        progress.verbose(
+            f"[pipeline] Planner Claim Verifier (v2, post-revision, mode={_v2_mode}): "
+            f"status={verifier_v2.status} failure_kind={verifier_v2.failure_kind}"
+        )
+        result["verifier_v2"] = verifier_v2
+
+        if verifier_v2.status == "SUPPORTED":
+            result["authoritative"] = "v2"
+            return result
+
+        # v2 CONTRADICTED or v2 UNRESOLVED: a concrete contradiction was
+        # already established once, and the one bounded revision did not
+        # clear it -- per locked policy this is treated exactly like a
+        # second contradiction, never promoted to Strategy either as v1 or
+        # v2 (see module docstring and pipeline.py's own orchestration
+        # comment at the call site). No second revision is attempted in
+        # either mode.
+        result["authoritative"] = "none"
+        result["forced_skip"] = True
+        result["skip_reason"] = (
+            "Planner Claim Verifier: causal contradiction not cleared after one "
+            f"bounded revision (second verification, mode={_v2_mode}: {verifier_v2.status})"
+        )
+        return result
+    except ModelUnavailableError:
+        # Same explicit execution/configuration-decision exception every
+        # other LLM call in this module family re-raises unconditionally --
+        # never treated as best-effort, never converted into a forced skip.
+        raise
+    except Exception as exc:
+        # Anything else reaching here is unexpected -- not a documented
+        # failure mode of generate_remediation_plan/build_planner_evidence/
+        # verify_planner_claim (each already degrades ordinary failures
+        # internally; see their own docstrings), but exactly the case the
+        # architectural invariant requires failing closed for: a concrete
+        # contradiction is already established, and it must not be cleared
+        # by accident. No second attempt of anything -- this returns
+        # immediately, it does not retry the revision or the verification.
+        progress.verbose(f"[pipeline] Planner Claim Verifier: internal failure while attempting to "
+            f"clear an already-established contradiction: {type(exc).__name__}: {exc}")
+        result["authoritative"] = "none"
+        result["forced_skip"] = True
+        result["skip_reason"] = (
+            "Planner Claim Verifier: internal failure while attempting to clear an "
+            f"already-established contradiction ({type(exc).__name__}: {exc})"
+        )
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Evidence-Gap Strategy Fallback -- sits between Final Strategy's first
+# (S2) call and the Final-Target Remediation Slice (S3). Addresses one
+# specific, structurally-detectable deadlock: Final Strategy correctly
+# refuses to name a target because the candidate context it was given was
+# too small/mistruncated to decide from (not because it looked and found
+# nothing) -- and, unrecovered, guided context acquisition (S3) can never
+# run to fetch more, because S3 itself is gated on Final Strategy already
+# having named a target (see pipeline.run()'s own S3 gate). Without this,
+# that is a genuine deadlock, demonstrated by a real urllib3/CVE-2023-43804
+# run whose captured artifacts this module's tests replay.
+#
+# Authority boundary (see remediation_planner.build_final_target_slice's
+# own docstring: "from generate_remediation_strategy()'s VERIFIED result
+# only -- never the earlier, exploratory Target Discovery candidates"):
+# the Planner's target_files/target_symbols are used here ONLY as
+# retrieval seeds for the existing, deterministic, no-LLM-call
+# build_planner_evidence()/build_planner_source_excerpts() path -- never
+# as, or to construct, a RemediationStrategyResult/FinalTargetSliceResult/
+# IntendedEdit/EditReadinessResult. Only a SECOND, genuine
+# generate_remediation_strategy() call may produce anything downstream
+# treats as authoritative; if that second call also fails to name a
+# target, the run fails closed exactly as it already does today -- this
+# module never retries a third time and never substitutes Planner data
+# for a Strategy decision.
+#
+# Second trigger case (scope-v4 Run 5 forensic finding): Final Strategy can
+# ALSO name a real, repository-resolvable target/mechanism while its own
+# structured `target_authority_unresolved` says it cannot yet justify that
+# SAME target/mechanism from available evidence -- a materially different
+# deadlock from the zero-target one above (there IS a target; it just may
+# not be the right one), which the zero-target-only trigger below cannot
+# see at all. The caller (pipeline.run(), where `_evidence_gap_fallback_
+# trigger` is invoked) is responsible for seeding reacquisition from
+# Strategy's OWN target_files/target_symbols for this case -- NOT
+# Planner's original guess -- since Strategy's own choice is the thing
+# whose authority is in doubt; see the call site's own comment. This
+# function stays a pure predicate over `strategy_result` alone and never
+# itself decides which candidates to reacquire.
+# ---------------------------------------------------------------------------
+
+def _evidence_gap_fallback_trigger(strategy_result) -> bool:
+    """True in either of two structurally-detectable cases, both requiring
+    Final Strategy #1 to have evaluated a real response:
+
+    1. Zero-target case (original): named zero authoritative targets AND
+       explicitly reported non-empty `insufficient_evidence` -- the one
+       structural signal (no prose/keyword inspection) that distinguishes
+       "the evidence I was given was too thin to decide from" from a
+       genuine "I looked and there is no viable target here" decision
+       (which has `insufficient_evidence == []` and must never trigger
+       this fallback -- see RemediationStrategyResult's own docstring on
+       why an empty target list is never, by itself, a signal to retry).
+
+    2. Named-target authority-gap case (additive): named at least one
+       target/symbol AND `target_authority_unresolved is True`. Reads
+       ONLY this one structured boolean -- never `insufficient_evidence`'s
+       text, never `rejected_targets`' text, never any keyword/file-name
+       match against either. A `True` value is honored on its own,
+       corroborating prose or not (see RemediationStrategyResult.
+       target_authority_unresolved's own docstring: this field's whole
+       purpose is to make prose-independent, so requiring prose alongside
+       it would defeat that). Conversely, non-empty `insufficient_evidence`
+       alone -- with `target_authority_unresolved` absent/False -- must
+       NEVER trigger this branch; that is the legitimate, non-blocking
+       "validation-only gap" shape and must keep proceeding exactly as
+       before this field existed."""
+    if strategy_result is None or not strategy_result.evaluated:
+        return False
+    has_target = bool(strategy_result.target_files or strategy_result.target_symbols)
+    if not has_target:
+        return bool(strategy_result.insufficient_evidence)
+    return bool(strategy_result.target_authority_unresolved)
+
+
+def _run_evidence_gap_strategy_fallback(
+    *, plan_result, repo_root, vulnerability_text, investigation_context,
+    budget_controller, llm,
+    repo_grounding_ctx, repository_understanding_ctx, discovery_plan_ctx,
+    baseline_planner_evidence_result, merge_with_baseline=False,
+):
+    """One-shot, bounded recovery attempted only when
+    `_evidence_gap_fallback_trigger` fires on Final Strategy #1's result
+    (checked by the caller before this is ever invoked). Never calls this
+    more than once per run -- there is no loop here, and the caller never
+    calls this function a second time in the same run regardless of what
+    it returns.
+
+    Shares ONE Planner-evidence construction/expansion implementation with
+    Strategy #1's own construction (see
+    `_run_repository_analysis_and_remediation_planning`,
+    `remediation_planner.build_planner_evidence_with_budget`) -- no bespoke
+    budget-growth logic lives here anymore. Calling the shared helper again
+    against the SAME run-scoped `budget_controller` naturally continues any
+    deterministic expansion Strategy #1's own construction did not exhaust
+    (that construction stops as soon as ANY new coverage appears -- see the
+    shared helper's own docstring -- so a different, still-omitted
+    candidate may still be reachable here); it is not a second, independent
+    budget.
+
+    "New evidence actually acquired" is determined from STRUCTURAL source
+    coverage (`PlannerEvidenceResult.excerpt_plan.included_labels`), never
+    from comparing two rendered Markdown strings (see EVIDENCE-01: a
+    rendered omission notice embeds the budget ceiling itself, so two
+    calls at different ceilings always produce different text even when
+    the exact same symbol is omitted both times). The comparison baseline
+    is `baseline_planner_evidence_result` -- the ACTUAL evidence Strategy
+    #1 already saw, threaded in by the caller -- never recomputed from
+    scratch here, so this can never disagree with what Strategy #1 was
+    really given.
+
+    `plan_result.target_files`/`.target_symbols` are used here ONLY as the
+    seeds `build_planner_evidence_with_budget` already verifies and reads
+    source for -- nothing here constructs a RemediationStrategyResult,
+    FinalTargetSliceResult, IntendedEdit, or EditReadinessResult from them.
+    Only a second, genuine `generate_remediation_strategy()` call's own
+    result (Strategy #2) may become authoritative for anything downstream.
+
+    `plan_result` need not be the actual Stage-1 Planner result: the two
+    `_evidence_gap_fallback_trigger` cases need different reacquisition
+    seeds, and the CALLER (not this function) is responsible for choosing
+    which one to pass -- the real Planner `RemediationPlanResult` for the
+    zero-target case (there is no other candidate list to seed from), or a
+    caller-constructed `RemediationPlanResult`-shaped stand-in carrying
+    Strategy #1's OWN `target_files`/`target_symbols` for the named-target
+    authority-gap case (that is the target/mechanism actually in doubt,
+    not Planner's original, possibly different, guess). This function
+    itself performs no branching on which case triggered it and does not
+    need to -- `build_planner_evidence_with_budget`/`_build_planner_
+    evidence_result` read only `.target_files`/`.target_symbols` from
+    whatever they are given, so either seed is a faithful input.
+
+    `merge_with_baseline` (additive, default False so the zero-target
+    case's existing behavior is completely unaffected): when True, the
+    named-target authority-gap case's own CALLER sets this so Strategy
+    #2's `planner_evidence_ctx` becomes `baseline_planner_evidence_result`
+    UNION the freshly-reacquired evidence (see
+    `remediation_planner.merge_baseline_and_reacquired_planner_evidence`),
+    never the fresh evidence alone -- fixing a forensically-confirmed
+    regression (scope-v4/authority-v1) where Strategy #1's own already-
+    acquired evidence (e.g. a consumer's full source) silently disappeared
+    from Strategy #2's prompt because the reacquisition's narrower,
+    single-target seed produced a `PlannerEvidenceResult` with no memory
+    of what Strategy #1's own (broader) construction already resolved.
+    False for the zero-target case: there, `plan_result` IS the same
+    Planner candidates `baseline_planner_evidence_result` was itself built
+    from, so `fresh` already structurally supersedes the baseline (see
+    `build_planner_evidence_with_budget`'s own monotonic-budget-growth
+    behavior for the same candidate set) and a union would be redundant.
+
+    The merge's own combined size is then checked against the SAME
+    "planner_evidence" stage's real per-call technical-capacity ceiling
+    (`utilities.autopatcher.technical_capacity`) `fresh`'s own construction
+    just used -- Fix B: no more window-growth request, since the ceiling
+    already IS the real technical capacity from the start -- failing this
+    fallback closed (`skip_reason="preserved_evidence_budget_exhausted"`,
+    no Strategy #2 call) if the combined evidence still exceeds it. Never
+    truncates either evidence set to make it fit -- see the merge-size
+    accounting block below.
+
+    Returns a dict (never raises -- any internal failure degrades to "no
+    recovery this run", identical to every other best-effort section in
+    this module):
+      attempted                    : bool -- always True when this function
+                                      is called (the caller already checked
+                                      the trigger); kept for a single,
+                                      uniform observability shape even if a
+                                      future caller invokes this
+                                      unconditionally.
+      evidence_acquired            : bool -- the fresh structural source-
+                                      coverage signature genuinely differs
+                                      from baseline_planner_evidence_result.
+      rerun_performed              : bool -- Strategy #2 was actually called.
+      enriched_planner_evidence_ctx: str | None -- the enlarged rendered
+                                      evidence, only when evidence_acquired.
+      strategy_result               : RemediationStrategyResult | None --
+                                      Strategy #2's result, only when
+                                      rerun_performed.
+      skip_reason                  : str | None -- why no rerun happened,
+                                      for observability only (never
+                                      branched on downstream). Includes
+                                      "preserved_evidence_budget_exhausted"
+                                      when `merge_with_baseline` produced
+                                      combined evidence that could not be
+                                      brought within the "planner_evidence"
+                                      stage's budget (no controller and the
+                                      combined size exceeds the single fixed
+                                      ceiling; or a controller that refused
+                                      -- policy="never", an "ask" refusal, or
+                                      the hard max_windows cap) -- Strategy
+                                      #2 is never called in that case, and
+                                      Strategy #1's own result (including
+                                      target_authority_unresolved=True)
+                                      remains the caller's only result,
+                                      exactly like every other skip_reason.
+    """
+    result = {
+        "attempted": True, "evidence_acquired": False, "rerun_performed": False,
+        "enriched_planner_evidence_ctx": None, "strategy_result": None, "skip_reason": None,
+        # Fix B: preserved structured inclusion provenance for THIS
+        # reacquisition attempt -- requested/resolved is implicit in
+        # `plan_result.target_files`/`.target_symbols` (the caller's own
+        # seed); `included_labels` is what `fresh.excerpt_plan` actually
+        # admitted; `omission_reason`/`omitted_sizes` name exactly what
+        # didn't fit and why (always "technical_capacity" when populated).
+        # `None` here (every early-return path above `evidence_acquired`
+        # ever being set) means "never reached a real acquisition attempt"
+        # -- distinct from an attempt that resolved nothing new.
+        "evidence_provenance": None,
+    }
+    if plan_result is None or not (plan_result.target_files or plan_result.target_symbols):
+        result["skip_reason"] = "no_planner_targets_to_seed_from"
+        return result
+    if not repo_root:
+        result["skip_reason"] = "no_repo_root"
+        return result
+
+    try:
+        from .remediation_planner import build_planner_evidence_with_budget
+        baseline_labels = baseline_planner_evidence_result.excerpt_plan.included_labels
+        fresh = build_planner_evidence_with_budget(
+            plan_result, repo_root, vulnerability_text, investigation_context,
+            budget_controller=budget_controller,
+        )
+    except Exception as exc:
+        result["skip_reason"] = f"acquisition_failed:{type(exc).__name__}"
+        return result
+
+    # Fix B: recorded regardless of whether this attempt goes on to find
+    # anything new -- "resolved this round, but already covered by
+    # baseline" is a real, distinct outcome from "never resolved at all",
+    # and this is the one place that fact is still visible before the
+    # no_new_evidence early return below discards `fresh` otherwise.
+    result["evidence_provenance"] = {
+        "included_labels": sorted(fresh.excerpt_plan.included_labels),
+        "omission_reason": dict(fresh.excerpt_plan.omission_reason),
+        "omitted_sizes": dict(fresh.excerpt_plan.omitted_sizes),
+    }
+
+    if fresh.excerpt_plan.included_labels == baseline_labels or not fresh.rendered:
+        result["skip_reason"] = "no_new_evidence"
+        return result
+
+    result["evidence_acquired"] = True
+
+    if merge_with_baseline:
+        from .remediation_planner import (
+            _planner_evidence_known_overhead_chars,
+            merge_baseline_and_reacquired_planner_evidence,
+        )
+        from .technical_capacity import compute_source_capacity
+        from .llm_client import resolve_active_model, resolve_max_tokens
+        enriched_ctx = merge_baseline_and_reacquired_planner_evidence(
+            baseline_planner_evidence_result, fresh,
+        )
+
+        # Fix B: the merge concatenates two independently-capacity-bounded
+        # renders, so its length can exceed the "planner_evidence" stage's
+        # real per-call technical ceiling even though neither input
+        # violated it on its own. This now reuses the exact SAME shared
+        # implementation `build_planner_evidence_with_budget` itself uses
+        # (`technical_capacity.compute_source_capacity`) -- no bespoke
+        # budget-growth logic lives here anymore (there is no more growth
+        # to have: the ceiling `fresh` was just built against, moments
+        # above, is already the real technical capacity for this stage,
+        # cached on `budget_controller` when one is given). This never
+        # truncates or drops either evidence set: if the combined text
+        # still exceeds real technical capacity, the fallback fails closed
+        # and returns without a Strategy #2 call, leaving Strategy #1's
+        # own result (including target_authority_unresolved=True)
+        # load-bearing -- identical in shape to every other skip_reason
+        # this function already returns.
+        _STAGE = "planner_evidence"
+        known_overhead_chars = _planner_evidence_known_overhead_chars(vulnerability_text)
+        if budget_controller is not None:
+            ceiling = budget_controller.effective_budget(_STAGE, known_overhead_chars=known_overhead_chars)
+        else:
+            ceiling = compute_source_capacity(
+                *resolve_active_model(), reserved_output_tokens=resolve_max_tokens(),
+                known_overhead_chars=known_overhead_chars,
+            ).source_capacity_chars
+        if len(enriched_ctx) > ceiling:
+            result["skip_reason"] = "preserved_evidence_budget_exhausted"
+            return result
+        if budget_controller is not None:
+            # Observability only -- never consulted by any capacity
+            # decision, purely keeps the run's own trace accurate.
+            budget_controller.record_used(_STAGE, len(enriched_ctx))
+        # The FINAL evidence Strategy #2 actually receives is the union
+        # (baseline OR fresh), never fresh alone -- update the preserved
+        # provenance to match what's really being sent, not just what
+        # this round's own reacquisition found.
+        result["evidence_provenance"]["included_labels"] = sorted(
+            fresh.excerpt_plan.included_labels | baseline_planner_evidence_result.excerpt_plan.included_labels
+        )
+    else:
+        enriched_ctx = fresh.rendered
+
+    result["enriched_planner_evidence_ctx"] = enriched_ctx
+
+    try:
+        from .remediation_planner import generate_remediation_strategy
+        strategy_v2 = generate_remediation_strategy(
+            vulnerability_text, llm, repo_root, investigation_context,
+            repo_grounding_ctx=repo_grounding_ctx,
+            repository_understanding_ctx=repository_understanding_ctx,
+            discovery_plan_ctx=discovery_plan_ctx,
+            planner_evidence_ctx=enriched_ctx,
+        )
+    except ModelUnavailableError:
+        # Same explicit execution/configuration-decision exception every
+        # other LLM call in this module family re-raises unconditionally.
+        raise
+    except Exception as exc:
+        result["skip_reason"] = f"rerun_failed:{type(exc).__name__}"
+        return result
+
+    result["rerun_performed"] = True
+    result["strategy_result"] = strategy_v2
+    return result
+
+
+def _build_retry_hint(stderr: str, failed_file: str) -> str:
+    excerpt_lines = (stderr or "").splitlines()[:_RETRY_STDERR_LINES]
+    excerpt = "\n".join(excerpt_lines)
+    return (
+        f"The previous patch attempt failed to apply to `{failed_file}`.\n\n"
+        f"Git error:\n```\n{excerpt}\n```\n\n"
+        "The patch context lines did not match the actual file content.\n"
+        "Regenerate the patch using **only** the code shown in the "
+        "\"Repository code context\" section above.\n"
+        "Do not use your training-data memory of this file — "
+        "the code above is the ground truth.\n"
+        "Keep the same fix logic; only update the surrounding context lines "
+        "to match the actual code exactly."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Patch Generator response-contract enforcement
+#
+# Orchestration only — classification itself (classify_patch_response) is
+# pure and lives in patch_generator.py; this is the decision, made here and
+# only here, about whether a contract violation warrants one bounded retry.
+# generate_patch()/generate_patch_raw() never retry internally; this
+# function is what may make a second LLM call, and it is capped at exactly
+# one. Deliberately NOT wired into every generate_patch() call site — see
+# the two call sites below that use it (initial generation, applicability-
+# aware retry) and their own comments for why those two and not the other
+# two (Slice 4 Post-Patch Recovery regeneration, Challenger-repair loop).
+# ---------------------------------------------------------------------------
+
+_CONTRACT_VIOLATION_RETRY_HINT = (
+    "Your previous response violated the required output format: it must contain "
+    "exactly one fenced ```diff block and nothing else — no prose, no explanation, "
+    "no alternative patches, no self-correction. Output ONLY your single, final, "
+    "best patch as one ```diff fenced block. Nothing before it, nothing after it."
+)
+
+_CONTRACT_RETRY_STAGE = "patch_generation_contract_retry"
+
+# Canonical-stage LLM-ownership disambiguation (Auto Patcher stage-replay
+# foundation): the Challenger-driven repair loop's patch regeneration
+# belongs to the patch_repair_and_calibration canonical stage, not
+# patch_generation_and_post_patch_investigation -- even though both call
+# generate_patch(). Before this tag existed, both call sites traced under
+# the plain "patch_generation" default, making the two canonical stages'
+# LLM calls indistinguishable in a trace and unenforceable for stage-replay
+# LLM-ownership checks (a replay of one stage could not be told apart from
+# a leaked call belonging to the other). This is an observability/ownership
+# change only -- it does not alter prompt content, retry behavior, or the
+# request itself; see generate_patch()'s `stage` parameter.
+_REPAIR_REGENERATION_STAGE = "patch_repair_regeneration"
+
+# Planner Claim Verifier orchestration tags -- owned by the SAME canonical
+# stage as the Planner's own first call (repository_analysis_and_
+# remediation_planning; see stage_registry.STAGE_OWNED_LLM_TAGS), never a
+# new canonical stage. Distinct names for the revision call and the
+# post-revision re-verification call so a traced run shows all four
+# possible calls (initial plan, v1 verify, revision, v2 verify)
+# individually, mirroring exactly how patch_generation_contract_retry is
+# distinguished from plain patch_generation above.
+_PLAN_REVISION_STAGE = "remediation_plan_revision"
+_PLAN_REVERIFICATION_STAGE = "remediation_plan_reverification"
+
+
+def _generate_patch_with_contract_check(
+    vulnerability_text: str,
+    llm,
+    code_context: str = "",
+    retry_hint: str = "",
+    *,
+    context_sections=None,
+    required_label=None,
+) -> "tuple[str, str, int]":
+    """Make one Patch Generator call, classify it, and — ONLY for
+    status == "contract_violation" (2+ candidate diff blocks, or one block
+    with non-whitespace prose around it) — make exactly one further call
+    with an explicit contract-violation hint before giving up. Never loops;
+    at most 2 LLM calls total.
+
+    "no_diff" and "malformed_fence" are passed through unretried — neither
+    is a formatting problem a stricter instruction would fix (see
+    classify_patch_response's own docstring for why).
+
+    The retry call is traced under stage="patch_generation_contract_retry"
+    (see generate_patch_raw's `stage` parameter) so a future trace shows
+    e.g. "003_patch_generation" followed by
+    "004_patch_generation_contract_retry" — never two indistinguishable
+    "patch_generation" entries.
+
+    Fix B: the retry adds `_CONTRACT_VIOLATION_RETRY_HINT` on top of
+    whatever `retry_hint` the caller already passed, which strictly grows
+    the request's overhead (see patch_generator.compute_patch_generation_
+    capacity) — `code_context` having fit the FIRST call's ceiling never
+    proves it fits the retry's (smaller) one. `context_sections` (an
+    ordered list of (label, text) pairs -- the SAME structured sections
+    `code_context` was originally built from, see patch_generator.
+    fit_patch_generation_context) and `required_label` let this refit the
+    retry's own `code_context` at whole-block granularity before issuing
+    the retry call; both default to None for callers that only have the
+    already-flattened string (e.g. replay), which instead get a coarser
+    whole-context capacity check — still never a mid-string truncation,
+    just less granularity to selectively drop with. Either way, a retry
+    that would not fit is never sent: the ORIGINAL "contract_violation"
+    classification is returned unchanged (as `llm_calls_made=1`) rather
+    than issuing a second, over-budget request.
+
+    Returns (patch, final_status, llm_calls_made):
+      patch          -- the single valid diff when final_status == "valid".
+                        When no retry ran (first response already valid or
+                        already "no_diff"/"malformed_fence"), the exact
+                        same value generate_patch() has always returned for
+                        that status (raw.strip() for "no_diff", "" for
+                        "malformed_fence"). When a retry DID run and its
+                        response is still not "valid" (including a retry
+                        that itself comes back "no_diff"), `patch` is
+                        always "" — never the retry's raw.strip() text —
+                        because both call sites below decide "keep the
+                        original patch" / "skip validation" partly by
+                        checking `patch` truthiness, and a contract-
+                        violation retry's leftover prose must never be
+                        mistaken for a candidate to validate.
+      final_status   -- "valid" | "no_diff" | "malformed_fence" |
+                        "contract_violation" — the LAST classification
+                        produced (i.e. the retry's, when a retry ran).
+                        Callers should prefer this over `patch == ""` to
+                        distinguish "no usable patch because the response
+                        was invalid" from any other empty-patch reason —
+                        see the two call sites below.
+      llm_calls_made -- 1 or 2, for observability/tests.
+    """
+    raw = generate_patch_raw(vulnerability_text, llm, code_context=code_context, retry_hint=retry_hint)
+    result = classify_patch_response(raw)
+    if result.status != "contract_violation":
+        return result.diff, result.status, 1
+
+    progress.verbose(f"[pipeline] Patch Generator response violated the output contract "
+        f"({result.block_count} candidate diff block(s) and/or surrounding prose) "
+        "— retrying once with an explicit contract reminder …")
+    combined_hint = (retry_hint + "\n\n" if retry_hint else "") + _CONTRACT_VIOLATION_RETRY_HINT
+
+    # Fix B: refit code_context against the retry's own (smaller) ceiling
+    # before issuing it — see this function's own docstring above.
+    _retry_capacity = compute_patch_generation_capacity(vulnerability_text, retry_hint=combined_hint)
+    retry_code_context = code_context
+    if context_sections is not None:
+        _retry_plan = fit_patch_generation_context(
+            context_sections, _retry_capacity.source_capacity_chars,
+            required_label=required_label, capacity=_retry_capacity,
+        )
+        if _retry_plan.required_missing:
+            progress.warning("Contract-violation retry skipped — required evidence exceeds technical capacity")
+            return result.diff, result.status, 1
+        retry_code_context = _retry_plan.rendered
+    elif len(code_context) > _retry_capacity.source_capacity_chars:
+        progress.warning("Contract-violation retry skipped — repository context exceeds technical "
+            "capacity once the retry hint is added")
+        return result.diff, result.status, 1
+
+    retry_raw = generate_patch_raw(
+        vulnerability_text, llm, code_context=retry_code_context, retry_hint=combined_hint,
+        stage=_CONTRACT_RETRY_STAGE,
+    )
+    retry_result = classify_patch_response(retry_raw)
+    if retry_result.status == "valid":
+        progress.verbose("[pipeline] Contract-violation retry succeeded — single valid diff produced.")
+        return retry_result.diff, retry_result.status, 2
+
+    # Anything other than "valid" after the one bounded retry fails closed
+    # uniformly — including "no_diff": once the model has been explicitly
+    # told to output ONLY one diff block and still doesn't produce one,
+    # that response's text must not leak into `patch` as if it were an
+    # ordinary candidate either (both call sites below decide "keep
+    # original"/"skip validation" partly by checking `patch` truthiness,
+    # not only `final_status` — so `diff` must actually BE "" here, not
+    # merely be labelled non-"valid").
+    progress.verbose(f"[pipeline] Contract-violation retry still invalid (status={retry_result.status}) "
+        "— failing closed.")
+    return "", retry_result.status, 2
+
+
+# ---------------------------------------------------------------------------
+# Phase E experiment — hand-written plan loader
+# ---------------------------------------------------------------------------
+
+_PHASE_E_PLANS_DIR = Path(__file__).parent.parent / "evaluation" / "phase_e"
+_GHSA_RE = re.compile(r"GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}")
+
+
+def _load_experiment_plan(vulnerability_text: str) -> str:
+    """Phase E experiment: return hand-written plan markdown for a known GHSA, or ''.
+
+    Appended as the final context block before generate_patch(). Never raises.
+    Has no effect when no plan file exists for the matched GHSA.
+    """
+    m = _GHSA_RE.search(vulnerability_text)
+    if not m:
+        return ""
+    plan_path = _PHASE_E_PLANS_DIR / f"{m.group(0)}.md"
+    if not plan_path.exists():
+        return ""
+    try:
+        text = plan_path.read_text(encoding="utf-8")
+        progress.verbose(f"[pipeline] Phase E plan loaded for {m.group(0)} ({len(text)} chars).")
+        return text
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Post-Patch Recovery -> ReadyEdit reconciliation (Slice 4)
+#
+# Post-Patch Recovery's own certification that a target now has verified,
+# patch-ready source must reach the SECOND (post-regeneration) Patch Target
+# Conformance check, or a regenerated patch re-targeting the very file
+# recovery just verified fails closed unconditionally regardless of match
+# quality. This promotes a recovery attempt to a real ReadyEdit -- the
+# exact shape check_edit_readiness itself already produces -- rather than
+# passing the attempt object through structurally: check_patch_target_
+# conformance currently reads only `.file` off each ready_edits element,
+# but this must keep working even if that ever reads `.symbol` too.
+# ---------------------------------------------------------------------------
+
+
+def _recovered_ready_edit(attempt):
+    """Promote one Post-Patch Recovery attempt to a real ReadyEdit, using
+    ONLY its deterministically verified recovery identity
+    (resolved_file/resolved_target) -- never the original, possibly-
+    unexpected `attempt.file`. Returns None when the attempt does not
+    clear every verification bar (success, patch_ready, a real
+    resolved_file) -- a partial or failed attempt is never promoted."""
+    if not (attempt.success and attempt.patch_ready and attempt.resolved_file is not None):
+        return None
+    from .remediation_planner import IntendedEdit, ReadyEdit
+    edit = IntendedEdit(file=attempt.resolved_file, symbol=attempt.resolved_target)
+    return ReadyEdit(
+        edit=edit, role="edit_target",
+        file=attempt.resolved_file, symbol=attempt.resolved_target,
+    )
+
+
+def _prior_supported_target_files(plan_result, strategy_result) -> "set[str]":
+    """Files with prior support BEFORE Patch Generation ran -- Target
+    Discovery's own (unverified) target_files, or Final Strategy's
+    deterministically re-verified target_files. File-level only: this is
+    the evidence floor a recovered target's resolved FILE must clear to be
+    promoted (see _recovered_ready_edit) -- it deliberately does not also
+    require the exact recovered SYMBOL to have been named up front, since
+    recovery discovering a better symbol inside an already-supported file
+    is exactly what this slice exists to allow (a file already named by
+    Target Discovery or Final Strategy, with the wrong symbol initially
+    proposed inside it, where recovery later finds the real one -- the
+    file itself was never a new, unsupported target)."""
+    return (
+        set(plan_result.target_files if plan_result is not None else [])
+        | set(strategy_result.target_files if strategy_result is not None else [])
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline entry point
+# ---------------------------------------------------------------------------
+
+
+def _run_patch_generation_and_investigation(
+    *, vulnerability_text, llm, repo_root, code_context, budget_controller,
+    _skip_patch_generation, _edit_readiness, _slice_result, _investigation_context,
+    _pre_patch_anchors, _plan_result, _strategy_result,
+    _skip_patch_generation_reason=None,
+    _patch_gen_context_plan=None,
+):
+    """Reusable Stage-4 (patch_generation_and_post_patch_investigation)
+    executor -- the COMPLETE current production contract (contract
+    retry, hunk repair, Slice-4 conformance/recovery, hygiene,
+    applicability + its own bounded retry, Post-Patch Investigation),
+    extracted VERBATIM from pipeline.run() (Batch B7) so production and
+    replay share exactly the same implementation -- see
+    replay_engine.py's patch_generation_and_post_patch_investigation
+    ReplayHandler, the other caller. No behavior change: this function's
+    body is byte-identical to what used to be inline in run(); only the
+    function boundary (parameters in, `return locals()` out) is new.
+
+    Returns every local variable this body binds (`locals()`), so the
+    caller (run() or a replay run_fn) picks whichever fields it needs by
+    name -- avoids hand-enumerating an exhaustive, easy-to-drift return
+    signature for ~20 produced values.
+
+    `_skip_patch_generation_reason` (additive, default None so every
+    pre-existing caller/test gets the exact prior "no verified final-target
+    source" text unchanged): an optional, more specific skip reason -- set
+    by the Planner Claim Verifier orchestration when `_skip_patch_generation`
+    is True because a causal contradiction was never cleared, rather than
+    because of an ordinary Edit-Readiness/Strategy-Gate outcome. Threaded
+    straight into `_patch_validation_skip_reason` below, the SAME field
+    that already surfaces through `applicability_result["skipped_reason"]`
+    into the Recommendation Policy's "Not Verified"/"Manual Review
+    Required" path (see `_applicability_unavailable_reason` and I1) -- no
+    new report field, no new recommendation category.
+
+    `_patch_gen_context_plan` (additive, default None -- replay_engine.py's
+    call site does not supply one): the `PatchGenerationContextPlan` (see
+    patch_generator.fit_patch_generation_context) that ALREADY produced
+    `code_context` above, before this function was called. Passed through
+    so this function's own internal retry/recovery regeneration paths can
+    refit the SAME structured sections at whole-block granularity for
+    THEIR OWN, larger request (retry hint, recovery hint added) instead of
+    only having the already-flattened `code_context` string to work with.
+    None here is not an error -- every affected code path below falls back
+    to a coarser (but still real, still never mid-string-truncating)
+    capacity check when it is None.
+    """
+    _patch_validation_skip_reason: str | None = None
+    _patch_generation_status: str | None = None  # set only when generation actually ran
+    progress.stage(3, 5, "Generate")
+    if _skip_patch_generation:
+        _skip_reason_text = _skip_patch_generation_reason or "no verified final-target source"
+        # Release polish: the same plain-language reason the report's NO
+        # PATCH PRODUCED card shows; the raw recorded reason stays available
+        # under --verbose and verbatim in the report's Patch Applicability.
+        _skip_reason_display = (_describe_no_patch_reason(_skip_reason_text) or _skip_reason_text).rstrip(".")
+        progress.skipped(
+            "Patch generation skipped",
+            reason=_skip_reason_display[:1].lower() + _skip_reason_display[1:],
+        )
+        progress.verbose(f"[pipeline] Patch generation skipped: {_skip_reason_text}")
+        patch = ""
+        _patch_validation_skip_reason = _skip_reason_text
+    else:
+        patch, _patch_generation_status, _patch_generation_llm_calls = _generate_patch_with_contract_check(
+            vulnerability_text, llm, code_context=code_context,
+            context_sections=(
+                _patch_gen_context_plan.included_sections if _patch_gen_context_plan is not None else None
+            ),
+            required_label=PATCH_GENERATION_REQUIRED_LABEL,
+        )
+        # Only a contract-violation retry that STILL isn't valid (2 calls
+        # made, final status not "valid") gets the new skip-validation
+        # treatment. A first response that's already "no_diff" or
+        # "malformed_fence" (1 call, no retry attempted) is deliberately
+        # UNCHANGED from pre-existing behavior — those two states are out
+        # of this task's scope; only "contract_violation" is new, and it
+        # only ever reaches this point after its own bounded retry (see
+        # _generate_patch_with_contract_check).
+        if _patch_generation_llm_calls == 2 and _patch_generation_status != "valid":
+            _patch_validation_skip_reason = (
+                f"Patch Generator response invalid (status={_patch_generation_status}) "
+                f"after bounded contract regeneration ({_patch_generation_llm_calls} call(s))"
+            )
+            progress.warning("Patch generation failed validation")
+            progress.verbose(f"[pipeline] Step 1/4 – {_patch_validation_skip_reason}")
+        else:
+            progress.success("Patch generated")
+
+    # Hunk header repair — recompute @@ counts from body, and (with repo_root)
+    # relocate a drifted old-side line number by content; never blocks the pipeline
+    _raw_patch_for_telemetry = patch  # captured BEFORE repair, for the telemetry block below
+    # Tracks the RepairResult (and therefore .relocations) belonging to
+    # whichever repair pass actually produced the CURRENT `patch` — reassigned
+    # below whenever the retry or challenger-repair loop replaces `patch`, so
+    # the Evidence Sufficiency Gate signal computed further down always
+    # describes the patch that's actually being reported on, never a
+    # superseded earlier attempt.
+    _final_repair_meta = None
+    if _patch_validation_skip_reason is None:
+        try:
+            from .diff_hunk_repair import repair_hunk_headers
+            patch, _repair_meta = repair_hunk_headers(patch, repo_root=repo_root)
+            _final_repair_meta = _repair_meta
+            if _repair_meta.normalization_applied:
+                progress.verbose(f"[pipeline] Hunk headers repaired: "
+                    f"{_repair_meta.hunks_rewritten} hunk(s) in "
+                    f"{_repair_meta.files_rewritten} file(s)"
+                    f" ({_repair_meta.hunks_relocated} relocated by content)")
+        except Exception:
+            pass
+
+    # Candidate 1 relocation telemetry — observability only. Independently
+    # recomputes both a WITHOUT-relocation and a WITH-relocation variant of
+    # the same raw patch and checks `git apply --check` against each, so it
+    # can never mutate or influence `patch`/`applicability_result` above or
+    # below (see relocation_telemetry.py's module docstring). Read-only,
+    # deterministic, never blocks the pipeline, never consulted by the
+    # retry loop, the repair loop, or the Recommendation Policy below.
+    _relocation_telemetry = None
+    try:
+        from .relocation_telemetry import build_relocation_telemetry, summarize as _summarize_relocation
+        _relocation_telemetry = build_relocation_telemetry(_raw_patch_for_telemetry, repo_root)
+        progress.verbose(f"[pipeline] Relocation telemetry: {_summarize_relocation(_relocation_telemetry)}")
+        if os.environ.get("AUTOPATCHER_DEBUG") and _relocation_telemetry is not None:
+            import datetime as _dt
+            import json as _json
+            _debug_dir = Path("reports") / "debug"
+            _debug_dir.mkdir(parents=True, exist_ok=True)
+            _ts = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+            (_debug_dir / f"relocation_telemetry_{_ts}.json").write_text(
+                _json.dumps(_relocation_telemetry.to_dict(), indent=2), encoding="utf-8"
+            )
+    except Exception as exc:
+        progress.verbose(f"[pipeline] Relocation telemetry unavailable: {type(exc).__name__}: {exc}")
+
+    # Slice 4 -- Patch Target Conformance Gate + Post-Patch Recovery: the
+    # final deterministic gate, catching a generated patch that edits a
+    # DIFFERENT repository target than the one Edit Readiness actually
+    # approved -- something no earlier slice can catch, since Slices 1-3
+    # only validate/acquire source for targets known BEFORE Patch
+    # Generation runs. Runs only when there IS an Edit Readiness context
+    # to compare against (a Final Strategy ran) and a non-empty patch was
+    # actually generated. Reuses _final_repair_meta.relocations (already
+    # computed above, as a side effect of repair_hunk_headers' own repair
+    # pass over THIS `patch`) for old-side verification -- no second
+    # relocation mechanism, no new git call. Fails closed: a failure here
+    # before conformance is established for the current patch withdraws it.
+    _patch_target_conformance = None        # initial conformance (this section's own PipelineResult field)
+    _regenerated_patch_target_conformance = None  # only set if regeneration actually ran
+    _post_patch_recovery = None
+    _initial_patch_before_slice4 = patch     # captured for the trace artifact below, regardless of outcome
+    _conformance_established = False         # set only where the CURRENT patch is known to conform
+    if patch and patch.strip() and repo_root and _edit_readiness is not None:
+        try:
+            from .remediation_planner import (
+                build_post_patch_recovery_hint, build_recovery_targets,
+                check_patch_target_conformance,
+                post_patch_recovery_trigger_reasons, recover_post_patch_source,
+                remove_final_target_slice_section,
+            )
+            # Patch Target Conformance is checked against ReadyEdit ONLY --
+            # "currently approved edit intent" -- never against the
+            # broader recovery-eligibility set built below. Post-Patch
+            # Recovery is what's allowed to look beyond ReadyEdit (at
+            # prior-supported files); conformance itself must not.
+            #
+            # _prior_supported_files is computed ONCE, here -- before the
+            # patch is even inspected -- and reused both to build recovery
+            # eligibility below AND, unchanged, by the reconciliation
+            # guard further down (no second computation, same existing
+            # helper/data the guard already used).
+            _prior_supported_files = _prior_supported_target_files(_plan_result, _strategy_result)
+            _recovery_targets = build_recovery_targets(_edit_readiness.ready_edits, _prior_supported_files)
+            _patch_target_conformance = check_patch_target_conformance(
+                patch, _final_repair_meta.relocations if _final_repair_meta is not None else [],
+                _edit_readiness.ready_edits, _slice_result,
+            )
+            _recovery_reasons = post_patch_recovery_trigger_reasons(_patch_target_conformance)
+            progress.verbose(f"[pipeline] Patch Target Conformance: all_conformant={_patch_target_conformance.all_conformant}, "
+                f"edited files={_patch_target_conformance.edited_files}"
+                + (f", trigger_reasons={_recovery_reasons}" if _recovery_reasons else ""))
+            if not _recovery_reasons:
+                _conformance_established = True
+                progress.success(
+                    "Target conformance passed",
+                    detail=f"Files changed: {', '.join(_patch_target_conformance.edited_files)}",
+                )
+
+            if _recovery_reasons:
+                _post_patch_recovery = recover_post_patch_source(
+                    _strategy_result, repo_root, _investigation_context,
+                    _slice_result, _patch_target_conformance, patch,
+                    recovery_targets=_recovery_targets,
+                    budget_controller=budget_controller,
+                    vulnerability_text=vulnerability_text,
+                )
+                progress.verbose(f"[pipeline] Post-Patch Recovery: targets={[t.file for t in _post_patch_recovery.recovery_targets]}, "
+                    f"ready_for_regeneration={_post_patch_recovery.ready_for_regeneration}"
+                    + (f", failure_reason={_post_patch_recovery.failure_reason}"
+                       if _post_patch_recovery.failure_reason else ""))
+
+                if not _post_patch_recovery.ready_for_regeneration:
+                    progress.warning("Evidence recovery insufficient — patch withdrawn")
+                    patch = ""
+                else:
+                    _recovery_hint = build_post_patch_recovery_hint(_patch_target_conformance, _post_patch_recovery, patch)
+                    _recovered_rendered = (
+                        _post_patch_recovery.slice_result.rendered if _post_patch_recovery.slice_result else ""
+                    )
+                    # Fix B: the COMPLETE regenerated request (retained sibling
+                    # context + the freshly recovered slice + vulnerability text +
+                    # system prompt + _recovery_hint) must itself fit real Patch
+                    # Generation technical capacity -- the recovered slice being
+                    # independently bounded (recover_post_patch_source's own
+                    # ceiling) is not sufficient; _recovery_hint alone can also
+                    # shrink what's left. Reuses the SAME "Final-Target Remediation
+                    # Slice" required slot the initial generation call used (the
+                    # recovered slice occupies it in place of the pre-recovery one)
+                    # -- if the recovered evidence Post-Patch Recovery itself just
+                    # certified as ready_for_regeneration cannot fit, regeneration
+                    # must be withdrawn, never sent truncated or silently thinned.
+                    _recovery_capacity = compute_patch_generation_capacity(vulnerability_text, retry_hint=_recovery_hint)
+                    _recovery_context = None
+                    if _patch_gen_context_plan is not None:
+                        _recovery_sections = [
+                            (label, (_recovered_rendered if label == PATCH_GENERATION_REQUIRED_LABEL else text))
+                            for label, text in _patch_gen_context_plan.included_sections
+                        ]
+                        if _recovered_rendered and not any(
+                            label == PATCH_GENERATION_REQUIRED_LABEL for label, _ in _recovery_sections
+                        ):
+                            _recovery_sections.append((PATCH_GENERATION_REQUIRED_LABEL, _recovered_rendered))
+                        _recovery_plan = fit_patch_generation_context(
+                            _recovery_sections, _recovery_capacity.source_capacity_chars,
+                            required_label=(PATCH_GENERATION_REQUIRED_LABEL if _recovered_rendered else None),
+                            capacity=_recovery_capacity,
+                        )
+                        if _recovery_plan.required_missing:
+                            progress.warning(
+                                "Post-Patch Recovery evidence exceeds Patch Generation technical "
+                                "capacity — regeneration withdrawn"
+                            )
+                        else:
+                            _recovery_context = _recovery_plan.rendered
+                    else:
+                        # No structured plan (e.g. replay) -- coarser whole-
+                        # request check: drop the stale slice section the same
+                        # way as before, append the recovered one, and verify
+                        # the COMBINED result fits before sending it. Never
+                        # mid-string-truncated; a request that doesn't fit is
+                        # withdrawn entirely rather than sent anyway.
+                        _candidate_context = code_context
+                        if _recovered_rendered:
+                            _candidate_context = remove_final_target_slice_section(code_context)
+                            _candidate_context = (
+                                (_candidate_context + "\n\n" if _candidate_context else "") + _recovered_rendered
+                            )
+                        if len(_candidate_context) <= _recovery_capacity.source_capacity_chars:
+                            _recovery_context = _candidate_context
+                        else:
+                            progress.warning(
+                                "Post-Patch Recovery evidence exceeds Patch Generation technical "
+                                "capacity — regeneration withdrawn"
+                            )
+
+                    if _recovery_context is None:
+                        _regenerated_raw = ""
+                    else:
+                        try:
+                            _regenerated_raw = generate_patch(
+                                vulnerability_text, llm, code_context=_recovery_context, retry_hint=_recovery_hint,
+                            )
+                        except Exception:
+                            _regenerated_raw = ""
+
+                    if not _regenerated_raw or not _regenerated_raw.strip():
+                        progress.warning("Patch regeneration produced no usable patch")
+                        patch = ""
+                    else:
+                        from .diff_hunk_repair import repair_hunk_headers as _repair_regenerated
+                        _regenerated_patch, _regen_meta = _repair_regenerated(_regenerated_raw, repo_root=repo_root)
+                        # Reconcile Post-Patch Recovery's own verified identity into the
+                        # ready-edit set used for THIS (second, post-regeneration) check
+                        # only -- the first check above, and any target that never went
+                        # through recovery, are unaffected. Deduplicated conservatively
+                        # by (file, symbol); a recovered attempt is only ever promoted via
+                        # _recovered_ready_edit's own strict gate (success, patch_ready, a
+                        # real resolved_file) -- never merely `attempt.file`.
+                        #
+                        # Evidence-floor guard (security): _recovered_ready_edit's checks
+                        # prove the recovered SOURCE is real and patch-ready, but not that
+                        # the FILE had any support before Patch Generation ran. Without
+                        # this, Patch Generation could invent a brand-new target file with
+                        # zero prior evidence and have recovery "launder" it into an
+                        # approved target merely because the file happens to exist and its
+                        # source can be read. Reuses Target Discovery's own (unverified)
+                        # target_files and Final Strategy's deterministically re-verified
+                        # target_files -- no new retrieval, no LLM call, no Markdown
+                        # parsing. File-level only: recovery refining WHICH symbol inside
+                        # an already-supported file is exactly what this slice exists to
+                        # allow -- a file already named by Target Discovery/Final
+                        # Strategy, with the wrong symbol initially proposed inside it,
+                        # where recovery later finds the real one in that same,
+                        # already-supported file.
+                        # Reuses the SAME _prior_supported_files computed above --
+                        # no second call to _prior_supported_target_files.
+                        _reconciled_ready_edits = list(_edit_readiness.ready_edits)
+                        _reconciled_ready_keys = {(e.file, e.symbol) for e in _reconciled_ready_edits}
+                        for _attempt in _post_patch_recovery.attempts:
+                            _promoted = _recovered_ready_edit(_attempt)
+                            if _promoted is None or _promoted.file not in _prior_supported_files:
+                                continue
+                            _key = (_promoted.file, _promoted.symbol)
+                            if _key not in _reconciled_ready_keys:
+                                _reconciled_ready_edits.append(_promoted)
+                                _reconciled_ready_keys.add(_key)
+                        _regen_conformance = check_patch_target_conformance(
+                            _regenerated_patch, _regen_meta.relocations,
+                            _reconciled_ready_edits, _post_patch_recovery.slice_result,
+                        )
+                        _regenerated_patch_target_conformance = _regen_conformance
+                        _regen_ok = _regen_conformance.all_conformant and not _regen_conformance.unexpected_files
+                        progress.verbose(f"[pipeline] Post-Patch Recovery: regeneration_performed=True, "
+                            f"regenerated all_conformant={_regen_conformance.all_conformant}, "
+                            f"accepted={_regen_ok}")
+                        if _regen_ok:
+                            patch = _regenerated_patch
+                            _final_repair_meta = _regen_meta
+                            _slice_result = _post_patch_recovery.slice_result
+                            _patch_target_conformance = _regen_conformance
+                            _conformance_established = True
+                            progress.recovery("Patch regenerated to match approved target")
+                        else:
+                            progress.warning("Regenerated patch still fails target conformance")
+                            patch = ""
+        except Exception as exc:
+            progress.verbose(f"[pipeline] Patch Target Conformance unavailable: {type(exc).__name__}: {exc}")
+            if not _conformance_established and patch and patch.strip():
+                # Conformance never completed for the current patch -- it is
+                # unchecked, or already known not to conform (a crash during
+                # recovery). Withdraw it; never let it continue as if checked.
+                progress.warning("Target conformance could not be completed — patch withdrawn")
+                patch = ""
+                _patch_validation_skip_reason = (
+                    "Patch Target Conformance could not be completed -- candidate patch withdrawn "
+                    f"({type(exc).__name__}: {exc})"
+                )
+
+    if os.environ.get("AUTOPATCHER_DEBUG"):
+        try:
+            import datetime as _dt4
+            import json as _json4
+
+            def _conformance_doc(c):
+                if c is None:
+                    return None
+                return {
+                    "all_conformant": c.all_conformant,
+                    "edited_files": c.edited_files,
+                    "unexpected_files": c.unexpected_files,
+                    "uncovered_files": c.uncovered_files,
+                    "no_match_files": c.no_match_files,
+                    "results": [
+                        {
+                            "file": r.file, "hunk_index": r.hunk_index,
+                            "target_coverage": r.target_coverage,
+                            "old_side_status": r.old_side_status,
+                            "conformant": r.conformant,
+                        }
+                        for r in c.results
+                    ],
+                }
+
+            def _recovery_doc(rec):
+                if rec is None:
+                    return None
+                return {
+                    "triggered": rec.triggered,
+                    "trigger_reasons": rec.trigger_reasons,
+                    "recovery_targets": [
+                        {"file": t.file, "kind": t.kind, "identity": t.identity}
+                        for t in rec.recovery_targets
+                    ],
+                    "ready_for_regeneration": rec.ready_for_regeneration,
+                    "failure_reason": rec.failure_reason,
+                    "attempts": [
+                        {
+                            "file": a.file, "trigger_reason": a.trigger_reason,
+                            "identifiers_considered": a.identifiers_considered,
+                            "resolved_file": a.resolved_file,
+                            "start_line": a.start_line, "end_line": a.end_line,
+                            "source_kind": a.source_kind, "source_chars": a.source_chars,
+                            "success": a.success, "failure_reason": a.failure_reason,
+                            "covered_hunk_indices": a.covered_hunk_indices,
+                        }
+                        for a in rec.attempts
+                    ],
+                }
+
+            try:
+                from .diff_parsing import parse_diff as _parse_diff_for_trace
+                _initial_changed_files, _initial_file_hunks = _parse_diff_for_trace(_initial_patch_before_slice4 or "")
+            except Exception:
+                _initial_changed_files, _initial_file_hunks = [], {}
+
+            _debug_dir4 = Path("reports") / "debug"
+            _debug_dir4.mkdir(parents=True, exist_ok=True)
+            _ts4 = _dt4.datetime.now().strftime("%Y%m%dT%H%M%S")
+            _post_patch_doc = {
+                "initial_patch_files": _initial_changed_files,
+                "initial_patch_hunks": {f: len(hs) for f, hs in _initial_file_hunks.items()},
+                "approved_intended_targets": [
+                    {"file": e.file, "symbol": e.symbol}
+                    for e in (_edit_readiness.ready_edits if _edit_readiness is not None else [])
+                ],
+                "target_conformance_results": _conformance_doc(_patch_target_conformance),
+                "recovery_triggered": _post_patch_recovery.triggered if _post_patch_recovery is not None else False,
+                "recovery_reasons": _post_patch_recovery.trigger_reasons if _post_patch_recovery is not None else [],
+                "recovery_targets": (
+                    [{"file": t.file, "kind": t.kind, "identity": t.identity} for t in _post_patch_recovery.recovery_targets]
+                    if _post_patch_recovery is not None else []
+                ),
+                "post_patch_recovery": _recovery_doc(_post_patch_recovery),
+                "regeneration_performed": _regenerated_patch_target_conformance is not None,
+                "regenerated_target_conformance_results": _conformance_doc(_regenerated_patch_target_conformance),
+                "final_recovery_state": (
+                    "not_triggered" if _post_patch_recovery is None or not _post_patch_recovery.triggered
+                    else "regenerated_and_accepted" if patch and patch.strip() and _regenerated_patch_target_conformance is not None
+                    else "failed_closed"
+                ),
+                "patch_generation_skipped": not bool(patch and patch.strip()),
+                # Best-effort only -- see ContextBudgetController.to_trace_dict();
+                # None whenever no controller was supplied.
+                "budget_trace": budget_controller.to_trace_dict() if budget_controller is not None else None,
+            }
+            (_debug_dir4 / f"post_patch_recovery_{_ts4}.json").write_text(
+                _json4.dumps(_post_patch_doc, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    # Shared generated-diff mechanics -- hygiene, applicability, and
+    # (allow_context_reconstruction=True, preserving this path's existing
+    # behavior exactly) deterministic context reconstruction -- see
+    # generated_patch_processing.py's own module docstring. Skipped
+    # entirely (not merely no-op'd on "") when _patch_validation_skip_reason
+    # is set: an invalid Patch Generator response must never reach this —
+    # or the applicability-aware retry machinery below — as if it were an
+    # ordinary empty candidate. See the reason captured at Step 1/4 above.
+    _context_expansion = None
+    if _patch_validation_skip_reason is not None:
+        hygiene_findings = []
+        applicability_result = {
+            "applicable": None, "skipped": True,
+            "skipped_reason": _patch_validation_skip_reason,
+            "error": None, "exit_code": None, "stderr": "",
+        }
+    else:
+        from .generated_patch_processing import process_generated_patch
+        _processed = process_generated_patch(patch, repo_root, allow_context_reconstruction=True)
+        patch = _processed.patch
+        hygiene_findings = _processed.hygiene_findings
+        applicability_result = _processed.applicability_result
+        _context_expansion = _processed.context_expansion
+        if _processed.empty_hunks_removed:
+            progress.verbose(f"[pipeline] Deterministic repair removed {_processed.empty_hunks_removed} "
+                f"zero-change hunk(s) — applicable={applicability_result.get('applicable')}")
+        if _context_expansion is not None:
+            if _context_expansion.succeeded:
+                progress.recovery("Patch context reconstructed")
+                progress.verbose(
+                    f"[pipeline] Deterministic context reconstruction succeeded: "
+                    f"{_context_expansion.hunks_expanded} hunk(s) expanded, "
+                    f"{_context_expansion.hunks_unchanged} already sufficient "
+                    f"— applicable={applicability_result.get('applicable')}"
+                )
+            else:
+                progress.verbose(f"[pipeline] Deterministic context reconstruction did not apply "
+                    f"(reason={_context_expansion.skipped_reason}) — "
+                    f"falling through to applicability-aware retry.")
+        if applicability_result.get("applicable") is True:
+            progress.success("Patch applicable")
+
+    # Applicability-aware retry — triggered only on applicable=False with a known repo_root
+    original_patch = patch
+    retry_patch = None
+    retry_attempted = False
+    retry_succeeded = False
+    retry_failed_file = None
+    retry_error_before = None
+
+    if applicability_result.get("applicable") is False and repo_root:
+        stderr = applicability_result.get("stderr", "")
+        failed_files = _extract_failed_files(stderr)
+        if not failed_files:
+            _target = _extract_patch_target(patch)
+            if _target:
+                failed_files = [_target]
+
+        if failed_files:
+            failed_file = failed_files[0]
+            progress.recovery("Patch did not apply — attempting recovery")
+            progress.verbose(f"[pipeline] Applicability failed — `{failed_file}` did not apply; attempting retry …")
+            retry_failed_file = failed_file
+            retry_error_before = stderr
+            try:
+                repo_ctx = TargetRepoContext(Path(repo_root))
+                # Fix B: `hint` no longer needs the blocks built first, so it's
+                # computed up front -- the applicability retry's own capacity
+                # ceiling must account for it (a retry_hint is real overhead
+                # in the same request, exactly like the contract-violation
+                # retry's own hint; see compute_patch_generation_capacity).
+                # This replaces the old hardcoded `_RETRY_CONTENT_LIMIT`
+                # (50,000 chars, unrelated to the active model or this
+                # request's actual overhead) as the per-file inclusion
+                # ceiling below.
+                hint = _build_retry_hint(stderr, failed_file)
+                _applicability_retry_capacity = compute_patch_generation_capacity(vulnerability_text, retry_hint=hint)
+                _applicability_retry_max_chars = _applicability_retry_capacity.source_capacity_chars
+
+                # True only once a *successfully-read* file's block actually lands in
+                # `blocks` (not `omitted_files`). Gating on this — rather than on "was
+                # any read attempt successful" — matters because a large-but-readable
+                # file can itself exceed the budget and land in `omitted_files` while
+                # an unrelated unreadable file's small "(could not be read)" note still
+                # fits and lands in `blocks`; without this distinction the retry would
+                # proceed with a code_context containing zero real source. Whole-file
+                # blocks only -- a file that doesn't fit is omitted entirely (never
+                # mid-file-truncated), same discipline as before, now measured against
+                # real Patch Generation technical capacity instead of a hardcoded
+                # constant.
+                included_real_content = False
+                blocks: list[str] = []
+                block_labels: list[str] = []
+                omitted_files: list[str] = []
+                running = 0
+                for f in failed_files:
+                    is_real_content = False
+                    try:
+                        f_content = repo_ctx.read_file(f)
+                        is_real_content = True
+                        n_lines = len(f_content.splitlines())
+                        block = f"# {f} (full file, {n_lines} lines)\n{f_content}\n"
+                    except Exception:
+                        block = f"### {f}\n\n(could not be read — likely deleted or renamed)\n"
+                    if running + len(block) <= _applicability_retry_max_chars:
+                        blocks.append(block)
+                        block_labels.append(f"applicability_retry_file::{f}")
+                        running += len(block)
+                        included_real_content = included_real_content or is_real_content
+                    else:
+                        omitted_files.append(f)
+
+                if not included_real_content:
+                    progress.verbose(f"[pipeline] Retry skipped — no real content for the failed "
+                        f"file(s) ({', '.join(failed_files)}) could be included "
+                        f"(missing, unreadable, or over the {_applicability_retry_max_chars}-character "
+                        "technical-capacity budget).")
+                else:
+                    actual_content = "\n".join(blocks)
+                    if omitted_files:
+                        actual_content += (
+                            f"\n\n*({len(omitted_files)} file(s) omitted to stay within the "
+                            f"{_applicability_retry_max_chars}-character technical-capacity budget "
+                            f"(omission_reason=technical_capacity): {', '.join(omitted_files)})*\n"
+                        )
+                    retry_attempted = True
+                    # Same contract check as the initial generation call
+                    # (Step 1/4 above) — a contract-violating regeneration
+                    # response must behave like "the applicability retry
+                    # failed to produce a usable replacement", never like
+                    # "here is an empty candidate to validate". r_patch_raw
+                    # is already "" for "malformed_fence" and for
+                    # "contract_violation" that's still invalid after its
+                    # own bounded retry, so the pre-existing falsy check
+                    # below already keeps the original patch and never
+                    # calls repair_hunk_headers/check_patch/
+                    # check_applicability on it — no separate branch
+                    # needed. "no_diff" (a genuinely empty/non-fenced
+                    # response) is unchanged from before this fix.
+                    # context_sections lets a further contract-violation
+                    # retry (inside _generate_patch_with_contract_check) drop
+                    # individual per-file blocks whole rather than only
+                    # having the already-joined `actual_content` string;
+                    # required_label=None -- no single file here is
+                    # "required" beyond the aggregate included_real_content
+                    # gate already enforced above.
+                    r_patch_raw, r_status, r_llm_calls = _generate_patch_with_contract_check(
+                        vulnerability_text, llm,
+                        code_context=actual_content,
+                        retry_hint=hint,
+                        context_sections=list(zip(block_labels, blocks)),
+                        required_label=None,
+                    )
+                    if not r_patch_raw or not r_patch_raw.strip():
+                        if r_status in ("malformed_fence", "contract_violation"):
+                            progress.verbose(f"[pipeline] Retry's Patch Generator response was invalid "
+                                f"(status={r_status}, {r_llm_calls} call(s)) — keeping original.")
+                        else:
+                            progress.warning("Applicability retry produced no usable patch")
+                    else:
+                        # Shared generated-diff mechanics (repair_hunk_headers ->
+                        # check_patch -> check_applicability) -- see
+                        # generated_patch_processing.py's own module docstring.
+                        # allow_context_reconstruction=False here, preserving this
+                        # retry's existing behavior exactly: it never attempted
+                        # context reconstruction before this extraction either.
+                        from .generated_patch_processing import process_generated_patch
+                        _r_processed = process_generated_patch(
+                            r_patch_raw, repo_root, allow_context_reconstruction=False,
+                        )
+                        r_patch_raw = _r_processed.patch
+                        r_hygiene = _r_processed.hygiene_findings
+                        r_app = _r_processed.applicability_result
+                        _r_repair_meta = _r_processed.repair_result
+                        retry_patch = r_patch_raw
+                        if r_app.get("applicable") is True:
+                            # Applicability alone is not sufficient to accept a
+                            # regenerated patch: the retry was asked only to fix
+                            # `failed_files`, so every OTHER file's own semantic
+                            # edits (additions/removals) must survive unchanged --
+                            # reusing the same semantic_delta() invariant
+                            # reconstruct_hunk_context() already uses to guard its
+                            # own deterministic reconstruction, applied here to the
+                            # LLM's output instead. No new LLM call, no repair --
+                            # a candidate that fails this is simply rejected and
+                            # the original (pre-retry) patch is kept, exactly like
+                            # the existing "did not apply" fallback below.
+                            from .diff_parsing import semantic_delta_preserved
+                            if semantic_delta_preserved(original_patch, r_patch_raw, failed_files):
+                                retry_succeeded = True
+                                patch = r_patch_raw
+                                hygiene_findings = r_hygiene
+                                applicability_result = r_app
+                                if _r_repair_meta is not None:
+                                    _final_repair_meta = _r_repair_meta
+                                progress.success("Patch applicable")
+                            else:
+                                progress.warning("Applicability retry rejected — modified unrelated file")
+                        else:
+                            progress.warning("Patch does not apply to target file")
+            except Exception as exc:
+                progress.verbose(f"[pipeline] Retry failed unexpectedly: {exc}")
+        else:
+            progress.verbose("[pipeline] Applicability failed — target file not identified; retry skipped.")
+
+    # Post-Patch Vulnerability Investigation: re-evaluate the pre-patch
+    # Anchors against an isolated, patched copy of repo_root. Runs once,
+    # here -- right after the applicability-retry loop settles and before
+    # the FIRST challenge_patch() call below -- so its evidence can reach
+    # that call, not just the Trust Report. The Challenger-driven repair
+    # loop further down is single-shot (fires at most once, per its own
+    # comment); if it replaces `patch`, this evidence describes a patch
+    # that no longer exists. The staleness guard after that loop (comparing
+    # `patch` against `_investigated_patch`) keeps it out of
+    # calibrate_findings()/score_confidence() in that case. Never re-run
+    # inside the repair loop itself -- extending fresh evidence to that
+    # path is an explicitly separate, later decision.
+    _post_patch_observations: list | None = None
+    _post_patch_coverage: "CoverageResult | None" = None
+    _post_patch_ctx = ""
+    # The structured form of every Post-patch definition rendered into
+    # _post_patch_ctx -- the Challenger's only trusted source of complete
+    # post-change functions (see post_patch_evaluation.post_patch_definitions).
+    _post_patch_definitions: list = []
+    _post_patch_context = None
+    _investigated_patch: str | None = None
+    # No candidate patch -- there is no "post-patch" state to investigate;
+    # skip entirely rather than evaluate an isolated copy against an empty
+    # diff (see the no-candidate-patch early stop below, which this joins).
+    # Grounding fallback ("no advisory candidate was identified") is NOT
+    # "post-patch evidence cannot be established": a valid candidate patch is
+    # investigated either way. Missing pre-patch anchors are an empty list --
+    # never fabricated -- and evidence then comes only from what the diff
+    # itself touches (derive_patch_touched_anchors), with every downstream
+    # check unchanged.
+    _pre_patch_scratch = None
+    if patch and patch.strip() and repo_root:
+        try:
+            import tempfile as _tempfile
+            from .patch_workspace import temporary_repo_copy
+            from .patch_applicability import apply_patch
+            from .candidate_enrichment import build_investigation_context
+            from .post_patch_evaluation import compute_coverage, derive_patch_touched_anchors, evaluate_anchors
+            from core.parser_adapter import suppress_summary_announcement
+
+            _investigated_patch = patch
+            _resolved_repo_root = Path(repo_root).resolve()
+            # Candidate-selection-independent gap fix: derive_patch_touched_anchors
+            # resolves the FINAL patch's own diff directly against the pre-patch
+            # InvestigationContext (repo-wide, built before Candidate Selection
+            # ever ran) -- catching a semantic element (e.g. a literal constant)
+            # the patch touches even when no selected candidate ever surfaced it.
+            # _pre_patch_anchors itself is never mutated; this only concatenates a
+            # disjoint, already-deduplicated list of net-new, origin="patch_touched"
+            # anchors onto it for evaluation/coverage purposes below.
+            _grounded_anchors = list(_pre_patch_anchors or [])
+            _pre_patch_resolution_context = _investigation_context
+            if _pre_patch_resolution_context is None and not _grounded_anchors:
+                # Grounding fell back, so S1 never built the repo-wide
+                # pre-patch index; build it here from the same repository
+                # with the existing builder (grounded runs never take this
+                # branch and keep their own context exactly as before).
+                _pre_patch_scratch = _tempfile.TemporaryDirectory(prefix="openant-prepatch-investigation-")
+                with suppress_summary_announcement():
+                    _pre_patch_resolution_context = build_investigation_context(
+                        _resolved_repo_root, Path(_pre_patch_scratch.name)
+                    )
+            _patch_touched_anchors = derive_patch_touched_anchors(
+                _investigated_patch, _resolved_repo_root, _pre_patch_resolution_context, _grounded_anchors
+            )
+            _all_anchors = _grounded_anchors + _patch_touched_anchors
+            if not _all_anchors:
+                # Nothing genuine to re-evaluate: grounding produced no anchors
+                # and the diff resolves to no indexed source unit. Post-patch
+                # evidence cannot be established, so the run is reported as not
+                # evaluated -- exactly as before -- rather than as an empty one.
+                _investigated_patch = None
+            else:
+                with temporary_repo_copy(_resolved_repo_root) as _workspace_root:
+                    _apply_result = apply_patch(_investigated_patch, _workspace_root)
+                    _post_patch_context = None
+                    if _apply_result.applied:
+                        _investigation_output_dir = _workspace_root.parent / "investigation"
+                        # Presentation only: this is an internal re-parse of an
+                        # isolated patched copy, not a second user-facing
+                        # "repository analyzed" event -- see
+                        # core/parser_adapter.suppress_summary_announcement's
+                        # own docstring. Never affects parsing, evidence, or
+                        # what gets investigated -- only whether the parser
+                        # re-announces itself in default-mode terminal output.
+                        with suppress_summary_announcement():
+                            _post_patch_context = build_investigation_context(_workspace_root, _investigation_output_dir)
+                    _post_patch_unavailable_reason = None
+                    if not _apply_result.applied:
+                        _post_patch_unavailable_reason = (
+                            f"the patch did not apply to the isolated copy ({_apply_result.error_kind})"
+                        )
+                        progress.warning(
+                            "Post-patch analysis unavailable — the patch did not apply to the isolated copy"
+                        )
+                    _post_patch_observations = evaluate_anchors(
+                        _all_anchors, _post_patch_context, unavailable_reason=_post_patch_unavailable_reason,
+                    )
+                    # Coverage Analysis reuses the PRE-patch InvestigationContext (the
+                    # diff's context/removed lines describe that state) and the same
+                    # repo_root -- unrelated to the isolated post-patch workspace above,
+                    # so it runs regardless of whether patch application succeeded.
+                    # Fed the merged list so "uncovered" means "genuinely unsupported
+                    # element type", not "Candidate Selection didn't pick this file."
+                    _post_patch_coverage = compute_coverage(
+                        _investigated_patch, _all_anchors, _resolved_repo_root, _pre_patch_resolution_context
+                    )
+                    # Fix B: this evidence feeds the Challenger's own prompt
+                    # (challenger_context = _challenger_base_context +
+                    # _post_patch_ctx, built later in run()) -- the ceiling
+                    # here must be the REAL remaining technical capacity after
+                    # that call's other mandatory content (system prompt,
+                    # vulnerability text, the patch diff itself, and whatever
+                    # code_context/_recovery_context already carries), never
+                    # the historical fixed 4,000-character default. Never a
+                    # report-formatting bound determining Challenger evidence
+                    # visibility -- this is a SEPARATE call from the Trust
+                    # Report's own render_post_patch_investigation() use
+                    # (which keeps its own, independently-bounded default).
+                    from .llm_client import resolve_active_model, resolve_max_tokens
+                    from .patch_challenger import _PROMPT_PATH as _CHALLENGER_PROMPT_PATH
+                    from .post_patch_evaluation import compute_post_patch_investigation_plan
+                    from .technical_capacity import compute_source_capacity
+                    try:
+                        _challenger_system_prompt_len = len(_CHALLENGER_PROMPT_PATH.read_text(encoding="utf-8"))
+                    except Exception:
+                        _challenger_system_prompt_len = 0
+                    _challenger_mandatory_overhead = (
+                        _challenger_system_prompt_len + len(vulnerability_text or "")
+                        + len(_investigated_patch or "") + len(code_context or "")
+                    )
+                    _post_patch_ctx_ceiling = compute_source_capacity(
+                        *resolve_active_model(), reserved_output_tokens=resolve_max_tokens(),
+                        known_overhead_chars=_challenger_mandatory_overhead,
+                    ).source_capacity_chars
+                    _post_patch_investigation_plan = compute_post_patch_investigation_plan(
+                        _post_patch_observations, _post_patch_coverage, max_chars=_post_patch_ctx_ceiling,
+                    )
+                    _post_patch_ctx = _post_patch_investigation_plan.rendered
+                    # Complete post-change source of every function the diff
+                    # changed, read from THIS patched copy's own index (no new
+                    # source) and appended to the one string that becomes both
+                    # the Challenger's shown context and a D7 citation-authority
+                    # part -- a single rendering, so what the model sees and what
+                    # citation validation trusts are byte-identical. Only when the
+                    # investigation itself rendered, and only within the capacity
+                    # that rendering left (whole-block-or-omit, fail-closed).
+                    if _post_patch_ctx:
+                        from .post_patch_evaluation import post_patch_definitions
+                        _definitions_rendered, _post_patch_definitions = post_patch_definitions(
+                            _post_patch_observations, _post_patch_context,
+                            max_chars=max(0, _post_patch_ctx_ceiling - len(_post_patch_ctx)),
+                        )
+                        _post_patch_ctx += _definitions_rendered
+            if _post_patch_ctx and _post_patch_context is not None:
+                progress.success("Post-patch analysis completed")
+                progress.verbose(
+                    f"[pipeline] Post-Patch Investigation rendered "
+                    f"({len(_post_patch_ctx)} chars)."
+                )
+        except Exception as exc:
+            progress.warning("Post-patch analysis unavailable")
+            progress.verbose(
+                f"[pipeline] Post-Patch Investigation unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            _post_patch_observations = None
+            _post_patch_coverage = None
+            _post_patch_ctx = ""
+            _post_patch_definitions = []
+            _investigated_patch = None
+        finally:
+            if _pre_patch_scratch is not None:
+                _pre_patch_scratch.cleanup()
+    return locals()
+
+
+# ---------------------------------------------------------------------------
+# Bounded post-Finding-Calibration evidence-acquisition loop.
+#
+# Finding Calibration can identify (via `remediation_impact: proof_required`
+# + an optional structured "Evidence request:" field -- see finding_
+# calibration.md/finding_calibration.py) that a decision-relevant
+# uncertainty could be resolved by one concrete repository file/symbol, but
+# had no mechanism of its own to acquire it before this addition. This
+# mirrors the same bounded question -> identify -> acquire -> rerun ->
+# decide shape Planning (run_planning_evidence_acquisition) and Strategy
+# (_run_evidence_gap_strategy_fallback) already use -- reusing their own
+# deterministic resolution/dedup primitives rather than a second
+# implementation, but a ONE-SHOT rerun (like Strategy's fallback), never
+# Planning's own 3-attempt loop: Finding Calibration's gaps are narrower
+# and this sits deep in the pipeline where an extra iteration costs more
+# relative to benefit.
+# ---------------------------------------------------------------------------
+
+MAX_CALIBRATION_ACQUISITION_ATTEMPTS = 2
+"""Initial Finding Calibration call + at most one evidence-informed
+rerun. A structural safety bound, not a resource/cost budget -- mirrors
+MAX_PLANNING_ATTEMPTS/MAX_GUIDED_ACQUISITION_ROUNDS's own convention.
+Enforced structurally by _calibrate_findings_with_evidence_acquisition's
+own shape (exactly one optional second calibrate_findings() call, never a
+loop) -- there is no runtime counter to compare this against because
+there is no loop for one to bound; this constant documents the bound the
+code's own shape already guarantees, the same way a function that makes
+"at most one" call needs no counter to prove it."""
+
+MAX_CALIBRATION_EVIDENCE_REQUESTS = 3
+"""At most this many deduplicated Evidence request(s) -- across the
+WHOLE finding batch, not per finding -- are even attempted; any beyond
+this are ignored for this run, never queued for a later one (there is no
+later one). Mirrors MAX_EVIDENCE_REQUESTS_PER_ROUND/MAX_CONTEXT_REQUESTS_
+PER_ROUND's own convention."""
+
+
+def _calibration_request_key(evidence_request: "dict") -> tuple:
+    """Cross-finding duplicate-detection key for one Finding-Calibration
+    Evidence request -- reuses remediation_planner._planning_request_key
+    UNCHANGED (via a PlanningEvidenceRequest built from this dict) so two
+    findings naming the SAME underlying file/symbol (e.g. one raised as an
+    edge case, one as a potential issue) resolve to exactly one acquisition
+    attempt, never two. No second dedup-key implementation."""
+    from .remediation_planner import PlanningEvidenceRequest, _planning_request_key
+    req = PlanningEvidenceRequest(
+        request_type=evidence_request.get("request_type"),
+        file_hint=evidence_request.get("file_hint"),
+        symbol=evidence_request.get("symbol"),
+        reason=None,
+    )
+    return _planning_request_key(req)
+
+
+def _render_calibration_evidence_block(request_type, file_hint, symbol, resolved_file, resolved_symbol, repo_root, investigation_context):
+    """Render ONE already-resolved Finding-Calibration evidence request as
+    a whole, labeled verified-source block -- (render_label, block_text),
+    or None if the source could not actually be read (resolution only
+    confirms existence, not readability; rare).
+
+    Reuses remediation_planner.py's own _read_symbol_source /
+    _resolve_guided_symbol / _render_source_excerpt for the symbol_
+    definition branch (the exact primitives Planning/Guided Acquisition
+    already use to turn a resolved symbol into rendered text) and the
+    exact same whole-file-read-then-_render_source_excerpt recipe
+    build_planner_source_excerpts' own full-file fallback pass already
+    uses for file_source -- never a second source-rendering
+    implementation. `resolved_file`/`resolved_symbol` are the values
+    _resolve_planning_evidence_request already produced for this exact
+    request (re-resolving `symbol_definition` here, via the same pure
+    _resolve_guided_symbol call, only to reach the underlying `_SymbolMatch`
+    object _resolve_planning_evidence_request itself does not expose)."""
+    from .remediation_planner import _resolve_guided_symbol, _read_symbol_source, _render_source_excerpt
+    if request_type == "file_source":
+        try:
+            full_text = (Path(repo_root) / resolved_file).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return None
+        n_lines = len(full_text.splitlines())
+        return f"calibration_evidence::{resolved_file}", _render_source_excerpt(resolved_file, None, 1, n_lines, full_text)
+
+    match, _reason = _resolve_guided_symbol(symbol, file_hint, repo_root, investigation_context)
+    if match is None:
+        return None
+    source = _read_symbol_source(match, investigation_context)
+    if source is None:
+        return None
+    label = f"calibration_evidence::{match.file}:{match.label}"
+    return label, _render_source_excerpt(match.file, match.label, match.line, match.end_line, source)
+
+
+def _calibrate_findings_with_evidence_acquisition(
+    vulnerability_text, patch, findings, llm, code_context, *,
+    repo_root=None, investigation_context=None,
+    known_included_evidence_labels=None,
+):
+    """Bounded post-Finding-Calibration evidence-acquisition loop.
+
+    calibrate_findings() #1 -> extract actionable, proof_required-only
+    Evidence requests -> deduplicate/bound -> deterministically resolve
+    (no LLM call) -> fit newly resolved evidence into Finding Calibration's
+    own real technical capacity (Fix B), whole-block-or-omit, alongside
+    the code_context #1 already used -> at least one genuinely new block
+    actually included? No -> #1 stands, unchanged (no second LLM call). Yes
+    -> calibrate_findings() #2, over the SAME, complete `findings` list
+    (never a subset -- the prompt's own "every finding must appear exactly
+    once" contract and the block-number-keyed parser both require this)
+    and the enriched code_context -- and #2's result becomes final,
+    whatever it says (including, genuinely, still proof_required). Never a
+    third call for this batch -- see MAX_CALIBRATION_ACQUISITION_ATTEMPTS.
+
+    `repo_root`/`investigation_context` absent (e.g. replay, which has no
+    real investigation_context for this stage either -- see replay_
+    engine.py's own analogous, already-documented limitation for Patch
+    Generation's context) means every request fails resolution
+    deterministically (nothing to resolve against); #1 stands, unchanged
+    -- byte-identical to today's behavior, never an invented acquisition.
+
+    `known_included_evidence_labels` (additive, default None): a frozenset
+    of "path"/"path:Symbol" labels already known to be included somewhere
+    in THIS run's own evidence chain -- see PlannerEvidenceResult.
+    excerpt_plan.included_labels, the one already-computed, EXACT
+    structural signal available at this call boundary (never a substring/
+    text-similarity check against the rendered code_context string, which
+    would be fragile and was explicitly rejected for this purpose).
+    Deliberately scoped: this checks only Planning's own evidence
+    coverage, not repository_grounding's/repository_understanding's own
+    (unifying every rendering path's own inclusion labels into one set
+    would be a disproportionate restructuring for this addition -- named
+    explicitly here, not silently assumed complete). A request whose
+    dedup label is a member is `resolved=True, already_present=True`: not
+    re-added to code_context, and not counted toward "genuinely new
+    evidence" for the rerun gate -- but never dropped from provenance.
+
+    Returns a dict (never raises -- any internal failure degrades to "no
+    acquisition this run", identical to every other best-effort section in
+    this module):
+      attempted         : bool -- always True (calibrate_findings() #1 is
+                          always called).
+      evidence_requests  : list[dict] -- the deduplicated, bounded Evidence
+                          requests actually attempted this run.
+      resolutions        : list[dict] -- one per attempted request:
+                          {request, resolved, failure_reason, resolved_file,
+                          resolved_symbol, already_present, included,
+                          omission_reason}. `included`/`omission_reason`
+                          stay None for anything not `resolved` (or
+                          `already_present`) -- inclusion is never even
+                          evaluated for a request that was never real
+                          evidence to begin with.
+      rerun_performed    : bool -- calibrate_findings() #2 was actually
+                          called.
+      skip_reason        : str | None -- why no rerun happened, for
+                          observability only, never branched on downstream.
+      final_calibration  : list[dict] -- #2's result if rerun_performed,
+                          else #1's, byte-identical shape either way -- the
+                          ONE value any caller should read as authoritative.
+    """
+    calibration_1 = calibrate_findings(vulnerability_text, patch, findings, llm, code_context=code_context)
+    result = {
+        "attempted": True, "evidence_requests": [], "resolutions": [],
+        "rerun_performed": False, "skip_reason": None, "final_calibration": calibration_1,
+    }
+
+    # Fix (Finding Calibration acquirability contract): only an
+    # AUTHORITATIVE `evidence_acquirability == "actionable"` may enter
+    # acquisition -- checked explicitly here rather than merely testing
+    # `evidence_request` for truthiness, even though finding_calibration.
+    # py's own _reconcile_acquirability_and_request already guarantees a
+    # non-None `evidence_request` exists only alongside `"actionable"`.
+    # `not_expressible`/`conceptual_scope`/`unclear`(missing or malformed
+    # declaration)/None(not proof_required) all correctly yield no
+    # request from that reconciliation already, so this check is
+    # currently redundant with it in practice -- it is kept explicit
+    # anyway so this wrapper's own intent (only an authoritative,
+    # declared-actionable state may trigger acquisition) does not depend
+    # silently on finding_calibration.py's internal implementation never
+    # changing.
+    proof_required_requests = [
+        e["evidence_request"] for e in calibration_1
+        if e.get("remediation_impact") == "proof_required"
+        and e.get("evidence_acquirability") == "actionable"
+        and e.get("evidence_request")
+    ]
+    if not proof_required_requests:
+        result["skip_reason"] = "no_actionable_evidence_request"
+        return result
+
+    # Both, not just repo_root, must be real: repo_root alone (e.g. a real
+    # checked-out repo with no parsed InvestigationContext -- exactly
+    # replay_engine.py's own shape for this stage) is deliberately treated
+    # as insufficient acquisition context, not merely "symbol_definition
+    # requests degrade" -- a replay run must never issue an LLM call this
+    # execution's original run never made, and file_source alone reading a
+    # real on-disk file would otherwise do exactly that. Production always
+    # supplies both (see _run_patch_repair_and_calibration's own docstring
+    # on these two parameters); their absence together is the actual,
+    # single signal that this call site has no real acquisition context.
+    if not repo_root or investigation_context is None:
+        result["skip_reason"] = "no_repo_root"
+        return result
+
+    seen_keys: set = set()
+    deduped: "list[dict]" = []
+    for req in proof_required_requests:
+        try:
+            key = _calibration_request_key(req)
+        except Exception:
+            continue
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(req)
+    capped = deduped[:MAX_CALIBRATION_EVIDENCE_REQUESTS]
+    result["evidence_requests"] = capped
+
+    from .remediation_planner import (
+        PlanningEvidenceRequest, _validate_planning_request_schema, _resolve_planning_evidence_request,
+    )
+
+    resolutions: "list[dict]" = []
+    new_blocks: "list[tuple[str, str]]" = []  # (render_label, block_text)
+    pending_labels: "dict[int, str]" = {}  # index into resolutions -> render_label, for the fit pass below
+    for req in capped:
+        planning_req = PlanningEvidenceRequest(
+            request_type=req.get("request_type"), file_hint=req.get("file_hint"),
+            symbol=req.get("symbol"), reason=None,
+        )
+        base = {
+            "request": req, "resolved": False, "failure_reason": None,
+            "resolved_file": None, "resolved_symbol": None,
+            "already_present": False, "included": None, "omission_reason": None,
+        }
+        schema_reason = _validate_planning_request_schema(planning_req)
+        if schema_reason is not None:
+            base["failure_reason"] = schema_reason
+            resolutions.append(base)
+            continue
+        rf, rs, reason = _resolve_planning_evidence_request(planning_req, repo_root, investigation_context)
+        if reason is not None:
+            base["failure_reason"] = reason
+            resolutions.append(base)
+            continue
+
+        base["resolved"] = True
+        base["resolved_file"] = rf
+        base["resolved_symbol"] = rs
+        dedup_label = rf if req.get("request_type") == "file_source" else f"{rf}:{rs}"
+        if known_included_evidence_labels and dedup_label in known_included_evidence_labels:
+            base["already_present"] = True
+            resolutions.append(base)
+            continue
+
+        rendered = _render_calibration_evidence_block(
+            req.get("request_type"), req.get("file_hint"), req.get("symbol"),
+            rf, rs, repo_root, investigation_context,
+        )
+        if rendered is None:
+            base["resolved"] = False
+            base["failure_reason"] = "source_unavailable"
+            resolutions.append(base)
+            continue
+        render_label, block_text = rendered
+        new_blocks.append((render_label, block_text))
+        pending_labels[len(resolutions)] = render_label
+        resolutions.append(base)
+
+    result["resolutions"] = resolutions
+
+    if not new_blocks:
+        already_present_any = any(r["already_present"] for r in resolutions)
+        result["skip_reason"] = "no_new_evidence_present" if already_present_any else "no_evidence_resolved"
+        return result
+
+    from .finding_calibration import compute_finding_calibration_capacity, fit_calibration_evidence
+    capacity = compute_finding_calibration_capacity(vulnerability_text, patch, findings)
+    plan = fit_calibration_evidence(code_context, new_blocks, capacity.source_capacity_chars, capacity=capacity)
+
+    if plan.required_missing:
+        for idx, label in pending_labels.items():
+            resolutions[idx]["included"] = False
+            resolutions[idx]["omission_reason"] = "technical_capacity"
+        result["skip_reason"] = "existing_context_exceeds_capacity"
+        return result
+
+    any_new_included = False
+    for idx, label in pending_labels.items():
+        if label in plan.included_labels:
+            resolutions[idx]["included"] = True
+            any_new_included = True
+        else:
+            resolutions[idx]["included"] = False
+            resolutions[idx]["omission_reason"] = plan.omission_reason.get(label, "technical_capacity")
+
+    if not any_new_included:
+        result["skip_reason"] = "technical_capacity_exhausted"
+        return result
+
+    try:
+        calibration_2 = calibrate_findings(vulnerability_text, patch, findings, llm, code_context=plan.rendered)
+    except Exception as exc:
+        result["skip_reason"] = f"rerun_failed:{type(exc).__name__}"
+        return result
+
+    result["rerun_performed"] = True
+    result["final_calibration"] = calibration_2
+    return result
+
+
+def _run_patch_repair_and_calibration(
+    *, vulnerability_text, llm, repo_root, code_context, challenger_context,
+    patch, challenger, applicability_result, hygiene_findings, _final_repair_meta,
+    _post_patch_observations, _investigated_patch,
+    _patch_gen_context_plan=None,
+    _investigation_context=None, _planner_evidence_included_labels=None,
+    _challenger_provenance_parts=(),
+):
+    """Reusable Stage-6 (patch_repair_and_calibration) executor -- the
+    COMPLETE current production contract (classification, calibration v1,
+    the Challenger-driven repair loop, and the final-calibration
+    fallback), extracted VERBATIM from pipeline.run() (Batch B7) so
+    production and replay share exactly the same implementation -- see
+    replay_engine.py's patch_repair_and_calibration ReplayHandler, the
+    other caller. No behavior change: byte-identical body to what used to
+    be inline in run(); only the function boundary is new. Repair-
+    triggered regeneration/re-challenge remain internal to this one
+    execution, exactly as before -- never migrated to canonical S4#2/S5#2.
+
+    Returns every local variable this body binds (`locals()`) -- see
+    _run_patch_generation_and_investigation's docstring for why.
+
+    `_patch_gen_context_plan` (additive, default None -- replay_engine.py's
+    call site does not supply one): see _run_patch_generation_and_
+    investigation's own docstring for the same parameter -- used here so
+    the Challenger-driven repair loop's own regeneration call can refit
+    `code_context` at whole-block granularity for its own request (which
+    adds `_r_hint` on top) instead of assuming the original, un-hinted
+    `code_context` remains safe once that hint is added.
+
+    `_investigation_context`/`_planner_evidence_included_labels` (additive,
+    both default None -- replay_engine.py's call site supplies neither):
+    threaded into every `calibrate_findings(...)` call site below, which
+    now goes through `_calibrate_findings_with_evidence_acquisition`
+    instead of the bare function -- see that function's own docstring for
+    exactly what these two enable (deterministic repository resolution,
+    and the one already-computed structural "already included" signal).
+    Both absent means every one of this stage's own evidence-acquisition
+    attempts fails resolution deterministically, and every calibration
+    call site below behaves byte-identically to before this addition.
+    """
+    _repair_classified = _classify_challenger(challenger)
+    # Post-review correction: `_orig_defect_count` is a historically
+    # confirmed_defect-ONLY count, read directly into the PUBLIC
+    # `PipelineResult.original_challenger_defect_count` field and into
+    # execution-artifact/replay keys literally named "confirmed_defect_
+    # count" -- it must never silently mean "confirmed_defect +
+    # behavioral_defect", even though both categories are now repair-
+    # eligible. A prior revision of this feature widened this exact
+    # variable to include behavioral_defect_count, which would have made
+    # every one of those historically-confirmed-defect-specific
+    # names/fields semantically misleading (e.g. a run with 0 confirmed
+    # defects and 1 Observed behavioral defect would have reported
+    # "original_challenger_defect_count == 1", falsely implying a
+    # confirmed SECURITY defect existed). Reverted.
+    #
+    # `_orig_repair_eligible_count` is the SEPARATE, NEW control-flow-only
+    # concept this feature actually needs: "is there anything eligible to
+    # calibrate/repair at all" (confirmed_defect + behavioral_defect,
+    # mirroring _REPAIR_ELIGIBLE_CATEGORIES exactly). It gates the block
+    # below and distinguishes the two "repair never attempted" outcome
+    # labels (see run()/replay_engine.py's own repair_outcome computation)
+    # -- it is NEVER itself treated as a confirmed-defect count, never
+    # stored under a "confirmed_defect_count"-named field/key, and the
+    # repair gate functions (should_auto_repair/accept_repair) never read
+    # it either -- they inspect findings by category + calibration
+    # directly (see their own docstrings); this count exists purely for
+    # "should we even bother running calibration/the repair loop at all"
+    # and for observability, never as an authorization input itself.
+    _orig_defect_count = _repair_classified["confirmed_defect_count"]
+    _orig_repair_eligible_count = _orig_defect_count + _repair_classified["behavioral_defect_count"]
+
+    repair_attempted = False
+    repair_succeeded = False
+    repair_patch_content: str | None = None
+    repair_challenger_result: dict | None = None
+    repair_defect_count = 0
+    repair_eligible_defect_count = 0
+    _r_behavioral_defect_count = 0
+    repair_rechallenged = False
+    finding_calibration: list[dict] | None = None
+    # Batch B3: pre-initialized (not previously read outside the repair
+    # try/except block, so never previously needed a default) purely so
+    # this batch's S6 artifact-building code below can safely reference
+    # them even in the edge case where the repair try block raised before
+    # reaching their own assignment (e.g. generate_patch() itself failing)
+    # -- repair_attempted can be True with these still None in that case.
+    # No effect on existing repair-loop behavior: nothing inside the try
+    # block reads these before assigning them.
+    _r_hygiene: "list | None" = None
+    _r_app: "dict | None" = None
+    _r_applicable: "bool | None" = None
+
+    if _orig_repair_eligible_count > 0:
+        # Finding Calibration v1: widened to include confirmed_defect AND
+        # behavioral_defect findings (not just plausible_risk/generic) so
+        # the repair gate below reads calibration-aware state, not the raw
+        # regex classification alone. Best-effort: a failure leaves
+        # _calibration_v1 as None, which _build_known_findings treats as
+        # "no calibration entry" -- fail-closed, every confirmed_defect or
+        # behavioral_defect finding stays classified as a defect, and
+        # should_auto_repair therefore still may authorize repair on the
+        # raw evidence (see its own docstring) rather than silently
+        # clearing.
+        _calibration_inputs_v1 = [
+            f["text"]
+            for f in (
+                _repair_classified["classified_edge_cases"]
+                + _repair_classified["classified_potential_issues"]
+            )
+            # validation_gap is included alongside plausible_risk/generic
+            # (widened for the semantic remediation-proof reconciliation --
+            # see _reconcile_verification_status_with_calibration): the new
+            # "Remediation impact" calibration axis must be available to an
+            # unresolved-evidence finding regardless of which lexical
+            # bucket _classify_finding happened to sort it into, or the
+            # axis could never normalize a validation_gap-worded finding
+            # against a plausible_risk-worded twin expressing the same
+            # unresolved dependency.
+            if f["category"] in (*_REPAIR_ELIGIBLE_CATEGORIES, "plausible_risk", "validation_gap", "generic")
+        ]
+        _post_patch_evidence_current_v1 = (
+            _post_patch_observations is not None and patch == _investigated_patch
+        )
+        _calibration_v1: list[dict] | None = None
+        _calibration_v1_acquisition: dict | None = None
+        try:
+            _calibration_v1_acquisition = _calibrate_findings_with_evidence_acquisition(
+                vulnerability_text, patch, _calibration_inputs_v1, llm,
+                code_context=(challenger_context if _post_patch_evidence_current_v1 else code_context),
+                repo_root=repo_root, investigation_context=_investigation_context,
+                known_included_evidence_labels=_planner_evidence_included_labels,
+            )
+            _calibration_v1 = _calibration_v1_acquisition["final_calibration"]
+        except Exception as _exc:
+            progress.warning("Finding calibration unavailable")
+            progress.verbose(f"[pipeline] Finding calibration (v1) failed (non-fatal): {_exc}")
+        _known_findings_v1 = _build_known_findings(_repair_classified, _calibration_v1)
+        # This IS the final calibration unless repair is both authorized
+        # and later accepted below (see accept_repair branch, which
+        # overwrites this with _calibration_v2).
+        finding_calibration = _calibration_v1
+
+        if should_auto_repair(_repair_classified, _calibration_v1, applicability_result.get("applicable") is True):
+            try:
+                repair_attempted = True
+                # Both repair-eligible categories reach the repair hint --
+                # a behavioral_defect finding that authorized this repair
+                # must actually be told to the patch generator, exactly
+                # like a confirmed_defect finding always was (see
+                # _build_repair_hint's own docstring: reused unchanged,
+                # its wording no longer says "security" specifically).
+                _confirmed_texts = [
+                    f["text"]
+                    for f in (
+                        _repair_classified["classified_edge_cases"]
+                        + _repair_classified["classified_potential_issues"]
+                    )
+                    if f["category"] in _REPAIR_ELIGIBLE_CATEGORIES
+                ]
+                progress.verbose(f"[pipeline] Repair loop – should_auto_repair authorized on "
+                    f"{len(_confirmed_texts)} raw repair-eligible finding(s) "
+                    "(confirmed_defect and/or behavioral_defect); attempting one repair …")
+                _r_hint = _build_repair_hint(_confirmed_texts)
+                # Fix B: the original `code_context` was sized without
+                # `_r_hint` in scope -- it must not be assumed safe once this
+                # repair hint is added (see compute_patch_generation_capacity,
+                # which treats retry_hint as real request overhead). Refit at
+                # whole-block granularity when a structured plan is
+                # available; a caller without one (e.g. replay) falls back
+                # to a coarser whole-request check that still never sends a
+                # truncated context, only ever a wholesale-omitted one.
+                _repair_capacity = compute_patch_generation_capacity(vulnerability_text, retry_hint=_r_hint)
+                _repair_context = code_context
+                _repair_required_missing = False
+                if _patch_gen_context_plan is not None:
+                    _repair_plan = fit_patch_generation_context(
+                        _patch_gen_context_plan.included_sections, _repair_capacity.source_capacity_chars,
+                        required_label=PATCH_GENERATION_REQUIRED_LABEL, capacity=_repair_capacity,
+                    )
+                    _repair_context = _repair_plan.rendered
+                    _repair_required_missing = _repair_plan.required_missing
+                elif len(code_context) > _repair_capacity.source_capacity_chars:
+                    _repair_required_missing = True
+
+                if _repair_required_missing:
+                    progress.warning(
+                        "Challenger-driven repair regeneration skipped — required evidence "
+                        "exceeds Patch Generation technical capacity once the repair hint is added"
+                    )
+                    _r_raw = ""
+                else:
+                    _r_raw = generate_patch(
+                        vulnerability_text, llm,
+                        code_context=_repair_context,
+                        retry_hint=_r_hint,
+                        stage=_REPAIR_REGENERATION_STAGE,
+                    )
+                # Shared generated-diff mechanics (repair_hunk_headers ->
+                # check_patch -> check_applicability) -- see
+                # generated_patch_processing.py's own module docstring.
+                # allow_context_reconstruction=False here, preserving this
+                # repair loop's existing behavior exactly: it never attempted
+                # context reconstruction before this extraction either.
+                from .generated_patch_processing import process_generated_patch
+                _r_processed = process_generated_patch(_r_raw, repo_root, allow_context_reconstruction=False)
+                _r_raw = _r_processed.patch
+                _repair_loop_meta = _r_processed.repair_result
+                _r_hygiene = _r_processed.hygiene_findings
+                _r_app = _r_processed.applicability_result
+                repair_patch_content = _r_raw
+                _r_applicable = _r_app.get("applicable") is True
+                if _r_applicable:
+                    _r_challenger = challenge_patch(
+                        vulnerability_text, _r_raw, llm, code_context=code_context,
+                        provenance_context=_challenger_provenance_context(_challenger_provenance_parts, code_context),
+                    )
+                    _r_classified = _classify_challenger(_r_challenger)
+                    # Same correction as _orig_defect_count above: restored
+                    # to confirmed_defect-ONLY (the historical, public
+                    # meaning), with a separate eligible count alongside it.
+                    repair_defect_count = _r_classified["confirmed_defect_count"]
+                    _r_behavioral_defect_count = _r_classified["behavioral_defect_count"]
+                    repair_eligible_defect_count = repair_defect_count + _r_behavioral_defect_count
+                    repair_rechallenged = True
+                    repair_challenger_result = _r_challenger
+
+                    # Finding Calibration v2: freshly grounded on the
+                    # repaired patch and its own re-challenge -- v1's
+                    # calibration is never reused for v2's decision.
+                    _calibration_inputs_v2 = [
+                        f["text"]
+                        for f in (
+                            _r_classified["classified_edge_cases"]
+                            + _r_classified["classified_potential_issues"]
+                        )
+                        if f["category"] in (*_REPAIR_ELIGIBLE_CATEGORIES, "plausible_risk", "generic")
+                    ]
+                    _calibration_v2: list[dict] | None = None
+                    _calibration_v2_acquisition: dict | None = None
+                    try:
+                        if _calibration_inputs_v2:
+                            _calibration_v2_acquisition = _calibrate_findings_with_evidence_acquisition(
+                                vulnerability_text, _r_raw, _calibration_inputs_v2, llm,
+                                code_context=code_context,
+                                repo_root=repo_root, investigation_context=_investigation_context,
+                                known_included_evidence_labels=_planner_evidence_included_labels,
+                            )
+                            _calibration_v2 = _calibration_v2_acquisition["final_calibration"]
+                    except Exception as _exc:
+                        progress.warning("Finding calibration unavailable")
+                        progress.verbose(f"[pipeline] Finding calibration (v2) failed (non-fatal): {_exc}")
+                    _known_findings_v2 = _build_known_findings(_r_classified, _calibration_v2)
+
+                    if accept_repair(
+                        _r_classified, _calibration_v2, _r_applicable,
+                        original_still_vulnerable=_repair_classified.get("still_vulnerable") is True,
+                    ):
+                        repair_succeeded = True
+                        patch = _r_raw
+                        challenger = _r_challenger
+                        hygiene_findings = _r_hygiene
+                        applicability_result = _r_app
+                        finding_calibration = _calibration_v2
+                        if _repair_loop_meta is not None:
+                            _final_repair_meta = _repair_loop_meta
+                        progress.recovery("Patch repaired and re-verified")
+                        progress.verbose(
+                            "[pipeline] Repair succeeded – 0 calibration-confirmed "
+                            "issue(s) after re-challenge."
+                        )
+                    elif _r_classified.get("still_vulnerable") and not (
+                        _repair_classified.get("still_vulnerable") is True
+                    ):
+                        progress.warning("Patch repair rejected — introduced new risk")
+                        progress.verbose(
+                            "[pipeline] Repair rejected – original Challenger reported "
+                            "still_vulnerable=False, repair Challenger reports "
+                            "still_vulnerable=True; keeping original."
+                        )
+                    else:
+                        progress.warning("Patch repair rejected — issues remain")
+                        progress.verbose(
+                            f"[pipeline] Repair rejected – "
+                            f"{len(_known_findings_v2['potential_remaining_risks'])} calibration-confirmed "
+                            f"confirmed_defect(s) and/or a calibrated-observed behavioral_defect "
+                            "remain; keeping original."
+                        )
+                else:
+                    progress.warning("Patch repair did not apply — keeping original")
+            except Exception as exc:
+                progress.warning("Patch repair failed unexpectedly")
+                progress.verbose(f"[pipeline] Repair loop failed unexpectedly: {exc}")
+
+    # Batch B3: moved here from further below (originally after Existing
+    # Test Comparison/deterministic signals) so ALL Stage-6-owned
+    # computation -- classification, calibration v1, the repair loop, and
+    # this final-calibration fallback -- is textually contiguous and fully
+    # settles before the S6 execution below finishes, and before Evidence
+    # Sufficiency Gate/Existing Test Comparison/Stage 7 (none of which are
+    # Stage-6-owned) begin. Pure reordering: this block reads only
+    # `_post_patch_observations`/`patch`/`_investigated_patch` (settled by
+    # Stage 4, long before this point) and `finding_calibration`/
+    # `challenger` (settled by the repair loop directly above) -- nothing
+    # produced by Evidence Sufficiency Gate/Existing Test Comparison/
+    # deterministic signals, so moving it earlier changes no computed
+    # value, only the console-log line order (never report/result content).
+    #
+    # Post-Patch Investigation staleness guard: if the repair loop above
+    # replaced `patch`, the evidence computed before the first Challenger
+    # call describes a patch that no longer exists. Never let it leak into
+    # calibrate_findings() below (or score_confidence() further down,
+    # which reuses this same flag) in that case -- they must fall back to
+    # the plain code_context, same as if the feature never ran.
+    _post_patch_evidence_current = (
+        _post_patch_observations is not None and patch == _investigated_patch
+    )
+
+    # Finding calibration (evidence-quality pass) — classifies and rewords
+    # the plausible_risk/validation_gap/generic findings from the FINAL
+    # challenger result (post-repair, if a repair was accepted) so
+    # calibration reasons about the patch that will actually be reported.
+    # validation_gap findings ARE now sent here (widened alongside the
+    # gated v1 filter above -- see that filter's own comment): the semantic
+    # "Remediation impact" axis must be available to an unresolved-evidence
+    # finding regardless of which lexical bucket _classify_finding sorted
+    # it into, and _reconcile_verification_status_with_calibration (run
+    # after this stage, in _build_report) is the only thing authorized to
+    # turn that axis into remediation-proof blocking authority. Best-effort:
+    # any failure leaves finding_calibration as None, and report rendering
+    # falls back to the uncalibrated classifier text rather than losing
+    # findings or crashing the run.
+    #
+    # Normally runs only when the repair block above did NOT already
+    # compute the authoritative calibration (i.e. _orig_defect_count was 0
+    # -- no raw confirmed_defect OR behavioral_defect finding existed, so
+    # `challenger`/`patch` are still exactly what they were before the
+    # repair block, and this is identical to the pre-existing, unwidened
+    # plausible_risk/generic-only call). This is what keeps the common
+    # all-clear case free of any extra LLM call. `behavioral_defect` is
+    # ALSO included in this fallback's own filter (not just
+    # plausible_risk/validation_gap/generic) purely for resilience: if
+    # _orig_defect_count WAS > 0 but the earlier calibration_v1 call itself
+    # failed outright (finding_calibration left None by that failure, not
+    # by this block never running), this still gives a behavioral_defect
+    # finding one more best-effort chance at a calibration entry, same
+    # spirit as every other best-effort degradation in this module family.
+    _finding_calibration_source = "none"
+    if finding_calibration is not None:
+        _finding_calibration_source = "v2" if repair_succeeded else "v1"
+    if finding_calibration is None:
+        _final_classified = _classify_challenger(challenger)
+        _calibration_inputs = [
+            f["text"]
+            for f in (
+                _final_classified["classified_edge_cases"]
+                + _final_classified["classified_potential_issues"]
+            )
+            if f["category"] in ("behavioral_defect", "plausible_risk", "validation_gap", "generic")
+        ]
+        _calibration_fallback_acquisition: dict | None = None
+        if _calibration_inputs:
+            try:
+                _calibration_fallback_acquisition = _calibrate_findings_with_evidence_acquisition(
+                    vulnerability_text, patch, _calibration_inputs, llm,
+                    code_context=(challenger_context if _post_patch_evidence_current else code_context),
+                    repo_root=repo_root, investigation_context=_investigation_context,
+                    known_included_evidence_labels=_planner_evidence_included_labels,
+                )
+                finding_calibration = _calibration_fallback_acquisition["final_calibration"]
+                _finding_calibration_source = "fallback"
+            except Exception as _exc:
+                progress.warning("Finding calibration unavailable")
+                progress.verbose(f"[pipeline] Finding calibration failed (non-fatal): {_exc}")
+    return locals()
+
+
+def _adjust_confidence_score_for_challenger(score_text, challenger):
+    """Reusable Stage-8 (confidence_scoring) deterministic adjustment --
+    extracted VERBATIM from pipeline.run() (Batch B7) so production and
+    replay share exactly the same scoring semantics. Post-processes
+    score_confidence()'s own raw score_text using the Challenger result
+    already consumed via Stage 6 -- no LLM call, no behavior change.
+
+    Returns every local variable this body binds (`locals()`); callers
+    read `orig_score`, `adjusted_score`, `score_text` (the adjusted one).
+    """
+    # Adjust the numeric score based on adversarial challenger results
+    orig_score_str = _extract_score(score_text)
+    try:
+        orig_score = float(orig_score_str)
+    except Exception:
+        orig_score = None
+
+    adjusted_score = orig_score
+    try:
+        still = bool(challenger.get("still_vulnerable"))
+        edge_cases = challenger.get("edge_cases", []) or []
+        potential_issues = challenger.get("potential_issues", []) or []
+    except Exception:
+        still = False
+        edge_cases = []
+        potential_issues = []
+
+    if orig_score is not None:
+        if still:
+            adjusted_score = orig_score * 0.4
+            reason_lines = [
+                "Challenger indicates the vulnerability may still exist; applied strong reduction (0.4x).",
+            ]
+        elif edge_cases or potential_issues:
+            adjusted_score = orig_score * 0.7
+            reason_lines = [
+                "Challenger found edge cases or potential issues; applied moderate reduction (0.7x).",
+            ]
+        else:
+            adjusted_score = orig_score
+            reason_lines = ["No adversarial issues found; score unchanged."]
+
+        adjusted_score_str = f"{adjusted_score:.2f}"
+        orig_score_display = f"{orig_score:.2f}"
+
+        # Build a new score_text that places the adjusted score first so
+        # _extract_score() picks it up when building the report.
+        adjustment_text = (
+            f"**Confidence score:** {adjusted_score_str}\n\n"
+            f"**Original score:** {orig_score_display}\n\n"
+            "**Adjustment reasoning:**\n"
+            + "\n".join(f"- {l}" for l in reason_lines)
+            + "\n\n"
+        )
+
+        # Prepend adjustment summary to the original scorer output for context
+        score_text = adjustment_text + score_text
+    return locals()
+
+
+def _run_repository_analysis_and_remediation_planning(
+    *, vulnerability_text, repo_root, investigation_output_dir, llm, budget_controller=None
+):
+    """Reusable Stage-1 (repository_analysis_and_remediation_planning)
+    executor -- the COMPLETE current production contract (repo grounding,
+    vulnerability-pattern context, deterministic Repository Understanding,
+    and the Remediation Planner's first LLM call), extracted VERBATIM from
+    pipeline.run() (Batch B7 continuation). Byte-identical to the prior
+    inline block: same prompts, same best-effort try/except degradation,
+    same ModelUnavailableError re-raise. Returns every local variable this
+    body binds (`locals()`), so callers (run() and replay_engine.py) unpack
+    only the specific keys they need.
+
+    `budget_controller` (additive, default None so replay_engine.py's own
+    call site -- which never passes one, by design; see its "fixed-budget
+    default" comments -- is completely unaffected): threaded into
+    `build_planner_evidence_with_budget` so Strategy #1's own evidence
+    construction can request deterministic, policy-gated context-budget
+    expansion under the "planner_evidence" stage key -- the SAME shared
+    path the evidence-gap Strategy fallback uses (see
+    `_run_evidence_gap_strategy_fallback` below).
+    """
+    _plan_text = _load_experiment_plan(vulnerability_text)
+
+    # Fix B: `_repo_code` (repo_locator's grounding pass) and
+    # `_repository_understanding_ctx` (evidence_fusion's structural-facts
+    # render, below) both unconditionally precede Fix A's own acquired
+    # evidence in Planning's `base_evidence` -- they must share ONE real
+    # per-call technical-capacity ceiling, not each independently claim a
+    # full one (which would double-count and risk a combined prompt larger
+    # than the model can actually take). Reuses the exact same overhead
+    # computation the "planner_evidence" stage itself uses (this content
+    # ends up in the same prompt), so both halves of Planning's evidence
+    # -- what's built here and what Fix A resolves later -- are sized
+    # against a consistent notion of "what else is in this call."
+    from .llm_client import resolve_active_model, resolve_max_tokens
+    from .remediation_planner import _planner_evidence_known_overhead_chars
+    from .technical_capacity import compute_source_capacity
+    _grounding_capacity = compute_source_capacity(
+        *resolve_active_model(), reserved_output_tokens=resolve_max_tokens(),
+        known_overhead_chars=_planner_evidence_known_overhead_chars(vulnerability_text),
+    )
+    _grounding_ceiling = _grounding_capacity.source_capacity_chars
+
+    # Locate relevant code from the target repository (best-effort).
+    _repo_code = ""
+    _grounding: RepositoryGroundingResult | None = None
+    if repo_root:
+        from .repo_locator import ground_repository
+        _grounding = ground_repository(vulnerability_text, Path(repo_root), max_chars=_grounding_ceiling)
+        _repo_code = _grounding.rendered_context
+        if _repo_code:
+            progress.verbose(f"[pipeline] Code context found ({len(_repo_code)} chars); injecting into patch prompt.")
+        else:
+            progress.warning("No repository context found — patch will be best-effort")
+
+    # Phase C.5: inject vulnerability class guidance (canonical patterns + sink coverage).
+    # Pass _repo_code (not the accumulated context) so sink detection scans only source code.
+    _pattern_ctx = ""
+    try:
+        from .vulnerability_patterns import build_vulnerability_pattern_context
+        _pattern_ctx = build_vulnerability_pattern_context(
+            vulnerability_text, _repo_code, Path(repo_root) if repo_root else None
+        )
+        if _pattern_ctx:
+            progress.verbose(f"[pipeline] Vulnerability class guidance injected ({len(_pattern_ctx)} chars).")
+    except Exception:
+        pass
+
+    # Deterministic Repository Understanding: bounded candidate selection +
+    # enrichment + fusion, reusing the same _grounding computed above (no
+    # second ground_repository() call, no second candidate set). Best-effort
+    # -- any failure degrades to today's existing repo_code/pattern_ctx
+    # context rather than aborting the run. Rendered only when selection
+    # actually found something to select (CandidateSelection.used_fallback
+    # documents this as the caller's cue to fall back to existing behavior).
+    _repository_understanding: RepositoryUnderstanding | None = None
+    _repository_understanding_ctx = ""
+    _pre_patch_anchors: list | None = None
+    _investigation_context = None  # InvestigationContext | None -- only set below when
+    # investigation_output_dir is provided and grounding/selection succeed; kept as a
+    # top-level local so the Post-Patch Investigation block below (which reuses it for
+    # Coverage Analysis) can safely check it without a NameError on every other path.
+    if _grounding is not None:
+        try:
+            from .candidate_enrichment import build_investigation_context, enrich_candidates
+            from .candidate_selection import select_candidates
+            from .evidence_fusion import fuse_evidence, render_repository_understanding
+
+            _selection = select_candidates(_grounding)
+            if not _selection.used_fallback:
+                _investigation_context = None
+                if investigation_output_dir:
+                    _investigation_context = build_investigation_context(
+                        Path(repo_root), Path(investigation_output_dir)
+                    )
+                enrich_candidates(_selection, Path(repo_root), vulnerability_text, _investigation_context)
+                _repository_understanding = fuse_evidence(
+                    _selection, investigation_context_available=_investigation_context is not None
+                )
+                # Fix B: whatever ceiling _repo_code (above) and _pattern_ctx
+                # didn't already spend -- never a second, independent full
+                # ceiling for this section (see _grounding_ceiling's own
+                # comment above).
+                _understanding_ceiling = max(0, _grounding_ceiling - len(_repo_code) - len(_pattern_ctx))
+                _repository_understanding_ctx = render_repository_understanding(
+                    _repository_understanding, max_chars=_understanding_ceiling,
+                )
+                if _repository_understanding_ctx:
+                    if _investigation_context is None:
+                        # No parser ran (no investigation_output_dir was
+                        # given, e.g. a direct library caller) -- this is
+                        # the one positive signal available in that case.
+                        # When the parser DID run, it already printed its
+                        # own richer "Repository analyzed" line (with
+                        # file/function/class counts) from inside
+                        # build_investigation_context() above -- printing
+                        # a second, plainer one here would just duplicate
+                        # it.
+                        progress.success("Repository analyzed")
+                    progress.verbose(
+                        f"[pipeline] Repository Understanding rendered "
+                        f"({len(_repository_understanding_ctx)} chars)."
+                    )
+
+                from .post_patch_investigation import derive_pre_patch_anchors
+                _pre_patch_anchors = derive_pre_patch_anchors(_repository_understanding)
+        except Exception as exc:
+            progress.warning("Repository analysis unavailable")
+            progress.verbose(
+                f"[pipeline] Repository Understanding unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    # Experimental: Remediation Planner. One bounded LLM call that asks the
+    # model to commit to a narrow remediation strategy before Patch
+    # Generation runs, using exactly the evidence already assembled above.
+    # Not verified against the repository by itself -- an intentionally
+    # minimal proof-of-concept, not a trust boundary on its own. Skipped
+    # when a hand-authored plan (_plan_text) already exists. Best-effort:
+    # any failure degrades to no plan, same as every other optional
+    # context section.
+    _plan_ctx = ""
+    _planner_evidence_ctx = ""
+    # PlannerEvidenceResult | None -- always defined for the same "locals()/
+    # _s1_result always carries this key" reason as _plan_result below.
+    # Tracks the exact structural source coverage (.excerpt_plan.
+    # included_labels) Strategy #1's own construction actually saw, so the
+    # evidence-gap Strategy fallback (pipeline.py, below) can compare its
+    # own fresh attempt against what Strategy #1 ACTUALLY had, rather than
+    # recomputing a baseline from scratch. Stays in lockstep with
+    # _planner_evidence_ctx on every path (hand-authored plan, Planner-call
+    # failure, v1/v2/none authority outcomes) below.
+    _planner_evidence_result = None
+    _plan_result = None  # set below only when the Planner actually runs; read again
+    # much further down (as a source of "files already connected via Planner
+    # evidence") by the Final-Target Remediation Slice builder.
+    # Planner Claim Verifier defaults -- ALWAYS defined (not only inside the
+    # `if not _plan_text` branch below) so `locals()`/`_s1_result` always
+    # carries these keys, including the hand-authored-plan and Planner-call-
+    # failure paths where the Planner never even runs. "No verifier ran" is
+    # these values' own steady state, exactly like `_plan_result = None`
+    # above -- not a special case callers need to guard for separately.
+    _verifier_v1 = None
+    _verifier_v2 = None
+    _verifier_mode_v1 = None
+    _verifier_mode_v2 = None
+    _planner_revision_attempted = False
+    _verifier_forced_skip = False
+    _verifier_skip_reason = None
+    _verifier_broadening_unresolved = False
+    # Verified-narrower authority split defaults -- ALWAYS defined for the
+    # same "locals()/_s1_result always carries these keys" reason as the
+    # verifier defaults above. `_active_verifier_result` is whichever of
+    # verifier_v1/verifier_v2 is bound to the Planner result that actually
+    # became authoritative (see the three-way branch below); it stays None
+    # whenever no verifier ran, or the verifier resolved to "none" (neither
+    # v1 nor v2 cleared). `_plan_authority_version` records which Planner
+    # version ("v1"/"v2") that verifier result corresponds to, purely for
+    # observability -- never consumed as a branching condition itself.
+    _active_verifier_result = None
+    _plan_authority_version = None
+    # Bounded iterative Planning evidence acquisition ("Fix A") defaults --
+    # ALWAYS defined for the same "locals()/_s1_result always carries these
+    # keys" reason as the verifier defaults above. `_planning_forced_skip`
+    # mirrors `_verifier_forced_skip`'s own existing role/propagation
+    # exactly (see _run_guided_context_acquisition below, which ORs the
+    # two together) but is a SEPARATE signal -- Planning never having
+    # reached a grounded terminal state is a materially different
+    # situation from Verification finding an uncleared contradiction in an
+    # already-grounded plan, and the trace must be able to tell them apart
+    # (see run_planning_evidence_acquisition's own docstring).
+    _planning_forced_skip = False
+    _planning_skip_reason = None
+    _planning_terminal_state = None
+    _planning_attempts: "list" = []
+    if not _plan_text:
+        try:
+            from .remediation_planner import (
+                build_planner_evidence_with_budget,
+                run_planning_evidence_acquisition,
+            )
+            _evidence_so_far = "\n\n".join(
+                p for p in [_repo_code, _pattern_ctx, _repository_understanding_ctx] if p and p.strip()
+            )
+            # Bounded iterative Planning evidence acquisition ("Fix A"):
+            # attempt #1 -> (if the Planner explicitly requests evidence)
+            # deterministic bounded acquisition -> further attempts with
+            # prior evidence plus newly acquired evidence -> either a
+            # sufficiently grounded plan or a fail-closed ungrounded
+            # result. See run_planning_evidence_acquisition's own
+            # docstring for the full state machine and authority contract.
+            # Structural bounds only (MAX_PLANNING_ATTEMPTS/
+            # MAX_EVIDENCE_REQUESTS_PER_ROUND) -- entirely independent of
+            # budget_controller, which is still only ever used (exactly as
+            # before this existed) to gate HOW MUCH of any resolved
+            # evidence renders, never whether acquisition itself may
+            # continue.
+            _planning_acquisition = run_planning_evidence_acquisition(
+                vulnerability_text, llm, repo_root, _investigation_context,
+                base_evidence=_evidence_so_far, budget_controller=budget_controller,
+            )
+            _plan_result = _planning_acquisition.plan_result
+            _plan_ctx = _plan_result.rendered
+            _planning_terminal_state = _planning_acquisition.terminal_state
+            _planning_attempts = _planning_acquisition.attempts
+            if _plan_ctx:
+                progress.success("Remediation plan generated")
+                progress.verbose(f"[pipeline] Remediation plan generated ({len(_plan_ctx)} chars).")
+
+            if not _planning_acquisition.grounded:
+                # Planning never reached a grounded terminal state (see
+                # RemediationPlanResult.additional_evidence_required's own
+                # docstring for the governing invariant) -- the Planner's
+                # own hypothesis must never become authoritative merely
+                # because acquisition ran out of rounds or could not
+                # resolve what it asked for. Mirrors EXACTLY how the
+                # Planner Claim Verifier orchestration already clears
+                # these same two locals when a contradiction is never
+                # cleared (see the "authoritative == 'none'" branch
+                # below) -- reusing generate_remediation_strategy's own
+                # existing "nothing materially new to reason over" skip
+                # (see its docstring) rather than a new gate at the S2
+                # boundary. Plan Verification is never run on an
+                # ungrounded plan -- see this function's own body below,
+                # which only reaches the verifier dispatch when this
+                # branch was NOT taken.
+                _planner_evidence_ctx = ""
+                _planner_evidence_result = None
+                _planning_forced_skip = True
+                _planning_skip_reason = f"planning_ungrounded: {_planning_terminal_state}"
+                progress.warning("Remediation planning could not establish a grounded plan")
+                progress.verbose(
+                    f"[pipeline] Planning evidence acquisition ended ungrounded "
+                    f"(terminal_state={_planning_terminal_state}, "
+                    f"attempts={len(_planning_attempts)}) -- Strategy and Patch "
+                    f"Generation will be skipped for this run."
+                )
+                return locals()
+
+            # Deterministic bridge: verify the Planner's proposed files/symbols
+            # against the real repository, then run only what verifies through
+            # the SAME enrich_candidates/fuse_evidence/render_repository_
+            # understanding chain already used above -- reusing
+            # _investigation_context as-is, never rebuilding it. Bounded,
+            # policy-gated context-budget expansion happens INSIDE
+            # build_planner_evidence_with_budget itself (stage key
+            # "planner_evidence") -- zero additional LLM calls here, same as
+            # before this existed. Kept in its own try/except so a failure
+            # here can never suppress the plan text itself, gathered above.
+            try:
+                _planner_evidence_result = _planning_acquisition.planner_evidence_result
+                _planner_evidence_ctx = _planner_evidence_result.rendered
+                if _planner_evidence_ctx:
+                    progress.verbose(f"[pipeline] Planner-proposed candidate evidence rendered "
+                        f"({len(_planner_evidence_ctx)} chars).")
+            except Exception as exc:
+                progress.verbose(f"[pipeline] Planner candidate evidence unavailable: {type(exc).__name__}: {exc}")
+                # Planning failed to establish grounded evidence -- same
+                # outcome as the ungrounded branch above, never State A.
+                _planner_evidence_ctx = ""
+                _planner_evidence_result = None
+                _planning_forced_skip = True
+                _planning_terminal_state = f"planning_failed ({type(exc).__name__}: {exc})"
+                _planning_skip_reason = f"planning_ungrounded: {_planning_terminal_state}"
+                progress.warning("Remediation planning could not establish a grounded plan")
+                return locals()
+
+            # Planner Claim Verifier: sits between this Planner call and S2
+            # (Remediation Strategy), still owned by this same canonical
+            # stage (see stage_registry.STAGE_OWNED_LLM_TAGS). The trigger
+            # is now mode-aware and structural, never inferred from prose:
+            # `_dispatch_narrower_mode` reads the Planner's OWN
+            # `narrower_alternative_decision` enum (falling back to a fixed,
+            # conservative "REJECTED" default only when that field is
+            # missing/invalid AND there is a non-empty narrative to check --
+            # see that function's own docstring for why this default is
+            # safe). "NONE_IDENTIFIED" is the only value that makes ZERO
+            # additional LLM calls, leaving every local above at its default
+            # ("no verifier ran") value -- so a run that genuinely has no
+            # narrower alternative to compare (or, as before this change,
+            # says nothing about one at all) is completely unchanged.
+            _narrower_mode = _dispatch_narrower_mode(_plan_result)
+            if _narrower_mode != "NONE_IDENTIFIED":
+                try:
+                    _verification = _run_planner_claim_verification(
+                        vulnerability_text=vulnerability_text, llm=llm, repo_root=repo_root,
+                        investigation_context=_investigation_context, evidence_so_far=_evidence_so_far,
+                        plan_result=_plan_result, planner_evidence_ctx=_planner_evidence_ctx,
+                        mode=_narrower_mode,
+                    )
+                    _verifier_v1 = _verification["verifier_v1"]
+                    _verifier_v2 = _verification["verifier_v2"]
+                    _verifier_mode_v1 = _verification["mode_v1"]
+                    _verifier_mode_v2 = _verification["mode_v2"]
+                    _planner_revision_attempted = _verification["revision_attempted"]
+                    _verifier_forced_skip = _verification["forced_skip"]
+                    _verifier_skip_reason = _verification["skip_reason"]
+                    _verifier_broadening_unresolved = _verification["broadening_unresolved"]
+                    if _verification["authoritative"] == "v2":
+                        # v2 SUPPORTED -- the revised Planner result becomes
+                        # authoritative for Strategy, exactly as locked
+                        # policy case B requires. Never a silent partial
+                        # swap: rendered/target_files/target_symbols and
+                        # the evidence bridge are replaced together.
+                        _plan_result = _verification["revised_plan_result"]
+                        _plan_ctx = _verification["revised_plan_ctx"]
+                        # _planner_evidence_ctx is derived from
+                        # _planner_evidence_result.rendered below -- never
+                        # taken directly from _verification["revised_
+                        # planner_evidence_ctx"] (the verifier's OWN plain,
+                        # controller-less rebuild, used only for the
+                        # verifier's internal SUPPORTED/CONTRADICTED
+                        # decision) -- so the two locals can never diverge,
+                        # and so the now-authoritative v2 evidence gets the
+                        # SAME run-scoped budget_controller treatment
+                        # Strategy #1's own pre-revision construction
+                        # already received above, rather than silently
+                        # reverting to an unbudgeted rebuild. Zero new LLM
+                        # calls: still the same deterministic, no-LLM-call
+                        # bridge; only the budget ceiling this rebuild is
+                        # allowed to reach can differ from the verifier's
+                        # own (necessarily budget_controller=None) check.
+                        #
+                        # Evidence-continuity fix: this rebuild targets only
+                        # the REVISED plan's own target_files/target_symbols
+                        # -- it must not silently discard whatever the
+                        # pre-revision Planning evidence-acquisition loop had
+                        # already resolved AND included (e.g. whole files
+                        # requested via evidence_requests earlier in this
+                        # same run, which the revised plan's own narrower
+                        # target list would never re-derive on its own).
+                        # Merge fresh-v2 evidence into the pre-revision
+                        # baseline with the SAME structural merge Planning's
+                        # own acquisition loop and the Evidence-Gap Strategy
+                        # Fallback already use for this exact purpose
+                        # (_merge_planner_evidence_results, never a bare
+                        # replace) -- reused here, not reimplemented, so
+                        # `included_labels`/`omission_reason` provenance
+                        # stays truthful and no evidence already `included`
+                        # can be silently dropped. `_planner_evidence_result`
+                        # is still None here only if the pre-revision bridge
+                        # above (the try/except at this function's own
+                        # earlier candidate-evidence block) never produced a
+                        # result at all -- in that case there is nothing to
+                        # merge with, and the fresh v2 evidence stands alone,
+                        # unchanged from prior behavior.
+                        _pre_revision_planner_evidence_result = _planner_evidence_result
+                        _fresh_v2_planner_evidence_result = build_planner_evidence_with_budget(
+                            _plan_result, repo_root, vulnerability_text, _investigation_context,
+                            budget_controller=budget_controller,
+                        )
+                        if _pre_revision_planner_evidence_result is not None:
+                            from .remediation_planner import _merge_planner_evidence_results
+                            _planner_evidence_result = _merge_planner_evidence_results(
+                                _pre_revision_planner_evidence_result, _fresh_v2_planner_evidence_result,
+                            )
+                        else:
+                            _planner_evidence_result = _fresh_v2_planner_evidence_result
+                        _planner_evidence_ctx = _planner_evidence_result.rendered
+                        # Bind the verifier result that actually vouches for
+                        # THIS (revised) Planner result -- never verifier_v1,
+                        # which verified the superseded pre-revision claim.
+                        _active_verifier_result = _verifier_v2
+                        _plan_authority_version = "v2"
+
+                        # The SAME evidence-sufficiency gate that gated v1
+                        # before Verification ever ran must ALSO gate v2 --
+                        # the revision call is still a generate_remediation_
+                        # plan response, still carries its own
+                        # additional_evidence_required/evidence_requests,
+                        # and a revision that itself declares evidence
+                        # insufficient must not be laundered into
+                        # authoritative just because it happened to also
+                        # resolve v1's specific CONTRADICTED coherence
+                        # issue. See run_planning_evidence_acquisition's own
+                        # docstring/_planning_gate_outcome for the contract
+                        # this reapplies; never a second acquisition round
+                        # here -- v2 gets exactly one check, no retry.
+                        from .remediation_planner import _planning_gate_outcome
+                        _v2_grounded, _v2_actionable, _v2_gate_reason = _planning_gate_outcome(_plan_result)
+                        if not _v2_grounded:
+                            _planner_evidence_ctx = ""
+                            _planner_evidence_result = None
+                            _planning_forced_skip = True
+                            _planning_terminal_state = f"ungrounded_post_revision_{_v2_gate_reason}"
+                            _planning_skip_reason = f"planning_ungrounded: {_planning_terminal_state}"
+                            progress.warning("Revised plan could not establish sufficient evidence")
+                            progress.verbose(
+                                f"[pipeline] Post-revision (v2) Planning result failed the "
+                                f"evidence-sufficiency gate: {_v2_gate_reason} -- Strategy and "
+                                f"Patch Generation will be skipped for this run."
+                            )
+                    elif _verification["authoritative"] == "none":
+                        # A contradiction was found and the one bounded
+                        # revision did not clear it (cases C/D). Neither v1
+                        # nor v2 may reach Strategy: clearing
+                        # _planner_evidence_ctx reuses generate_remediation_
+                        # strategy's OWN existing "nothing materially new to
+                        # reason over" skip (see its docstring) -- Strategy
+                        # is never called, never faked as evaluated. The
+                        # explicit _verifier_forced_skip/_verifier_skip_reason
+                        # below is what independently guarantees Patch
+                        # Generation is also skipped, rather than relying on
+                        # the Edit Readiness/Strategy gates to reach the same
+                        # conclusion on their own by coincidence.
+                        _planner_evidence_ctx = ""
+                        _planner_evidence_result = None
+                        # Neither verifier cleared -- no Planner result is
+                        # independently verified, so no active verifier
+                        # result/authority version exists (stays at the
+                        # "no verifier ran" default set above).
+                    else:
+                        # "v1" -- the exhaustive default: v1 already
+                        # SUPPORTED (mode B) or the counterexample was
+                        # invalidated (mode A), so the original Planner
+                        # result stands unmodified; verifier_v1 is the
+                        # result that vouches for it.
+                        _active_verifier_result = _verifier_v1
+                        _plan_authority_version = "v1"
+
+                    # Presentation only -- reads the SAME `authoritative`/
+                    # `verifier_v1.status` this block already computed above;
+                    # never a second judgment. Default-visible: this is the
+                    # one line a user needs to know whether the Planner's
+                    # claim was independently verified, without the raw
+                    # status=/failure_kind= diagnostic (see progress.verbose
+                    # calls at the verifier call sites for that detail).
+                    if _verification["authoritative"] == "v2":
+                        progress.recovery("Plan revised and re-verified")
+                    elif _verification["authoritative"] == "none":
+                        progress.warning("Plan verification unresolved")
+                    elif _verifier_v1.status == "SUPPORTED":
+                        progress.success("Plan verified")
+                    else:
+                        progress.warning("Plan verification unresolved")
+                except ModelUnavailableError:
+                    raise
+                except Exception as exc:
+                    progress.warning("Plan verification failed unexpectedly")
+                    progress.verbose(f"[pipeline] Planner Claim Verifier unavailable: {type(exc).__name__}: {exc}")
+                    # Verification was required (a narrower-alternative claim
+                    # exists) but did not complete -- possibly after v2 was
+                    # half-adopted (plan swapped, evidence/gate not). Never
+                    # proceed as though it passed: same outcome as an
+                    # uncleared verification ("none" above).
+                    _planner_evidence_ctx = ""
+                    _planner_evidence_result = None
+                    _active_verifier_result = None
+                    _plan_authority_version = None
+                    _verifier_forced_skip = True
+                    _verifier_skip_reason = (
+                        "Planner Claim Verifier: verification did not complete "
+                        f"({type(exc).__name__}: {exc})"
+                    )
+        except ModelUnavailableError:
+            # An explicit execution/configuration decision (non-interactive
+            # rejection, or a declined/cancelled interactive reselection),
+            # not ordinary evidence-acquisition failure -- must abort the
+            # run, not degrade to "no plan" like every other failure here.
+            raise
+        except Exception as exc:
+            progress.warning("Remediation planning unavailable")
+            progress.verbose(f"[pipeline] Remediation planning unavailable: {type(exc).__name__}: {exc}")
+            # Planning raised before establishing grounded evidence -- same
+            # outcome as an ungrounded plan, never State A.
+            _planner_evidence_ctx = ""
+            _planner_evidence_result = None
+            _planning_forced_skip = True
+            _planning_terminal_state = f"planning_failed ({type(exc).__name__}: {exc})"
+            _planning_skip_reason = f"planning_ungrounded: {_planning_terminal_state}"
+    return locals()
+
+
+def _strategy_invocation_failure(planner_evidence_ctx, strategy_result) -> "str | None":
+    """Why an INVOKED Final Strategy produced no usable result, or None.
+    generate_remediation_strategy skips its LLM call only when
+    `planner_evidence_ctx` is empty (not invoked -- State A); with evidence
+    it either returns an evaluated result or swallows a call/parse failure
+    into an unevaluated one. That failure must not read as "not invoked"."""
+    if not (planner_evidence_ctx or "").strip():
+        return None
+    if strategy_result is not None and getattr(strategy_result, "evaluated", False):
+        return None
+    return (
+        "Final Remediation Strategy was invoked but produced no usable result -- "
+        "edit readiness and target authority could not be established"
+    )
+
+
+def _run_guided_context_acquisition(
+    *, vulnerability_text, llm, repo_root, budget_controller,
+    _strategy_result, _plan_result, _investigation_context,
+    _verifier_forced_skip=False, _verifier_skip_reason=None,
+    _planning_forced_skip=False, _planning_skip_reason=None,
+    _planner_evidence_result=None, _strategy_failure_reason=None,
+):
+    """Reusable Stage-3 (guided_context_acquisition) executor -- the
+    COMPLETE current production contract (Final-Target Remediation Slice,
+    Edit Readiness Gate, Slice 2 deterministic acquisition, Slice 3
+    LLM-guided acquisition, the bounded target-file fallback, and the
+    skip-patch-generation decision), extracted VERBATIM from pipeline.run()
+    (Batch B8). Byte-identical to the prior inline block: same budgeting,
+    same retry/fallback order, same LLM ordering (guided_context_request
+    only, bounded), same best-effort try/except degradation. Returns every
+    local variable this body binds (`locals()`), so callers (run() and
+    replay_engine.py) unpack only the specific keys they need.
+
+    `_verifier_forced_skip`/`_verifier_skip_reason` (both additive, default
+    False/None so every pre-existing caller is unaffected): set by the
+    Planner Claim Verifier orchestration (see
+    _run_repository_analysis_and_remediation_planning) when a concrete
+    causal contradiction survived its one bounded Planner revision -- an
+    EXPLICIT third trigger onto this function's own `_skip_patch_generation`
+    flag, seeded here rather than left to fall through to whatever the
+    Edit Readiness Gate/Strategy Gate below happen to conclude on their
+    own (by this point `_strategy_result` is already None/unevaluated --
+    Strategy was never called for the same reason -- so relying on those
+    gates alone would work by coincidence, not by design). Never a new
+    terminal state: this reuses the exact same flag and skip-reason
+    propagation (`_patch_validation_skip_reason`, see
+    _run_patch_generation_and_investigation) the Strategy Gate below
+    already established for "a real decision exists but is not safe to
+    build a patch from."
+
+    `_planning_forced_skip`/`_planning_skip_reason` (both additive, default
+    False/None, same propagation shape as `_verifier_forced_skip`/
+    `_verifier_skip_reason` immediately above -- but a SEPARATE signal, not
+    a reuse of those two): set by
+    `_run_repository_analysis_and_remediation_planning`'s own bounded
+    Planning evidence-acquisition loop when it never reached a grounded
+    terminal state (see RemediationPlanResult.additional_evidence_required's
+    own docstring) -- distinct from a Verification-found contradiction,
+    which only ever runs on an ALREADY-grounded plan (Plan Verification
+    never runs at all when Planning is ungrounded -- see that function's
+    own body). Mutually exclusive with `_verifier_forced_skip` in practice
+    (Verification cannot find anything on a plan that was never grounded
+    enough to reach it), but kept as an independent flag/reason so a
+    trace/replay can always tell WHICH mechanism caused the skip, never
+    collapsing "Planning could not establish a sufficiently grounded plan"
+    into "a logical contradiction was never cleared" or into Strategy's own
+    `target_authority_unresolved` (a materially different, later-stage
+    failure -- see the three-way Strategy Gate below, which this is
+    additive to, not a replacement for).
+
+    `_planner_evidence_result` (additive, default None so every
+    pre-existing caller -- including replay_engine.py, which has no
+    PlannerEvidenceResult to reconstruct from a recorded trace -- is
+    unaffected): when provided, its already-computed
+    `.excerpt_plan.blocks` are passed through to build_final_target_slice
+    unchanged, as additional scan input for the Final-Target Slice's own
+    method-call one-hop expansion. Never recomputed, never re-fetched.
+
+    Three-way Strategy Gate on `_strategy_result` (additive middle branch):
+    a named target/mechanism with `target_authority_unresolved` still True
+    at this point (Strategy #1's own value, or Strategy #2's if the
+    evidence-gap fallback reran it -- see pipeline.run()'s own evidence-gap
+    fallback block, which runs before this function is called) is exactly
+    as unsafe to build a patch from as naming zero targets, and reuses the
+    same `_skip_patch_generation` flag/`_skip_patch_generation_reason`
+    propagation the other two branches already use -- see
+    RemediationStrategyResult.target_authority_unresolved's own docstring.
+    """
+    _slice_ctx = ""
+    _coverage_warning_ctx = ""
+    _skip_patch_generation = bool(_verifier_forced_skip) or bool(_planning_forced_skip)
+    _skip_patch_generation_reason = (
+        _planning_skip_reason if _planning_forced_skip
+        else (_verifier_skip_reason if _verifier_forced_skip else None)
+    )
+    if _strategy_failure_reason and not _skip_patch_generation:
+        # Strategy was invoked and failed: the gates it establishes (edit
+        # readiness, target authority) cannot run -- never State A.
+        _skip_patch_generation = True
+        _skip_patch_generation_reason = _strategy_failure_reason
+    _edit_readiness = None  # EditReadinessResult | None -- see PipelineResult.edit_readiness
+    _edit_acquisition = None  # AcquisitionResult | None -- see PipelineResult.edit_acquisition
+    _guided_acquisition = None  # GuidedAcquisitionResult | None -- see PipelineResult.guided_acquisition
+    # Minimal compatibility pre-inits for Slice 4 (Patch Target Conformance
+    # Gate + Post-Patch Recovery, much further below in this function): both
+    # are otherwise only ever assigned inside the `if _strategy_result is
+    # not None...` block below, so a run with no Final Strategy (or one
+    # naming no targets) would leave them undefined by the time Slice 4
+    # reads them -- never actually reassigned above, only guaranteed defined.
+    _slice_result = None  # FinalTargetSliceResult | None
+    _intended_edits = []  # list[IntendedEdit]
+    _strategy_has_named_target = _strategy_result is not None and (
+        _strategy_result.target_files or _strategy_result.target_symbols
+    )
+    if _strategy_has_named_target and not _strategy_result.target_authority_unresolved:
+        try:
+            from .remediation_planner import build_final_target_slice, _file_part
+            _planner_evidence_files: "list[str]" = []
+            _seen_planner_evidence_files: set = set()
+            for _f in (list(_plan_result.target_files) if _plan_result is not None else []):
+                if _f not in _seen_planner_evidence_files:
+                    _seen_planner_evidence_files.add(_f)
+                    _planner_evidence_files.append(_f)
+            # Evidence continuity fix: also widen this seed with the file
+            # component of every label Planning's OWN bounded evidence-
+            # acquisition loop actually INCLUDED (rendered into its final,
+            # accumulated evidence) -- `excerpt_plan.included_labels`,
+            # never merely `resolved` (see PlanningRequestResolution's own
+            # resolved/included distinction: a request can validly be
+            # `resolved=True, included=False` when its source was verified
+            # but never rendered, e.g. technical-capacity omission -- that
+            # combination must NOT gain this continuity). A label is
+            # either a bare file path or "path:Symbol"; `_file_part`
+            # extracts just the file, the same helper already used
+            # throughout remediation_planner.py for this exact shape.
+            #
+            # This can surface a file Planning verified and rendered but
+            # that never made it into the Final Strategy's own selected
+            # `target_files` (e.g. it named a symbol Strategy went on to
+            # explicitly reject) -- letting Category 2/3a supporting-
+            # context discovery in build_final_target_slice() find it.
+            # Never widens Category 1/3b/4 edit-target resolution: those
+            # never consult `preferred_files` for target SELECTION at all
+            # (only `strategy.target_files`/`target_symbols` do) -- this
+            # list has only ever fed the bounded, supporting-context-only
+            # lookups (_lookup_identifier_definition/_lookup_identifier_
+            # usages), and continues to feed only those.
+            if _planner_evidence_result is not None:
+                for _label in sorted(_planner_evidence_result.excerpt_plan.included_labels):
+                    _label_file = _file_part(_label)
+                    if _label_file and _label_file not in _seen_planner_evidence_files:
+                        _seen_planner_evidence_files.add(_label_file)
+                        _planner_evidence_files.append(_label_file)
+            # Already-computed Planner excerpt blocks (PlannerEvidenceResult.
+            # excerpt_plan.blocks) -- passed through unchanged as additional
+            # scan input for the Final-Target Slice's own method-call
+            # one-hop expansion; never recomputed, never re-fetched, never a
+            # second Planner-evidence acquisition.
+            _planner_excerpt_blocks = (
+                _planner_evidence_result.excerpt_plan.blocks if _planner_evidence_result is not None else ()
+            )
+            _slice_result = build_final_target_slice(
+                _strategy_result, repo_root, _investigation_context,
+                planner_evidence_files=_planner_evidence_files,
+                planner_excerpt_blocks=_planner_excerpt_blocks,
+                budget_controller=budget_controller, vulnerability_text=vulnerability_text,
+            )
+            _slice_ctx = _slice_result.rendered
+            _coverage_warning_ctx = _slice_result.warning_text
+            if _slice_ctx:
+                progress.verbose(f"[pipeline] Final-Target Remediation Slice built "
+                    f"({len(_slice_ctx)} chars); covered files={_slice_result.covered_target_files}, "
+                    f"covered symbols={_slice_result.covered_target_symbols}.")
+            if not _slice_result.coverage_complete:
+                progress.verbose(
+                    f"[pipeline] Final-target source coverage incomplete -- "
+                    f"uncovered files={_slice_result.uncovered_target_files}, "
+                    f"uncovered symbols={_slice_result.uncovered_target_symbols}."
+                )
+
+            # Edit Readiness Gate (Slice 1) -- replaces the coarse
+            # "has_any_coverage == safe to generate" assumption with a
+            # decision made separately for every intended edit. Reuses only
+            # data build_final_target_slice() already computed above; no
+            # new repository read, no new resolution, no new LLM call.
+            from .remediation_planner import build_intended_edits, check_edit_readiness
+            _intended_edits = build_intended_edits(_strategy_result, _slice_result)
+            _initial_edit_readiness = check_edit_readiness(_intended_edits, _slice_result)
+            progress.verbose(f"[pipeline] Edit Readiness Gate: strategy_ready={_initial_edit_readiness.strategy_ready}, "
+                f"edit_source_ready={_initial_edit_readiness.edit_source_ready}, "
+                f"{len(_initial_edit_readiness.ready_edits)}/{len(_initial_edit_readiness.intended_edits)} "
+                f"intended edit(s) ready"
+                + (f", failure_reasons={_initial_edit_readiness.failure_reasons}"
+                   if _initial_edit_readiness.unready_edits else ""))
+
+            # Slice 2 -- Deterministic Pre-Patch Retrieval: attempt
+            # additional verified repository source for whatever is still
+            # unready, deterministically and bounded (see
+            # remediation_planner.run_deterministic_acquisition). No-op
+            # (0 rounds) when the initial readiness above was already
+            # complete. Best-effort: any failure here leaves the initial
+            # readiness/slice exactly as already computed.
+            _edit_readiness = _initial_edit_readiness
+            if not _initial_edit_readiness.edit_source_ready:
+                try:
+                    from .remediation_planner import run_deterministic_acquisition
+                    _edit_acquisition = run_deterministic_acquisition(
+                        _strategy_result, repo_root, _investigation_context,
+                        _slice_result, _initial_edit_readiness,
+                        budget_controller=budget_controller,
+                    )
+                    if _edit_acquisition.rounds_used > 0:
+                        _slice_result = _edit_acquisition.slice_result
+                        _slice_ctx = _slice_result.rendered
+                        _coverage_warning_ctx = _slice_result.warning_text
+                        _edit_readiness = check_edit_readiness(_intended_edits, _slice_result)
+                        progress.verbose(f"[pipeline] Deterministic Pre-Patch Retrieval: "
+                            f"{_edit_acquisition.rounds_used} round(s), "
+                            f"{len(_edit_acquisition.attempts)} attempt(s); "
+                            f"edit_source_ready now={_edit_readiness.edit_source_ready} "
+                            f"({len(_edit_readiness.ready_edits)}/{len(_edit_readiness.intended_edits)} "
+                            f"intended edit(s) ready)"
+                            + (f", failure_reasons={_edit_readiness.failure_reasons}"
+                               if _edit_readiness.unready_edits else ""))
+                except Exception as exc:
+                    progress.verbose(f"[pipeline] Deterministic Pre-Patch Retrieval unavailable: "
+                        f"{type(exc).__name__}: {exc}")
+
+            # Snapshot for the debug artifact's own "readiness_after_
+            # deterministic_acquisition" key -- BEFORE Slice 3 (below) can
+            # reassign _edit_readiness again.
+            _readiness_after_deterministic = _edit_readiness
+
+            # Slice 3 -- Bounded LLM-guided pre-patch context retrieval:
+            # runs ONLY when Slice 2 above still leaves readiness
+            # incomplete (see remediation_planner.run_guided_acquisition).
+            # At most MAX_GUIDED_ACQUISITION_ROUNDS narrow LLM calls
+            # (stage "guided_context_request") -- never the Patch
+            # Generator, never a Planner/Final Strategy rerun, never the
+            # Challenger. Best-effort: any failure here leaves the
+            # Slice-2 readiness/slice exactly as already computed.
+            if not _edit_readiness.edit_source_ready:
+                try:
+                    from .remediation_planner import run_guided_acquisition
+                    _deterministic_attempts = _edit_acquisition.attempts if _edit_acquisition is not None else []
+                    _guided_acquisition = run_guided_acquisition(
+                        _strategy_result, vulnerability_text, llm, repo_root, _investigation_context,
+                        _slice_result, _edit_readiness, _deterministic_attempts,
+                        budget_controller=budget_controller,
+                    )
+                    if _guided_acquisition.rounds_used > 0:
+                        _slice_result = _guided_acquisition.slice_result
+                        _slice_ctx = _slice_result.rendered
+                        _coverage_warning_ctx = _slice_result.warning_text
+                        _edit_readiness = _guided_acquisition.readiness
+                        progress.verbose(f"[pipeline] Guided Context Retrieval: "
+                            f"{_guided_acquisition.rounds_used} round(s), "
+                            f"{len(_guided_acquisition.attempts)} request(s); "
+                            f"edit_source_ready now={_edit_readiness.edit_source_ready} "
+                            f"({len(_edit_readiness.ready_edits)}/{len(_edit_readiness.intended_edits)} "
+                            f"intended edit(s) ready)"
+                            + (f", failure_reasons={_edit_readiness.failure_reasons}"
+                               if _edit_readiness.unready_edits else ""))
+                except ModelUnavailableError:
+                    # See the matching guard around generate_remediation_plan
+                    # above -- run_guided_acquisition calls
+                    # generate_guided_context_requests without its own
+                    # try/except, so this is the layer that would otherwise
+                    # swallow it.
+                    raise
+                except Exception as exc:
+                    progress.verbose(f"[pipeline] Guided Context Retrieval unavailable: "
+                        f"{type(exc).__name__}: {exc}")
+
+            # Bounded target-file fallback: a known-verified Final Strategy
+            # target file whose specific symbol never resolved (through
+            # Slice 2's deterministic retries or Slice 3's guided
+            # acquisition above) must not, by itself, force "no patch" --
+            # not when that file's own whole-file source was ALREADY
+            # rendered into the slice as a matter of course (category 5 of
+            # build_final_target_slice, computed the very first time this
+            # file became a target). This re-derives readiness from data
+            # already computed above -- no new file read, no new
+            # resolution, no LLM call -- via check_edit_readiness's own
+            # existing full_file_fallback_covered/identifier_definition_
+            # covered signals, which are themselves fixed by the Final
+            # Strategy's own verified target_files before this ever runs,
+            # so an unverified/LLM-invented file can never qualify. Applied
+            # exactly once, only here, only after guided acquisition has
+            # already been exhausted -- every earlier readiness check
+            # above (Slice 1/2/3) keeps its own exact, stricter semantics
+            # unchanged.
+            _target_file_fallback_used = False
+            if not _edit_readiness.edit_source_ready:
+                _fallback_readiness = check_edit_readiness(
+                    _intended_edits, _slice_result, allow_full_file_fallback_for_symbols=True,
+                )
+                if _fallback_readiness.edit_source_ready:
+                    _target_file_fallback_used = True
+                    progress.recovery("Target file fallback used")
+                    progress.verbose(
+                        "[pipeline] Target-file source fallback: symbol-level acquisition never "
+                        "resolved, but the Final Strategy's own verified target file(s) "
+                        f"{sorted(_slice_result.full_file_fallback_covered)} were already rendered "
+                        "in full -- Patch Generation will proceed using that source."
+                    )
+                _edit_readiness = _fallback_readiness
+
+            if os.environ.get("AUTOPATCHER_DEBUG"):
+                try:
+                    import datetime as _dt
+                    import json as _json
+
+                    def _readiness_doc(r):
+                        if r is None:
+                            return None
+                        return {
+                            "strategy_ready": r.strategy_ready,
+                            "edit_source_ready": r.edit_source_ready,
+                            "intended_edits": [{"file": e.file, "symbol": e.symbol} for e in r.intended_edits],
+                            "ready_edits": [
+                                {"file": rd.file, "symbol": rd.symbol, "role": rd.role} for rd in r.ready_edits
+                            ],
+                            "unready_edits": [
+                                {"file": u.edit.file, "symbol": u.edit.symbol, "reason": u.reason}
+                                for u in r.unready_edits
+                            ],
+                            "failure_reasons": r.failure_reasons,
+                        }
+
+                    # Explicit even when Slice 2 never ran at all (initial
+                    # readiness was already complete, or it failed) -- a
+                    # present `null`/empty-list value, never an omitted key.
+                    _deterministic_doc = None
+                    if _edit_acquisition is not None:
+                        _deterministic_doc = {
+                            "rounds": _edit_acquisition.rounds_used,
+                            "source_added": any(a.success for a in _edit_acquisition.attempts),
+                            "attempts": [
+                                {
+                                    "round": a.round,
+                                    "file": a.intended_edit.file,
+                                    "symbol": a.intended_edit.symbol,
+                                    "retrieval_strategy": a.retrieval_strategy,
+                                    "resolved_file": a.resolved_file,
+                                    "resolved_symbol": a.resolved_symbol,
+                                    "start_line": a.start_line,
+                                    "end_line": a.end_line,
+                                    "source_kind": a.source_kind,
+                                    "source_chars": a.source_chars,
+                                    "success": a.success,
+                                    "failure_reason": a.failure_reason,
+                                }
+                                for a in _edit_acquisition.attempts
+                            ],
+                        }
+
+                    # Same explicitness rule for Slice 3: present (as null)
+                    # even when Slice 2 alone already made readiness
+                    # complete, so guided acquisition never ran.
+                    _guided_doc = None
+                    if _guided_acquisition is not None:
+                        _guided_doc = {
+                            "rounds": _guided_acquisition.rounds_used,
+                            "source_added": any(a.verified and a.source_chars > 0 for a in _guided_acquisition.attempts),
+                            "requests": [
+                                {
+                                    "round": a.round,
+                                    "request_type": a.request.request_type,
+                                    "file_hint": a.request.file_hint,
+                                    "symbol": a.request.symbol,
+                                    "identifier": a.request.identifier,
+                                    "reason": a.request.reason,
+                                    "attributed_file": a.request.intended_edit.file if a.request.intended_edit else None,
+                                    "attributed_symbol": a.request.intended_edit.symbol if a.request.intended_edit else None,
+                                }
+                                for a in _guided_acquisition.attempts
+                            ],
+                            "verification_results": [
+                                {
+                                    "round": a.round,
+                                    "schema_valid": a.schema_valid,
+                                    "verified": a.verified,
+                                    "failure_reason": a.failure_reason,
+                                    "resolved_file": a.resolved_file,
+                                    "resolved_symbol": a.resolved_symbol,
+                                    "start_line": a.start_line,
+                                    "end_line": a.end_line,
+                                    "source_kind": a.source_kind,
+                                    "source_chars": a.source_chars,
+                                    "readiness_improved": a.readiness_improved,
+                                }
+                                for a in _guided_acquisition.attempts
+                            ],
+                        }
+
+                    _debug_dir = Path("reports") / "debug"
+                    _debug_dir.mkdir(parents=True, exist_ok=True)
+                    _ts = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+                    _doc = {
+                        "initial_edit_readiness": _readiness_doc(_initial_edit_readiness),
+                        "deterministic_acquisition": _deterministic_doc,
+                        "readiness_after_deterministic_acquisition": _readiness_doc(_readiness_after_deterministic),
+                        "guided_acquisition": _guided_doc,
+                        "target_file_fallback_used": _target_file_fallback_used,
+                        "final_edit_readiness": _readiness_doc(_edit_readiness),
+                        "patch_generation_skipped": not _edit_readiness.edit_source_ready,
+                        # Best-effort only -- see ContextBudgetController.to_trace_dict();
+                        # None whenever no controller was supplied (policy="never"-equivalent
+                        # library use, or a CLI run that never built one).
+                        "budget_trace": budget_controller.to_trace_dict() if budget_controller is not None else None,
+                    }
+                    (_debug_dir / f"edit_readiness_{_ts}.json").write_text(
+                        _json.dumps(_doc, indent=2), encoding="utf-8"
+                    )
+                except Exception:
+                    pass
+
+            # Presentation only -- one summary line for the whole readiness
+            # gate (Slice 1 alone, or Slices 2/3/target-file-fallback above
+            # having filled the gap, or none of them managing to). Reads
+            # values this block already computed; decides nothing new.
+            if _edit_readiness.edit_source_ready:
+                # Target file(s)/symbol(s) are already resolved on each
+                # ReadyEdit (remediation_planner.ReadyEdit.file/.symbol) --
+                # no new lookup, just formatting for display.
+                _target_summary = ", ".join(
+                    f"{e.file} · {e.symbol}" if e.symbol else e.file
+                    for e in _edit_readiness.ready_edits
+                )
+                _readiness_detail = (
+                    (f"{_target_summary}\n      " if _target_summary else "")
+                    + f"Edits ready: {len(_edit_readiness.ready_edits)}/{len(_edit_readiness.intended_edits)}"
+                )
+                if _initial_edit_readiness.edit_source_ready:
+                    progress.success("Target context ready", detail=_readiness_detail)
+                else:
+                    progress.recovery("Additional evidence collected", detail=_readiness_detail)
+            if not _edit_readiness.edit_source_ready:
+                _skip_patch_generation = True
+                progress.warning("Evidence gap could not be resolved")
+                progress.verbose(
+                    "[pipeline] Not every intended edit has verified, patch-ready repository "
+                    f"source -- skipping Patch Generation for this run. "
+                    f"failure_reasons={_edit_readiness.failure_reasons}"
+                )
+        except Exception as exc:
+            progress.warning("Target context unavailable")
+            progress.verbose(f"[pipeline] Final-Target Remediation Slice unavailable: {type(exc).__name__}: {exc}")
+            # The Edit Readiness Gate did not complete -- readiness is
+            # unknown, never assumed. Same outcome as a gate that ran and
+            # found the edit source not ready.
+            _skip_patch_generation = True
+            _skip_patch_generation_reason = _skip_patch_generation_reason or (
+                "Edit Readiness could not be established -- the target-context step failed "
+                f"({type(exc).__name__}: {exc})"
+            )
+    elif _strategy_has_named_target:
+        # Final Strategy named a real, repository-resolvable target/
+        # mechanism, but -- even after the bounded evidence-gap
+        # reacquisition attempt above (if it fired at all; see
+        # _evidence_gap_fallback_trigger/_run_evidence_gap_strategy_
+        # fallback) -- still reports target_authority_unresolved=True: at
+        # least one evidence gap remains load-bearing for whether THIS
+        # target/mechanism is the correct remediation location, per
+        # Strategy's own structured self-report. This is exactly as unsafe
+        # to build a patch from as the "no evidence-backed target at all"
+        # branch below, so it reuses the SAME _skip_patch_generation flag,
+        # never a new terminal state, and there is no second retry --
+        # scope-v4 Run 5's own forensic finding is precisely a named
+        # target reaching Patch Generation despite this exact self-
+        # reported gap. See RemediationStrategyResult.target_authority_
+        # unresolved's own docstring: this is a withholding-only signal --
+        # honored here regardless of whether corroborating prose exists in
+        # insufficient_evidence, and never second-guessed by re-reading
+        # that prose.
+        _skip_patch_generation = True
+        _skip_patch_generation_reason = _skip_patch_generation_reason or (
+            "Final Remediation Strategy named a target/mechanism but reported "
+            "target_authority_unresolved=True -- repository evidence remains "
+            "insufficient to justify granting edit authority to it"
+        )
+        progress.warning("Target authority unresolved")
+        progress.verbose(
+            "[pipeline] Final Remediation Strategy named target_files="
+            f"{_strategy_result.target_files} target_symbols={_strategy_result.target_symbols} "
+            "but still reports target_authority_unresolved=True -- skipping Patch "
+            "Generation for this run."
+        )
+    elif _strategy_result is not None and _strategy_result.evaluated:
+        # Final Strategy actually ran (a real, successfully-parsed response
+        # -- see RemediationStrategyResult.evaluated) and named ZERO
+        # verified target_files/target_symbols. This is a real decision
+        # (or a rejected-then-empty one -- see _verify_strategy_targets),
+        # not the absence of one, and it is exactly as unsafe to generate
+        # a patch from as the Edit Readiness Gate's own "not every intended
+        # edit has verified source" conclusion above -- so it reuses the
+        # SAME _skip_patch_generation flag, never a new terminal state.
+        # Deliberately does NOT branch on whether insufficient_evidence
+        # happens to be populated: a real decision with no verified target
+        # is unsafe to build a patch from whether or not the model also
+        # explained itself (see RemediationStrategyResult's own docstring)
+        # -- and deliberately does NOT read `rendered` (presentation
+        # output) for this decision either.
+        _skip_patch_generation = True
+        progress.warning("No evidence-backed target identified")
+        progress.verbose(
+            "[pipeline] Final Remediation Strategy ran but selected no evidence-backed "
+            f"target -- skipping Patch Generation for this run. "
+            f"insufficient_evidence={_strategy_result.insufficient_evidence}"
+        )
+    return locals()
+
+
+def _run_impact_and_behavior_analysis(*, patch, challenger, repo_root):
+    """Reusable Stage-9 (impact_and_behavior_analysis) executor -- the
+    COMPLETE current production contract (Impact Surface analysis +
+    Behavior summary, both deterministic), extracted VERBATIM from
+    pipeline.run() (Batch B8). Byte-identical to the prior inline block.
+    Returns every local variable this body binds (`locals()`).
+    """
+    impact_dict = None
+    behavior = None
+    _detected_language = "python"
+    if repo_root:
+        try:
+            repo_root_for_context = Path(repo_root)
+            repo_context = TargetRepoContext(repo_root_for_context)
+            _detected_language = detect_language(repo_root_for_context)
+
+            analyzer = LightweightImpactAnalyzer()
+            impact = analyzer.analyze(
+                patch,
+                adversarial_findings=challenger,
+                repo_context=repo_context,
+                repo_language=_detected_language,
+            )
+            # attach deterministic annotations to challenger for reporting
+            enhance_findings_with_impact(challenger, impact.to_dict())
+            impact_dict = impact.to_dict()
+        except Exception:
+            pass
+
+    # Behavior summary (minimal deterministic analyzer) -- operates purely
+    # on the diff text (see behavior_summary.py: it never reads repository
+    # files despite accepting a repo_context parameter), so unlike Impact
+    # Surface above it is not repository-dependent and always runs.
+    try:
+        behavior = BehaviorAnalyzer().analyze(patch)
+    except Exception:
+        behavior = None
+    return locals()
+
+
+def run(
+    vulnerability_text: str,
+    api_key: str = "",
+    repo_root: str | Path | None = None,
+    investigation_output_dir: str | Path | None = None,
+    budget_controller: "object | None" = None,
+    compare_existing_tests: bool = False,
+    execution_recorder: "object | None" = None,
+) -> str:
+    """
+    Execute the full patching pipeline.
+
+    Parameters
+    ----------
+    vulnerability_text:
+        The vulnerability description as a string (Markdown).  The caller is
+        responsible for reading a file or fetching an advisory before calling
+        this function.
+    api_key:
+        Optional OpenAI API key.  When empty the pipeline uses mock responses.
+    investigation_output_dir:
+        Optional run-scoped directory for the deterministic Repository
+        Understanding investigation's parser artifacts (candidate_enrichment.
+        build_investigation_context's analyzer_output.json/call_graph.json).
+        When omitted, investigation still runs (selection + fusion +
+        rendering) but candidate enrichment degrades to its existing
+        file/test/sink-only mode -- no parse/call-graph/reachability -- same
+        as when candidate_enrichment.enrich_candidates() is given
+        context=None. Callers that don't pass this (all existing callers)
+        are unaffected beyond that graceful degradation.
+    budget_controller:
+        Optional utilities.autopatcher.context_budget.ContextBudgetController,
+        threaded unmodified into Slices 2/3/4's own acquisition/recovery
+        calls (run_deterministic_acquisition/run_guided_acquisition/
+        recover_post_patch_source) -- the ONLY thing that lets a soft
+        character budget exhausted purely by capacity (never a safety/
+        verification failure) be extended by one more fixed-size window,
+        with the user's approval, instead of failing the run closed. This
+        is the CLI's responsibility to build (see openant/cli.py's `patch`
+        command --context-budget-policy/--max-context-budget-windows) --
+        `None` (every existing caller, and any library caller) preserves
+        the pre-existing fixed-budget behavior exactly, with zero
+        interactive prompts from this module.
+    compare_existing_tests:
+        Opt-in (default False) for Existing Test Comparison -- see
+        existing_test_regression.py. When True and repo_root/patch are
+        both available, discovers a TestExecutionPlan for the repository
+        (test_plan_discovery.py, one bounded LLM call) and runs it once
+        against an isolated, unpatched copy and once against an isolated,
+        patched copy (Docker-only; see test_executors.py -- never falls
+        back to host execution), and compares results. Adds a new,
+        observability-only Trust Signal and report section; never read by
+        _build_recommendation_v1, never fed back into Challenger or the
+        repair loop in this slice. False (every existing caller) runs
+        neither the LLM Test Plan Discovery call nor Docker, and leaves
+        PipelineResult.existing_test_comparison as None, exactly as
+        before this parameter existed.
+    execution_recorder:
+        Optional utilities.autopatcher.execution_recorder.ExecutionRecorder
+        (Batch B2) -- PURELY OBSERVATIONAL. When given, this function
+        records real StageExecution entries (see lineage.py) for the
+        canonical stages it currently instruments: Stage 1
+        (repository_analysis_and_remediation_planning), Stage 2
+        (remediation_strategy), Stage 3 (guided_context_acquisition), and
+        the INITIAL pass only of Stage 4
+        (patch_generation_and_post_patch_investigation) and Stage 5
+        (challenger). Recording then stops -- the Challenger-driven repair
+        loop (Stage 6 and everything after) is NOT instrumented in this
+        batch and runs completely unmodified/unrecorded, exactly as
+        before. `None` (every existing caller: openant/cli.py, every
+        library caller, every test) makes every recorder call inside this
+        function a guarded no-op -- this parameter changes nothing about
+        prompts, retries, gates, or the report for a normal run. Only
+        tools/run_traced.py constructs one today.
+
+    Returns
+    -------
+    str
+        The formatted Markdown report.
+    """
+
+    # Ensure downstream challenger reads the same API key if provided.
+    os.environ.setdefault("OPENAI_API_KEY", api_key or os.environ.get("OPENAI_API_KEY", ""))
+
+    llm = LLMClient(api_key=api_key)
+    mode = "MOCK" if llm.is_mock else "LIVE"
+    # Presentation (release polish, round 2): this raw diagnostic no longer
+    # bypasses progress.py -- default/quiet no longer show it (the run
+    # header's own "Model" line, from core/patch.py, already tells a human
+    # which provider/mode is in effect); verbose still shows it verbatim,
+    # unchanged text, never a model name (see the two tests in
+    # test_llm_client.py::TestPipelineLLMModeLog this line still satisfies).
+    progress.verbose(f"[pipeline] LLM mode: {mode}")
+    progress.stage(1, 5, "Analyze")
+
+    # Batch B2: begin recording ONE real StageExecution for canonical Stage 1
+    # (repository_analysis_and_remediation_planning) -- covers everything
+    # from here through the Remediation Planner's own verification bridge
+    # below (finished just before "# Final Strategy"). Purely observational
+    # -- see execution_recorder=None's docstring above; a no-op when None.
+    _s1_handle = None
+    if execution_recorder is not None:
+        _s1_handle = execution_recorder.start(_S_REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING)
+
+    # Experiment H1: plan first, then repo code, then vulnerability pattern guidance.
+    # Previously: repo code → vuln patterns → plan.
+    # H1 hypothesis: placing plan constraints before repo code reduces prior-override failures.
+    # Batch B7: S1 body now lives in _run_repository_analysis_and_remediation_planning
+    # (reusable executor shared with replay_engine.py) -- extracted verbatim,
+    # called here with run()'s own inputs, unpacking only what downstream code needs.
+    _s1_result = _run_repository_analysis_and_remediation_planning(
+        vulnerability_text=vulnerability_text,
+        repo_root=repo_root,
+        investigation_output_dir=investigation_output_dir,
+        llm=llm,
+        budget_controller=budget_controller,
+    )
+    _plan_text = _s1_result["_plan_text"]
+    _repo_code = _s1_result["_repo_code"]
+    _grounding = _s1_result["_grounding"]
+    _pattern_ctx = _s1_result["_pattern_ctx"]
+    _repository_understanding = _s1_result["_repository_understanding"]
+    _repository_understanding_ctx = _s1_result["_repository_understanding_ctx"]
+    _pre_patch_anchors = _s1_result["_pre_patch_anchors"]
+    _investigation_context = _s1_result["_investigation_context"]
+    _plan_ctx = _s1_result["_plan_ctx"]
+    _planner_evidence_ctx = _s1_result["_planner_evidence_ctx"]
+    _planner_evidence_result = _s1_result["_planner_evidence_result"]
+    _plan_result = _s1_result["_plan_result"]
+    _verifier_v1 = _s1_result["_verifier_v1"]
+    _verifier_v2 = _s1_result["_verifier_v2"]
+    _verifier_mode_v1 = _s1_result["_verifier_mode_v1"]
+    _verifier_mode_v2 = _s1_result["_verifier_mode_v2"]
+    _planner_revision_attempted = _s1_result["_planner_revision_attempted"]
+    _verifier_forced_skip = _s1_result["_verifier_forced_skip"]
+    _verifier_skip_reason = _s1_result["_verifier_skip_reason"]
+    _verifier_broadening_unresolved = _s1_result["_verifier_broadening_unresolved"]
+    _active_verifier_result = _s1_result["_active_verifier_result"]
+    _plan_authority_version = _s1_result["_plan_authority_version"]
+    _planning_forced_skip = _s1_result["_planning_forced_skip"]
+    _planning_skip_reason = _s1_result["_planning_skip_reason"]
+    _planning_terminal_state = _s1_result["_planning_terminal_state"]
+    _planning_attempts = _s1_result["_planning_attempts"]
+
+    # Verified-narrower authority split (deterministic, structural
+    # activation only -- see remediation_planner._render_verified_
+    # authoritative_semantics/_render_strategy_target_block for what this
+    # gates). All conditions are read from already-computed structured
+    # fields/enums; nothing here compares or inspects any prose.
+    # `_active_verifier_result` is already bound to whichever of
+    # verifier_v1/verifier_v2 vouches for the CURRENT `_plan_result`
+    # (see the three-way branch in _run_repository_analysis_and_
+    # remediation_planning above), so this can never bind the wrong
+    # verifier to the wrong Planner version. When False (the default for
+    # every path other than SELECTED+SUPPORTED+match=True+not-post-revision),
+    # every line below this point behaves exactly as it did before this
+    # change.
+    #
+    # `_plan_authority_version != "v2"` (fail-closed authority fix): a "v2"
+    # plan only ever exists because verifier_v1 already returned
+    # CONTRADICTED once (see the bounded revision trigger above -- there is
+    # no other path that produces a v2 at all). The ONLY verification mode
+    # that can make a SELECTED-decision v2 reach this gate at all is Mode B
+    # (decision coherence -- see prompts/remediation_verifier.md's own
+    # explicit contract: "strictly a coherence check between two
+    # descriptions the planner itself produced, not an evaluation of the
+    # remediation on its own merits" and "never asks... whether the
+    # remediation is globally correct or actually closes the vulnerability").
+    # A Mode-B SUPPORTED on the revised text proves only that the revision's
+    # OWN two self-authored descriptions are now mutually consistent -- it
+    # is not, and was never designed to be, evidence that the ORIGINAL
+    # CONTRADICTED finding was resolved by anything repository-grounded.
+    # Observed directly: a real revision can remove a self-contradictory
+    # assertion (e.g. an unsupported citation) while leaving the disputed
+    # target/mechanism and the repository evidence backing it completely
+    # unchanged, and Mode B alone cannot tell that apart from a genuine
+    # correction. Excluding "v2" here does not require detecting whether the
+    # target/mechanism/evidence actually changed (no such heuristic is
+    # introduced, and none is needed): every "v2" that could reach this gate
+    # is, by construction, Mode-B-coherence-only, so this exclusion is exact,
+    # not an approximation. `_plan_authority_version` is the same pre-
+    # existing, already-computed observability field this module already
+    # carries (see its own "purely for observability" note above) -- reused
+    # here as the provenance signal, never inferred from text. A denied "v2"
+    # falls through to Strategy's own mechanism prose, exactly like any
+    # other case where this split never activates (see
+    # TestNegativeCompatibility) -- never a retry, never a second revision,
+    # never a new LLM call.
+    _verified_narrower_authoritative = (
+        _plan_result is not None
+        and _plan_result.narrower_alternative_decision == "SELECTED"
+        and _active_verifier_result is not None
+        and _active_verifier_result.status == "SUPPORTED"
+        and _active_verifier_result.authoritative_remediation_matches_selected_alternative is True
+        and _plan_authority_version != "v2"
+    )
+
+    # Batch B2: finish S1's execution -- outcome reflects which of the three
+    # sub-paths above actually settled; the artifact carries the REAL
+    # structured output (never mere presence booleans) a future Stage-4
+    # replay would need: the Planner's own result, Repository Understanding,
+    # and the pre-patch anchors derived from it. Never the raw repository
+    # text/_grounding itself (that stays a run() local, not persisted here --
+    # not owned by this canonical stage's contract; see
+    # RepositoryGroundingResult/_repo_code, which are inputs to this stage,
+    # not its output).
+    _s1_rec = None
+    if execution_recorder is not None:
+        if _planning_forced_skip:
+            # Distinct from "generated" below: a plan object exists (the
+            # loop's final attempt), but Planning's own evidence-
+            # sufficiency gate never certified it -- see
+            # RemediationPlanResult.additional_evidence_required's own
+            # docstring and _planning_gate_outcome. Checked FIRST so this
+            # can never be shadowed by the `_plan_result is not None`
+            # check below (the loop always returns SOME RemediationPlanResult,
+            # grounded or not).
+            _s1_outcome = "planning_ungrounded"
+        elif _plan_result is not None:
+            _s1_outcome = "generated"
+        elif _plan_text:
+            _s1_outcome = "skipped_hand_authored_plan"
+        else:
+            _s1_outcome = "unavailable"
+        _s1_rec = execution_recorder.finish(
+            _s1_handle,
+            outcome=_s1_outcome,
+            artifact={
+                "plan_result": to_jsonable(_plan_result),
+                # Top-level, easy-to-find mirror of the terminal-state
+                # information below -- read by S2/S3 replay (see
+                # replay_engine.py's own S2/S3 run_fns) to reproduce the
+                # authoritative skip decision exactly as production made
+                # it, never re-derived from strategy_result/plan_result
+                # being empty (the same "must consume, never re-derive"
+                # discipline `planner_claim_verification.forced_skip`
+                # already established for the verifier's own skip).
+                "planning_forced_skip": _planning_forced_skip,
+                "planning_skip_reason": _planning_skip_reason,
+                # Bounded iterative Planning evidence acquisition ("Fix A")
+                # observability -- lets a trace/replay reconstruct what the
+                # Planner knew, what it requested, what was acquired, what
+                # could not be resolved, and why the loop continued or
+                # stopped, without reconstructing any of it from prose. See
+                # PlanningAttemptRecord's own docstring for field meanings.
+                "evidence_acquisition": {
+                    "terminal_state": _planning_terminal_state,
+                    "attempts_used": len(_planning_attempts),
+                    "attempts": [
+                        {
+                            "attempt": a.attempt,
+                            "llm_tag": a.llm_tag,
+                            "gate_state": a.gate_state,
+                            "evidence_requests": [
+                                {
+                                    "request_type": r.request_type,
+                                    "file_hint": r.file_hint,
+                                    "symbol": r.symbol,
+                                    "reason": r.reason,
+                                }
+                                for r in a.evidence_requests
+                            ],
+                            "invalid_requests": [
+                                {
+                                    "request_type": r.request_type,
+                                    "file_hint": r.file_hint,
+                                    "symbol": r.symbol,
+                                    "schema_failure_reason": reason,
+                                }
+                                for r, reason in a.invalid_requests
+                            ],
+                            "resolutions": [
+                                {
+                                    "request_type": res.request.request_type,
+                                    "file_hint": res.request.file_hint,
+                                    "symbol": res.request.symbol,
+                                    "resolved": res.resolved,
+                                    "failure_reason": res.failure_reason,
+                                    "resolved_file": res.resolved_file,
+                                    "resolved_symbol": res.resolved_symbol,
+                                }
+                                for res in a.resolutions
+                            ],
+                            "outcome": a.outcome,
+                        }
+                        for a in _planning_attempts
+                    ],
+                },
+                "repository_understanding": to_jsonable(_repository_understanding),
+                "pre_patch_anchors": to_jsonable(_pre_patch_anchors),
+                # Batch B7: minimal additive fields -- the ORIGINAL run-level
+                # input (not stage-owned output, but not persisted ANYWHERE
+                # else either, and genuinely indispensable for replaying S4+
+                # -- see replay_engine.py's patch_generation_and_post_patch_
+                # investigation ReplayHandler) and Repository Understanding's
+                # own rendered text (so replay can reconstruct code_context
+                # without needing to re-render the structured object itself).
+                # Zero behavior change: purely additive artifact content.
+                # planner_evidence_ctx/plan_ctx/repo_code are ALSO needed by S2
+                # replay (generate_remediation_strategy is a no-op LLM call
+                # without a non-empty planner_evidence_ctx -- see its own
+                # docstring) -- same additive-field rationale as above.
+                "vulnerability_text": vulnerability_text,
+                "repository_understanding_ctx": _repository_understanding_ctx,
+                "planner_evidence_ctx": _planner_evidence_ctx,
+                "plan_ctx": _plan_ctx,
+                "repo_code": _repo_code,
+                # Batch B8: minimal additive field -- the raw
+                # RepositoryGroundingResult (_grounding) itself. Needed by the
+                # combined trust_signals_and_recommendation+report_generation
+                # replay unit: _build_report() renders result.grounding
+                # (Repository Context section) directly, and nothing else
+                # already persists this object (repository_understanding
+                # above is a DIFFERENT, derived object). Zero behavior
+                # change: purely additive artifact content.
+                "grounding": to_jsonable(_grounding),
+                # Planner Claim Verifier observability -- additive, never
+                # read by _build_recommendation_v1/_compute_trust_signals
+                # (see remediation_verifier.VerifierResult's own docstring):
+                # lets a trace/replay answer "did the verifier run, what did
+                # it find, was a revision attempted, did it clear" without
+                # re-deriving any of this from _plan_ctx prose.
+                "planner_claim_verification": {
+                    "verifier_v1": to_jsonable(_verifier_v1),
+                    "verifier_v2": to_jsonable(_verifier_v2),
+                    "mode_v1": _verifier_mode_v1,
+                    "mode_v2": _verifier_mode_v2,
+                    "revision_attempted": _planner_revision_attempted,
+                    "forced_skip": _verifier_forced_skip,
+                    "skip_reason": _verifier_skip_reason,
+                    "broadening_necessity_unresolved": _verifier_broadening_unresolved,
+                    # Verified-narrower authority split observability
+                    # (additive only -- never read by any decision logic;
+                    # see the `_verified_narrower_authoritative` computation
+                    # above for the actual, structural activation gate).
+                    # `semantic_authority_plan_version` is deliberately None
+                    # whenever the split is not active, even if a verifier
+                    # ran and cleared -- it answers "which Planner version
+                    # is patch-generation-authoritative", not "which
+                    # version did a verifier look at".
+                    "verified_narrower_authoritative": _verified_narrower_authoritative,
+                    "semantic_authority_plan_version": (
+                        _plan_authority_version if _verified_narrower_authoritative else None
+                    ),
+                },
+            },
+        )
+
+    # Final Strategy: a second, distinct Planner call (stage
+    # "remediation_strategy") that runs only once verified Planner evidence
+    # exists -- it receives materially new evidence (the verified structural
+    # facts and source excerpts above) the first call never saw, and is not
+    # a blind retry of it. Skipped entirely (no LLM call) when
+    # _planner_evidence_ctx is empty -- generate_remediation_strategy enforces
+    # this itself. Best-effort: any failure here leaves the Target Discovery
+    # Plan and Planner-Proposed Candidate Evidence exactly as already
+    # gathered, and the pipeline continues without a Final Strategy section.
+    # Batch B2: begin recording S2 (remediation_strategy). consumed=[S1] --
+    # S2 is what actually reads S1's verified evidence (planner_evidence_ctx
+    # etc.), per stage_registry.STAGE_DEPENDENCIES.
+    _s2_handle = None
+    if execution_recorder is not None:
+        _s2_handle = execution_recorder.start(
+            _S_REMEDIATION_STRATEGY, consumed=[_s1_rec] if _s1_rec is not None else [],
+        )
+
+    _strategy_ctx = ""
+    _strategy_result = None  # read again below by the Final-Target Remediation Slice builder
+    _strategy_failure_reason = None  # set only when Strategy was invoked and failed
+    if _planner_evidence_ctx:
+        try:
+            from .remediation_planner import (
+                _STRATEGY_PROMPT_PATH, build_planner_evidence_with_budget, generate_remediation_strategy,
+            )
+            from .llm_client import resolve_active_model, resolve_max_tokens
+            from .technical_capacity import compute_source_capacity
+
+            # Fix B: repo_grounding_ctx/repository_understanding_ctx/
+            # discovery_plan_ctx are already-rendered, EXACT-length strings
+            # by this point -- mandatory content for THIS call, ahead of
+            # planner_evidence_ctx. If the four sections combined would
+            # exceed Strategy's own real technical capacity, re-render
+            # planner_evidence_ctx narrower (deterministic, no new LLM
+            # call, whole-block-or-omit unchanged) rather than send an
+            # oversized request or silently truncate the final prompt.
+            try:
+                _strategy_system_prompt_len = len(_STRATEGY_PROMPT_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                _strategy_system_prompt_len = 0
+            _strategy_fixed_overhead = (
+                _strategy_system_prompt_len + len(vulnerability_text or "")
+                + len(_repo_code or "") + len(_repository_understanding_ctx or "") + len(_plan_ctx or "")
+            )
+            _strategy_capacity = compute_source_capacity(
+                *resolve_active_model(), reserved_output_tokens=resolve_max_tokens(),
+                known_overhead_chars=_strategy_fixed_overhead,
+            )
+            _planner_evidence_ctx_ceiling = _strategy_capacity.source_capacity_chars
+            if len(_planner_evidence_ctx) > _planner_evidence_ctx_ceiling:
+                progress.verbose(
+                    f"[pipeline] planner_evidence_ctx ({len(_planner_evidence_ctx)} chars) exceeds "
+                    f"Strategy's real remaining capacity ({_planner_evidence_ctx_ceiling} chars) once "
+                    f"repo grounding/understanding/discovery-plan context is accounted for -- "
+                    f"re-rendering narrower rather than sending an oversized request."
+                )
+                _narrowed = build_planner_evidence_with_budget(
+                    _plan_result, repo_root, vulnerability_text, _investigation_context,
+                    budget_controller=budget_controller, base_max_chars=_planner_evidence_ctx_ceiling,
+                )
+                _planner_evidence_ctx = _narrowed.rendered
+                _planner_evidence_result = _narrowed
+        except Exception as exc:
+            progress.verbose(
+                f"[pipeline] Strategy combined-prompt capacity check unavailable "
+                f"(proceeding with previously-rendered evidence): {type(exc).__name__}: {exc}"
+            )
+        try:
+            _strategy_result = generate_remediation_strategy(
+                vulnerability_text, llm, repo_root, _investigation_context,
+                repo_grounding_ctx=_repo_code,
+                repository_understanding_ctx=_repository_understanding_ctx,
+                discovery_plan_ctx=_plan_ctx,
+                planner_evidence_ctx=_planner_evidence_ctx,
+            )
+            _strategy_failure_reason = _strategy_invocation_failure(_planner_evidence_ctx, _strategy_result)
+            _strategy_ctx = _strategy_result.rendered
+            if _strategy_ctx:
+                progress.success("Final strategy generated")
+                progress.verbose(
+                    f"[pipeline] Final remediation strategy generated "
+                    f"({len(_strategy_ctx)} chars)."
+                )
+            if _strategy_result.warnings:
+                progress.warning("Final strategy dropped unverified item(s)")
+                progress.verbose(
+                    f"[pipeline] Final strategy dropped unverified item(s): "
+                    f"{_strategy_result.warnings}"
+                )
+        except ModelUnavailableError:
+            # See the matching guard around generate_remediation_plan above.
+            raise
+        except Exception as exc:
+            progress.warning("Final strategy unavailable")
+            progress.verbose(f"[pipeline] Final remediation strategy unavailable: {type(exc).__name__}: {exc}")
+            _strategy_failure_reason = (
+                f"Final Remediation Strategy was invoked but failed ({type(exc).__name__}: {exc}) -- "
+                "edit readiness and target authority could not be established"
+            )
+
+    # Evidence-Gap Strategy Fallback: Final Strategy #1 evaluated a real
+    # response and either (a) named zero authoritative targets while
+    # explicitly reporting non-empty insufficient_evidence, or (b) named a
+    # real target/mechanism while explicitly reporting
+    # target_authority_unresolved=True -- see _evidence_gap_fallback_
+    # trigger's own docstring for the exact two-case predicate. Both are
+    # structurally-detectable deadlocks, distinct from a genuine "I looked
+    # and there is no viable target"/"I am confident in this target"
+    # decision, which must never trigger this. One-shot: this block runs
+    # at most once per run, and _run_evidence_gap_strategy_fallback itself
+    # never calls Final Strategy more than the single extra time documented
+    # in its own docstring -- if THAT second call (Strategy #2) also comes
+    # back unresolved (no targets + non-empty insufficient_evidence, or a
+    # named target + target_authority_unresolved=True), no third attempt is
+    # made; the existing fail-closed behavior below (in
+    # _run_guided_context_acquisition) applies to Strategy #2's result
+    # exactly as it would have to Strategy #1's.
+    #
+    # Reacquisition seed differs by case (see _run_evidence_gap_strategy_
+    # fallback's own docstring on why `plan_result` need not be the real
+    # Planner result): case (a) has no target of its own to seed from, so
+    # Planner's original candidates remain the only useful seed, exactly as
+    # before this field existed. Case (b) already has a target -- Strategy
+    # #1's own choice, which is the thing whose authority is actually in
+    # doubt -- so THAT is what reacquisition must expand around, not
+    # Planner's original (possibly different) guess.
+    _evidence_gap_fallback = None
+    if _evidence_gap_fallback_trigger(_strategy_result):
+        _fallback_has_named_target = bool(_strategy_result.target_files or _strategy_result.target_symbols)
+        if _fallback_has_named_target:
+            from .remediation_planner import RemediationPlanResult
+            _fallback_seed_plan_result = RemediationPlanResult(
+                rendered="",
+                target_files=_strategy_result.target_files,
+                target_symbols=_strategy_result.target_symbols,
+            )
+        else:
+            _fallback_seed_plan_result = _plan_result
+        _evidence_gap_fallback = _run_evidence_gap_strategy_fallback(
+            plan_result=_fallback_seed_plan_result,
+            repo_root=repo_root,
+            vulnerability_text=vulnerability_text,
+            investigation_context=_investigation_context,
+            budget_controller=budget_controller,
+            llm=llm,
+            repo_grounding_ctx=_repo_code,
+            repository_understanding_ctx=_repository_understanding_ctx,
+            discovery_plan_ctx=_plan_ctx,
+            baseline_planner_evidence_result=_planner_evidence_result,
+            # Preserve Strategy #1's own already-acquired evidence for the
+            # named-target case only -- see _run_evidence_gap_strategy_
+            # fallback's own docstring on merge_with_baseline. The
+            # zero-target case is untouched: its seed IS the same Planner
+            # candidates the baseline was already built from, so a union
+            # would be redundant (see that same docstring).
+            merge_with_baseline=_fallback_has_named_target,
+        )
+        progress.verbose(f"[pipeline] Evidence-gap Strategy fallback: evidence_acquired="
+            f"{_evidence_gap_fallback['evidence_acquired']} rerun_performed="
+            f"{_evidence_gap_fallback['rerun_performed']} skip_reason="
+            f"{_evidence_gap_fallback['skip_reason']}")
+        if _evidence_gap_fallback["rerun_performed"]:
+            # Strategy #2 is now the ONLY authoritative Strategy result --
+            # every downstream reader (Final-Target Remediation Slice,
+            # Edit Readiness, Patch Generation's own context concatenation)
+            # keys off these same two locals and needs no other change.
+            _strategy_result = _evidence_gap_fallback["strategy_result"]
+            _strategy_ctx = _strategy_result.rendered if _strategy_result is not None else ""
+            _planner_evidence_ctx = _evidence_gap_fallback["enriched_planner_evidence_ctx"]
+            # An unusable Strategy #2 (call/parse failure -> unevaluated) is
+            # an invoked-and-failed Strategy, exactly like #1 would be: it
+            # must never read as "Strategy not invoked" and let Patch
+            # Generation run without the authority gate.
+            _strategy_failure_reason = _strategy_failure_reason or _strategy_invocation_failure(
+                _planner_evidence_ctx, _strategy_result,
+            )
+            # "Resolved" now means more than "a target exists" -- for case
+            # (b) above, Strategy #1 already had a target; what matters is
+            # whether Strategy #2 ALSO cleared target_authority_unresolved.
+            # For case (a), target_authority_unresolved is irrelevant (there
+            # was no target either way), so this reduces to the original
+            # "does a target exist now" check unchanged.
+            _fallback_resolved = (
+                _strategy_result is not None
+                and (_strategy_result.target_files or _strategy_result.target_symbols)
+                and not _strategy_result.target_authority_unresolved
+            )
+            if _fallback_resolved:
+                progress.recovery("Additional evidence collected")
+                progress.verbose(
+                    "[pipeline] Evidence-gap Strategy fallback recovered authoritative "
+                    f"target(s): target_files={_strategy_result.target_files} "
+                    f"target_symbols={_strategy_result.target_symbols}"
+                )
+            else:
+                progress.warning("Evidence gap could not be resolved")
+                progress.verbose(
+                    "[pipeline] Evidence-gap Strategy fallback: Strategy #2 still has no "
+                    "evidence-backed, authority-resolved target -- no further retry this run."
+                )
+
+    # Batch B2: finish S2. artifact is the real RemediationStrategyResult
+    # (rendered + target_files/target_symbols/warnings/extended_mechanism/
+    # required_edits/security_invariant) -- the actual structured output a
+    # future Stage-3/Stage-4 replay would need, not a summary. Also
+    # records the Evidence-Gap Strategy Fallback's own outcome (never a
+    # new stage/execution record -- see this section's own comment above)
+    # so a trace/replay can distinguish the normal Strategy path from an
+    # evidence-gap recovery attempt without re-deriving it from prose;
+    # deliberately omits Planner's own target_files/target_symbols here --
+    # they are retrieval seeds only and must never appear anywhere that
+    # could be read as an authoritative target list.
+    _s2_rec = None
+    if execution_recorder is not None:
+        if _planning_forced_skip:
+            # Distinct from "skipped_no_planner_evidence" below: Strategy
+            # was never even attempted because Planning itself never
+            # reached a grounded terminal state -- checked FIRST so this
+            # specific, named cause is never collapsed into the generic
+            # "no evidence" bucket (which also covers an ordinary Planner-
+            # call failure or an uncleared verifier contradiction). See
+            # _run_guided_context_acquisition's own docstring on
+            # `_planning_forced_skip`.
+            _s2_outcome = "skipped_planning_ungrounded"
+        elif _strategy_failure_reason is not None:
+            _s2_outcome = "unavailable"
+        elif _strategy_result is not None:
+            _s2_outcome = "generated"
+        elif not _planner_evidence_ctx:
+            _s2_outcome = "skipped_no_planner_evidence"
+        else:
+            _s2_outcome = "unavailable"
+        _s2_rec = execution_recorder.finish(
+            _s2_handle,
+            outcome=_s2_outcome,
+            artifact={
+                "strategy_result": to_jsonable(_strategy_result),
+                "strategy_failure_reason": _strategy_failure_reason,
+                "evidence_gap_fallback": to_jsonable(
+                    {
+                        "attempted": _evidence_gap_fallback["attempted"],
+                        "evidence_acquired": _evidence_gap_fallback["evidence_acquired"],
+                        "rerun_performed": _evidence_gap_fallback["rerun_performed"],
+                        "skip_reason": _evidence_gap_fallback["skip_reason"],
+                    }
+                    if _evidence_gap_fallback is not None else None
+                ),
+                # Verified-narrower authority split observability --
+                # additive, never read by any decision logic (see the
+                # `_verified_narrower_authoritative` computation above for
+                # the actual, structural activation gate). `target_
+                # authority_source` is always "strategy": this split only
+                # ever moves semantic (mechanism) authority, never target
+                # authority -- see Section 5 of the architecture this
+                # implements. `strategy_reported_implementation_gap` is
+                # Strategy's own `insufficient_evidence` reduced to a
+                # single boolean signal -- observability only, never a
+                # trigger for falling back to Strategy's mechanism text
+                # (see _run_guided_context_acquisition/build_intended_edits,
+                # which already derive edits from target_files/
+                # target_symbols only, never from mechanism prose).
+                # `target_authority_unresolved`, unlike every other key in
+                # this dict, mirrors a field that IS load-bearing elsewhere
+                # (_evidence_gap_fallback_trigger/_run_guided_context_
+                # acquisition) -- recorded here purely so a trace can show
+                # whether Patch Generation authority was withheld for this
+                # reason, never re-derived or re-decided from this copy.
+                "verified_authority": {
+                    "verified_narrower_authoritative": _verified_narrower_authoritative,
+                    "semantic_authority_source": (
+                        "planner" if _verified_narrower_authoritative else "strategy"
+                    ),
+                    "target_authority_source": "strategy",
+                    "semantic_authority_plan_version": (
+                        _plan_authority_version if _verified_narrower_authoritative else None
+                    ),
+                    "strategy_reported_implementation_gap": bool(
+                        _strategy_result is not None and _strategy_result.insufficient_evidence
+                    ),
+                    "target_authority_unresolved": bool(
+                        _strategy_result is not None and _strategy_result.target_authority_unresolved
+                    ),
+                },
+            },
+        )
+
+    # Final-Target Remediation Slice: deterministic, bounded exact source
+    # built ONLY from generate_remediation_strategy()'s VERIFIED result --
+    # never the earlier, exploratory Target Discovery candidates, so
+    # source budget is never spent on a candidate the Final Strategy
+    # already rejected. No new LLM call (build_final_target_slice takes no
+    # `llm` parameter), no new repository parse -- reuses
+    # _investigation_context as-is. Best-effort: any failure degrades to a
+    # short note and the pipeline continues with whatever context already
+    # exists; only a genuinely ZERO-coverage Final Strategy result (one
+    # that named targets but produced no usable verified source for any of
+    # them) skips the Patch Generator call itself, per the coverage
+    # contract below -- this never fails the run and never introduces a
+    # new recommendation category.
+    # Batch B2: begin recording S3 (guided_context_acquisition). consumed=
+    # [S1, S2] -- covers the Final-Target Slice, Edit Readiness Gate,
+    # deterministic + guided acquisition, and the target-file fallback,
+    # through the skip-patch-generation decision below.
+    _s3_handle = None
+    if execution_recorder is not None:
+        _s3_handle = execution_recorder.start(
+            _S_GUIDED_CONTEXT_ACQUISITION,
+            consumed=[r for r in (_s1_rec, _s2_rec) if r is not None],
+        )
+
+    # Batch B8: S3 body now lives in _run_guided_context_acquisition
+    # (reusable executor shared with replay_engine.py) -- extracted verbatim,
+    # called here with run()'s own inputs, unpacking only what downstream code needs.
+    progress.stage(2, 5, "Prepare")
+    _s3_result = _run_guided_context_acquisition(
+        vulnerability_text=vulnerability_text,
+        llm=llm,
+        repo_root=repo_root,
+        budget_controller=budget_controller,
+        _strategy_result=_strategy_result,
+        _plan_result=_plan_result,
+        _investigation_context=_investigation_context,
+        _planner_evidence_result=_planner_evidence_result,
+        _verifier_forced_skip=_verifier_forced_skip,
+        _verifier_skip_reason=_verifier_skip_reason,
+        _planning_forced_skip=_planning_forced_skip,
+        _planning_skip_reason=_planning_skip_reason,
+        _strategy_failure_reason=_strategy_failure_reason,
+    )
+    _slice_ctx = _s3_result["_slice_ctx"]
+    _coverage_warning_ctx = _s3_result["_coverage_warning_ctx"]
+    _skip_patch_generation = _s3_result["_skip_patch_generation"]
+    _skip_patch_generation_reason = _s3_result["_skip_patch_generation_reason"]
+    _edit_readiness = _s3_result["_edit_readiness"]
+    _edit_acquisition = _s3_result["_edit_acquisition"]
+    _guided_acquisition = _s3_result["_guided_acquisition"]
+    _slice_result = _s3_result["_slice_result"]
+    _intended_edits = _s3_result["_intended_edits"]
+
+    # Batch B2: finish S3. Per Final Correction 1: persist the REAL
+    # structured slice/readiness output Stage 4 actually consumes (`.rendered`
+    # source text included) -- Stage 4's own artifact must not become the
+    # only place this exists; never mere presence booleans.
+    _s3_rec = None
+    if execution_recorder is not None:
+        if _planning_forced_skip:
+            # Distinct from "skipped_no_strategy_targets" below: Strategy
+            # never ran at all, so there is no "zero targets" decision to
+            # attribute this to -- Planning itself is the cause. Checked
+            # FIRST for the same reason as S2's own outcome above.
+            _s3_outcome = "skipped_planning_ungrounded"
+        elif _slice_result is not None:
+            _s3_outcome = "ready"
+        elif not (_strategy_result is not None and (_strategy_result.target_files or _strategy_result.target_symbols)):
+            _s3_outcome = "skipped_no_strategy_targets"
+        elif _strategy_result.target_authority_unresolved:
+            # Distinct from "unavailable" below: a target WAS named and no
+            # exception occurred -- this is the deliberate, correct skip
+            # from _run_guided_context_acquisition's new authority-gap
+            # branch, not a failure. See RemediationStrategyResult.
+            # target_authority_unresolved's own docstring.
+            _s3_outcome = "skipped_target_authority_unresolved"
+        else:
+            _s3_outcome = "unavailable"
+        _s3_rec = execution_recorder.finish(
+            _s3_handle,
+            outcome=_s3_outcome,
+            artifact={
+                "slice_result": to_jsonable(_slice_result),
+                "edit_readiness": to_jsonable(_edit_readiness),
+                "skip_patch_generation": _skip_patch_generation,
+            },
+        )
+
+    # Verified-narrower authority split: when `_verified_narrower_
+    # authoritative` is True, an INDEPENDENTLY VERIFIED Planner decision
+    # becomes semantic authority for Patch Generation in place of
+    # Strategy's own mechanism-bearing prose. This is enforced purely by
+    # WHICH rendered text occupies the `code_context` positions below --
+    # never by comparing Planner's and Strategy's prose against each
+    # other. `_verified_authoritative_ctx` carries ONLY the 5 verified
+    # Planner semantic fields (see _render_verified_authoritative_
+    # semantics); `_strategy_ctx` is replaced with a target/
+    # concretization-only view of the SAME already-computed
+    # `_strategy_result` (see _render_strategy_target_block) that
+    # deliberately, by field allowlist, omits `extended_mechanism`,
+    # Strategy's own `security_invariant`, and Strategy's own
+    # `required_edits`. Strategy's independently re-verified
+    # target_files/target_symbols/rejected_targets remain fully present --
+    # target authority is untouched; only semantic (mechanism) authority
+    # moves. When False (every path other than SELECTED + SUPPORTED +
+    # match=True), neither local is touched and both variables keep
+    # exactly the values already computed above, unchanged.
+    _verified_authoritative_ctx = ""
+    if _verified_narrower_authoritative:
+        from .remediation_planner import (
+            _render_strategy_target_block,
+            _render_verified_authoritative_semantics,
+        )
+        # `_plan_result.required_edits` was captured before Strategy's own,
+        # later, independently re-verified `target_files` decision existed --
+        # a bullet naming a file Strategy's own target set no longer
+        # includes is a superseded remediation proposal, not a current edit
+        # instruction (evidence/proposal != edit authority, exactly like
+        # resolved-but-not-included evidence is not included evidence).
+        # Computed as an exact file-path-string set difference against
+        # Strategy's OWN target_files -- never a prose/semantic comparison,
+        # and never touching target authority itself (Strategy's
+        # target_files/target_symbols/rejected_targets below are already,
+        # and remain, fully Strategy's own). Empty (a no-op) whenever
+        # Strategy's target set matches or is a superset of the Planner's.
+        _superseded_target_files = frozenset()
+        if _strategy_result is not None and _strategy_result.target_files:
+            _superseded_target_files = frozenset(
+                f for f in _plan_result.target_files if f not in _strategy_result.target_files
+            )
+        _verified_authoritative_ctx = _render_verified_authoritative_semantics(
+            _plan_result, _superseded_target_files,
+        )
+        if _strategy_result is not None:
+            _strategy_ctx = _render_strategy_target_block(_strategy_result)
+
+    # Assemble final context, in order: hand-authored Patch Plan → original
+    # Repository Grounding → vuln patterns → ordinary Repository
+    # Understanding → Target Discovery Plan (exploratory) → Planner-Proposed
+    # Candidate Evidence (deterministically verified) → Verified
+    # Authoritative Remediation Semantics (only under the verified-narrower
+    # authority split above; empty otherwise) → Final Evidence-Backed
+    # Remediation Strategy (or, under that same split, its target/
+    # concretization-only view) → Final-Target Remediation Slice (the last
+    # source-bearing section before Patch Generation) → final-target source
+    # coverage warning, only when incomplete.
+    #
+    # Fix B: each of these sections was already bounded against ITS OWN
+    # producing stage's technical capacity (grounding's, Planning's,
+    # Strategy's) -- never against Patch Generation's own request, which is
+    # what actually embeds ALL of them together plus patch_generator.md's
+    # system prompt and vulnerability_text. `fit_patch_generation_context`
+    # is the one place that combined fit is enforced: it treats each
+    # section as a whole block (never mid-string-truncated) and reserves
+    # room for the Final-Target Remediation Slice FIRST (`required_label=
+    # PATCH_GENERATION_REQUIRED_LABEL`) -- the one section Edit Readiness's
+    # own deterministic gate already requires before Patch Generation is
+    # allowed to run at all; every other section here is optional under
+    # that SAME existing gate (its absence never blocks generation) and is
+    # included, whole, in this existing order, only as room remains.
+    _patch_gen_sections = [
+        ("phase_e_plan", _plan_text),
+        ("repository_grounding", _repo_code),
+        ("vulnerability_pattern_context", _pattern_ctx),
+        ("repository_understanding", _repository_understanding_ctx),
+        ("remediation_plan", _plan_ctx),
+        ("planner_evidence", _planner_evidence_ctx),
+        ("verified_authoritative_semantics", _verified_authoritative_ctx),
+        ("remediation_strategy", _strategy_ctx),
+        (PATCH_GENERATION_REQUIRED_LABEL, _slice_ctx),
+        ("coverage_warning", _coverage_warning_ctx),
+    ]
+    _patch_gen_capacity = compute_patch_generation_capacity(vulnerability_text)
+    _patch_gen_context_plan = fit_patch_generation_context(
+        _patch_gen_sections, _patch_gen_capacity.source_capacity_chars,
+        required_label=PATCH_GENERATION_REQUIRED_LABEL, capacity=_patch_gen_capacity,
+    )
+    code_context = _patch_gen_context_plan.rendered
+
+    if _patch_gen_context_plan.required_missing and not _skip_patch_generation:
+        # Fix B fail-closed case: the Final-Target Remediation Slice is
+        # resolved (Edit Readiness already verified it) but does not fit
+        # within Patch Generation's real technical capacity. Reuses the
+        # SAME _skip_patch_generation/_skip_patch_generation_reason
+        # mechanism the pre-existing Edit-Readiness/Strategy-Gate branches
+        # already use -- never a new report field, never a new outcome
+        # category (see _run_patch_generation_and_investigation's own
+        # docstring on _skip_patch_generation_reason's downstream reach).
+        # This preserves the FACT that generation could not safely proceed;
+        # it does not decide what that fact means for the final
+        # recommendation -- that stays this same pre-existing machinery's
+        # job, unchanged.
+        _skip_patch_generation = True
+        _slice_omitted_size = _patch_gen_context_plan.omitted_sizes.get(PATCH_GENERATION_REQUIRED_LABEL, 0)
+        _skip_patch_generation_reason = _skip_patch_generation_reason or (
+            "Final-Target Remediation Slice evidence is resolved but does not fit within Patch "
+            f"Generation technical capacity ({_slice_omitted_size} chars needed, "
+            f"{_patch_gen_context_plan.max_chars} chars available) -- omission_reason=technical_capacity"
+        )
+        progress.warning("Patch generation blocked by technical capacity")
+        progress.verbose(
+            f"[pipeline] Final-Target Remediation Slice ({_slice_omitted_size} chars) exceeds Patch "
+            f"Generation technical capacity ({_patch_gen_context_plan.max_chars} chars) -- skipping "
+            "Patch Generation for this run rather than sending an incomplete request."
+        )
+
+    if os.environ.get("AUTOPATCHER_DEBUG"):
+        try:
+            import datetime as _dt
+            import json as _json
+            _debug_dir = Path("reports") / "debug"
+            _debug_dir.mkdir(parents=True, exist_ok=True)
+            _ts = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+            (_debug_dir / f"patch_generation_context_{_ts}.json").write_text(_json.dumps({
+                "max_chars": _patch_gen_context_plan.max_chars,
+                "included_labels": list(_patch_gen_context_plan.included_labels),
+                "omission_reason": _patch_gen_context_plan.omission_reason,
+                "omitted_sizes": _patch_gen_context_plan.omitted_sizes,
+                "required_missing": _patch_gen_context_plan.required_missing,
+            }, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    # Batch B2: begin recording S4's INITIAL execution only
+    # (patch_generation_and_post_patch_investigation) -- covers contract
+    # retry, hunk repair, Slice-4 conformance/recovery, hygiene,
+    # applicability (+ its own bounded retry), and Post-Patch Investigation,
+    # through where `patch`/the investigation triple settle just before the
+    # Challenger call. consumed=[S1, S2, S3] -- the real dependencies this
+    # stage's own context/conformance/recovery machinery reads (see
+    # stage_registry.STAGE_DEPENDENCIES). Deliberately NOT recorded again
+    # for the Challenger-driven repair loop's own regeneration further below
+    # -- that path is a materially narrower contract (no contract retry, no
+    # conformance gate, no applicability retry, no Post-Patch Investigation)
+    # and is NOT instrumented as a canonical Stage-4 execution in this batch.
+    _s4_handle = None
+    if execution_recorder is not None:
+        _s4_handle = execution_recorder.start(
+            _S_PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
+            consumed=[r for r in (_s1_rec, _s2_rec, _s3_rec) if r is not None],
+        )
+
+    # _patch_validation_skip_reason distinguishes, for observability, WHY
+    # patch/hunk-repair/hygiene/applicability validation is being skipped —
+    # never conflated into a single generic flag. Both reasons converge on
+    # the same downstream behavior (validation machinery never runs; the
+    # already-existing empty-patch/no_patch execution outcome renders), but
+    # the reason itself must stay legible: "no verified final-target
+    # source" (Recommendation-Policy-relevant evidence gap) is a materially
+    # different situation from "the model's response was structurally
+    # invalid" (an LLM output-contract failure) — see the module-level
+    # correction this section implements: an invalid Patch Generator
+    # response must fail closed BEFORE hunk repair/hygiene/git apply
+    # --check/applicability-aware retry, not merely collapse to "" and let
+    # "" flow through that machinery as if it were an ordinary empty patch.
+    _s4 = _run_patch_generation_and_investigation(
+        vulnerability_text=vulnerability_text, llm=llm, repo_root=repo_root, code_context=code_context,
+        budget_controller=budget_controller, _skip_patch_generation=_skip_patch_generation,
+        _edit_readiness=_edit_readiness, _slice_result=_slice_result, _investigation_context=_investigation_context,
+        _pre_patch_anchors=_pre_patch_anchors, _plan_result=_plan_result, _strategy_result=_strategy_result,
+        _skip_patch_generation_reason=_skip_patch_generation_reason,
+        _patch_gen_context_plan=_patch_gen_context_plan,
+    )
+    patch = _s4["patch"]
+    _patch_generation_status = _s4["_patch_generation_status"]
+    _patch_validation_skip_reason = _s4["_patch_validation_skip_reason"]
+    _final_repair_meta = _s4["_final_repair_meta"]
+    _relocation_telemetry = _s4["_relocation_telemetry"]
+    _patch_target_conformance = _s4["_patch_target_conformance"]
+    _regenerated_patch_target_conformance = _s4["_regenerated_patch_target_conformance"]
+    _post_patch_recovery = _s4["_post_patch_recovery"]
+    _slice_result = _s4["_slice_result"]
+    hygiene_findings = _s4["hygiene_findings"]
+    applicability_result = _s4["applicability_result"]
+    original_patch = _s4["original_patch"]
+    retry_patch = _s4["retry_patch"]
+    retry_attempted = _s4["retry_attempted"]
+    retry_succeeded = _s4["retry_succeeded"]
+    retry_failed_file = _s4["retry_failed_file"]
+    retry_error_before = _s4["retry_error_before"]
+    _post_patch_observations = _s4["_post_patch_observations"]
+    _post_patch_coverage = _s4["_post_patch_coverage"]
+    _post_patch_ctx = _s4["_post_patch_ctx"]
+    _investigated_patch = _s4["_investigated_patch"]
+    # Trusted only for the exact patch the patched workspace was built from.
+    _challenger_post_patch_definitions = (
+        list(_s4.get("_post_patch_definitions") or [])
+        if _post_patch_ctx.strip() and patch == _investigated_patch else []
+    )
+
+    # Post-Patch Recovery evidence parity: when a regenerated patch was
+    # accepted (_regen_ok), `_run_patch_generation_and_investigation`
+    # already built `_recovery_context` -- the enriched context (real
+    # source Recovery re-verified) actually used to produce that accepted
+    # regeneration -- and it is already present in `_s4` via that
+    # function's own `return locals()`. Neither local exists in `_s4` on
+    # any path where recovery never triggered or was not accepted, so
+    # `.get(...)` defaults both to "recovery had no effect here",
+    # preserving the exact prior `code_context`-only behavior in every
+    # other case. No new acquisition, no new budget: this only reuses a
+    # value already computed once, upstream.
+    _regen_ok = _s4.get("_regen_ok", False)
+    _recovery_context = _s4.get("_recovery_context") if _regen_ok else None
+    _challenger_base_context = _recovery_context if _recovery_context else code_context
+    # Citation-authority boundary (D7): the repository-derived parts the
+    # Challenger may cite as evidence -- by provenance (section label at
+    # assembly), never by rendered heading. Filtered per call against the
+    # context actually shown (see _challenger_provenance_context).
+    _challenger_provenance_parts = tuple(
+        text for label, text in _patch_gen_sections if label in _CHALLENGER_PROVENANCE_SECTION_LABELS
+    ) + (_s4.get("_recovered_rendered") or "", _post_patch_ctx)
+
+    # Batch B2: finish S4's INITIAL execution -- `patch` and the full
+    # investigation triple are settled at this exact point (before the
+    # Challenger call below, and well before the repair loop can replace
+    # `patch` further down -- see this stage's start() comment on why the
+    # repair-loop regeneration is deliberately NOT a second S4 execution
+    # yet). `canonical_contract_scope: "full"` records, honestly, that THIS
+    # execution ran every internal mechanic the canonical contract
+    # includes (contract retry, hunk repair, conformance/recovery,
+    # applicability retry, post-patch investigation) -- distinguishing it
+    # from the narrower repair-loop regeneration path, which does not, and
+    # is not recorded as an execution of this canonical stage in this batch.
+    _s4_rec = None
+    if execution_recorder is not None:
+        _s4_outcome = "no_candidate_patch" if _patch_validation_skip_reason is not None or not (patch and patch.strip()) else "settled"
+        _s4_rec = execution_recorder.finish(
+            _s4_handle,
+            outcome=_s4_outcome,
+            artifact={
+                "patch": patch,
+                "original_patch": original_patch,
+                "retry_patch": retry_patch,
+                "retry_attempted": retry_attempted,
+                "retry_succeeded": retry_succeeded,
+                "retry_failed_file": retry_failed_file,
+                "retry_error_before": retry_error_before,
+                "hygiene_findings": to_jsonable(hygiene_findings),
+                "applicability_result": to_jsonable(applicability_result),
+                "final_repair_meta": to_jsonable(_final_repair_meta),
+                "patch_target_conformance": to_jsonable(_patch_target_conformance),
+                "post_patch_recovery": to_jsonable(_post_patch_recovery),
+                "post_patch_observations": to_jsonable(_post_patch_observations),
+                "post_patch_coverage": to_jsonable(_post_patch_coverage),
+                "investigated_patch": _investigated_patch,
+                # Batch B7: minimal additive fields -- the exact context
+                # string this execution used, and the Challenger-ready
+                # variant (code_context + post-patch-investigation text),
+                # so S5's replay can consume S4's own artifact directly
+                # instead of needing to reconstruct S1-S3's context itself.
+                # Zero behavior change: purely additive artifact content.
+                "code_context": code_context,
+                "challenger_context": _challenger_base_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else ""),
+                # D7: repository-derived citation-authority parts, so S5/S6
+                # replay validates Challenger citations against the same
+                # boundary as production. Purely additive.
+                "challenger_provenance_parts": list(_challenger_provenance_parts),
+                # Trusted complete post-change functions (see challenge_patch's
+                # `post_patch_definitions`), so replay passes the same channel.
+                "challenger_post_patch_definitions": _challenger_post_patch_definitions,
+                "vulnerability_text": vulnerability_text,
+            },
+            extra={"canonical_contract_scope": "full"},
+        )
+
+    challenger_context = _challenger_base_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else "")
+
+    # No-candidate-patch early stop: once Patch Generation has definitively
+    # ended without a valid candidate, every remaining patch-dependent
+    # review stage (Challenger, the Challenger-driven repair loop, Finding
+    # Calibration, the Patch Reviewer, and Confidence Scorer below) must
+    # not run against an empty diff -- there is nothing to challenge,
+    # calibrate, review, or score, and doing so previously produced
+    # internally contradictory output (e.g. "Still vulnerable: No" /
+    # "Adversarial review confirms fix approach" with no patch at all).
+    # `challenger = {}` alone is sufficient to also correctly skip the
+    # repair loop and Finding Calibration below WITHOUT any change to
+    # either's own decision logic: _classify_challenger({}) yields
+    # confirmed_defect_count == 0 and empty classified-finding lists, and
+    # both the repair loop's trigger and the calibration-input filter
+    # already key off exactly those derived values.
+    #
+    # Batch B2: begin recording S5's INITIAL execution only (challenger).
+    # consumed=[S4] -- the ONLY real dependency (stage_registry.
+    # STAGE_DEPENDENCIES[CHALLENGER]). The repair loop's own re-challenge
+    # call further below is NOT recorded as a second S5 execution in this
+    # batch (see this stage's start() comment on S4 for why).
+    _s5_handle = None
+    if execution_recorder is not None:
+        _s5_handle = execution_recorder.start(
+            _S_CHALLENGER, consumed=[_s4_rec] if _s4_rec is not None else [],
+        )
+
+    progress.stage(4, 5, "Validate")
+    if patch and patch.strip():
+        challenger = challenge_patch(
+            vulnerability_text, patch, llm, code_context=challenger_context,
+            provenance_context=_challenger_provenance_context(_challenger_provenance_parts, challenger_context),
+            post_patch_definitions=_challenger_post_patch_definitions,
+        )
+        # Release polish: completing the adversarial review is not passing
+        # it. Reads only flags/consequences challenge_patch already set.
+        _review_counts = (
+            _structured_concern_counts(challenger) if _is_structured_challenger(challenger) else None
+        )
+        if _review_counts and (_review_counts["BLOCKING"] or _review_counts["UNRESOLVED"]):
+            progress.warning("Adversarial review completed — concerns remain")
+        elif (challenger or {}).get("still_vulnerable"):
+            progress.warning("Adversarial review completed — fix not verified")
+        else:
+            progress.success("Adversarial review completed")
+    else:
+        progress.skipped("Challenger skipped", reason="no candidate patch was produced")
+        challenger = {}
+
+    # Batch B2: finish S5. Persist the raw Challenger output plus the
+    # deterministic classified result (_classify_challenger) -- the
+    # cleanest canonical Stage-5 output, matching what a future repair-loop
+    # migration's own S5#2 artifact would also carry.
+    _s5_rec = None
+    if execution_recorder is not None:
+        _s5_outcome = "settled" if patch and patch.strip() else "skipped_no_candidate_patch"
+        _s5_rec = execution_recorder.finish(
+            _s5_handle,
+            outcome=_s5_outcome,
+            artifact={
+                "challenger": to_jsonable(challenger),
+                "classified_challenger": to_jsonable(_classify_challenger(challenger)),
+            },
+        )
+
+    # Batch B3: begin recording S6's execution (patch_repair_and_calibration).
+    # consumed=[S4, S5] (stage_registry.STAGE_DEPENDENCIES[PATCH_REPAIR_AND_
+    # CALIBRATION]) -- covers classification, calibration v1, the repair
+    # loop, and the (now-adjacent, see below) final-calibration fallback --
+    # through where `finding_calibration` is FULLY, finally settled, before
+    # Evidence Sufficiency Gate/Existing Test Comparison/Stage 7 begin.
+    # Repair-triggered regeneration/re-challenge remain INTERNAL to this one
+    # S6 execution in this batch -- NOT recorded as canonical S4#2/S5#2 (the
+    # repair-regeneration code path is proven NOT equivalent to Stage 4's
+    # full canonical contract: no contract retry, no conformance/recovery,
+    # no applicability-aware retry, no post-patch investigation -- forcing
+    # symmetry now would misrepresent two different contracts as one).
+    _s6_handle = None
+    if execution_recorder is not None:
+        _s6_handle = execution_recorder.start(
+            _S_PATCH_REPAIR_AND_CALIBRATION,
+            consumed=[r for r in (_s4_rec, _s5_rec) if r is not None],
+        )
+
+    # Phase C: Challenger-driven repair loop.
+    #
+    # Flow: Patch v1 -> Challenger v1 -> raw classification -> Finding
+    # Calibration v1 -> deterministic repair gate (should_auto_repair) ->
+    # optional Repair v2 -> deterministic applicability/hygiene checks ->
+    # Challenger v2 -> Finding Calibration v2 -> deterministic accept/reject
+    # (accept_repair) -> continue.
+    #
+    # Calibration is deliberately run here, early, rather than only after
+    # this block (as before) -- but ONLY when there is at least one raw
+    # confirmed_defect finding to gate on. When there are none
+    # (_orig_defect_count == 0, the common case), this block does nothing
+    # and calibration runs exactly once, later, immediately after this
+    # block (see the "Finding calibration" fallback right below -- moved
+    # here, adjacent, in Batch B3, so ALL of Stage 6's owned computation is
+    # textually contiguous and settles before the S6 execution finishes;
+    # previously this same fallback ran much further down, after Existing
+    # Test Comparison) -- no extra LLM call is added for the all-clear path.
+    _s6 = _run_patch_repair_and_calibration(
+        vulnerability_text=vulnerability_text, llm=llm, repo_root=repo_root, code_context=code_context,
+        challenger_context=challenger_context, patch=patch, challenger=challenger,
+        applicability_result=applicability_result, hygiene_findings=hygiene_findings,
+        _final_repair_meta=_final_repair_meta, _post_patch_observations=_post_patch_observations,
+        _investigated_patch=_investigated_patch,
+        _patch_gen_context_plan=_patch_gen_context_plan,
+        _challenger_provenance_parts=_challenger_provenance_parts,
+        _investigation_context=_investigation_context,
+        _planner_evidence_included_labels=(
+            _planner_evidence_result.excerpt_plan.included_labels if _planner_evidence_result is not None else None
+        ),
+    )
+    patch = _s6["patch"]
+    challenger = _s6["challenger"]
+    applicability_result = _s6["applicability_result"]
+    hygiene_findings = _s6["hygiene_findings"]
+    _final_repair_meta = _s6["_final_repair_meta"]
+    finding_calibration = _s6["finding_calibration"]
+    _repair_classified = _s6["_repair_classified"]
+    _orig_defect_count = _s6["_orig_defect_count"]
+    _orig_repair_eligible_count = _s6["_orig_repair_eligible_count"]
+    repair_attempted = _s6["repair_attempted"]
+    repair_succeeded = _s6["repair_succeeded"]
+    repair_patch_content = _s6["repair_patch_content"]
+    repair_challenger_result = _s6["repair_challenger_result"]
+    repair_defect_count = _s6["repair_defect_count"]
+    repair_eligible_defect_count = _s6["repair_eligible_defect_count"]
+    _r_behavioral_defect_count = _s6["_r_behavioral_defect_count"]
+    repair_rechallenged = _s6["repair_rechallenged"]
+    _r_hygiene = _s6["_r_hygiene"]
+    _r_app = _s6["_r_app"]
+    _r_applicable = _s6["_r_applicable"]
+    _post_patch_evidence_current = _s6["_post_patch_evidence_current"]
+    _finding_calibration_source = _s6["_finding_calibration_source"]
+    # Additive (Fix B follow-up: bounded post-Finding-Calibration evidence
+    # acquisition) -- each is only ever bound inside _run_patch_repair_and_
+    # calibration's own control flow that actually reached it (e.g.
+    # _calibration_v2_acquisition never exists at all on a run where repair
+    # was never authorized), so .get(...) rather than a bare subscript.
+    _calibration_v1_acquisition = _s6.get("_calibration_v1_acquisition")
+    _calibration_v2_acquisition = _s6.get("_calibration_v2_acquisition")
+    _calibration_fallback_acquisition = _s6.get("_calibration_fallback_acquisition")
+
+    # Batch B3: finish S6. `consumed` stays strictly {S4#1, S5#1} -- the
+    # exact canonical candidate this execution evaluated -- regardless of
+    # whether an internal repair attempt fired; the repair-triggered
+    # regeneration/re-challenge have NO canonical execution identity yet
+    # (see this stage's start() comment), so their result is represented
+    # ONLY inside this artifact's own `repair_regeneration`/
+    # `repair_rechallenge` fields, never smuggled into `consumed`. Likewise
+    # `authoritative_candidate` distinguishes the ORIGINAL canonical
+    # candidate (a real {run, execution_id} pointer to S4#1/S5#1) from an
+    # accepted INTERNAL repair candidate (no execution identity exists for
+    # it -- represented by its own settled content instead, never a vague
+    # display string).
+    _s6_rec = None
+    if execution_recorder is not None:
+        if not (patch and patch.strip()) and not repair_attempted:
+            _s6_outcome = "skipped_no_candidate_patch"
+        else:
+            _s6_outcome = "settled"
+        if not repair_attempted:
+            # Uses the ELIGIBLE count (confirmed_defect + behavioral_defect),
+            # not the confirmed-only _orig_defect_count -- a run whose ONLY
+            # finding is an un-Observed behavioral_defect must report
+            # "gate_declined" (something eligible existed but wasn't
+            # authorized), never "no_defects" (nothing eligible existed at
+            # all). See _orig_repair_eligible_count's own comment.
+            _repair_outcome = "not_triggered_no_defects" if _orig_repair_eligible_count == 0 else "not_triggered_gate_declined"
+        elif _r_applicable is None:
+            _repair_outcome = "attempted_failed"  # never even completed applicability check
+        elif _r_applicable is False:
+            _repair_outcome = "attempted_inapplicable"
+        elif repair_succeeded:
+            _repair_outcome = "attempted_applicable_accepted"
+        elif repair_rechallenged:
+            _repair_outcome = "attempted_applicable_rejected"
+        else:
+            _repair_outcome = "attempted_failed"  # applicable, but re-challenge/calibration itself raised
+        # `authoritative_candidate` names ONLY what was actually selected --
+        # it must never repeat S4#1/S5#1 in a way that implies they
+        # identify/produced the repaired candidate (they didn't; they are
+        # this execution's canonical CONSUMED inputs, already recorded
+        # exactly once, correctly, in StageExecution.consumed above). No
+        # execution identity exists for an internal repair candidate --
+        # fabricating one here would misrepresent it as canonical.
+        _authoritative_candidate = {
+            "source": "internal_repair" if repair_succeeded else "original",
+            "patch": patch,
+            "applicability_result": to_jsonable(applicability_result),
+            "hygiene_findings": to_jsonable(hygiene_findings),
+        }
+        _s6_rec = execution_recorder.finish(
+            _s6_handle,
+            outcome=_s6_outcome,
+            artifact={
+                "original_candidate_evaluated": {
+                    "patch": original_patch,
+                    "challenger": to_jsonable(_repair_classified),
+                },
+                "repair_attempted": repair_attempted,
+                "repair_regeneration": (
+                    {
+                        "patch": repair_patch_content,
+                        "hygiene_findings": to_jsonable(_r_hygiene) if repair_attempted else None,
+                        "applicability_result": to_jsonable(_r_app) if repair_attempted else None,
+                    } if repair_attempted else None
+                ),
+                "repair_rechallenge": (
+                    {
+                        "challenger": to_jsonable(repair_challenger_result),
+                        # confirmed_defect-ONLY, matching this key's own
+                        # name exactly -- see repair_defect_count's own
+                        # comment. behavioral_defect_count is a SEPARATE,
+                        # additive key (never merged into this one) so an
+                        # old artifact/reader that only knows about
+                        # "confirmed_defect_count" still gets the correct,
+                        # unwidened value; a reader that wants the
+                        # repair-eligible total combines both explicitly
+                        # (see replay_engine.py's own reconstruction).
+                        "confirmed_defect_count": repair_defect_count,
+                        "behavioral_defect_count": _r_behavioral_defect_count,
+                    } if repair_rechallenged else None
+                ),
+                "repair_outcome": _repair_outcome,
+                "finding_calibration": to_jsonable(finding_calibration),
+                "finding_calibration_source": _finding_calibration_source,
+                # Additive: the bounded post-Finding-Calibration evidence-
+                # acquisition loop's own provenance, for each calibration
+                # call site that actually ran -- lets a trace answer "what
+                # proof was requested, was it found, was it actually shown
+                # to a rerun, and what did that rerun conclude" without
+                # re-deriving any of it from prose. `finding_calibration_
+                # source` above already names which of these (if any) is
+                # authoritative for the `finding_calibration` key alongside
+                # it -- this is additional detail, never a replacement.
+                "finding_calibration_evidence_acquisition": {
+                    "v1": to_jsonable(_calibration_v1_acquisition),
+                    "v2": to_jsonable(_calibration_v2_acquisition),
+                    "fallback": to_jsonable(_calibration_fallback_acquisition),
+                },
+                "authoritative_candidate": _authoritative_candidate,
+                # Batch B7: minimal additive field -- relays vulnerability_text
+                # forward so S7/S8's replay can consume it from S6's own
+                # artifact without declaring a non-canonical dependency on S1.
+                "vulnerability_text": vulnerability_text,
+                # Batch B8: minimal additive field -- the FINAL, RAW challenger
+                # dict this execution settled on (repair_challenger_result when
+                # repair_succeeded, otherwise the untouched original S5
+                # challenger) -- same shape challenge_patch()/S5's own artifact
+                # produce. `authoritative_candidate` deliberately omits
+                # challenger identity (see the comment above it), and
+                # `original_candidate_evaluated.challenger` is the CLASSIFIED
+                # (not raw) shape -- neither is the value S9 (impact_and_
+                # behavior_analysis) actually needs. Relayed here so S9's
+                # replay can consume it from S6's own artifact without
+                # declaring a non-canonical dependency on S5.
+                "challenger": to_jsonable(challenger),
+            },
+        )
+
+    # Evidence Sufficiency Gate (Phase 1) -- a deterministic Trust Signal,
+    # computed here because everything above (the retry and challenger-repair
+    # loops) has now settled and `_final_repair_meta` reflects whichever
+    # repair pass actually produced the FINAL `patch`. Derived entirely from
+    # data Candidate 1 already computes (RepairResult.relocations) -- no new
+    # git calls, no new LLM calls. Deliberately observability-only: this
+    # signal is exposed in the Trust Report and in relocation telemetry, and
+    # made available in the Trust Signals dict, but is NOT read by
+    # _build_recommendation_v1 -- current Recommendation Policy behavior is
+    # unchanged by this signal's presence. See source_verification.py.
+    _source_verification_signal = None
+    try:
+        from .source_verification import classify_source_verification
+        _source_verification_signal = classify_source_verification(
+            _final_repair_meta.relocations if _final_repair_meta is not None else []
+        )
+    except Exception:
+        pass
+
+    # (Batch B3: `_post_patch_evidence_current` now computed earlier,
+    # immediately after the repair loop -- see that comment -- since
+    # calibrate_findings()'s own use of it moved there too. Still used
+    # below, unchanged, by score_confidence().)
+
+    # Existing Test Comparison (opt-in) -- runs here because everything
+    # above (applicability-aware retry AND the Challenger-driven repair
+    # loop) has now settled: `patch` is the FINAL candidate, and
+    # `applicability_result` already reflects it. Must never run against a
+    # pre-repair candidate. Deliberately does not feed into Challenger,
+    # Finding Calibration, or the repair loop above -- detection only, in
+    # this slice; observability-only Trust Signal, same as source_
+    # verification above. Docker-only (see test_executors.py); never
+    # falls back to host execution when Docker is unavailable -- that
+    # degrades to NOT_VERIFIED, same as every other unsupported case.
+    _existing_test_comparison: "ExistingTestComparisonResult | None" = None
+    # Existing Test Amendment (see existing_test_amendment.py): False unless
+    # S11's own bounded amendment-and-rerun cycle below actually accepts an
+    # amended candidate. Declared here (not just inside the branch that can
+    # set it True) so the S7/S8/S9 `consumed` list construction below can
+    # read it unconditionally, including when compare_existing_tests is off.
+    _test_amendment_accepted = False
+    _s11_rec = None
+    if compare_existing_tests:
+        if not repo_root:
+            _existing_test_comparison = _existing_test_comparison_not_verified(
+                "no repository root was provided"
+            )
+        elif not (patch and patch.strip()):
+            _existing_test_comparison = _existing_test_comparison_not_verified(
+                "no candidate patch was produced"
+            )
+        elif applicability_result.get("applicable") is not True:
+            _existing_test_comparison = _existing_test_comparison_not_verified(
+                "the final candidate patch does not apply; existing-test comparison "
+                "requires an applicable patch"
+            )
+        else:
+            # Batch B5: begin recording S10 (test_analysis_and_plan).
+            # consumed=[S6] -- the exact ACTUAL dataflow: discover_test_
+            # plan()/evaluate_existing_test_comparison_with_plan() below
+            # read only `repo_root`/`patch` (S6-settled), never `impact`/
+            # `behavior` (S9). NOTE: stage_registry.STAGE_DEPENDENCIES[
+            # TEST_ANALYSIS_AND_PLAN] also declares IMPACT_AND_BEHAVIOR_
+            # ANALYSIS (S9) as a dependency -- but S9 does not even execute
+            # until AFTER this block in current code order, so no S9
+            # execution exists yet to truthfully reference here. This is a
+            # genuine, pre-existing mismatch between the registry's
+            # declared graph and actual production dataflow/ordering, not
+            # invented by this batch -- consumed stays strictly truthful
+            # (S6 only) rather than fabricating a forward reference.
+            _s10_handle = None
+            if execution_recorder is not None:
+                _s10_handle = execution_recorder.start(
+                    _S_TEST_ANALYSIS_AND_PLAN, consumed=[_s6_rec] if _s6_rec is not None else [],
+                )
+            try:
+                _test_plan, _discovery_early_result, _executor_for_comparison = discover_test_plan_for_comparison(
+                    Path(repo_root), patch, llm,
+                )
+            except Exception as exc:
+                _test_plan = None
+                _executor_for_comparison = None
+                _discovery_early_result = _existing_test_comparison_execution_error(
+                    f"comparison failed unexpectedly: {type(exc).__name__}: {exc}"
+                )
+
+            # Batch B5: finish S10. Mirrors the transitional Stage-10
+            # replay's own artifact contract exactly for the accepted case
+            # (the real TestExecutionPlan fields, via the same "accepted"/
+            # "rejected" outcome vocabulary) -- see this stage's own
+            # comment below on the one remaining, honestly-reported
+            # mismatch (rejected-case reason specificity).
+            _s10_rec = None
+            if execution_recorder is not None:
+                if _test_plan is not None:
+                    _s10_rec = execution_recorder.finish(
+                        _s10_handle, outcome="accepted", artifact=to_jsonable(_test_plan),
+                    )
+                else:
+                    _s10_rec = execution_recorder.finish(
+                        _s10_handle, outcome="rejected",
+                        artifact={"reason": _discovery_early_result.reason if _discovery_early_result else None},
+                    )
+
+            # Batch B5: begin recording S11 (existing_test_comparison).
+            # consumed=[S6, S10] (stage_registry.STAGE_DEPENDENCIES[
+            # EXISTING_TEST_COMPARISON]) -- matches actual dataflow exactly:
+            # evaluate_existing_test_comparison_with_plan() reads
+            # `repo_root`/`patch` (S6) and `plan` (S10). Also consumed=[S2]
+            # now (stage_registry.STAGE_DEPENDENCIES[EXISTING_TEST_
+            # COMPARISON]) -- the Existing Test Amendment step below reads
+            # S2's own `security_invariant` field.
+            _s11_handle = None
+            _s11_rec = None
+            if execution_recorder is not None:
+                _s11_handle = execution_recorder.start(
+                    _S_EXISTING_TEST_COMPARISON,
+                    consumed=[r for r in (_s6_rec, _s10_rec, _s2_rec) if r is not None],
+                )
+
+            if _discovery_early_result is not None:
+                # No plan -- S11 truthfully never attempts comparison
+                # (matches the ORIGINAL fused function's exact behavior:
+                # discovery failing short-circuits everything below it).
+                _existing_test_comparison = _discovery_early_result
+                progress.info(f"Existing Test Comparison: {_existing_test_comparison.status}")
+                if execution_recorder is not None:
+                    _s11_rec = execution_recorder.finish(
+                        _s11_handle, outcome="skipped_no_plan",
+                        artifact=to_jsonable(_existing_test_comparison),
+                    )
+            else:
+                try:
+                    # Existing Test Amendment (bounded feedback mechanism):
+                    # evaluate_existing_test_comparison_with_plan() itself
+                    # is called, unchanged, by this shared orchestrator --
+                    # see existing_test_amendment.py's module docstring.
+                    # `security_invariant` is Final Strategy's (S2) own
+                    # already-computed field; passing it here adds no new
+                    # LLM call by itself -- amendment's own bounded call
+                    # only fires when its own gate (NEW_FAILURES_DETECTED
+                    # with deterministic identity, a non-empty invariant,
+                    # and at least one groundable test file) is met.
+                    _amendment_outcome = evaluate_existing_test_comparison_with_amendment(
+                        Path(repo_root), patch, _test_plan,
+                        security_invariant=(_strategy_result.security_invariant if _strategy_result else None),
+                        executor=_executor_for_comparison, llm=llm,
+                    )
+                    _existing_test_comparison = _amendment_outcome.result
+                    _test_amendment_accepted = _amendment_outcome.accepted
+                    if _test_amendment_accepted:
+                        # Authoritative-candidate handoff: `patch` is
+                        # reassigned HERE, before the constraint/remediation
+                        # signals and S7/S8/S9 blocks below -- in ACTUAL
+                        # production code order (see this block's own
+                        # comment above) none of those have run yet, so
+                        # they see the amended patch with no further
+                        # plumbing. See this stage's `consumed` list below
+                        # and stage_registry.STAGE_DEPENDENCIES[PATCH_REVIEW/
+                        # CONFIDENCE_SCORING] for the provenance edit this
+                        # new data flow required.
+                        patch = _amendment_outcome.patch
+                        progress.recovery("Existing test amendment accepted")
+                    elif _amendment_outcome.amendment.status != "not_attempted":
+                        progress.verbose(f"[pipeline] Existing Test Amendment: {_amendment_outcome.amendment.status} "
+                            f"({_amendment_outcome.amendment.reason}) -- original patch kept.")
+                    progress.info(f"Existing Test Comparison: {_existing_test_comparison.status}")
+                    if execution_recorder is not None:
+                        _s11_artifact = to_jsonable(_existing_test_comparison)
+                        # Additive-only fields -- ExistingTestComparisonResult's
+                        # own schema/semantics are untouched; this is
+                        # observability for the amendment mechanism, recorded
+                        # inside S11's OWN artifact (no new canonical stage),
+                        # mirroring S6's authoritative_candidate/repair_* shape.
+                        _s11_artifact["test_amendment"] = {
+                            "status": _amendment_outcome.amendment.status,
+                            "reason": _amendment_outcome.amendment.reason,
+                            "accepted": _test_amendment_accepted,
+                            "grounded_files": list(_amendment_outcome.amendment.grounded_files),
+                            "ungrounded_ids": list(_amendment_outcome.amendment.ungrounded_ids),
+                        }
+                        if _amendment_outcome.pre_amendment_result is not None:
+                            _s11_artifact["pre_amendment_result"] = to_jsonable(_amendment_outcome.pre_amendment_result)
+                        _s11_artifact["authoritative_candidate"] = {
+                            "source": "existing_test_amendment" if _test_amendment_accepted else "original",
+                            "patch": patch,
+                        }
+                        _s11_rec = execution_recorder.finish(_s11_handle, outcome="settled", artifact=_s11_artifact)
+                except Exception as exc:
+                    progress.warning("Existing Test Comparison failed unexpectedly")
+                    progress.verbose(f"[pipeline] Existing Test Comparison failed unexpectedly: {exc}")
+                    _existing_test_comparison = _existing_test_comparison_execution_error(
+                        f"comparison failed unexpectedly: {type(exc).__name__}: {exc}"
+                    )
+                    if execution_recorder is not None:
+                        _s11_rec = execution_recorder.finish(
+                            _s11_handle, outcome="error",
+                            artifact=to_jsonable(_existing_test_comparison),
+                        )
+
+    # Deterministic patch signals — run on final patch after any repair loop changes
+    _c_signals: list[dict] | None = None
+    _r_signals: list[dict] | None = None
+    if _STATIC_SIGNALS_AVAILABLE and repo_root:
+        try:
+            _c_signals = _run_constraint_signals(patch, _Path(repo_root))
+        except Exception as _exc:
+            progress.verbose(f"[pipeline] Constraint signals failed (non-fatal): {_exc}")
+        try:
+            _r_signals = _run_remediation_signals(patch, _Path(repo_root))
+        except Exception as _exc:
+            progress.verbose(f"[pipeline] Remediation signals failed (non-fatal): {_exc}")
+
+    # (Batch B3: the final-calibration fallback that used to live here now
+    # runs immediately after the repair loop, above -- see that comment --
+    # so it's part of Stage 6's contiguous, fully-settled output. `finding_
+    # calibration` is already its final value by the time execution reaches
+    # here.)
+
+    # Batch B4: begin recording S7 (patch_review). consumed=[S6] (stage_
+    # registry.STAGE_DEPENDENCIES[PATCH_REVIEW]) -- PLUS [S11] whenever an
+    # Existing Test Amendment was actually accepted above: `patch` is then
+    # S11's own settled authoritative candidate, not S6's, and `consumed`
+    # must say so truthfully (see existing_test_amendment.py; this is the
+    # one provenance edit this new data flow required -- see stage_
+    # registry.STAGE_DEPENDENCIES[PATCH_REVIEW]'s own updated comment).
+    _s7_handle = None
+    if execution_recorder is not None:
+        _s7_consumed = [_s6_rec] if _s6_rec is not None else []
+        if _test_amendment_accepted and _s11_rec is not None:
+            _s7_consumed.append(_s11_rec)
+        _s7_handle = execution_recorder.start(_S_PATCH_REVIEW, consumed=_s7_consumed)
+    _s8_handle = None  # opened right after S7 finishes, in each branch below
+
+    # No-candidate-patch early stop (continued -- see the Challenger gate
+    # above): the Patch Reviewer and Confidence Scorer are equally
+    # patch-dependent and must not fabricate a review/score for a diff
+    # that does not exist.
+    _s7_rec = None
+    if patch and patch.strip():
+        review = review_patch(vulnerability_text, patch, llm, finding_calibration=finding_calibration)
+        progress.success("Review completed")
+        if execution_recorder is not None:
+            _s7_rec = execution_recorder.finish(_s7_handle, outcome="settled", artifact={"review": review})
+            # Batch B4: begin recording S8 (confidence_scoring), right after
+            # S7's own LLM call settles and before score_confidence()'s --
+            # consumed=[S6, S7] (stage_registry.STAGE_DEPENDENCIES[
+            # CONFIDENCE_SCORING]). Must start here, not earlier, so
+            # review_patch()'s "patch_review"-tagged call is never inside
+            # S8's own cursor window (STAGE_OWNED_LLM_TAGS would reject it).
+            _s8_consumed = [r for r in (_s6_rec, _s7_rec) if r is not None]
+            if _test_amendment_accepted and _s11_rec is not None:
+                _s8_consumed.append(_s11_rec)
+            _s8_handle = execution_recorder.start(_S_CONFIDENCE_SCORING, consumed=_s8_consumed)
+
+        # Presentation note: this is confidence_scorer (canonical S8), NOT
+        # Trust Signals (S12, computed later in _build_report). Its score
+        # is deterministic-adjusted and then discarded -- never read by
+        # Trust Signals/the Recommendation Policy, never rendered in the
+        # report (see auto-patcher-architecture.md's S8 entry) -- so it
+        # never earns a default-visible line implying it's authoritative.
+        progress.verbose("[pipeline] Step 4/4 – Evaluating confidence score (informational only)…")
+        score_text = score_confidence(
+            vulnerability_text, patch, review, llm,
+            code_context=(challenger_context if _post_patch_evidence_current else code_context),
+            finding_calibration=finding_calibration,
+        )
+    else:
+        progress.skipped("Review skipped", reason="no candidate patch was produced")
+        progress.verbose(
+            "[pipeline] Step 4/4 – Evaluating Trust Signals skipped (no candidate patch was produced)."
+        )
+        review = ""
+        score_text = ""
+        if execution_recorder is not None:
+            _s7_rec = execution_recorder.finish(_s7_handle, outcome="skipped_no_candidate_patch", artifact={"review": review})
+            _s8_consumed = [r for r in (_s6_rec, _s7_rec) if r is not None]
+            if _test_amendment_accepted and _s11_rec is not None:
+                _s8_consumed.append(_s11_rec)
+            _s8_handle = execution_recorder.start(_S_CONFIDENCE_SCORING, consumed=_s8_consumed)
+
+    _s8_adj = _adjust_confidence_score_for_challenger(score_text, challenger)
+    orig_score = _s8_adj["orig_score"]
+    adjusted_score = _s8_adj["adjusted_score"]
+    score_text = _s8_adj["score_text"]
+
+    # Batch B4: finish S8. The deterministic score-adjustment above is part
+    # of Confidence Scoring's own settled output (it post-processes only
+    # THIS call's own score_text + challenger, already an S6-consumed
+    # value) -- no new LLM call, so it stays inside this same execution.
+    _s8_rec = None
+    if execution_recorder is not None:
+        _s8_outcome = "settled" if (patch and patch.strip()) else "skipped_no_candidate_patch"
+        _s8_rec = execution_recorder.finish(
+            _s8_handle, outcome=_s8_outcome,
+            artifact={"score_text": score_text, "orig_score": orig_score, "adjusted_score": adjusted_score},
+        )
+
+    # Batch B4: begin recording S9 (impact_and_behavior_analysis).
+    # consumed=[S6] (stage_registry.STAGE_DEPENDENCIES[
+    # IMPACT_AND_BEHAVIOR_ANALYSIS] -- NOT PATCH_REVIEW/CONFIDENCE_SCORING,
+    # matching the actual dataflow: both analyzers below read only
+    # `patch`/`challenger`, both S6-settled values). Owns zero LLM tags
+    # (STAGE_OWNED_LLM_TAGS[IMPACT_AND_BEHAVIOR_ANALYSIS] == ()) -- both
+    # analyzers are purely deterministic.
+    #
+    # PLUS [S11] here too, `consumed`-only, whenever an Existing Test
+    # Amendment was accepted above: `patch` below is then S11's settled
+    # candidate. Deliberately NOT added to stage_registry.STAGE_DEPENDENCIES
+    # [IMPACT_AND_BEHAVIOR_ANALYSIS] -- doing so would create a cycle
+    # (EXISTING_TEST_COMPARISON already transitively depends on
+    # IMPACT_AND_BEHAVIOR_ANALYSIS via TEST_ANALYSIS_AND_PLAN). `consumed`
+    # is a per-execution runtime record, already allowed to diverge from
+    # the static approved graph (see the S10/S9-ordering comment above) --
+    # recording the real dataflow here truthfully does not require
+    # resolving that separate, pre-existing, explicitly out-of-scope
+    # graph/order mismatch.
+    _s9_handle = None
+    if execution_recorder is not None:
+        _s9_consumed = [_s6_rec] if _s6_rec is not None else []
+        if _test_amendment_accepted and _s11_rec is not None:
+            _s9_consumed.append(_s11_rec)
+        _s9_handle = execution_recorder.start(_S_IMPACT_AND_BEHAVIOR_ANALYSIS, consumed=_s9_consumed)
+
+    # Run Impact Surface analysis (lightweight, deterministic).
+    # Repository-dependent: skipped entirely when no repo_root is known
+    # (F-01) instead of substituting Path.cwd(). impact_dict stays None,
+    # which _resolve_impact_level() already reads as "unavailable" and the
+    # existing trust policy (F-23/F-24) already renders as Not Verified
+    # rather than a false-positive "low risk".
+    # Batch B8: S9 body now lives in _run_impact_and_behavior_analysis
+    # (reusable executor shared with replay_engine.py) -- extracted verbatim.
+    _s9_result = _run_impact_and_behavior_analysis(patch=patch, challenger=challenger, repo_root=repo_root)
+    impact_dict = _s9_result["impact_dict"]
+    behavior = _s9_result["behavior"]
+    _detected_language = _s9_result["_detected_language"]
+
+    # Batch B4: finish S9. Always "settled" -- both analyzers are
+    # best-effort (their own try/except already degrades to None on
+    # failure, same as every other optional section in this function) and
+    # this stage's real contract is "ran its deterministic analysis,"
+    # never gated on repo_root/candidate-patch the way S7/S8 are.
+    if execution_recorder is not None:
+        execution_recorder.finish(
+            _s9_handle, outcome="settled",
+            artifact={
+                "impact": to_jsonable(impact_dict),
+                "behavior": to_jsonable(behavior),
+                "detected_language": _detected_language,
+            },
+        )
+
+    result = PipelineResult(
+        vulnerability_text=vulnerability_text,
+        patch=patch,
+        review=review,
+        score_text=score_text,
+        challenger=challenger,
+        impact=impact_dict,
+        final_score=adjusted_score,
+        orig_score=orig_score,
+        behavior=behavior,
+        repo_root=_Path(repo_root) if repo_root else None,
+        hygiene=hygiene_findings,
+        applicability=applicability_result,
+        original_patch=original_patch,
+        retry_patch=retry_patch,
+        retry_attempted=retry_attempted,
+        retry_succeeded=retry_succeeded,
+        retry_failed_file=retry_failed_file,
+        retry_error_before=retry_error_before,
+        repair_attempted=repair_attempted,
+        repair_succeeded=repair_succeeded,
+        repair_patch=repair_patch_content,
+        repair_challenger=repair_challenger_result,
+        repair_defect_count=repair_defect_count,
+        repair_rechallenged=repair_rechallenged,
+        original_challenger_defect_count=_orig_defect_count,
+        original_challenger_repair_eligible_count=_orig_repair_eligible_count,
+        repair_eligible_defect_count=repair_eligible_defect_count,
+        constraint_signals=_c_signals,
+        remediation_signals=_r_signals,
+        detected_language=_detected_language,
+        finding_calibration=finding_calibration,
+        grounding=_grounding,
+        repository_understanding=_repository_understanding,
+        post_patch_observations=_post_patch_observations,
+        post_patch_investigated_patch=_investigated_patch,
+        post_patch_coverage=_post_patch_coverage,
+        relocation_telemetry=_relocation_telemetry,
+        source_verification=_source_verification_signal,
+        existing_test_comparison=_existing_test_comparison,
+        edit_readiness=_edit_readiness,
+        edit_acquisition=_edit_acquisition,
+        guided_acquisition=_guided_acquisition,
+        patch_target_conformance=_patch_target_conformance,
+        post_patch_recovery=_post_patch_recovery,
+        security_invariant=(_strategy_result.security_invariant if _strategy_result else None),
+    )
+    return _build_report(result)

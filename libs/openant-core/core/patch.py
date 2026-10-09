@@ -1,0 +1,631 @@
+"""
+Patch-trust wrapper.
+
+Loads a Finding from pipeline_output.json, checks it is eligible for
+remediation, renders it into a vulnerability description, and runs it
+through the merged Auto Patcher engine (``utilities.autopatcher``) to
+produce a Trust Report. Mirrors core/dynamic_tester.py's shape: a thin
+wrapper around a heavier ``utilities.*`` engine.
+
+Also supports patching directly from a known CVE identifier
+(``run_patch_cve``), which shares ``run_patch``'s artifact-writing tail
+(``_run_engine_and_write_artifacts``) rather than duplicating it -- both
+entry points converge on the same ``utilities.autopatcher.pipeline.run()``
+call.
+
+The Trust Report is treated as an opaque artifact: this module never parses
+its Recommendation or Trust Signals, only the path it was written to.
+"""
+
+import os
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+from core.reporter import _coerce_to_str
+from core.verdict_taxonomy import PATCH_ELIGIBLE
+from utilities.file_io import read_json, normalize_results
+
+
+@dataclass
+class PatchStepResult:
+    """Result of `openant patch`.
+
+    input_type/input_id are additive fields distinguishing what finding_id
+    actually holds. finding_id itself is kept as-is (not renamed) for
+    backward compatibility: for a CVE-mode run it holds the CVE id, same as
+    it always has; input_type/input_id make that explicit rather than
+    leaving it implicit in a field name that predates CVE mode.
+    """
+    finding_id: str
+    vulnerability_path: str
+    trust_report_path: str
+    input_type: str = "finding"   # "finding" | "cve"
+    input_id: str | None = None   # mirrors finding_id's value, named accurately regardless of mode
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def find_finding_by_id(findings: list, finding_id: str) -> dict:
+    """Return the finding dict with the given id, or raise ValueError."""
+    for f in findings:
+        if isinstance(f, dict) and f.get("id") == finding_id:
+            return f
+    raise ValueError(f"no finding with id {finding_id!r} in pipeline_output.json")
+
+
+def effective_verdict(finding: dict) -> str:
+    """The verdict that governs eligibility: stage2_verdict if set, else stage1_verdict."""
+    return finding.get("stage2_verdict") or finding.get("stage1_verdict") or ""
+
+
+def check_eligible(finding: dict) -> None:
+    """Raise ValueError if finding's effective verdict is not patch-eligible.
+
+    Deliberately an explicit allowlist (PATCH_ELIGIBLE), not a denylist, so
+    an empty, unknown, or future verdict value fails closed.
+    """
+    verdict = effective_verdict(finding)
+    if verdict not in PATCH_ELIGIBLE:
+        raise ValueError(
+            f"finding {finding.get('id')} has verdict {verdict!r}, which is not "
+            f"eligible for remediation (eligible: {', '.join(sorted(PATCH_ELIGIBLE))})"
+        )
+
+
+def render_vulnerability_markdown(finding: dict) -> str:
+    """Render a Finding into deterministic Markdown for the patch engine's input.
+
+    suggested_fix and rejection_reason are never read here: feeding OpenAnt's
+    own suggested fix into the patch engine could bias its independently
+    generated candidate patch.
+    """
+    location = finding.get("location") or {}
+    lines = [
+        f"# {finding.get('name', '')}",
+        "",
+        "## Vulnerability description",
+        "",
+        f"- **Finding ID:** {finding.get('id', '')}",
+        f"- **CWE:** CWE-{finding.get('cwe_id', '')} ({finding.get('cwe_name', '')})",
+        f"- **Location:** {location.get('file', '')} ({location.get('function', '')})",
+        f"- **Verdict:** {effective_verdict(finding)}",
+    ]
+
+    description = finding.get("description")
+    if description:
+        lines += ["", _coerce_to_str(description)]
+
+    vulnerable_code = finding.get("vulnerable_code")
+    if vulnerable_code:
+        lines += ["", "## Vulnerable code", "", "```", _coerce_to_str(vulnerable_code), "```"]
+
+    # impact/steps_to_reproduce are documented as lists but some models emit a
+    # single string; iterating a string directly yields one bullet per
+    # character, so a lone string is normalized to a single-item list first.
+    impact = finding.get("impact") or []
+    if isinstance(impact, str):
+        impact = [impact]
+    if impact:
+        lines += ["", "## Impact", ""]
+        lines += [f"- {_coerce_to_str(item)}" for item in impact]
+
+    steps = finding.get("steps_to_reproduce") or []
+    if isinstance(steps, str):
+        steps = [steps]
+    if steps:
+        lines += ["", "## Attack scenario", ""]
+        lines += [f"{i + 1}. {_coerce_to_str(step)}" for i, step in enumerate(steps)]
+
+    return "\n".join(lines) + "\n"
+
+
+def _find_openant_root() -> Path | None:
+    """Walk up from this file to the OpenAnt repo root (contains libs/openant-core),
+    for the Run Metadata report's commit row. Returns None if not found (e.g.
+    installed as a wheel outside a git checkout) -- collect_git_info already
+    degrades to 'unknown' in that case."""
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "libs" / "openant-core").is_dir():
+            return parent
+    return None
+
+
+def _require_llm_provider() -> None:
+    """Fail fast, before any pipeline setup work, if no LLM provider can be
+    resolved.
+
+    Delegates entirely to ``utilities.autopatcher.llm_client``'s
+    authoritative resolver -- OpenAnt's canonical ``default_llm.analyze``
+    binding (falling back to the built-in ``openant-default``, exactly
+    like every other OpenAnt command), or the explicit
+    ``LLM_PROVIDER=mock`` test/research escape hatch -- rather than
+    re-implementing any part of that resolution here. This function's only
+    remaining job is to invoke that check EARLY -- before file I/O, an NVD
+    fetch, or investigation-directory creation -- for the same fail-fast
+    UX an env-only check used to provide, back when ``LLM_PROVIDER`` was
+    itself the real-provider selector. It no longer is: real-provider
+    selection now comes ONLY from OpenAnt's canonical configuration, and a
+    non-mock ``LLM_PROVIDER``/``LLM_MODEL`` value is a hard failure, not an
+    override -- see ``llm_client._resolve_active_provider``/``_resolve_model``.
+
+    Raises:
+        ConfigError: OpenAnt's config.json is malformed, or ``default_llm``
+            names a config that doesn't exist -- the identical failure
+            canonical OpenAnt commands raise for the same problem.
+        RuntimeError: a non-mock ``LLM_PROVIDER``/``LLM_MODEL`` value was
+            set, or no usable credential exists for the resolved provider.
+            Never silently degrades to mock -- see
+            ``llm_client.ensure_provider_configured`` for the exact
+            precedence and fail-closed guarantee.
+    """
+    from utilities.autopatcher.llm_client import ensure_provider_configured
+
+    ensure_provider_configured()
+
+
+class TestComparisonEnvironmentError(RuntimeError):
+    """Raised when ``--compare-existing-tests`` was explicitly requested
+    but the executor it requires cannot run (e.g. Docker not installed or
+    not reachable).
+
+    This is deliberately NOT the same thing as Existing Test Comparison's
+    own NOT_VERIFIED result (see existing_test_regression.py) -- that is
+    an observability-only signal computed AFTER a patch run has already
+    happened, and never changes Recommendation Policy. This exception
+    instead aborts the ENTIRE requested run, before any repository
+    analysis or LLM call, because the user explicitly asked for a test
+    comparison as part of this run and it structurally cannot even start.
+    There is no patch run, no report, and no Recommendation at all in
+    that case -- the requested command simply never began.
+    """
+    __test__ = False  # not a pytest test class -- name collides with pytest's Test* discovery
+
+
+def _require_test_comparison_environment(compare_existing_tests: bool) -> None:
+    """Fail fast, before ANY repository parsing, Repository Understanding,
+    remediation planning, patch generation, or Auto Patcher LLM call, if
+    ``--compare-existing-tests`` was explicitly requested and its
+    required executor cannot run.
+
+    A no-op when ``compare_existing_tests`` is False -- every existing
+    caller is completely unaffected. When True, delegates the actual
+    readiness probe entirely to
+    ``utilities.autopatcher.existing_test_regression.
+    preflight_test_comparison_environment`` (itself a thin wrapper over
+    the same executor ``.preflight()`` contract Existing Test Comparison
+    uses internally) -- this function's only job is deciding WHEN to call
+    it and how to turn a not-ready result into a hard abort of the whole
+    requested run, never re-implementing the Docker probe itself.
+
+    Raises:
+        TestComparisonEnvironmentError: the selected executor is not
+            ready (e.g. Docker CLI missing, daemon unreachable, preflight
+            timed out) -- message is a short, actionable sentence plus
+            bounded technical detail, never a raw stack trace. For every
+            status except CLI_MISSING, the message is built from
+            ``result.reason`` verbatim rather than composed alongside a
+            second, independently-worded call to action -- docker_
+            preflight's own reason text already ends with its own
+            actionable next step (e.g. "Start Docker and rerun..."), so
+            adding another one here would produce a message with that
+            phrase appearing twice.
+    """
+    if not compare_existing_tests:
+        return
+
+    from utilities.autopatcher.existing_test_regression import preflight_test_comparison_environment
+
+    result = preflight_test_comparison_environment()
+    if result.ready:
+        return
+
+    if result.status == "CLI_MISSING":
+        raise TestComparisonEnvironmentError(
+            "--compare-existing-tests requires Docker, but the `docker` command was not found. "
+            "Install/start Docker and rerun."
+        )
+    raise TestComparisonEnvironmentError(f"--compare-existing-tests requires Docker, but {result.reason}")
+
+
+def _run_engine_and_write_artifacts(
+    vulnerability_text: str,
+    repo_root: str | None,
+    output_dir: str,
+    artifact_label: str,
+    input_type: str = "finding",
+    advisory_id: str | None = None,
+    advisory_source: str | None = None,
+    budget_controller: "object | None" = None,
+    compare_existing_tests: bool = False,
+    execution_recorder: "object | None" = None,
+) -> PatchStepResult:
+    """Shared tail of run_patch()/run_patch_cve(): removes any stale trust
+    report from a previous failed run, writes {artifact_label}-vulnerability.md,
+    invokes the Auto Patcher engine (utilities.autopatcher.pipeline.run),
+    and writes {artifact_label}-trust-report.md.
+
+    This is run_patch()'s pre-existing tail, unchanged in behavior, with
+    finding_id generalized to a caller-supplied artifact_label so
+    run_patch_cve() can reuse it unmodified (naming its two artifacts after
+    the CVE id instead).
+
+    input_type/advisory_id/advisory_source are additive: run_patch() doesn't
+    pass them, so its RunMetadata/PatchStepResult output is unchanged from
+    before these parameters existed. run_patch_cve() passes
+    input_type="cve" so the written Trust Report honestly discloses its
+    provenance (see run_metadata.render_metadata_section).
+
+    budget_controller is additive too: an optional
+    utilities.autopatcher.context_budget.ContextBudgetController, threaded
+    unmodified into pipeline.run(). Fix B: this no longer selects between
+    "a small fixed budget" and "a larger, policy-approved one" -- every
+    acquisition stage is always bounded by the real per-call technical
+    capacity of the active model (see utilities.autopatcher.
+    technical_capacity). Omitted (None), this engine computes that exact
+    same technical-capacity ceiling fresh on each call instead of caching
+    it on a controller instance -- "no controller" has never meant "no
+    ceiling", and it never means "a smaller, arbitrary ceiling" either.
+
+    compare_existing_tests is additive too: threaded unmodified into
+    pipeline.run()'s compare_existing_tests parameter (default False).
+    False (every existing caller) preserves pre-existing behavior exactly
+    -- Existing Test Comparison never runs and
+    PipelineResult.existing_test_comparison stays None. Its required
+    environment is NOT checked here (see run_patch()/run_patch_cve()
+    instead, which each call _require_test_comparison_environment as the
+    first thing they do) -- checking it here too, after run_patch_cve()
+    has already fetched the CVE, would be too late for that entry point,
+    and duplicating the check in this shared tail as well as both
+    callers would mean three Docker readiness probes on some paths
+    instead of the intended two (the early whole-run gate, plus Existing
+    Test Comparison's own later defense-in-depth preflight). By the time
+    this function is reached, that gate has already passed.
+
+    execution_recorder is additive too (Batch B2): an optional
+    utilities.autopatcher.execution_recorder.ExecutionRecorder, threaded
+    unmodified into pipeline.run()'s execution_recorder parameter. Omitted
+    (None, every existing caller -- openant/cli.py's `patch` command) makes
+    every recorder call inside pipeline.run() a no-op; only
+    tools/run_traced.py constructs one.
+
+    Raises:
+        ConfigError: OpenAnt's config.json is malformed, or ``default_llm``
+            names a config that doesn't exist (see _require_llm_provider).
+        RuntimeError: no usable credential exists for the resolved
+            provider, or a non-mock ``LLM_PROVIDER``/``LLM_MODEL`` value
+            was set (see _require_llm_provider). (Also checked by
+            run_patch() itself before this is reached, preserving its
+            exact existing error-ordering relative to the
+            pipeline_output-not-found check; checked again here so
+            run_patch_cve(), which has no equivalent earlier check, still
+            gets the guarantee.)
+    """
+    _require_llm_provider()
+
+    # Run header -- printed once, here, rather than announced per-LLM-call
+    # (see llm_client.call_llm's own "announce once" fallback for callers
+    # that reach it without going through this header first). Provider/
+    # model are already authoritatively resolved by _require_llm_provider()
+    # above (utilities.autopatcher.llm_client._cached_provider/_cached_model)
+    # -- reused here, never re-resolved. Presentation only: no new
+    # provider-resolution logic, no effect on which provider/model is used.
+    from utilities.autopatcher import llm_client as _llm
+    from utilities.autopatcher import progress as _progress
+
+    _header_provider = _llm._cached_provider or "unknown"
+    if _header_provider == "mock":
+        _header_model = "mock"
+    else:
+        _header_model = _llm._cached_model.get(_header_provider, "unknown")
+    _header_provider_display = (
+        "mock" if _header_provider == "mock" else _llm.display_provider_name(_header_provider)
+    )
+    # Claimed here (return value unused) so llm_client's own first live
+    # call -- which checks the same claim -- becomes a no-op; the header
+    # below is this run's one and only announcement in production.
+    _progress.claim_model_announcement(_header_provider_display, _header_model)
+    _progress.header(
+        "OpenAnt Auto Patcher",
+        [
+            ("CVE" if input_type == "cve" else "Finding", artifact_label),
+            ("Repository", repo_root or "-"),
+            ("Model", _progress.format_provider_model(_header_provider_display, _header_model)),
+        ],
+    )
+
+    patch_dir = os.path.join(output_dir, "patch")
+    os.makedirs(patch_dir, exist_ok=True)
+
+    # Remove any trust report left behind by a previous failed run for this
+    # artifact_label *before* doing any work that can fail. The trust report
+    # is only written on success, at the very end of this function -- if a
+    # stale one from an earlier run were left in place, a failed run could
+    # look like it succeeded with a report that doesn't match the fresh
+    # vulnerability.md written below.
+    trust_report_path = os.path.join(patch_dir, f"{artifact_label}-trust-report.md")
+    if os.path.exists(trust_report_path):
+        os.remove(trust_report_path)
+
+    vulnerability_path = os.path.join(patch_dir, f"{artifact_label}-vulnerability.md")
+    # newline="": exact bytes on every platform -- blind evaluation verifies
+    # this artifact byte-for-byte against the text it was given.
+    with open(vulnerability_path, "w", encoding="utf-8", newline="") as f:
+        f.write(vulnerability_text)
+
+    from utilities.autopatcher import run_metadata as _rm
+    from utilities.autopatcher.pipeline import run as _run_pipeline
+
+    # Reset per-run LLM call metadata -- module-level state that would
+    # otherwise leak a stale stage entry from a prior run in this process.
+    _llm.clear_call_metadata()
+
+    timestamp = datetime.now(timezone.utc)
+    openant_root = _find_openant_root()
+    patcher_commit = _rm.collect_git_info(openant_root) if openant_root else "unknown"
+    repo_commit = _rm.collect_git_info(Path(repo_root)) if repo_root else "-"
+
+    # Run-scoped directory for the Repository Understanding investigation's
+    # parser artifacts (candidate_enrichment.build_investigation_context) --
+    # outside the target repo, under this run's own output directory, keyed
+    # by artifact_label so it doesn't collide with another run's artifacts.
+    # Only needed (and only created) when there's a repository to parse.
+    investigation_dir = None
+    if repo_root:
+        investigation_dir = os.path.join(patch_dir, f"{artifact_label}-investigation")
+        os.makedirs(investigation_dir, exist_ok=True)
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+
+    # Presentation only: outside verbose mode, ask the repository parser
+    # (parsers/python/parse_repository.py) to skip its own multi-line
+    # "PYTHON REPOSITORY PARSER" / "[Phase 1-4]" console report and print a
+    # one-line summary instead. An env var, not a parameter, so this stays
+    # entirely opt-in from the Auto Patcher side -- `openant parse`/
+    # `analyze` (which also call into this same parser) never set it and
+    # are completely unaffected; saved/restored exactly like run_traced.py
+    # already does for AUTOPATCHER_DEBUG, so a caller's own environment is
+    # never permanently mutated.
+    _prev_parser_quiet = os.environ.get("AUTOPATCHER_PARSER_QUIET")
+    if not _progress.is_verbose():
+        os.environ["AUTOPATCHER_PARSER_QUIET"] = "1"
+    try:
+        report_body = _run_pipeline(
+            vulnerability_text=vulnerability_text,
+            api_key=api_key,
+            repo_root=repo_root,
+            investigation_output_dir=investigation_dir,
+            budget_controller=budget_controller,
+            compare_existing_tests=compare_existing_tests,
+            execution_recorder=execution_recorder,
+        )
+    finally:
+        if _prev_parser_quiet is None:
+            os.environ.pop("AUTOPATCHER_PARSER_QUIET", None)
+        else:
+            os.environ["AUTOPATCHER_PARSER_QUIET"] = _prev_parser_quiet
+
+    # The provider is already authoritatively resolved by this point --
+    # _require_llm_provider() (above) ran the canonical resolver before any
+    # pipeline work started, and _run_pipeline() has since completed
+    # successfully, so llm_client's own session cache is the single source
+    # of truth here. Deliberately does NOT re-read LLM_PROVIDER from the
+    # environment: that variable is no longer a provider-selection
+    # mechanism (see llm_client's module docstring), and re-reading it for
+    # display could report a provider Auto Patcher never actually
+    # resolved/used. "unknown" is a defensive literal for the
+    # near-impossible case of a still-empty cache, never a fallback to a
+    # second, independent source of provider identity.
+    provider = _llm._cached_provider or "unknown"
+    model = _llm._cached_model.get(provider, "unknown") if provider != "unknown" else "unknown"
+    if provider == "mock":
+        model = "mock"
+
+    llm_mode = "MOCK" if _llm.LLMClient(api_key=api_key).is_mock else "LIVE"
+
+    call_metadata = _llm.get_call_metadata()
+    stage_stop_reasons = {stage: info.get("stop_reason") for stage, info in call_metadata.items()}
+    max_tokens_configured = next(
+        (
+            info.get("max_tokens_configured")
+            for info in call_metadata.values()
+            if info.get("max_tokens_configured") is not None
+        ),
+        None,
+    )
+
+    meta = _rm.RunMetadata(
+        timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        input_source=vulnerability_path,
+        repo_root=repo_root or "",
+        repo_commit=repo_commit,
+        llm_provider=provider,
+        llm_model=model,
+        llm_mode=llm_mode,
+        output_path=trust_report_path,
+        patcher_commit=patcher_commit,
+        max_tokens_configured=max_tokens_configured,
+        stage_stop_reasons=stage_stop_reasons,
+        input_type=input_type,
+        advisory_id=advisory_id,
+        advisory_source=advisory_source,
+    )
+    full_report = report_body + "\n---\n\n" + _rm.render_metadata_section(meta)
+
+    with open(trust_report_path, "w", encoding="utf-8") as f:
+        f.write(full_report)
+
+    return PatchStepResult(
+        finding_id=artifact_label,
+        vulnerability_path=vulnerability_path,
+        trust_report_path=trust_report_path,
+        input_type=input_type,
+        input_id=artifact_label,
+    )
+
+
+def run_patch(
+    pipeline_output_path: str,
+    finding_id: str,
+    output_dir: str,
+    repo_root: str | None = None,
+    budget_controller: "object | None" = None,
+    compare_existing_tests: bool = False,
+    execution_recorder: "object | None" = None,
+) -> PatchStepResult:
+    """Generate and evaluate a candidate remediation for one finding.
+
+    Requires an LLM provider to be resolvable before any pipeline work
+    starts -- OpenAnt's canonical ``default_llm.analyze`` config binding,
+    falling back to the built-in ``openant-default`` exactly like every
+    other OpenAnt command (see
+    utilities.autopatcher.llm_client.ensure_provider_configured for the
+    exact precedence). A run with an unresolvable/invalid config must
+    never silently produce a mock Trust Report that looks real -- it fails
+    clearly instead. LLM_PROVIDER=mock remains allowed as an explicit
+    test/research escape hatch; it is the ONLY value LLM_PROVIDER is still
+    read for -- any other non-empty value is itself a hard failure now,
+    never a real-provider selector.
+
+    Writes two artifacts under ``{output_dir}/patch/``:
+        {finding_id}-vulnerability.md  -- the rendered input (for transparency)
+        {finding_id}-trust-report.md   -- the engine's opaque Trust Report
+
+    Raises:
+        TestComparisonEnvironmentError: compare_existing_tests is True
+            and its required executor cannot run (see
+            _require_test_comparison_environment) -- checked FIRST,
+            before _require_llm_provider, before pipeline_output_path is
+            even read, so an explicitly-requested prerequisite that
+            can't be satisfied aborts before any file I/O, LLM-provider
+            resolution, or repository work.
+        RuntimeError: if no LLM provider can be resolved (see
+            _require_llm_provider).
+        FileNotFoundError: if pipeline_output_path doesn't exist.
+        ValueError: if finding_id is unknown or ineligible, or if repo_root
+            is given but is not an existing directory (checked first, as in
+            run_patch_cve).
+    """
+    if repo_root and not os.path.isdir(repo_root):
+        raise ValueError(f"--repo-root does not exist: {repo_root!r}")
+    _require_test_comparison_environment(compare_existing_tests)
+    _require_llm_provider()
+
+    if not os.path.exists(pipeline_output_path):
+        raise FileNotFoundError(f"pipeline_output.json not found: {pipeline_output_path}")
+
+    pipeline_data = read_json(pipeline_output_path)
+    if "findings" in pipeline_data:
+        normalize_results(pipeline_data, "findings")
+    findings = pipeline_data.get("findings", [])
+
+    finding = find_finding_by_id(findings, finding_id)
+    check_eligible(finding)
+
+    vulnerability_text = render_vulnerability_markdown(finding)
+
+    # Normalize repo_root once, here at the entry point, before it reaches
+    # InvestigationCase / ground_repository / parsing -- an unresolved path
+    # (e.g. macOS's /var/... symlink to /private/var/...) can otherwise
+    # degrade repository-grounding candidate paths to bare filenames.
+    if repo_root:
+        repo_root = str(Path(repo_root).resolve())
+
+    from utilities.autopatcher.investigation_adapters import case_from_vulnerability_text
+
+    case = case_from_vulnerability_text(
+        vulnerability_text, repo_root=Path(repo_root) if repo_root else None
+    )
+    projection = case.to_context_projection()
+
+    return _run_engine_and_write_artifacts(
+        vulnerability_text=projection.vulnerability_text,
+        repo_root=str(projection.repo_root) if projection.repo_root else None,
+        output_dir=output_dir,
+        artifact_label=finding_id,
+        budget_controller=budget_controller,
+        compare_existing_tests=compare_existing_tests,
+        execution_recorder=execution_recorder,
+    )
+
+
+def run_patch_cve(
+    cve_id: str,
+    repo_root: str,
+    output_dir: str,
+    budget_controller: "object | None" = None,
+    compare_existing_tests: bool = False,
+    execution_recorder: "object | None" = None,
+) -> PatchStepResult:
+    """Generate and evaluate a candidate remediation seeded from a public CVE
+    advisory instead of an OpenAnt Finding.
+
+    Fetches the CVE from NVD, builds an InvestigationCase from it
+    (utilities.autopatcher.investigation_adapters.case_from_cve), and
+    projects that case down to the same (vulnerability_text, repo_root)
+    contract the engine already accepts --
+    utilities.autopatcher.pipeline.run() itself is untouched, invoked
+    identically to the Finding-mode path via the same
+    _run_engine_and_write_artifacts tail.
+
+    Unlike run_patch(), repo_root is required and checked to exist on disk
+    before any network call: there is no pipeline_output.json fallback here,
+    and fetching NVD data is pointless if repo grounding will fail anyway.
+
+    Writes the same two artifacts as run_patch(), named after cve_id instead
+    of finding_id: {output_dir}/patch/{cve_id}-vulnerability.md and
+    {cve_id}-trust-report.md. The written Trust Report additionally
+    discloses its CVE provenance (see run_metadata.render_metadata_section)
+    and PatchStepResult.input_type/input_id make that explicit in the
+    returned result too -- finding_id itself still holds cve_id, kept for
+    backward compatibility with existing consumers of that field.
+
+    Raises:
+        ValueError: repo_root is missing or not a directory -- cheap,
+            local argument validation, checked first, before the
+            test-comparison-environment gate below: this is the kind of
+            "clearly invalid argument shape" check that's fine ahead of
+            Docker preflight, since it does no network/repository/LLM
+            work of its own.
+        TestComparisonEnvironmentError: compare_existing_tests is True
+            and its required executor cannot run (see
+            _require_test_comparison_environment) -- checked BEFORE
+            fetch_cve, so an unsatisfiable, explicitly-requested
+            prerequisite aborts before any NVD network call, not just
+            before pipeline.run().
+        RuntimeError: if no LLM provider can be resolved (see
+            _require_llm_provider).
+        CVENotFoundError: NVD has no record for cve_id.
+        CVEFetchError: network/HTTP/parse failure while contacting NVD.
+    """
+    if not repo_root or not os.path.isdir(repo_root):
+        raise ValueError(f"--repo-root does not exist: {repo_root!r}")
+
+    # Normalize once, here at the entry point, before InvestigationCase /
+    # ground_repository / parsing ever see it -- see run_patch()'s matching
+    # comment for why.
+    repo_root = str(Path(repo_root).resolve())
+
+    _require_test_comparison_environment(compare_existing_tests)
+
+    from utilities.autopatcher.cve_fetcher import fetch_cve
+    from utilities.autopatcher.investigation_adapters import case_from_cve
+
+    cve = fetch_cve(cve_id)
+    case = case_from_cve(cve, repo_root=Path(repo_root))
+    projection = case.to_context_projection()
+
+    return _run_engine_and_write_artifacts(
+        vulnerability_text=projection.vulnerability_text,
+        repo_root=str(projection.repo_root) if projection.repo_root else repo_root,
+        output_dir=output_dir,
+        artifact_label=cve_id,
+        input_type="cve",
+        advisory_id=cve_id,
+        advisory_source="NVD",
+        budget_controller=budget_controller,
+        compare_existing_tests=compare_existing_tests,
+        execution_recorder=execution_recorder,
+    )

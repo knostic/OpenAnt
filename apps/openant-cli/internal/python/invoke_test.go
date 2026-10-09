@@ -79,7 +79,7 @@ func TestInvoke_HangingSubprocessIsBoundedByTimeout(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = Invoke(hang, []string{"parse", "."}, "", true, "")
+		_, _ = Invoke(hang, []string{"parse", "."}, "", true, "", nil)
 	}()
 
 	select {
@@ -142,7 +142,7 @@ func writeEmptyStdoutScript(t *testing.T) string {
 // empty-stdout return path. A revert to `ExitCode: exitCode` would yield 0 here.
 func TestInvoke_EmptyStdoutSurfacesErrorCode(t *testing.T) {
 	script := writeEmptyStdoutScript(t)
-	res, err := Invoke(script, []string{"parse", "."}, "", true, "")
+	res, err := Invoke(script, []string{"parse", "."}, "", true, "", nil)
 	if err != nil {
 		t.Fatalf("Invoke returned error: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestInvoke_LateInterruptDoesNotDiscardEnvelope(t *testing.T) {
 	}
 	ch := make(chan outcome, 1)
 	go func() {
-		r, e := Invoke(script, []string{"scan", "."}, "", true, "")
+		r, e := Invoke(script, []string{"scan", "."}, "", true, "", nil)
 		ch <- outcome{r, e}
 	}()
 
@@ -262,7 +262,7 @@ func TestInvoke_TimeoutErrorNamesTheDeadline(t *testing.T) {
 	// C2: shrink the deadline via the PUBLIC override — no test hooks.
 	t.Setenv("OPENANT_INVOKE_TIMEOUT", "1") // 1 second
 
-	_, err := Invoke(hang, []string{"analyze", "."}, "", true, "")
+	_, err := Invoke(hang, []string{"analyze", "."}, "", true, "", nil)
 	if err == nil {
 		t.Fatalf("expected the deadline to fire on a hung subprocess")
 	}
@@ -310,7 +310,7 @@ func TestInvoke_NonDeadlineDeathDoesNotClaimADeadline(t *testing.T) {
 	t.Setenv("OPENANT_INVOKE_TIMEOUT", "600") // far beyond this test's run
 	s := writeScript(t, "exit 3\n")
 
-	res, err := Invoke(s, []string{"analyze", "."}, "", true, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "", nil)
 	if err != nil {
 		if strings.Contains(err.Error(), "invoke deadline") {
 			t.Errorf("a non-deadline death must not claim a deadline; got: %s", err)

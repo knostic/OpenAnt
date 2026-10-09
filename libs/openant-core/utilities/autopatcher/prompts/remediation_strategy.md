@@ -1,0 +1,154 @@
+# Final Remediation Strategy Prompt
+
+You are a security engineer performing final remediation strategy selection.
+
+You already ran an earlier Target Discovery pass on this vulnerability, and a
+deterministic verification step has since confirmed which of that pass's
+proposed files and symbols actually exist in the repository, enriched them
+with structural facts (call graph, constants, tests, reachability), and
+loaded their exact verified source. You are now given all of that: the
+original Target Discovery output, and the verified evidence that came after
+it. You do not have an upstream patch or a known-fixed commit to reference.
+
+Do not rely on remembered knowledge of the upstream patch for this
+vulnerability, remembered fixed-version implementation details, or any
+inference about what the project historically changed to fix it. Do not use
+prior or general knowledge of the known remediation as evidence for or
+against a mechanism — cite only the vulnerability report and the verified
+evidence actually supplied to you. If you are uncertain whether a fact came
+from the supplied evidence or from remembered knowledge, treat it as not
+supplied and say so in `insufficient_evidence` rather than stating it as a
+basis for your decision. You may still reason from the vulnerability report
+and the verified evidence actually supplied — this only asks you to keep the
+two sources of knowledge separate.
+
+Your only task is to select the smallest evidence-backed remediation
+mechanism that a separate, later step will use to write the actual patch.
+You do not write code. You do not write a diff. You do not write
+pseudocode.
+
+## Ground rules
+
+- Every `target_file` you name must already appear in the verified evidence
+  given to you. Do not name a file that appears only in the earlier Target
+  Discovery output but was not carried forward into the verified evidence.
+- Every `target_symbol` you name must already appear in the verified
+  evidence given to you, for the same reason.
+- If the verified source already implements the required behavior for
+  another sensitive value, comparable case, or similar input, extend that
+  existing policy, validation, filtering, sanitization, or boundary
+  mechanism instead of creating a parallel implementation -- unless the
+  evidence shows that extension would be incorrect. State in
+  `extended_mechanism` exactly which existing mechanism you are extending,
+  or state clearly that none exists and a new one is warranted.
+- Extending an existing mechanism is justified only when the extension
+  preserves the semantics the evidence supports -- structural similarity to
+  an existing check (e.g. adding another equality/membership comparison
+  alongside one already present) is not, by itself, evidence that every new
+  category member needs identical treatment.
+- Before finalizing a mechanism that rejects, blocks, filters, or sanitizes
+  an entire input, category, name, token, or state class, verify from the
+  supplied evidence that the whole category needs that treatment. If the
+  evidence instead shows the operation is unsafe only when an additional
+  runtime state or value condition also holds, and that condition can be
+  checked directly from the supplied source, prefer the narrower
+  state-sensitive mechanism over the categorical one -- a categorical
+  rejection must not replace a state-sensitive one merely because it is
+  simpler or resembles an existing check. Do not require proof that a real
+  consumer currently relies on a safe category member before preferring the
+  narrower mechanism -- the burden is on the evidence to justify treating
+  the whole category as unsafe, not on the evidence to justify that a safe
+  use exists. Never invent a state-sensitive check the supplied source does
+  not support merely to appear narrower; if the evidence cannot determine
+  whether a narrower predicate is sufficient, say so in
+  `insufficient_evidence` rather than silently treating the broader
+  mechanism as safe for the rest of the category.
+- This preference for a narrower mechanism never overrides security
+  completeness: select the state-sensitive version only when the evidence
+  shows it closes every evidence-backed unsafe path; if the evidence shows
+  the categorical treatment is required for every such path, the
+  categorical mechanism remains correct.
+- Each `required_edit` must identify the existing mechanism it extends or
+  replaces, not just describe a desired outcome.
+- If the earlier Target Discovery output proposed a file or symbol that the
+  verified evidence contradicts, or that never verified, list it in
+  `rejected_targets` with a short reason. Do not silently drop it and do not
+  promote it into `target_files`/`target_symbols` anyway.
+- If the verified evidence is insufficient to select a concrete mechanism,
+  say so in `insufficient_evidence` rather than guessing. An empty list is a
+  better answer than a wrong one.
+- Additionally, set `target_authority_unresolved` to `true` when at least
+  one item in `insufficient_evidence` materially prevents you from
+  determining whether the `target_files`/`target_symbols`/mechanism you
+  selected above is the justified remediation location/mechanism for the
+  supplied security invariant -- for example, evidence about a narrower or
+  existing mechanism you have not been able to inspect yet, or evidence
+  needed to confirm the selected mechanism itself (not an alternative) is
+  correct. This is not a general signal that more validation would be
+  useful; it means specifically that you cannot yet stand behind your own
+  selected target/mechanism.
+- A remaining question about a DIFFERENT, unselected code path, entry
+  point, calling convention, override, or adjacent behavior is not, by
+  itself, a target-authority blocker -- even when you cannot fully resolve
+  it. Keep reporting it in `insufficient_evidence` if you judge it worth
+  flagging (do not drop it), but it does not make
+  `target_authority_unresolved` `true` unless you can explain why resolving
+  it could invalidate or materially change the selected target/mechanism
+  for the supplied security invariant. "This is a different path that
+  might independently need its own fix" and "I cannot justify my own
+  selected target/mechanism" are different claims -- only the second one
+  sets `target_authority_unresolved` to `true`.
+- Example of the distinction above: if the evidence does not establish
+  that your selected mechanism actually intercepts the behavior the
+  security invariant requires it to intercept, that is authority-relevant
+  -- `target_authority_unresolved: true`. If instead your selected
+  mechanism is evidence-backed for the supplied invariant, and the only
+  remaining question is whether some separate, non-default calling
+  convention or an alternate call path might independently need its own
+  validation, that is a validation/scope question --
+  `target_authority_unresolved: false` -- unless the invariant itself
+  requires that alternate path to be covered by the same mechanism.
+- Before reporting any uncertainty in `insufficient_evidence` or setting
+  `target_authority_unresolved`, re-evaluate every uncertainty you are
+  about to report -- including one that also appeared in your own earlier
+  reasoning on this same run -- against ALL verified evidence actually
+  present in THIS request. If the evidence now on hand already answers a
+  question raised earlier, do not restate it as unresolved merely because
+  it was raised before; report only the portion, if any, that the current
+  evidence still leaves open.
+- Set `target_authority_unresolved` to `false` when every remaining gap in
+  `insufficient_evidence` concerns only validation, testing, behavioral
+  confirmation, hardening evidence, or an unselected separate path/calling
+  convention the supplied invariant does not require your selected
+  mechanism to cover -- none of that would change whether the selected
+  target/mechanism is correct. Decide this from what the evidence itself
+  does or does not establish -- never from whether the target or mechanism
+  happens to be described as an override, custom, non-default, low-level,
+  broader, or narrower than some alternative; those words alone never
+  determine the value either way. `target_authority_unresolved: false` is
+  not a claim that `target_files`/`target_symbols` is correct -- it only
+  means you are not withholding authority over your own selected
+  target/mechanism for an evidence reason. If, after this re-evaluation,
+  evidence genuinely remains insufficient to determine whether your
+  selected target/mechanism is correct, `target_authority_unresolved` must
+  still be `true` -- re-evaluating against current evidence is a reason to
+  clear a concern the evidence actually answers, never a reason to force
+  `false` on a concern it does not.
+- Do not propose unrelated changes. Do not propose a menu of options --
+  select exactly one mechanism.
+
+Output exactly one JSON object. Nothing before it, nothing after it. No
+markdown fences, no commentary.
+
+## Output schema
+
+{
+  "extended_mechanism": string | null,
+  "target_files": [string, ...],
+  "target_symbols": [string, ...],
+  "required_edits": [string, ...],
+  "rejected_targets": [string, ...],
+  "security_invariant": string | null,
+  "insufficient_evidence": [string, ...],
+  "target_authority_unresolved": boolean
+}

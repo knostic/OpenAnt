@@ -44,7 +44,7 @@ sleep 60 >&2 &
 exit 0
 `)
 	start := time.Now()
-	res, err := Invoke(s, []string{"analyze", "."}, "", true, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "", nil)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("envelope must be returned despite the stderr descendant: %v", err)
@@ -83,7 +83,7 @@ exec sleep 60
 	r, w, _ := os.Pipe()
 	old := os.Stderr
 	os.Stderr = w
-	res, err := Invoke(s, []string{"analyze", "."}, "", false, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", false, "", nil)
 	os.Stderr = old
 	w.Close()
 	b, _ := io.ReadAll(r)
@@ -115,7 +115,7 @@ func TestInvoke_Exit1WithHeldPipeKeepsExit1(t *testing.T) {
 sleep 60 &
 exit 1
 `)
-	res, err := Invoke(s, []string{"analyze", "."}, "", true, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "", nil)
 	if err != nil {
 		t.Fatalf("the envelope must win over the held write-end: %v", err)
 	}
