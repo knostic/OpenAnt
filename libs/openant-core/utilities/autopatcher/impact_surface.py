@@ -566,7 +566,8 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
 
     def _is_test_path(self, relpath: str) -> bool:
         lp = relpath.replace("\\", "/")
-        lower = lp.lower()
+        # Leading "/" so a root-level `test_x.py` / `tests/...` matches like a nested one.
+        lower = "/" + lp.lower().lstrip("/")
         if any(p in lower for p in self.TEST_PATH_PATTERNS):
             return True
         return False

@@ -1108,7 +1108,7 @@ def _parse_via_subprocess(
                 # cannot win over an explicit PYTHONPATH entry.
                 env=child_interpreter_env(),
             )
-        except subprocess.TimeoutExpired:
+        except Exception:  # timeout, OSError, ...: replay, then propagate unchanged
             _replay_quiet_stdout()
             raise
         if result.returncode != 0:

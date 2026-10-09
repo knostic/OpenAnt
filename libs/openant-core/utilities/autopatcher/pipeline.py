@@ -6748,6 +6748,10 @@ def _run_patch_generation_and_investigation(
     _post_patch_observations: list | None = None
     _post_patch_coverage: "CoverageResult | None" = None
     _post_patch_ctx = ""
+    # The structured form of every Post-patch definition rendered into
+    # _post_patch_ctx -- the Challenger's only trusted source of complete
+    # post-change functions (see post_patch_evaluation.post_patch_definitions).
+    _post_patch_definitions: list = []
     _post_patch_context = None
     _investigated_patch: str | None = None
     # No candidate patch -- there is no "post-patch" state to investigate;
@@ -6877,11 +6881,12 @@ def _run_patch_generation_and_investigation(
                     # investigation itself rendered, and only within the capacity
                     # that rendering left (whole-block-or-omit, fail-closed).
                     if _post_patch_ctx:
-                        from .post_patch_evaluation import render_post_patch_definitions
-                        _post_patch_ctx += render_post_patch_definitions(
+                        from .post_patch_evaluation import post_patch_definitions
+                        _definitions_rendered, _post_patch_definitions = post_patch_definitions(
                             _post_patch_observations, _post_patch_context,
                             max_chars=max(0, _post_patch_ctx_ceiling - len(_post_patch_ctx)),
                         )
+                        _post_patch_ctx += _definitions_rendered
             if _post_patch_ctx and _post_patch_context is not None:
                 progress.success("Post-patch analysis completed")
                 progress.verbose(
@@ -6897,6 +6902,7 @@ def _run_patch_generation_and_investigation(
             _post_patch_observations = None
             _post_patch_coverage = None
             _post_patch_ctx = ""
+            _post_patch_definitions = []
             _investigated_patch = None
         finally:
             if _pre_patch_scratch is not None:
@@ -9216,6 +9222,13 @@ def run(
             _strategy_result = _evidence_gap_fallback["strategy_result"]
             _strategy_ctx = _strategy_result.rendered if _strategy_result is not None else ""
             _planner_evidence_ctx = _evidence_gap_fallback["enriched_planner_evidence_ctx"]
+            # An unusable Strategy #2 (call/parse failure -> unevaluated) is
+            # an invoked-and-failed Strategy, exactly like #1 would be: it
+            # must never read as "Strategy not invoked" and let Patch
+            # Generation run without the authority gate.
+            _strategy_failure_reason = _strategy_failure_reason or _strategy_invocation_failure(
+                _planner_evidence_ctx, _strategy_result,
+            )
             # "Resolved" now means more than "a target exists" -- for case
             # (b) above, Strategy #1 already had a target; what matters is
             # whether Strategy #2 ALSO cleared target_authority_unresolved.
@@ -9610,6 +9623,11 @@ def run(
     _post_patch_coverage = _s4["_post_patch_coverage"]
     _post_patch_ctx = _s4["_post_patch_ctx"]
     _investigated_patch = _s4["_investigated_patch"]
+    # Trusted only for the exact patch the patched workspace was built from.
+    _challenger_post_patch_definitions = (
+        list(_s4.get("_post_patch_definitions") or [])
+        if _post_patch_ctx.strip() and patch == _investigated_patch else []
+    )
 
     # Post-Patch Recovery evidence parity: when a regenerated patch was
     # accepted (_regen_ok), `_run_patch_generation_and_investigation`
@@ -9678,6 +9696,9 @@ def run(
                 # replay validates Challenger citations against the same
                 # boundary as production. Purely additive.
                 "challenger_provenance_parts": list(_challenger_provenance_parts),
+                # Trusted complete post-change functions (see challenge_patch's
+                # `post_patch_definitions`), so replay passes the same channel.
+                "challenger_post_patch_definitions": _challenger_post_patch_definitions,
                 "vulnerability_text": vulnerability_text,
             },
             extra={"canonical_contract_scope": "full"},
@@ -9716,6 +9737,7 @@ def run(
         challenger = challenge_patch(
             vulnerability_text, patch, llm, code_context=challenger_context,
             provenance_context=_challenger_provenance_context(_challenger_provenance_parts, challenger_context),
+            post_patch_definitions=_challenger_post_patch_definitions,
         )
         # Release polish: completing the adversarial review is not passing
         # it. Reads only flags/consequences challenge_patch already set.

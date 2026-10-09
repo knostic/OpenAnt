@@ -749,3 +749,18 @@ class TestIgnoredDirsAreRepoRelative:
             _BODY_DIFF, repo_context=TargetRepoContext(repo), repo_language="python"
         )
         assert report.affected_files == []
+
+
+class TestRootLevelTestPaths:
+    """PR #763 review: a test file at the repository root is a test exactly
+    like a nested one (the path patterns require a leading `/`)."""
+
+    def test_root_level_and_nested_test_paths(self):
+        analyzer = LightweightImpactAnalyzer()
+        for path in ("test_util.py", "tests/helpers.py", "spec/a_spec.py", "pkg/tests/x.py", "pkg/test_x.py"):
+            assert analyzer._is_test_path(path), path
+
+    def test_non_test_paths_unchanged(self):
+        analyzer = LightweightImpactAnalyzer()
+        for path in ("app.py", "pkg/contest.py", "latest_util.py", "pkg/attest/x.py", "testing.py"):
+            assert not analyzer._is_test_path(path), path

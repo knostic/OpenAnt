@@ -1176,6 +1176,42 @@ class TestNamedTargetAuthorityGapFullPipelineWiring:
         assert spy_strategy.call_count == 1  # never rerun -- no new evidence to justify it
         mock_slice.assert_not_called()
 
+    def test_unparseable_strategy_2_never_clears_the_authority_gap(self, tmp_path):
+        """PR #763 review: Strategy #2's response does not parse (an
+        unevaluated result, target_authority_unresolved=False). It replaces
+        Strategy #1's doubted target, but must fail closed like a failed
+        Strategy #1 -- never let Patch Generation run as if no Strategy had
+        been invoked."""
+        strategy_v1 = _strategy(
+            evaluated=True, target_files=["target.py"], target_symbols=["Target"],
+            target_authority_unresolved=True,
+        )
+        strategy_v2 = _strategy(evaluated=False)
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_plan",
+                return_value=_plan(target_files=["target.py"], target_symbols=["Target"]),
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                side_effect=[
+                    _evidence_result("thin evidence", []),
+                    _evidence_result("enriched evidence", ["target.py:Target"]),
+                ],
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
+                side_effect=[strategy_v1, strategy_v2],
+            ) as spy_strategy,
+            mock.patch(
+                "utilities.autopatcher.pipeline._generate_patch_with_contract_check",
+                side_effect=AssertionError("Patch Generation must not run"),
+            ) as spy_generate,
+        ):
+            pipeline_mod.run(vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path))
+        assert spy_strategy.call_count == 2
+        spy_generate.assert_not_called()
+
     def test_multi_target_mechanism_authority_gap_applies_at_strategy_level(self, tmp_path):
         """A multi-file/symbol Strategy result with target_authority_
         unresolved=True must skip Patch Generation for the WHOLE mechanism

@@ -2217,7 +2217,8 @@ class TestPostPatchRecoveryEvidenceReachesChallenger:
         captured_challenger_contexts: list = []
         self.captured_provenance_contexts: list = []
 
-        def _capture_challenger(vulnerability_text, patch, llm, code_context="", provenance_context=None):
+        def _capture_challenger(vulnerability_text, patch, llm, code_context="", provenance_context=None,
+                                post_patch_definitions=None):
             captured_challenger_contexts.append(code_context)
             self.captured_provenance_contexts.append(provenance_context)
             return {}

@@ -21,6 +21,7 @@ from utilities.autopatcher.post_patch_evaluation import (
     AnchorObservation,
     compute_coverage,
     derive_patch_touched_anchors,
+    post_patch_definitions,
     render_post_patch_definitions,
 )
 from utilities.autopatcher.post_patch_investigation import ResolvedFunctionKey, ResolvedFunctionValue
@@ -284,7 +285,7 @@ def _concern(op_prov, role="primary"):
     )
 
 
-def _challenge(concern, corpus, patch):
+def _challenge(concern, corpus, patch, definitions=None):
     from utilities.autopatcher.patch_challenger import challenge_patch
 
     llm = mock.MagicMock()
@@ -292,7 +293,10 @@ def _challenge(concern, corpus, patch):
         "Verification status: VERIFIED_FIXED\n\nConcerns:\n\n" + concern
         + "\nEdge cases:\n- none\n\nPotential issues:\n- none\n\nSummary:\n- none\n"
     )
-    return challenge_patch("Over-long input is processed.", patch, llm, code_context=corpus, provenance_context=corpus)
+    return challenge_patch(
+        "Over-long input is processed.", patch, llm, code_context=corpus, provenance_context=corpus,
+        post_patch_definitions=definitions,
+    )
 
 
 class TestOrderingWithSpanExactBlocks:
@@ -301,18 +305,23 @@ class TestOrderingWithSpanExactBlocks:
         pre_block = _render_definition_block("lib/thing.js", "Thing.constructor", 2, 4, _span_lines(_JS_PRE, 2, 4))
         pre_parse = _render_definition_block("lib/thing.js", "Thing.parse", 6, 13, _span_lines(_JS_PRE, 6, 13))
         ctx = _context(_js_functions(pre=False, parse_code="\n\n" + _span_lines(_JS_POST, 6, 15)), repo_path=tmp_path)
-        post = render_post_patch_definitions([_changed("lib/thing.js:Thing.parse", "lib/thing.js", 6, 15)], ctx, max_chars=100_000)
-        assert post
+        # the rendered text and its trusted structured records, as the pipeline passes both
+        post, self._definitions = post_patch_definitions(
+            [_changed("lib/thing.js:Thing.parse", "lib/thing.js", 6, 15)], ctx, max_chars=100_000,
+        )
+        assert post and self._definitions
         return "\n\n".join([pre_block, pre_parse, "# lib/thing.js (lines 16-16)\nconst LIMIT = 256\n", post])
 
     def test_13_same_function_operation_orders_inside_span_exact_block(self, tmp_path):
-        result = _challenge(_concern("return use(parts, size)"), self._corpus(tmp_path), _JS_PATCH)
+        result = _challenge(_concern("return use(parts, size)"), self._corpus(tmp_path), _JS_PATCH, self._definitions)
         c = result["concerns"][0]
         assert c["reachability_facts"]["preceding_guard"] == "present"
         assert c["default_execution_reachability"] == "blocked" and c["consequence"] == "NON_BLOCKING"
 
     def test_14_operation_in_a_different_function_gains_no_evidence(self, tmp_path):
-        result = _challenge(_concern("this.items = input.map(i => this.parse(i))"), self._corpus(tmp_path), _JS_PATCH)
+        result = _challenge(
+            _concern("this.items = input.map(i => this.parse(i))"), self._corpus(tmp_path), _JS_PATCH, self._definitions,
+        )
         c = result["concerns"][0]
         assert c["reachability_facts"]["preceding_guard"] == "unresolved"
         assert c["consequence"] == "UNRESOLVED" and result["verification_status"] == "INSUFFICIENT_EVIDENCE"

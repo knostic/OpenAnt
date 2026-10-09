@@ -1053,6 +1053,11 @@ _POST_PATCH_DEFINITIONS_PREAMBLE = (
 
 
 def _post_patch_definition_block(func_id: str, context: "InvestigationContext | None") -> "str | None":
+    record = _post_patch_definition(func_id, context)
+    return record["block"] if record else None
+
+
+def _post_patch_definition(func_id: str, context: "InvestigationContext | None") -> "dict | None":
     """One rendered block, or None (never fabricated or partial text) when
     the patched copy cannot produce the complete source of `func_id`'s
     indexed span. The text is read from the patched workspace for exactly
@@ -1087,9 +1092,17 @@ def _post_patch_definition_block(func_id: str, context: "InvestigationContext | 
         return None
     if len(source.splitlines()) != end - start + 1:
         return None
-    return _render_definition_block(
-        file_path, label, start, end, source, heading_label=POST_PATCH_DEFINITION_HEADING_LABEL,
-    )
+    return {
+        "block": _render_definition_block(
+            file_path, label, start, end, source, heading_label=POST_PATCH_DEFINITION_HEADING_LABEL,
+        ),
+        # The trusted structured form patch_challenger receives through its
+        # own channel -- exactly the source rendered into `block`.
+        "definition": {
+            "path": file_path, "label": label, "start_line": start, "end_line": end,
+            "source": source.rstrip(),
+        },
+    }
 
 
 def render_post_patch_definitions(
@@ -1098,13 +1111,28 @@ def render_post_patch_definitions(
     *,
     max_chars: int,
 ) -> str:
+    """See `post_patch_definitions`; the rendered text only."""
+    return post_patch_definitions(observations, context, max_chars=max_chars)[0]
+
+
+def post_patch_definitions(
+    observations: "list[AnchorObservation] | None",
+    context: "InvestigationContext | None",
+    *,
+    max_chars: int,
+) -> "tuple[str, list[dict]]":
     """Render the complete post-change source of every `resolved_function`
     observation whose status is `changed`, deduplicated by func_id, in
     observation order. Whole-block-or-omit within `max_chars` (never
     sliced); returns "" when no block is available or none fits -- a block
     that is not shown is never citable, so omission fails closed. No LLM
-    calls, no I/O beyond the already-built index."""
-    blocks: list[str] = []
+    calls, no I/O beyond the already-built index.
+
+    Also returns the structured definition of every block actually rendered
+    (and only those): pipeline-produced evidence that the Challenger trusts
+    as complete post-change source through a channel separate from the
+    rendered text, which repository content could imitate."""
+    records: list[dict] = []
     seen: set[str] = set()
     for obs in observations or ():
         if obs.anchor_kind != "resolved_function" or obs.status != "changed":
@@ -1113,21 +1141,23 @@ def render_post_patch_definitions(
         if not func_id or func_id in seen:
             continue
         seen.add(func_id)
-        block = _post_patch_definition_block(func_id, context)
-        if block:
-            blocks.append(block)
-    if not blocks:
-        return ""
+        record = _post_patch_definition(func_id, context)
+        if record:
+            records.append(record)
+    if not records:
+        return "", []
 
     rendered = "\n" + _POST_PATCH_DEFINITIONS_HEADING + "\n\n" + _POST_PATCH_DEFINITIONS_PREAMBLE + "\n\n"
     omitted = 0
-    for block in blocks:
-        if len(rendered) + len(block) + 1 <= max_chars:
-            rendered += block + "\n"
+    included: list[dict] = []
+    for record in records:
+        if len(rendered) + len(record["block"]) + 1 <= max_chars:
+            rendered += record["block"] + "\n"
+            included.append(record["definition"])
         else:
             omitted += 1
-    if omitted == len(blocks):
-        return ""
+    if omitted == len(records):
+        return "", []
     if omitted:
         note = (
             f"{omitted} further changed function definition(s) omitted for technical capacity "
@@ -1135,4 +1165,4 @@ def render_post_patch_definitions(
         )
         if len(rendered) + len(note) <= max_chars:
             rendered += note
-    return rendered
+    return rendered, included

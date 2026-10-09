@@ -17,6 +17,7 @@ Covers:
 """
 from __future__ import annotations
 
+import subprocess
 import textwrap
 from unittest import mock
 
@@ -624,3 +625,24 @@ class TestParserQuietGate:
         monkeypatch.delenv("AUTOPATCHER_PARSER_QUIET", raising=False)
         self._parse(tmp_path, monkeypatch, exit_code=0)
         assert "PARSER PIPELINE TEST" in capfd.readouterr().err
+
+    @pytest.mark.parametrize("error", [
+        OSError("child died: Resource temporarily unavailable"),
+        subprocess.TimeoutExpired(["parser"], 1800),
+    ], ids=["oserror", "timeout"])
+    def test_quiet_child_failure_replays_and_reraises_unchanged(self, tmp_path, monkeypatch, capfd, error):
+        """PR #763 review: any exception out of the child run (not only a
+        timeout) replays the captured output, then propagates unchanged."""
+        monkeypatch.setenv("AUTOPATCHER_PARSER_QUIET", "1")
+        monkeypatch.setattr(parser_adapter, "parser_script_path", lambda language: self._script(tmp_path, 0))
+
+        def fake_run(cmd, **kwargs):
+            kwargs["stdout"].write("CAPTURED_CHILD_DIAGNOSTICS\n")
+            raise error
+
+        monkeypatch.setattr(parser_adapter.subprocess, "run", fake_run)
+        (tmp_path / "repo").mkdir()
+        with pytest.raises(type(error)) as raised:
+            parser_adapter._parse_via_subprocess("go", str(tmp_path / "repo"), str(tmp_path / "out"), "all")
+        assert raised.value is error
+        assert "CAPTURED_CHILD_DIAGNOSTICS" in capfd.readouterr().err

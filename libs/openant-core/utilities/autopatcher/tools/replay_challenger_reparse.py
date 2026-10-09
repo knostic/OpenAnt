@@ -28,13 +28,15 @@ What it does, precisely:
      re-derive. Never falls back to a newer/effective/same-stage-
      elsewhere execution if the exact recorded one cannot be resolved.
   3. Runs that EXACT archived response text through
-     reparse_challenger_response() below, which is a byte-for-byte copy
-     of patch_challenger.challenge_patch()'s own tail (everything after
-     `resp = llm.complete(...)`) -- every actual decision (schema
-     routing, per-concern parsing, reachability derivation, consequence
-     derivation, run-level status aggregation) is made by calling
-     patch_challenger.py's own current, unmodified functions; nothing
-     here recomputes, mirrors, or approximates any of that logic.
+     reparse_challenger_response() below, which calls the production
+     patch_challenger.challenge_patch() itself with a replay stub in
+     place of the LLM (returning the archived text) and the same
+     Challenger inputs the replay engine passes: the S4 artifact's
+     shown context, its recorded citation-authority parts, and its
+     trusted post-patch definitions. Every decision is therefore made by
+     production code; nothing here copies, mirrors, or approximates it.
+     Not reproduced: the archived call's own provider stop reason (a
+     truncated response is not detected here).
   4. Writes one JSON artifact to --output. Makes no LLM call (no
      LLMClient is ever constructed), runs no other canonical stage, and
      never touches production code.
@@ -63,16 +65,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from utilities.autopatcher import lineage  # noqa: E402
 from utilities.autopatcher.execution_recorder import to_jsonable  # noqa: E402
-from utilities.autopatcher.patch_challenger import (  # noqa: E402
-    _derive_status_from_concerns,
-    _is_placeholder,
-    _lines_from_bullets,
-    _parse_concerns,
-    _parse_verification,
-    _response_uses_v2_schema,
-    _split_sections,
-    _synthesize_summary_from_concerns,
-)
+from utilities.autopatcher.patch_challenger import challenge_patch  # noqa: E402
+from utilities.autopatcher.pipeline import _challenger_provenance_context  # noqa: E402
 from utilities.autopatcher.stage_registry import (  # noqa: E402
     CHALLENGER,
     PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
@@ -86,56 +80,31 @@ class ReparseError(RuntimeError):
     silently producing partial output."""
 
 
+class _ArchivedResponse:
+    """Stands in for the LLM: returns the archived response text, never a
+    model call."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def complete(self, system_prompt, user_message, stage=None) -> str:
+        return self._text
+
+
 def reparse_challenger_response(
     response_text: str, *, code_context: str, patch: str, vulnerability_text: str,
+    provenance_context: "str | None" = None, post_patch_definitions=None,
 ) -> dict:
-    """Run EXACTLY the post-`llm.complete()` processing
-    `patch_challenger.challenge_patch()` itself performs, on an already-
-    obtained response string instead of a fresh LLM call.
-
-    This function's own body is intentionally a byte-for-byte copy of
-    challenge_patch()'s own tail (patch_challenger.py, from `sections =
-    _split_sections(resp)` to its two `return` statements) -- kept in
-    sync BY INSPECTION whenever that tail changes, never by importing an
-    un-splittable piece of it. It calls patch_challenger.py's own current
-    functions verbatim for every actual decision (_parse_concerns, and
-    everything IT calls -- _derive_default_execution_reachability,
-    _concern_consequence -- plus _derive_status_from_concerns and
-    _synthesize_summary_from_concerns); nothing here reimplements,
-    duplicates, or approximates any of their logic."""
-    sections = _split_sections(response_text)
-
-    edge_cases = _lines_from_bullets(sections.get("edge_cases", ""))
-    potential_issues = _lines_from_bullets(sections.get("potential_issues", ""))
-    summary = sections.get("summary", response_text.strip())
-
-    if sections.get("concerns") is not None:
-        concerns_body = sections["concerns"]
-        concerns = _parse_concerns(concerns_body, code_context, patch, vulnerability_text)
-        structural_violation = (
-            any(not _is_placeholder(line) for line in edge_cases + potential_issues)
-            or not _is_placeholder(sections.get("summary"))
-        )
-        verification_status, still = _derive_status_from_concerns(concerns, structural_violation)
-        summary = _synthesize_summary_from_concerns(concerns, structural_violation)
-        return {
-            "verification_status": verification_status,
-            "still_vulnerable": still,
-            "edge_cases": edge_cases,
-            "potential_issues": potential_issues,
-            "summary": summary,
-            "concerns": concerns,
-            "schema_version": "concerns_v2" if _response_uses_v2_schema(concerns_body) else "concerns_v1",
-        }
-
-    verification_status, still = _parse_verification(sections)
-    return {
-        "verification_status": verification_status,
-        "still_vulnerable": still,
-        "edge_cases": edge_cases,
-        "potential_issues": potential_issues,
-        "summary": summary,
-    }
+    """The production `challenge_patch()` result for an already-obtained
+    response string: the same function, with the archived text in place of
+    a fresh LLM call. Pass the same `provenance_context` and
+    `post_patch_definitions` production passed (see
+    replay_challenger_reparse) -- omitting them reparses with no citation
+    boundary and no trusted post-patch definitions."""
+    return challenge_patch(
+        vulnerability_text, patch, _ArchivedResponse(response_text), code_context=code_context,
+        provenance_context=provenance_context, post_patch_definitions=post_patch_definitions,
+    )
 
 
 def _find_archived_challenger_response(chain: "list[Path]") -> "tuple[Path, str, dict]":
@@ -268,12 +237,17 @@ def replay_challenger_reparse(source_run: "Path | str", output_dir: "Path | str"
     vulnerability_text = upstream_artifact["vulnerability_text"]
     patch = upstream_artifact["patch"]
     challenger_context = upstream_artifact.get("challenger_context") or ""
+    # Exactly the replay engine's Challenger inputs (replay_engine.
+    # _run_replay_challenger): an artifact predating a field fails closed.
+    provenance_parts = upstream_artifact.get("challenger_provenance_parts") or ()
 
     result = reparse_challenger_response(
         response_text,
         code_context=challenger_context,
         patch=patch,
         vulnerability_text=vulnerability_text,
+        provenance_context=_challenger_provenance_context(provenance_parts, challenger_context),
+        post_patch_definitions=upstream_artifact.get("challenger_post_patch_definitions") or [],
     )
 
     output_dir = Path(output_dir)

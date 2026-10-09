@@ -524,7 +524,10 @@ from utilities.autopatcher.pipeline import _challenger_provenance_context  # noq
 _C_VULN = "# Path traversal in read_file\n\nread_file joins user input onto BASE without validation."
 _C_PATCH = ("--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,5 @@\n def read_file(name):\n"
             "+    if '..' in name:\n+        raise ValueError('bad')\n     return open(BASE + name).read()\n")
-_C_CODE = ("#### Target definition: `read_file` (mod.py)\n\n```python\ndef read_file(name):\n"
+# The production renderer's heading shape (path, symbol and line range): an
+# unlocated pre-change copy sharing lines with the patch can never support a
+# guard claim (patch_challenger's call-site identity fallback, PR #763).
+_C_CODE = ("#### Target definition: `mod.py:read_file` (lines 1\u20132)\n\n```python\ndef read_file(name):\n"
            "    return open(BASE + name).read()\n```")
 _REAL_QUOTES = ("if '..' in name:", "return open(BASE + name).read()", "if '..' in name:", "raise ValueError('bad')")
 

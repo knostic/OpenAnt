@@ -77,6 +77,15 @@ def _post_block(inserted: str = _TRANSFORM_LINE) -> str:
     return _block("Post-patch definition", "handle", _post_source(inserted))
 
 
+def _definition(inserted: str = _TRANSFORM_LINE) -> dict:
+    """The structured record the pipeline passes alongside `_post_block`
+    (post_patch_evaluation.post_patch_definitions): the only form the
+    Challenger trusts as a complete post-change function."""
+    source = _post_source(inserted)
+    return {"path": "pkg/handler.py", "label": "handle", "start_line": 1,
+            "end_line": len(source.splitlines()), "source": source}
+
+
 def _patch(inserted: str = _TRANSFORM_LINE) -> str:
     """One hunk inserting `inserted`; trailing context stops before the
     operation, which is therefore NOT present anywhere in the diff."""
@@ -139,7 +148,9 @@ def _response(concern: str) -> str:
     )
 
 
-def _challenge(concern: str, *, corpus: str, patch: str, shown: "str | None" = None) -> dict:
+def _challenge(
+    concern: str, *, corpus: str, patch: str, shown: "str | None" = None, definitions=None,
+) -> dict:
     from utilities.autopatcher.patch_challenger import challenge_patch
 
     llm = mock.MagicMock()
@@ -147,6 +158,7 @@ def _challenge(concern: str, *, corpus: str, patch: str, shown: "str | None" = N
     return challenge_patch(
         "Untrusted input reaches a write.", patch, llm,
         code_context=(corpus if shown is None else shown), provenance_context=corpus,
+        post_patch_definitions=definitions,
     )
 
 
@@ -173,14 +185,16 @@ class TestPostChangeDefinitionEstablishesOrdering:
         operation only in pre-change evidence outside the hunk, and the
         complete post-change definition (rendered AFTER the pre-change
         copy, as the pipeline orders them) contains both, in order."""
-        result = _challenge(_concern(), corpus=_PRE_BLOCK + "\n\n" + _post_block(), patch=_patch())
+        result = _challenge(
+            _concern(), corpus=_PRE_BLOCK + "\n\n" + _post_block(), patch=_patch(), definitions=[_definition()],
+        )
         assert _facts(result)["preceding_guard"] == "present"
         assert result["concerns"][0]["default_execution_reachability"] == "blocked"
         assert result["concerns"][0]["consequence"] == "NON_BLOCKING"
         assert result["verification_status"] == "VERIFIED_FIXED"
 
     def test_2_both_citations_in_same_trusted_post_change_block(self):
-        result = _challenge(_concern(), corpus=_post_block(), patch="")
+        result = _challenge(_concern(), corpus=_post_block(), patch="", definitions=[_definition()])
         assert _facts(result)["preceding_guard"] == "present"
 
     def test_3_reversed_order_inside_same_block_does_not_establish_order(self):
@@ -235,20 +249,34 @@ class TestPostChangeDefinitionEstablishesOrdering:
         precede the post-change block; first-match over the concatenation
         would compare against the WRONG copy."""
         corpus = "\n\n".join([_PRE_VERIFIED, _PRE_BLOCK, _PRE_WINDOW, _post_block()])
-        result = _challenge(_concern(), corpus=corpus, patch=_patch())
+        result = _challenge(_concern(), corpus=corpus, patch=_patch(), definitions=[_definition()])
         assert _facts(result)["preceding_guard"] == "present"
 
-    def test_5c_reversed_copy_in_an_earlier_block_does_not_defeat_correct_block(self):
-        """An unrelated earlier block contains both lines in the opposite
-        order; neither its position nor its order may decide for the
-        post-change block, whose own order is correct."""
+    def test_5c_unguarded_copy_of_the_operation_in_another_function_fails_closed(self):
+        """PR #763 (call-site identity): another function runs the SAME
+        operation before the transformation. Text alone cannot say which
+        call site the concern is about, so the unguarded one counts against
+        the claim -- however correct the post-change block's own order is.
+        (Previously asserted `present`: an unrelated block could not decide.)"""
         unrelated = (
             "#### Related definition (context only, not an approved edit target): "
             "`pkg/other.py:replay` (lines 1–3)\n\n"
             f"```python\ndef replay(sink, data):\n    {_OPERATION_LINE}\n    {_TRANSFORM_LINE}\n```\n"
         )
         corpus = "\n\n".join([unrelated, _PRE_BLOCK, _post_block()])
-        result = _challenge(_concern(), corpus=corpus, patch=_patch())
+        result = _challenge(_concern(), corpus=corpus, patch=_patch(), definitions=[_definition()])
+        assert _facts(result)["preceding_guard"] == "unresolved"
+
+    def test_5d_guarded_copy_of_the_operation_in_another_function_does_not_defeat_correct_block(self):
+        """Control for 5c: the other function also transforms first, so every
+        call site of the operation is guarded and the claim stands."""
+        unrelated = (
+            "#### Related definition (context only, not an approved edit target): "
+            "`pkg/other.py:replay` (lines 1–3)\n\n"
+            f"```python\ndef replay(sink, data):\n    {_TRANSFORM_LINE}\n    {_OPERATION_LINE}\n```\n"
+        )
+        corpus = "\n\n".join([unrelated, _PRE_BLOCK, _post_block()])
+        result = _challenge(_concern(), corpus=corpus, patch=_patch(), definitions=[_definition()])
         assert _facts(result)["preceding_guard"] == "present"
 
     def test_5b_operation_before_and_after_guard_in_same_block_does_not_order(self):
@@ -293,6 +321,7 @@ class TestPostChangeDefinitionEstablishesOrdering:
     def test_9_conditional_check_case_still_works(self):
         result = _challenge(
             _check_concern(), corpus=_PRE_BLOCK + "\n\n" + _post_block(_CHECK_LINE), patch=_patch(_CHECK_LINE),
+            definitions=[_definition(_CHECK_LINE)],
         )
         assert _facts(result) == {
             "operation_present_in_evidence": "present",
@@ -304,7 +333,9 @@ class TestPostChangeDefinitionEstablishesOrdering:
         assert result["concerns"][0]["consequence"] == "NON_BLOCKING"
 
     def test_10_always_executed_transformation_retains_reported_facts(self):
-        result = _challenge(_concern(), corpus=_PRE_BLOCK + "\n\n" + _post_block(), patch=_patch())
+        result = _challenge(
+            _concern(), corpus=_PRE_BLOCK + "\n\n" + _post_block(), patch=_patch(), definitions=[_definition()],
+        )
         assert _facts(result) == _REPORTED_TRANSFORM_FACTS
 
 
@@ -367,26 +398,30 @@ class TestOverrideFieldContract:
     def test_11b_answer_from_facts_alone_resolves_deterministically(self):
         """`false`, answered from the reported guard facts with no derived
         label, yields NON_BLOCKING through the UNCHANGED policy."""
-        result = _challenge(_concern(override="false"), corpus=_post_block(), patch="")
+        result = _challenge(_concern(override="false"), corpus=_post_block(), patch="", definitions=[_definition()])
         assert result["concerns"][0]["requires_explicit_non_default_action"] == "false"
         assert result["concerns"][0]["consequence"] == "NON_BLOCKING"
 
     def test_12_genuinely_insufficient_override_information_remains_unresolved(self):
-        result = _challenge(_concern(override="unresolved"), corpus=_post_block(), patch="")
+        result = _challenge(
+            _concern(override="unresolved"), corpus=_post_block(), patch="", definitions=[_definition()],
+        )
         assert result["concerns"][0]["consequence"] == "UNRESOLVED"
         assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
 
     def test_12b_not_applicable_under_protective_guard_still_fails_closed(self):
         """Deterministic handling is unchanged: the old ambiguous answer
         is still demoted to unresolved, never reinterpreted as `false`."""
-        result = _challenge(_concern(override="not_applicable"), corpus=_post_block(), patch="")
+        result = _challenge(
+            _concern(override="not_applicable"), corpus=_post_block(), patch="", definitions=[_definition()],
+        )
         assert result["concerns"][0]["requires_explicit_non_default_action"] == "unresolved"
         assert result["concerns"][0]["consequence"] == "UNRESOLVED"
 
     def test_12c_true_without_grounded_override_provenance_is_unresolved(self):
         result = _challenge(
             _concern(override="true", override_prov="handle(payload, sink, strict=False)"),
-            corpus=_post_block(), patch="",
+            corpus=_post_block(), patch="", definitions=[_definition()],
         )
         assert result["concerns"][0]["requires_explicit_non_default_action"] == "unresolved"
         assert result["concerns"][0]["consequence"] == "UNRESOLVED"
@@ -448,8 +483,12 @@ class TestRenderPostPatchDefinitions:
         assert _post_block() in rendered
 
     def test_rendered_block_is_accepted_by_block_local_ordering(self):
-        rendered = self._render([_observation()], _context({"pkg/handler.py:handle": _GOOD_FUNCTION}))
-        result = _challenge(_concern(), corpus=_PRE_BLOCK + "\n\n" + rendered, patch=_patch())
+        from utilities.autopatcher.post_patch_evaluation import post_patch_definitions
+        rendered, definitions = post_patch_definitions(
+            [_observation()], _context({"pkg/handler.py:handle": _GOOD_FUNCTION}), max_chars=100_000,
+        )
+        assert definitions == [_definition()]
+        result = _challenge(_concern(), corpus=_PRE_BLOCK + "\n\n" + rendered, patch=_patch(), definitions=definitions)
         assert _facts(result) == _REPORTED_TRANSFORM_FACTS
 
     @pytest.mark.parametrize("observation", [
@@ -564,6 +603,12 @@ class TestPipelineRendersPostPatchDefinition:
         )
         assert expected_block in shown
         assert expected_block in corpus
+        # ... and the same definition through the trusted structured channel.
+        definitions = kwargs["post_patch_definitions"]
+        assert definitions == [{
+            "path": "app/handler.py", "label": "handle", "start_line": 1, "end_line": 11,
+            "source": "\n".join(expected_source),
+        }]
 
         # The real parser, fed exactly what production fed the Challenger,
         # keeps the model-reported transformation facts.
@@ -573,5 +618,6 @@ class TestPipelineRendersPostPatchDefinition:
         llm.complete.return_value = _response(_concern())
         result = challenge_patch(
             "Untrusted input reaches a write.", _REAL_PATCH, llm, code_context=shown, provenance_context=corpus,
+            post_patch_definitions=definitions,
         )
         assert _facts(result) == _REPORTED_TRANSFORM_FACTS

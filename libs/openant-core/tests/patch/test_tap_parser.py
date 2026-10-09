@@ -556,3 +556,12 @@ class TestPr763FailuresMustNotBeHidden:
         parsed = parse_tap("TAP version 13\n1..1\nnot ok 1 - foo # TODO later\n")
         assert parsed.failed == 0
         assert parsed.skipped == 1
+
+    def test_escaped_backslash_before_a_real_directive_still_skips(self):
+        """PR #763 review: `\\\\#` is an escaped backslash followed by a real
+        directive; an odd backslash run (`\\\\\\#`) still escapes the hash."""
+        for directive in ("TODO", "SKIP"):
+            parsed = parse_tap(f"TAP version 13\n1..1\nnot ok 1 - foo \\\\# {directive} later\n")
+            assert (parsed.failed, parsed.skipped) == (0, 1), directive
+            parsed = parse_tap(f"TAP version 13\n1..1\nnot ok 1 - foo \\\\\\# {directive} later\n")
+            assert (parsed.failed, parsed.skipped) == (1, 0), directive

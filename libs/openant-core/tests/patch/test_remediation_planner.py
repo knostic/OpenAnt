@@ -5329,6 +5329,23 @@ class TestFocusedWindows:
         block = _render_usage_window_block("consumer.py", "C.m", [(1, 3), (50, 52)], context)
         assert "line(s) omitted" in block
 
+    def test_omitted_marker_counts_stripped_trailing_blank_lines(self, tmp_path):
+        """PR #763: the marker states the exact omitted range, counted from the
+        last line actually shown, so every shown line keeps its file line
+        number (patch_challenger locates call sites by it)."""
+        lines = [f"line_{n} = {n}" for n in range(1, 61)]
+        lines[3] = lines[4] = ""  # window 1 (lines 1-5) ends in two blank lines
+        (tmp_path / "consumer.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _render_usage_window_block
+        block = _render_usage_window_block("consumer.py", "C.m", [(1, 5), (10, 11)], context)
+        body = block.split("```python\n", 1)[1].split("\n```", 1)[0].splitlines()
+        assert body == [
+            "line_1 = 1", "line_2 = 2", "line_3 = 3",
+            "# ... (6 line(s) omitted: lines 4-9) ...",
+            "line_10 = 10", "line_11 = 11",
+        ]
+
 
 class TestOneHopDiscoveredTermsSeedUsageSearch:
     """FIX: proof-completion for non-callable targets. A bare, unqualified

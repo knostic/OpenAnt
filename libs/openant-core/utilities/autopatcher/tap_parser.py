@@ -85,8 +85,9 @@ _YAML_OPEN_RE = re.compile(r"^-{3}\s*$")
 _YAML_CLOSE_RE = re.compile(r"^\.{3}\s*$")
 _TEST_LINE_RE = re.compile(r"^(?P<not>not\s+)?ok\b(?:\s+(?P<num>\d+))?(?P<rest>.*)$")
 # A backslash-escaped "\#" is a literal hash in the description (TAP14),
-# never a directive -- `not ok 3 - a \# TODO` is a failure.
-_DIRECTIVE_RE = re.compile(r"(?<!\\)#\s*(SKIP|TODO)\b", re.IGNORECASE)
+# never a directive -- `not ok 3 - a \# TODO` is a failure. Only an ODD run
+# of backslashes escapes it: `\\#` is an escaped backslash, then a directive.
+_DIRECTIVE_RE = re.compile(r"(?<!\\)(?:\\\\)*(#)\s*(SKIP|TODO)\b", re.IGNORECASE)
 
 # Deterministic, conservative bound -- TAP is a text protocol with no
 # inherent size limit; without this a pathological input could make this
@@ -123,7 +124,7 @@ def _parse_test_line(content: str) -> "tuple[str, str] | None":
     directive_match = _DIRECTIVE_RE.search(rest)
     skipped = directive_match is not None
     if skipped:
-        rest = rest[: directive_match.start()]
+        rest = rest[: directive_match.start(1)]
 
     description = rest.strip()
     if description.startswith("-"):

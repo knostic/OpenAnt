@@ -268,9 +268,12 @@ class TestChallengerAndCalibrationUnchanged:
         from utilities.autopatcher.patch_challenger import challenge_patch
         sig = _inspect.signature(challenge_patch)
         # `provenance_context` (release audit D7, citation-authority
-        # boundary) is the only parameter added since; still no capacity
-        # coupling (checked below).
-        assert list(sig.parameters) == ["vulnerability_text", "patch", "llm", "code_context", "provenance_context"]
+        # boundary) and `post_patch_definitions` (PR #763: the trusted
+        # post-patch definition channel) are the only parameters added
+        # since; still no capacity coupling (checked below).
+        assert list(sig.parameters) == [
+            "vulnerability_text", "patch", "llm", "code_context", "provenance_context", "post_patch_definitions",
+        ]
         source = _inspect.getsource(challenge_patch)
         for term in ("technical_capacity", "omission_reason", "ContextBudgetController"):
             assert term not in source

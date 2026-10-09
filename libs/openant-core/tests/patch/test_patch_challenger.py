@@ -827,6 +827,19 @@ class TestMultiConcernAggregation:
         assert _derive_status_from_concerns(concerns, True) == ("INSUFFICIENT_EVIDENCE", True)
 
 
+# A fully cited concerns_v2 `blocked` chain over _V2_CLEAN_CONTEXT: the
+# clean-response vehicle for end-to-end tests now that a legacy concerns_v1
+# `blocked` claim never verifies (see TestLegacyV1BlockedFailsClosed).
+_V2_CLEAN_CONTEXT = "def handler(req):\n    if not allowed(req): raise Denied()\n    perform(req)\n"
+
+
+def _clean_v2_block(num=1, role="primary", override="false", **kwargs):
+    return _concern_block_v2(
+        num=num, role=role, op_prov="perform(req)", guard_prov="if not allowed(req)",
+        default_state_prov="allowed(req)", effect_prov="raise Denied()", override=override, **kwargs,
+    )
+
+
 class TestNewSchemaEndToEnd:
     """`challenge_patch` end to end for a genuinely valid structured
     response -- proves the additive `concerns`/`schema_version` keys and
@@ -836,20 +849,18 @@ class TestNewSchemaEndToEnd:
     def test_valid_new_schema_response_derives_verified_fixed(self):
         from utilities.autopatcher.patch_challenger import challenge_patch
 
-        concerns_text = _concern_block(
-            num=1, role="primary", reachability="blocked", reach_prov="guard line", override="false",
-        )
+        concerns_text = _clean_v2_block()
         llm = mock.MagicMock()
         llm.complete.return_value = _response_with_concerns(concerns_text, status="VERIFIED_FIXED")
 
-        result = challenge_patch("some vuln", "some diff", llm, code_context="guard line")
+        result = challenge_patch("some vuln", "some diff", llm, code_context=_V2_CLEAN_CONTEXT)
 
         # The structured facts (blocked, no override) govern the derived,
         # authoritative outcome (see the RESIDUAL_VULNERABILITY test below
         # for the header never raising it).
         assert result["verification_status"] == "VERIFIED_FIXED"
         assert result["still_vulnerable"] is False
-        assert result["schema_version"] == "concerns_v1"
+        assert result["schema_version"] == "concerns_v2"
         assert len(result["concerns"]) == 1
         assert result["concerns"][0]["consequence"] == "NON_BLOCKING"
         assert "verdict_conflict" not in result
@@ -860,13 +871,11 @@ class TestNewSchemaEndToEnd:
         instead of being silently overridden."""
         from utilities.autopatcher.patch_challenger import challenge_patch
 
-        concerns_text = _concern_block(
-            num=1, role="primary", reachability="blocked", reach_prov="guard line", override="false",
-        )
+        concerns_text = _clean_v2_block()
         llm = mock.MagicMock()
         llm.complete.return_value = _response_with_concerns(concerns_text, status="RESIDUAL_VULNERABILITY")
 
-        result = challenge_patch("some vuln", "some diff", llm, code_context="guard line")
+        result = challenge_patch("some vuln", "some diff", llm, code_context=_V2_CLEAN_CONTEXT)
 
         assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
         assert result["still_vulnerable"] is True
@@ -894,10 +903,9 @@ class TestNewSchemaEndToEnd:
         from utilities.autopatcher.patch_challenger import challenge_patch
 
         concerns_text = (
-            _concern_block(num=1, role="primary", reachability="blocked", reach_prov="guard", override="false")
-            + _concern_block(
-                num=2, role="additional", reachability="blocked", reach_prov="guard",
-                override="true", override_prov="override site",
+            _clean_v2_block()
+            + _clean_v2_block(
+                num=2, role="additional", override="true", override_prov="override site",
                 scope="explicitly_included", scope_prov="must hold even for the override path",
             )
         )
@@ -905,7 +913,8 @@ class TestNewSchemaEndToEnd:
         llm.complete.return_value = _response_with_concerns(concerns_text)
 
         result = challenge_patch(
-            "The fix must hold even for the override path.", "override site", llm, code_context="guard",
+            "The fix must hold even for the override path.", "override site", llm,
+            code_context=_V2_CLEAN_CONTEXT,
         )
 
         assert result["concerns"][1]["contract_addresses_override"] == "explicitly_included"
@@ -1021,11 +1030,11 @@ class TestOpenEndedProseCorrespondence:
         empty legacy section -- only a NON-empty one is a violation."""
         from utilities.autopatcher.patch_challenger import challenge_patch
 
-        concerns_text = _concern_block(num=1, role="primary", reachability="blocked", reach_prov="guard", override="false")
+        concerns_text = _clean_v2_block()
         llm = mock.MagicMock()
         llm.complete.return_value = _response_with_concerns(concerns_text)
 
-        result = challenge_patch("some vuln", "some diff", llm, code_context="guard")
+        result = challenge_patch("some vuln", "some diff", llm, code_context=_V2_CLEAN_CONTEXT)
 
         assert result["verification_status"] == "VERIFIED_FIXED"
 
@@ -1089,16 +1098,16 @@ class TestSummaryCannotHideAConcern:
         from utilities.autopatcher.patch_challenger import challenge_patch
 
         concerns_text = (
-            _concern_block(num=1, role="primary", reachability="blocked", reach_prov="guard", override="false")
-            + _concern_block(
-                num=2, role="additional", reachability="blocked", reach_prov="guard",
+            _clean_v2_block()
+            + _clean_v2_block(
+                num=2, role="additional",
                 override="true", override_prov="override site", scope="silent", scope_prov="whole document",
             )
         )
         llm = mock.MagicMock()
         llm.complete.return_value = _response_with_concerns(concerns_text, summary="none")
 
-        result = challenge_patch("some vuln", "override site", llm, code_context="guard")
+        result = challenge_patch("some vuln", "override site", llm, code_context=_V2_CLEAN_CONTEXT)
 
         assert result["verification_status"] == "VERIFIED_FIXED"
         assert result["still_vulnerable"] is False
@@ -1161,11 +1170,11 @@ class TestSummaryCannotHideAConcern:
         vocabulary -- neither should be misread as substantive content."""
         from utilities.autopatcher.patch_challenger import challenge_patch
 
-        concerns_text = _concern_block(num=1, role="primary", reachability="blocked", reach_prov="guard", override="false")
+        concerns_text = _clean_v2_block()
         for placeholder in ("none", "None", "N/A", "n/a"):
             llm = mock.MagicMock()
             llm.complete.return_value = _response_with_concerns(concerns_text, summary=placeholder)
-            result = challenge_patch("some vuln", "some diff", llm, code_context="guard")
+            result = challenge_patch("some vuln", "some diff", llm, code_context=_V2_CLEAN_CONTEXT)
             assert result["verification_status"] == "VERIFIED_FIXED", placeholder
 
     def test_synthesized_summary_never_echoes_raw_model_text(self):
@@ -1260,7 +1269,7 @@ class TestPlaceholderNormalization:
         failed closed before this fix."""
         from utilities.autopatcher.patch_challenger import challenge_patch
 
-        concerns_text = _concern_block(num=1, role="primary", reachability="blocked", reach_prov="guard", override="false")
+        concerns_text = _clean_v2_block()
         llm = mock.MagicMock()
         llm.complete.return_value = (
             "Verification status: VERIFIED_FIXED\n\n"
@@ -1270,7 +1279,7 @@ class TestPlaceholderNormalization:
             "Summary:\n- none\n"
         )
 
-        result = challenge_patch("some vuln", "some diff", llm, code_context="guard")
+        result = challenge_patch("some vuln", "some diff", llm, code_context=_V2_CLEAN_CONTEXT)
 
         assert result["verification_status"] == "VERIFIED_FIXED"
         assert result["still_vulnerable"] is False

@@ -162,6 +162,9 @@ class TestThinWrapperEquivalence:
             code_context=_CODE_CONTEXT,
             patch=_PATCH,
             vulnerability_text=_VULNERABILITY_TEXT,
+            # what production replay passes for an S4 artifact predating
+            # challenger_provenance_parts / challenger_post_patch_definitions
+            provenance_context="", post_patch_definitions=[],
         )
         assert artifact["result"] == expected
 
@@ -232,6 +235,9 @@ class TestHistoricalConsumedIdentityIgnoresRunRootVsTraceDirSpelling:
             code_context=_CODE_CONTEXT,
             patch=_PATCH,
             vulnerability_text=_VULNERABILITY_TEXT,
+            # what production replay passes for an S4 artifact predating
+            # challenger_provenance_parts / challenger_post_patch_definitions
+            provenance_context="", post_patch_definitions=[],
         )
         assert artifact["result"] == expected
         assert artifact["upstream_artifact_path"] == str(
@@ -252,6 +258,9 @@ class TestHistoricalConsumedIdentityIgnoresRunRootVsTraceDirSpelling:
             code_context=_CODE_CONTEXT,
             patch=_PATCH,
             vulnerability_text=_VULNERABILITY_TEXT,
+            # what production replay passes for an S4 artifact predating
+            # challenger_provenance_parts / challenger_post_patch_definitions
+            provenance_context="", post_patch_definitions=[],
         )
         assert artifact["result"] == expected
 
@@ -292,3 +301,79 @@ class TestMalformedSourceRunFailsClearly:
         with pytest.raises(ReparseError):
             replay_challenger_reparse(run_dir, output_dir)
         assert not (output_dir / "challenger_reparse.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# PR #763 validation (N4): the tool is production `challenge_patch()` with the
+# archived text in place of the LLM -- never a drifting copy of its logic.
+# ---------------------------------------------------------------------------
+
+import sys as _sys  # noqa: E402
+
+_sys.path.insert(0, str(Path(__file__).parent))
+from test_challenger_citation_polarity import (  # noqa: E402
+    ADDING, FAR_GUARD_PATCH, FAR_GUARD_POST, GUARD, OP, PRE_CTX, SCOPING_BYPASSES,
+    _post_definition, _post_definition_text, _v1, _v2,
+)
+
+
+def _reply(block, header="VERIFIED_FIXED", summary="- none"):
+    return (f"Verification status: {header}\n\nConcerns:\n\n{block}\n"
+            f"Edge cases:\n- none\n\nPotential issues:\n- none\n\nSummary:\n{summary}\n")
+
+
+_FAR_CTX = PRE_CTX + "\n\n" + _post_definition_text(FAR_GUARD_POST)
+_PARITY_CASES = {
+    # (response, patch, shown context, post_patch_definitions)
+    "v1-blocked-fails-closed": (_reply(_v1(GUARD)), ADDING, "", None),
+    "v2-removed-guard-cross-file": (_reply(_v2(OP, GUARD)), SCOPING_BYPASSES["re-added-in-another-file"], PRE_CTX, None),
+    "v2-trusted-definition-supports": (_reply(_v2(OP, GUARD)), FAR_GUARD_PATCH, _FAR_CTX, [_post_definition(FAR_GUARD_POST)]),
+    "v2-text-definition-only": (_reply(_v2(OP, GUARD)), FAR_GUARD_PATCH, _FAR_CTX, None),
+    "no-concerns-section": ("Verification status: VERIFIED_FIXED\n\nSummary:\nFixed.\n", ADDING, "", None),
+    "self-contradicting-header": (_reply(_v2(OP, GUARD), header="RESIDUAL_VULNERABILITY"), ADDING, "", None),
+    "substantive-summary": (_reply(_v2(OP, GUARD), summary="Still exploitable via bulk."), ADDING, "", None),
+    "ambiguous-block-numbering": (_reply(_v2(OP, GUARD) + "\n2) Role: additional\n   Description: x\n"), ADDING, "", None),
+}
+
+
+class TestProductionParity:
+    @pytest.mark.parametrize("case", list(_PARITY_CASES))
+    def test_tool_result_equals_production(self, case):
+        from unittest import mock
+
+        from utilities.autopatcher.patch_challenger import challenge_patch
+
+        response, patch, shown, definitions = _PARITY_CASES[case]
+        llm = mock.MagicMock()
+        llm.complete.return_value = response
+        production = challenge_patch(
+            "vuln", patch, llm, code_context=shown, provenance_context=shown or None,
+            post_patch_definitions=definitions,
+        )
+        tool = reparse_challenger_response(
+            response, code_context=shown, patch=patch, vulnerability_text="vuln",
+            provenance_context=shown or None, post_patch_definitions=definitions,
+        )
+        assert tool == production
+
+    def test_archived_run_uses_recorded_parts_and_definitions(self, tmp_path):
+        """End to end through the tool: the S4 artifact's recorded citation
+        parts and trusted definitions reach the decision exactly as the
+        replay engine passes them."""
+        run_dir = _build_archived_run(tmp_path, response_text=_reply(_v2(OP, GUARD)))
+        s4_path = run_dir / "004_patch_generation_and_post_patch_investigation.json"
+        s4_path.write_text(json.dumps({
+            "vulnerability_text": "vuln", "patch": FAR_GUARD_PATCH, "challenger_context": _FAR_CTX,
+            "challenger_provenance_parts": [_FAR_CTX],
+            "challenger_post_patch_definitions": [_post_definition(FAR_GUARD_POST)],
+        }), encoding="utf-8")
+        artifact = replay_challenger_reparse(run_dir, tmp_path / "out")
+        assert artifact["result"]["verification_status"] == "VERIFIED_FIXED"
+
+        # the same archive without the trusted record fails closed
+        s4_path.write_text(json.dumps({
+            "vulnerability_text": "vuln", "patch": FAR_GUARD_PATCH, "challenger_context": _FAR_CTX,
+            "challenger_provenance_parts": [_FAR_CTX],
+        }), encoding="utf-8")
+        artifact = replay_challenger_reparse(run_dir, tmp_path / "out2")
+        assert artifact["result"]["verification_status"] == "INSUFFICIENT_EVIDENCE"

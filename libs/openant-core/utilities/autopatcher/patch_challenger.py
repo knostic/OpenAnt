@@ -8,9 +8,10 @@ LLM-based adversarial check. Uses `LLMClient` (mock-capable) to make queries.
 
 from __future__ import annotations
 
+import bisect
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from .llm_client import get_call_history
 from .run_metadata import _TRUNCATION_STOP_REASONS
@@ -121,11 +122,12 @@ applicability discipline as `OVERRIDE_VALUES`/`SCOPE_VALUES`: a mismatch is
 a malformed concern, never silently corrected).
 
 `present`: a protective conditional relevant to the alleged operation is
-cited, and (see `_citation_precedes_within_one_block`) its citation's
-first occurrence is textually before the operation citation's first
-occurrence within ONE rendered evidence block (a fenced source block, a
-grounding excerpt, or a single diff hunk) -- never by positions across
-blocks or sources --
+cited, and (see `_post_change_guard_holds`) every occurrence of the
+operation citation in post-change evidence (a diff hunk, a `Post-patch
+definition`, or evidence of code the patch does not touch) is preceded by
+an occurrence of the guard citation within the same unit that the patch
+does not remove, with at least one such occurrence -- never by positions
+across blocks or sources --
 a NECESSARY, not sufficient, signal: it catches a citation that is
 textually backwards, but proves nothing about branches, helper calls, or
 alternate paths that might bypass the guard. No CFG analyzer is
@@ -503,29 +505,36 @@ def _patch_citation_view(patch: str) -> "Tuple[str, set]":
 
 
 def _without_removed_lines(corpus: str, removed_only: set) -> str:
-    """`corpus` minus diff metadata lines and minus every line whose text
-    the patch removes (a pre-change copy of the target, or a `-`-prefixed
-    rendering of it): such a line can never ground a post-change fact."""
+    """`corpus` with diff metadata lines and every line whose text the patch
+    removes (a pre-change copy of the target, or a `-`-prefixed rendering of
+    it) blanked: such a line can never ground a post-change fact. Blanked,
+    not dropped, so an evidence block's lines keep their file line numbers
+    (see `_located_blocks`)."""
     out: "List[str]" = []
     for line in (corpus or "").splitlines():
         stripped = line.strip()
-        if _DIFF_METADATA_LINE_RE.match(stripped):
-            continue
-        if stripped in removed_only or (stripped[:1] in "+-" and stripped[1:].strip() in removed_only):
+        if _DIFF_METADATA_LINE_RE.match(stripped) or stripped in removed_only or (
+            stripped[:1] in "+-" and stripped[1:].strip() in removed_only
+        ):
+            out.append("")
             continue
         out.append(line)
     return "\n".join(out)
 
 
-def _find_citation(haystack: str, quote: str) -> int:
-    """Offset of `quote` in `haystack` on token boundaries (never a
-    mid-identifier substring such as `ete` inside `delete`), or -1."""
+def _citation_pattern(quote: str) -> str:
     pattern = re.escape(quote)
     if re.match(_WORD_CHAR, quote[0]):
         pattern = rf"(?<!{_WORD_CHAR})" + pattern
     if re.match(_WORD_CHAR, quote[-1]):
         pattern += rf"(?!{_WORD_CHAR})"
-    match = re.search(pattern, haystack)
+    return pattern
+
+
+def _find_citation(haystack: str, quote: str) -> int:
+    """Offset of `quote` in `haystack` on token boundaries (never a
+    mid-identifier substring such as `ete` inside `delete`), or -1."""
+    match = re.search(_citation_pattern(quote), haystack)
     return match.start() if match else -1
 
 
@@ -684,29 +693,505 @@ def _ordering_blocks(source: "Optional[str]") -> "List[str]":
     return units
 
 
-def _citation_precedes_within_one_block(
-    earlier_raw: "Optional[str]", later_raw: "Optional[str]", *sources: str,
+# ---------------------------------------------------------------------------
+# Post-change scoping of `preceding_guard == present` (PR #763 review).
+#
+# Citation PRESENCE is text-global, so it cannot tell WHICH occurrence of a
+# quoted line the model means: a guard the patch removes from the vulnerable
+# function still "exists" when the same text survives as context elsewhere,
+# in another file, or is re-added in an unrelated function, a pre-change
+# evidence block of the patched function still shows the removed guard before
+# the operation, and a different guard in another function or file can
+# precede another occurrence of the same operation text. The guard claim is
+# therefore decided per OCCURRENCE of the operation, only inside units that
+# show the post-change code:
+#   - each trusted post-patch definition: a changed function's complete
+#     post-change source, received as structured data through
+#     `challenge_patch(post_patch_definitions=...)` -- never recognized by a
+#     heading in the context text, which repository content could imitate;
+#   - each diff hunk, read with its removed lines in place, so removing a
+#     guard occurrence is an event at a position, never a text set;
+#   - repository evidence blocks, each occurrence placed by the block's own
+#     heading (path and pre-change line range) -- see "Call-site identity"
+#     below.
+# Within a unit, the cited guard is in force after a post-change occurrence
+# of it, only for an operation in the same function by indentation
+# (`_guard_scope_covers`: no line between them dedented below both, such as
+# the next function's header), and stops being in force at a removed
+# occurrence. Each operation occurrence is then:
+#   supporting    -- the guard is in force (and, when a guard effect is
+#                    claimed, the cited effect occurs in post-change text
+#                    between that guard occurrence and the operation);
+#   contradicting -- the guard was removed before it and not re-added, the
+#                    guard is in force but the claimed effect is not between
+#                    them, no guard precedes it in a complete function, or
+#                    the patch adds this occurrence with no guard before it in
+#                    its hunk;
+#   neutral       -- an unchanged occurrence before any guard event in a
+#                    partial window (hunk or excerpt): whatever guards it lies
+#                    outside the window.
+# A hunk occurrence whose line lies inside a trusted definition of the same
+# file (matched by the hunk header's new-side line number and the line's own
+# text) is decided by that complete function instead of the hunk. Any other
+# neutral HUNK occurrence counts as contradicting: an operation in code the
+# patch changes, whose guard cannot be seen, is never vouched for by a guard
+# seen before a different occurrence in another hunk, function or file. A
+# neutral occurrence in an excerpt of untouched code stays neutral. A hunk
+# that removes a guard occurrence and does not re-add it later in the same
+# hunk is contradicting too (the operation it protected may lie outside the
+# hunk's context lines). A block in the context text merely HEADED
+# `Post-patch definition` is read as a complete function for contradictions
+# only -- it can reject, never support. The guard holds only with at least
+# one supporting occurrence and no contradicting one; anything less fails
+# closed to `unresolved`. This is still textual order, never control flow.
+#
+# Call-site identity: matching text never says WHICH occurrence of the cited
+# operation is the vulnerable one, so every occurrence shown must be
+# accounted for. A repository block's occurrence is located by its heading
+# and decided by the hunk whose pre-change span holds that line, else by the
+# trusted definition holding its post-change line (mapped through the
+# diff's hunk offsets), else in its own block, where a guard counts only if
+# no changed region lies between guard and operation and an unseen guard
+# counts against. A block with no usable location that shares a line with
+# the patched code may be a pre-change copy of it: it never supports, and
+# an unguarded occurrence in it still counts against.
+# ---------------------------------------------------------------------------
+
+_UNTRUSTED_POST_PATCH_DEFINITION_RE = re.compile(
+    r"^####[ \t]+Post-patch definition[ \t]*:[^\n]*\n\n```[^\n`]*\n(.*?)\n```",
+    re.MULTILINE | re.DOTALL,
+)
+"""A `Post-patch definition` heading in the context TEXT (see this section's
+module comment): untrusted -- repository content can imitate it."""
+
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+class _Hunk(NamedTuple):
+    path: "Optional[str]"
+    new_start: "Optional[int]"
+    lines: "List[Tuple[str, str]]"
+    # pre-change span (`old_len == 0`: a pure insertion after `old_start`)
+    old_start: "Optional[int]" = None
+    old_len: int = 0
+    new_len: int = 0
+
+
+class _Definition(NamedTuple):
+    path: str
+    start_line: int
+    lines: "List[str]"
+
+
+def _normalize_repo_path(path: "Optional[str]") -> "Optional[str]":
+    path = (path or "").strip().replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path or None
+
+
+def _diff_target_path(header: str) -> "Optional[str]":
+    """The post-change path a `+++ ` or `diff --git ` header names, or None."""
+    if header.startswith("+++ "):
+        target = header[4:].split("\t")[0].strip()
+        if target == "/dev/null":
+            return None
+        return _normalize_repo_path(target[2:] if target.startswith("b/") else target)
+    if header.startswith("diff --git ") and " b/" in header:
+        return _normalize_repo_path(header.rsplit(" b/", 1)[1])
+    return None
+
+
+def _diff_hunks(diff: "Optional[str]") -> "List[_Hunk]":
+    """Each hunk of `diff`: its post-change file path and new-side start line
+    (None when the headers do not state them) and its ordered `(tag, text)`
+    lines, tag one of `' '`, `'+'`, `'-'`. A diff without any `@@` header is
+    a single hunk."""
+    hunks: "List[_Hunk]" = []
+    current: "List[Tuple[str, str]]" = []
+    path: "Optional[str]" = None
+    span: "Tuple" = (None, None, 0, 0)  # (new_start, old_start, old_len, new_len)
+    for line in (diff or "").splitlines():
+        if line.startswith("@@") or _DIFF_FILE_HEADER_RE.match(line):
+            if current:
+                hunks.append(_Hunk(path, span[0], current, span[1], span[2], span[3]))
+            current = []
+            if line.startswith("@@"):
+                header = _HUNK_HEADER_RE.match(line)
+                span = (
+                    int(header.group(3)), int(header.group(1)),
+                    int(header.group(2) or 1), int(header.group(4) or 1),
+                ) if header else (None, None, 0, 0)
+            else:
+                span = (None, None, 0, 0)
+                if line.startswith(("+++ ", "diff --git ")):
+                    path = _diff_target_path(line)
+            continue
+        if line.startswith("\\"):
+            continue  # "\ No newline at end of file"
+        if line[:1] in ("+", "-"):
+            current.append((line[0], line[1:]))
+        else:
+            current.append((" ", line[1:] if line.startswith(" ") else line))
+    if current:
+        hunks.append(_Hunk(path, span[0], current, span[1], span[2], span[3]))
+    return hunks
+
+
+def _trusted_post_patch_definitions(
+    definitions, shown: "Optional[str]", corpus: "Optional[str]",
+) -> "List[_Definition]":
+    """The well-formed `post_patch_definitions` records whose complete source
+    the Challenger was shown and may cite (present in both `shown` and
+    `corpus`). A malformed or unshown record is dropped, never repaired."""
+    trusted: "List[_Definition]" = []
+    shown_text = _normalize_for_provenance(shown)
+    corpus_text = _normalize_for_provenance(corpus)
+    for record in definitions or ():
+        try:
+            path, start, end, source = record["path"], record["start_line"], record["end_line"], record["source"]
+        except (KeyError, TypeError, IndexError):
+            continue
+        if not isinstance(path, str) or not isinstance(source, str) or not source.strip():
+            continue
+        if not all(isinstance(n, int) and not isinstance(n, bool) for n in (start, end)) or not 1 <= start <= end:
+            continue
+        lines = source.splitlines()
+        normalized_path = _normalize_repo_path(path)
+        normalized_source = _normalize_for_provenance(source)
+        if normalized_path is None or len(lines) > end - start + 1:
+            continue
+        if normalized_source not in shown_text or normalized_source not in corpus_text:
+            continue
+        trusted.append(_Definition(normalized_path, start, lines))
+    return trusted
+
+
+def _occurrence_lines(lines: "List[str]", quote: str) -> "List[Tuple[int, int, int]]":
+    """`(offset, first_line, last_line)` of every token-bounded occurrence of
+    the normalized `quote` in the normalized concatenation of `lines`; the
+    offsets share one coordinate space per `lines` list."""
+    parts: "List[str]" = []
+    starts: "List[int]" = []
+    ids: "List[int]" = []
+    pos = 0
+    for idx, line in enumerate(lines):
+        normalized = _normalize_for_provenance(line)
+        if not normalized:
+            continue
+        starts.append(pos)
+        ids.append(idx)
+        parts.append(normalized)
+        pos += len(normalized) + 1
+    found = []
+    for match in re.finditer(_citation_pattern(quote), " ".join(parts)):
+        first = ids[bisect.bisect_right(starts, match.start()) - 1]
+        last = ids[bisect.bisect_right(starts, max(match.end() - 1, match.start())) - 1]
+        found.append((match.start(), first, last))
+    return found
+
+
+def _indentation(text: str) -> int:
+    expanded = text.expandtabs(8)
+    return len(expanded) - len(expanded.lstrip())
+
+
+def _guard_scope_covers(unit: "List[Tuple[str, str]]", guard_line: int, op_line: int) -> bool:
+    """Whether the guard line and the operation line lie in one function by
+    indentation: on the same line, or with no post-change line in between
+    (blank lines aside) dedented below both. Such a line is a boundary
+    neither sits inside -- the next function or method's header, or a
+    closing brace. A guard or operation nested in a block (the other one
+    outside it) is not rejected: whether that block runs is control flow,
+    not textual order. At column 0 no dedent can show a boundary, so there
+    the guard and operation must both stay at column 0, with every line in
+    between."""
+    if guard_line == op_line:
+        return True
+    guard_depth, op_depth = _indentation(unit[guard_line][1]), _indentation(unit[op_line][1])
+    between = [_indentation(text) for tag, text in unit[guard_line + 1:op_line] if tag != "-" and text.strip()]
+    depth = min(guard_depth, op_depth)
+    if depth == 0:
+        return guard_depth == 0 and op_depth == 0 and all(d == 0 for d in between)
+    return all(d >= depth for d in between)
+
+
+def _unit_verdicts(
+    unit: "List[Tuple[str, str]]", guard: str, op: str, effect: "Optional[str]", complete: bool,
+) -> "Tuple[List[Tuple[int, str, Optional[int]]], bool]":
+    """One `(unit line index, verdict, guard line index)` per operation
+    occurrence in one unit -- verdict `supporting`/`contradicting`/`neutral`
+    (see this section's module comment); the guard line is set only for a
+    supporting verdict -- and whether the unit ends with the cited guard
+    removed. `complete` marks a whole-function unit. A guard is in force for
+    an operation only within its own indented scope (`_guard_scope_covers`)."""
+    post = [i for i, (tag, _t) in enumerate(unit) if tag != "-"]
+    pre = [i for i, (tag, _t) in enumerate(unit) if tag != "+"]
+    post_text = [unit[i][1] for i in post]
+    pre_text = [unit[i][1] for i in pre]
+    events = []  # (unit line, post offset, kind, payload)
+    for off, first, _last in _occurrence_lines(post_text, guard):
+        events.append((post[first], off, 1, None))
+    for _off, first, last in _occurrence_lines(pre_text, guard):
+        removed = [pre[k] for k in range(first, last + 1) if unit[pre[k]][0] == "-"]
+        if removed:
+            events.append((removed[0], -1, 0, None))
+    for off, first, last in _occurrence_lines(post_text, op):
+        added = any(unit[post[k]][0] == "+" for k in range(first, last + 1))
+        events.append((post[first], off, 2, added))
+    effect_offsets = [off for off, _f, _l in _occurrence_lines(post_text, effect)] if effect else []
+
+    verdicts: "List[Tuple[int, str, Optional[int]]]" = []
+    state = "absent" if complete else "unknown"
+    guard_off, guard_line = -1, None
+    for line, off, kind, added in sorted(events, key=lambda e: (e[0], e[1], e[2])):
+        if kind == 0:
+            state = "removed"
+        elif kind == 1:
+            state, guard_off, guard_line = "in_force", off, line
+        elif state == "in_force" and not _guard_scope_covers(unit, guard_line, line):
+            # the guard seen belongs to another scope: as if none were seen
+            verdicts.append((line, "contradicting" if complete or added else "neutral", None))
+        elif state == "in_force" and (effect is None or any(guard_off <= e < off for e in effect_offsets)):
+            verdicts.append((line, "supporting", guard_line))
+        elif state != "unknown" or added:
+            verdicts.append((line, "contradicting", None))
+        else:
+            verdicts.append((line, "neutral", None))
+    return verdicts, state == "removed"
+
+
+def _definition_decides(
+    path: "Optional[str]", line_number: "Optional[int]", text: str, definitions: "List[Tuple[_Definition, set]]",
 ) -> bool:
-    """True only when some ONE rendered block (see `_ordering_blocks`) of
-    some ONE supplied source contains both citations, with the earlier
-    citation's first occurrence strictly before the later citation's
-    first occurrence WITHIN that block. Never compares positions across
-    blocks or sources, and a duplicate copy of either line in another
-    block can neither establish nor defeat a block's own ordering. Still
-    only the NECESSARY textual-order signal `_citation_precedes`
-    documents -- never control-flow proof."""
-    earlier = _normalize_for_provenance(_strip_quote_wrapping(earlier_raw))
-    later = _normalize_for_provenance(_strip_quote_wrapping(later_raw))
-    if not earlier or not later:
+    """Whether a trusted definition of `path` holds an operation occurrence on
+    post-change line `line_number`, whose text is `text`."""
+    if path is None or line_number is None:
         return False
-    for source in sources:
-        for unit in _ordering_blocks(source):
-            normalized_unit = _normalize_for_provenance(unit)
-            off_earlier = _find_citation(normalized_unit, earlier)
-            off_later = _find_citation(normalized_unit, later)
-            if off_earlier != -1 and off_later != -1 and off_earlier < off_later:
-                return True
+    normalized = _normalize_for_provenance(text)
+    for definition, op_lines in definitions:
+        offset = line_number - definition.start_line
+        if (
+            definition.path == path and 0 <= offset < len(definition.lines) and offset in op_lines
+            and _normalize_for_provenance(definition.lines[offset]) == normalized
+        ):
+            return True
     return False
+
+
+def _decided_by_definition(
+    hunk: _Hunk, index: int, definitions: "List[Tuple[_Definition, set]]",
+) -> bool:
+    """Whether the operation occurrence starting on `hunk.lines[index]` lies,
+    by the hunk header's new-side numbering and the line's own text, at an
+    operation occurrence of a trusted definition of the same file."""
+    if hunk.new_start is None or hunk.lines[index][0] == "-":
+        return False
+    line_number = hunk.new_start + sum(1 for tag, _t in hunk.lines[:index] if tag != "-")
+    return _definition_decides(hunk.path, line_number, hunk.lines[index][1], definitions)
+
+
+# Location of a repository evidence block (pre-change coordinates): a
+# deterministic `#### <kind>: `path[:label]` (lines a-b[, note])` /
+# `(full file, N lines)` / `(N lines)` heading over a fenced block, or a
+# grounding excerpt `# path (lines a-b)` / `(full file, N lines)`. A
+# discovered-usage window may skip lines with an explicit
+# `# ... (N line(s) omitted: lines a-b) ...` marker. The older marker form
+# without the range under-counted when a window ended in blank lines, so
+# lines after it carry no trusted number. Anything else is unlocated.
+_LOCATED_FENCED_BLOCK_RE = re.compile(
+    r"^####([^\n`]*)`([^`\n]+)`[ \t]*\(([^)\n]*)\)[ \t]*\n\n```[^\n`]*\n(.*?)\n```", re.MULTILINE | re.DOTALL,
+)
+_LOCATED_GROUNDING_HEADER_RE = re.compile(
+    r"^# (\S+) \((?:lines (\d+)-\d+|full file, \d+ lines)\)[ \t]*$", re.MULTILINE,
+)
+_OMITTED_LINES_RE = re.compile(r"^# \.\.\. \((\d+) line\(s\) omitted(?:: lines (\d+)-(\d+))?\) \.\.\.$")
+
+
+def _located_block_span(meta: str) -> "Optional[Tuple[int, int]]":
+    """`(first line, last line)` a heading's location states, or None."""
+    meta = meta.strip()
+    single_range = re.match(r"lines (\d+)\s*[\u2013-]\s*(\d+)(?:,\s*[^\d\s].*)?$", meta)
+    if single_range:
+        return int(single_range.group(1)), int(single_range.group(2))
+    whole = re.match(r"(?:full file, )?(\d+) lines$", meta)
+    return (1, int(whole.group(1))) if whole else None
+
+
+def _located_blocks(corpus: "Optional[str]") -> "List[Tuple[str, List[Tuple[Optional[Tuple[int, int]], str]]]]":
+    """`(path, [(line interval or None, text), ...])` for every evidence block
+    of `corpus` with a parseable single-range location (see above). A line's
+    interval `(lo, hi)` bounds its file line number: exact (`lo == hi`)
+    except after an older-form omitted-lines marker, which only ever
+    under-counted -- the heading's last line bounds the total shortfall. A
+    marker line is None. `Post-patch definition` blocks are excluded:
+    post-change text, handled separately."""
+    blocks = []
+
+    def numbered(path, span, body):
+        rows, number, legacy = [], span[0], False
+        for text in body.splitlines():
+            omitted = _OMITTED_LINES_RE.match(text.strip())
+            if omitted:
+                if omitted.group(3) and not legacy:
+                    number = int(omitted.group(3)) + 1
+                else:
+                    number, legacy = number + int(omitted.group(1)), True
+                rows.append((None, legacy, text))
+            else:
+                rows.append((number, legacy, text))
+                number += 1
+        shortfall = span[1] - (number - 1)
+        if shortfall < 0:
+            return  # numbering inconsistent with the heading: no usable location
+        blocks.append((path, [
+            (None if n is None else (n, n + shortfall if uncertain else n), text) for n, uncertain, text in rows
+        ]))
+
+    text = corpus or ""
+    for match in _LOCATED_FENCED_BLOCK_RE.finditer(text):
+        span = _located_block_span(match.group(3))
+        if "Post-patch definition" in match.group(1) or span is None:
+            continue
+        path = match.group(2)
+        path = _normalize_repo_path(path[:path.rfind(":")] if ":" in path else path)
+        if path:
+            numbered(path, span, match.group(4))
+    remainder = _LOCATED_FENCED_BLOCK_RE.sub("\n", text)
+    headers = list(_LOCATED_GROUNDING_HEADER_RE.finditer(remainder))
+    for i, header in enumerate(headers):
+        body = remainder[header.end():(headers[i + 1].start() if i + 1 < len(headers) else len(remainder))]
+        section = _MARKDOWN_SECTION_HEADING_RE.search(body)
+        body = (body[:section.start()] if section else body)
+        body = body[1:] if body.startswith("\n") else body
+        span = _located_block_span(header.group(0)[header.group(0).index("(") + 1:header.group(0).rindex(")")])
+        path = _normalize_repo_path(header.group(1))
+        if path and span and body.strip():
+            numbered(path, span, body.rstrip("\n"))
+    return blocks
+
+
+def _hunk_spans_line(hunk: _Hunk, line: int) -> bool:
+    return hunk.old_len > 0 and hunk.old_start <= line < hunk.old_start + hunk.old_len
+
+
+def _hunk_before_line(hunk: _Hunk, line: int) -> bool:
+    if hunk.old_len == 0:
+        return hunk.old_start < line
+    return hunk.old_start + hunk.old_len <= line
+
+
+def _hunk_touches_span(hunk: _Hunk, first: int, last: int) -> bool:
+    if hunk.old_len == 0:
+        return first <= hunk.old_start < last
+    return hunk.old_start <= last and hunk.old_start + hunk.old_len - 1 >= first
+
+
+def _post_change_guard_holds(
+    guard_raw: "Optional[str]", op_raw: "Optional[str]", corpus: "Optional[str]", diff: "Optional[str]",
+    effect_raw: "Optional[str]" = None, definitions: "Sequence[_Definition]" = (),
+) -> bool:
+    """Whether the cited guard precedes the cited operation in the
+    post-change code, per occurrence (see this section's module comment).
+    `diff` is the RAW patch, removed lines included; `corpus` is the
+    repository evidence the citations are checked against; `definitions`
+    are the trusted complete post-change functions."""
+    guard = _normalize_for_provenance(_strip_quote_wrapping(guard_raw))
+    op = _normalize_for_provenance(_strip_quote_wrapping(op_raw))
+    effect = _normalize_for_provenance(_strip_quote_wrapping(effect_raw)) if effect_raw is not None else None
+    if not guard or not op or guard == op or effect == "":
+        return False
+
+    supporting = contradicting = 0
+
+    def tally(verdict: str) -> None:
+        nonlocal supporting, contradicting
+        if verdict == "supporting":
+            supporting += 1
+        elif verdict != "ignored":
+            contradicting += 1  # contradicting, or neutral: its guard is not in evidence
+
+    decided: "List[Tuple[_Definition, set]]" = []
+    for definition in definitions:
+        verdicts, _removed = _unit_verdicts([(" ", line) for line in definition.lines], guard, op, effect, True)
+        decided.append((definition, {line for line, _v, _g in verdicts}))
+        for _line, verdict, _guard_line in verdicts:
+            tally(verdict)
+
+    hunks = _diff_hunks(diff)
+    for hunk in hunks:
+        verdicts, removed_at_end = _unit_verdicts(hunk.lines, guard, op, effect, False)
+        for line, verdict, _guard_line in verdicts:
+            if not _decided_by_definition(hunk, line, decided):
+                tally(verdict)
+        if removed_at_end:
+            contradicting += 1
+
+    untrusted_definitions = [
+        m.group(1) for m in _UNTRUSTED_POST_PATCH_DEFINITION_RE.finditer(corpus or "")
+    ]
+    for body in untrusted_definitions:
+        verdicts, _removed = _unit_verdicts([(" ", line) for line in body.splitlines()], guard, op, effect, True)
+        contradicting += sum(1 for _line, verdict, _g in verdicts if verdict == "contradicting")
+    skip_sources = {_normalize_for_provenance(body) for body in untrusted_definitions}
+    skip_sources |= {_normalize_for_provenance("\n".join(d.lines)) for d in definitions}
+
+    # Repository evidence: every occurrence of the operation is a call site
+    # the claim must account for. Located by its block's heading, it is
+    # decided by the hunk that spans it, else by the trusted definition of
+    # its post-change line, else in its own block -- where a guard counts
+    # only if no changed region lies between them. Its location is never
+    # inferred from matching text.
+    real_hunks = [h for h in hunks if h.new_start is not None]
+    locatable = all(h.path and h.old_start is not None for h in real_hunks) and not any(
+        h.new_start is None and any(tag != " " for tag, _t in h.lines) for h in hunks
+    )
+    located_texts = []
+    for path, lines in (_located_blocks(corpus) if locatable else []):
+        located_texts.append(_normalize_for_provenance("\n".join(text for _n, text in lines)))
+        if located_texts[-1] in skip_sources:
+            continue
+        file_hunks = [h for h in real_hunks if h.path == path]
+        file_definitions = [d for d, _lines in decided if d.path == path]
+
+        def decided_elsewhere(number):
+            if any(_hunk_spans_line(h, number) for h in file_hunks):
+                return True  # this call site's post-change state is in that hunk
+            post = number + sum(h.new_len - h.old_len for h in file_hunks if _hunk_before_line(h, number))
+            # a trusted complete function judges every occurrence in its span
+            return any(d.start_line <= post < d.start_line + len(d.lines) for d in file_definitions)
+
+        verdicts, _removed = _unit_verdicts([(" ", text) for _n, text in lines], guard, op, effect, False)
+        for line, verdict, guard_line in verdicts:
+            low, high = lines[line][0]
+            if high - low <= 200 and all(decided_elsewhere(n) for n in range(low, high + 1)):
+                continue
+            guard_interval = lines[guard_line][0] if guard_line is not None else None
+            if verdict == "supporting" and (low != high or guard_interval is None or any(
+                _hunk_touches_span(h, guard_interval[0], high) for h in file_hunks
+            )):
+                # an uncertain location may be a stale copy; a changed region
+                # between guard and operation voids this block's ordering
+                verdict = "contradicting" if low == high else "ignored"
+            tally(verdict)
+
+    # Fallback for evidence with no usable location: a block sharing a line
+    # with the patched code may be a pre-change copy of it, so it never
+    # supports; any unguarded occurrence anywhere still counts against.
+    patched_lines = {
+        normalized for hunk in hunks for tag, text in hunk.lines
+        if tag != "+" and (normalized := _normalize_for_provenance(text))
+    }
+    for block in _ordering_blocks(corpus):
+        normalized_block = _normalize_for_provenance(block)
+        if normalized_block in skip_sources or any(normalized_block in t for t in located_texts):
+            continue
+        maybe_stale = any(_find_citation(normalized_block, line) != -1 for line in patched_lines)
+        verdicts, _removed = _unit_verdicts([(" ", line) for line in block.splitlines()], guard, op, effect, False)
+        for _line, verdict, _guard_line in verdicts:
+            if not (maybe_stale and verdict == "supporting"):
+                tally(verdict)
+    return supporting > 0 and contradicting == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1111,7 +1596,8 @@ def _normalize_v2_override_scope(
 
 
 def _parse_concern_block_v2(
-    block: str, code_context: str, patch: str, vulnerability_text: str,
+    block: str, code_context: str, patch: str, vulnerability_text: str, diff: "Optional[str]" = None,
+    definitions: "Sequence[_Definition]" = (),
 ) -> dict:
     """Parse and deterministically validate ONE already-isolated
     `concerns_v2` concern block: five atomic reachability facts (each
@@ -1234,17 +1720,32 @@ def _parse_concern_block_v2(
     if op_present == "present" and not _point_citation_valid(op_prov, code_context, patch):
         effective_op_present = "unresolved"
 
+    # The guard-ORDERING rules (_post_change_guard_holds) verify a positive
+    # claim: they gate only a chain that can derive `blocked`. A chain the
+    # model reports as leading to `reachable` (the guard is false by default,
+    # has no effect, or is reset on re-entry) is never demoted by them -- its
+    # facts still need valid citations below, and whatever they demote to,
+    # such a chain can never derive `blocked`.
+    reports_reachable_chain = default_state == "condition_false_under_default" or (
+        default_state == "condition_true_under_default" and (
+            effect == "no_effect"
+            or (effect in ("prevents_operation", "neutralizes_operation") and reentry == "reset_or_bypassed")
+        )
+    )
+
     effective_guard = guard
     if effective_op_present != "present":
         effective_guard = "not_applicable"
     elif guard == "present":
         if not _point_citation_valid(guard_prov, code_context, patch):
             effective_guard = "unresolved"
-        elif not _citation_precedes_within_one_block(guard_prov, op_prov, code_context, patch):
-            # Necessary-but-not-sufficient ordering check (see
-            # _citation_precedes_within_one_block) -- a guard citation not
-            # textually before the operation's own citation, inside ONE
-            # rendered evidence block, can never establish a PRECEDING guard.
+        elif not reports_reachable_chain and not _post_change_guard_holds(
+            guard_prov, op_prov, code_context, patch if diff is None else diff, definitions=definitions,
+        ):
+            # Necessary-but-not-sufficient ordering check, scoped per
+            # occurrence to post-change evidence (see _post_change_guard_holds):
+            # a removed guard, or one whose only surviving copy is elsewhere,
+            # can never establish a PRECEDING guard.
             effective_guard = "unresolved"
     elif guard == "absent":
         # Bounded-absence rule: the `whole function` marker and a grounded
@@ -1274,6 +1775,14 @@ def _parse_concern_block_v2(
         effective_effect = "not_applicable"
     elif effect in ("prevents_operation", "neutralizes_operation", "no_effect"):
         if not _point_citation_valid(effect_prov, code_context, patch):
+            effective_effect = "unresolved"
+        elif effect != "no_effect" and not reports_reachable_chain and not _post_change_guard_holds(
+            guard_prov, op_prov, code_context, patch if diff is None else diff, effect_raw=effect_prov,
+            definitions=definitions,
+        ):
+            # A protective effect must be the cited guard's own: present in
+            # post-change text between that guard and the operation (a
+            # removed `raise` surviving elsewhere is not this guard's effect).
             effective_effect = "unresolved"
 
     effective_reentry = reentry
@@ -1347,6 +1856,7 @@ def _response_uses_v2_schema(concerns_body: "Optional[str]") -> bool:
 
 def _parse_concerns(
     concerns_body: "Optional[str]", code_context: str, patch: str, vulnerability_text: str,
+    diff: "Optional[str]" = None, definitions: "Sequence[_Definition]" = (),
 ) -> "List[dict]":
     if not concerns_body:
         return []
@@ -1358,10 +1868,25 @@ def _parse_concerns(
         if span is None:
             concerns.append(_malformed_concern("duplicate_concern_number"))
         elif use_v2:
-            concerns.append(_parse_concern_block_v2(span, code_context, patch, vulnerability_text))
+            concerns.append(_parse_concern_block_v2(span, code_context, patch, vulnerability_text, diff, definitions))
         else:
             concerns.append(_parse_concern_block(span, code_context, patch, vulnerability_text))
     return concerns
+
+
+def _unscoped_v1_blocked_to_unresolved(concern: dict) -> dict:
+    """A `concerns_v1` concern whose effective reachability is `blocked`,
+    demoted to `unresolved` (see the call site in `challenge_patch`)."""
+    if concern.get("malformed") or concern.get("default_execution_reachability") != "blocked":
+        return concern
+    return {
+        **concern,
+        "default_execution_reachability": "unresolved",
+        "consequence": _concern_consequence(
+            "unresolved", concern.get("requires_explicit_non_default_action"),
+            concern.get("contract_addresses_override"),
+        ),
+    }
 
 
 def _derive_status_from_concerns(
@@ -1536,6 +2061,7 @@ def _synthesize_summary_from_concerns(concerns: "List[dict]", structural_violati
 def challenge_patch(
     vulnerability_text: str, patch: str, llm, code_context: str = "",
     provenance_context: "Optional[str]" = None,
+    post_patch_definitions: "Optional[Sequence[dict]]" = None,
 ) -> dict:
     """
     Run an adversarial challenger against a proposed patch.
@@ -1566,6 +2092,15 @@ def challenge_patch(
         previous behavior (validate against `code_context`) for callers
         that do not supply one. Scope citations are unaffected: they are
         still validated against `vulnerability_text` only.
+    post_patch_definitions:
+        Trusted complete post-change functions, as pipeline-produced records
+        `{"path", "start_line", "end_line", "source"}` (see
+        post_patch_evaluation.post_patch_definitions). The only evidence
+        treated as a complete function when ordering a guard before the
+        operation: a `Post-patch definition` heading inside the context
+        text is never trusted, since repository content can imitate it. A
+        record whose source the model was not shown (or may not cite) is
+        ignored. `None`/empty: no complete post-change evidence.
 
     Returns a dict with keys: `verification_status` (one of
     `VERIFICATION_STATUSES`, or `None` -- see `_parse_verification`),
@@ -1640,8 +2175,15 @@ def challenge_patch(
         citation_patch, removed_only = _patch_citation_view(patch)
         concerns = _parse_concerns(
             concerns_body, _without_removed_lines(citation_corpus, removed_only),
-            citation_patch, vulnerability_text,
+            citation_patch, vulnerability_text, diff=patch,
+            definitions=_trusted_post_patch_definitions(post_patch_definitions, code_context, citation_corpus),
         )
+        # A legacy `concerns_v1` `blocked` claim rests on ONE quote with no
+        # operation or ordering, so it cannot be tied to the vulnerable code
+        # location (any surviving line, anywhere in the evidence, grounds it).
+        # It fails closed to `unresolved`; a `reachable` claim is unaffected.
+        if not _response_uses_v2_schema(concerns_body):
+            concerns = [_unscoped_v1_blocked_to_unresolved(c) for c in concerns]
         # A bare placeholder (see _PLACEHOLDER_VALUES) is the prompt's own
         # documented way to leave a legacy section empty -- it must count
         # as empty here too, never as real, unstructured content that

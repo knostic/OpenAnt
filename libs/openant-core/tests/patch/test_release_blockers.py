@@ -32,16 +32,27 @@ from utilities.autopatcher.vulnerability_patterns import (
 
 PATCH = (
     "--- a/app.py\n+++ b/app.py\n@@ -1,3 +1,4 @@\n"
-    " def handler(req):\n+    validate(req)\n     run(req.data)\n"
+    " def handler(req):\n+    validate(req)\n     run(req.data)\n     other_sink(req.raw)\n"
 )
 CTX = "```python\ndef handler(req):\n    validate(req)\n    run(req.data)\n    other_sink(req.raw)\n```"
 VULN = "# Injection\n\n## Vulnerability description\n\nrun(req.data) is injectable."
 APPLIES = {"applicable": True, "skipped": False, "skipped_reason": None, "error": None, "stderr": ""}
 
+# concerns_v2 (the live schema): a legacy concerns_v1 `blocked` claim never
+# verifies, so it cannot serve as the clean-response vehicle here.
 PRIMARY_FIELDS = """Role: primary
    Description: original path
-   Default execution reachability: blocked
-   Reachability provenance: validate(req)
+   Operation present in evidence: present
+   Operation provenance: run(req.data)
+   Preceding guard: present
+   Guard provenance: validate(req)
+   Function provenance: none
+   Guard default state: condition_true_under_default
+   Guard default state provenance: validate(req)
+   Guard effect: neutralizes_operation
+   Guard effect provenance: validate(req)
+   Reentry state propagation: not_applicable
+   Reentry provenance: none
    Requires explicit non-default action: false
    Override provenance: none
    Contract addresses override: not_applicable
@@ -49,8 +60,17 @@ PRIMARY_FIELDS = """Role: primary
 """
 BLOCKING_FIELDS = """Role: additional
    Description: other_sink(req.raw) still receives unvalidated input
-   Default execution reachability: reachable
-   Reachability provenance: other_sink(req.raw)
+   Operation present in evidence: present
+   Operation provenance: other_sink(req.raw)
+   Preceding guard: present
+   Guard provenance: validate(req)
+   Function provenance: none
+   Guard default state: condition_true_under_default
+   Guard default state provenance: validate(req)
+   Guard effect: no_effect
+   Guard effect provenance: other_sink(req.raw)
+   Reentry state propagation: not_applicable
+   Reentry provenance: none
    Requires explicit non-default action: not_applicable
    Override provenance: none
    Contract addresses override: not_applicable
@@ -475,7 +495,7 @@ def test_rb5_3_truncated_immediately_before_a_blocking_concern(live_llm):
 
 
 def test_rb5_4_truncated_in_the_middle_of_a_concern(live_llm):
-    cut = WITH_BLOCKING[: WITH_BLOCKING.index("Reachability provenance: other_sink")]
+    cut = WITH_BLOCKING[: WITH_BLOCKING.index("Operation provenance: other_sink")]
     challenger = _challenge_live(live_llm(cut, "max_tokens"))
     assert challenger["still_vulnerable"] is True
     assert _decision(challenger) != GREEN
@@ -516,3 +536,25 @@ def test_rb5_stale_truncation_from_an_earlier_call_is_not_applied(live_llm):
     challenger = _challenge_live(live_llm(CLEAN_COMPLETE, "end_turn", clear=False))
     assert challenger["verification_status"] == "VERIFIED_FIXED"
     assert challenger["still_vulnerable"] is False
+
+
+def test_enrichment_constants_never_follow_a_symlink_out_of_the_repo(tmp_path):
+    """PR #763 review: InvestigationContext constants are read only from files
+    resolving inside repo_root; an in-repo symlink keeps working."""
+    from types import SimpleNamespace
+
+    from utilities.autopatcher.candidate_enrichment import _collect_repo_constants
+
+    repo, outside = tmp_path / "repo", tmp_path / "outside"
+    repo.mkdir()
+    outside.mkdir()
+    (outside / "secret.py").write_text('CANARY = "outside-repository"\n', encoding="utf-8")
+    (repo / "real.py").write_text('INSIDE = "in-repository"\n', encoding="utf-8")
+    (repo / "escape.py").symlink_to(outside / "secret.py")
+    (repo / "alias.py").symlink_to(repo / "real.py")
+    index = SimpleNamespace(by_file={"escape.py": [], "alias.py": [], "real.py": []})
+    constants = _collect_repo_constants(repo, index)
+    assert "escape.py" not in constants
+    assert "outside-repository" not in repr(constants)
+    assert "in-repository" in repr(constants.get("alias.py"))
+    assert "in-repository" in repr(constants.get("real.py"))

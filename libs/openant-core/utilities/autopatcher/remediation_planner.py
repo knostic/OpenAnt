@@ -274,7 +274,26 @@ def _has_plan_shape(parsed) -> bool:
     return all(field in parsed for field in _PLAN_SHAPE_FIELDS)
 
 
-def _parse_json_response(raw: str) -> "dict | None":
+_STRATEGY_SHAPE_FIELDS = (
+    "extended_mechanism", "target_files", "target_symbols",
+    "required_edits", "security_invariant", "insufficient_evidence",
+)
+"""The Final Strategy counterpart of `_PLAN_SHAPE_FIELDS` (the Strategy
+schema in prompts/remediation_strategy.md has no `remediation_mechanism`/
+`narrower_alternative_decision`, so the Planner fingerprint can never match
+it): key presence only, same role. `target_authority_unresolved` is not
+required -- `_parse_target_authority_unresolved` already handles its absence."""
+
+
+def _has_strategy_shape(parsed) -> bool:
+    if not isinstance(parsed, dict):
+        return False
+    return all(field in parsed for field in _STRATEGY_SHAPE_FIELDS)
+
+
+def _parse_json_response(raw: str, has_shape=_has_plan_shape) -> "dict | None":
+    """`has_shape` is the caller's own response fingerprint for the
+    prose-prefixed fallback below (default: the Planner's)."""
     if not raw or not isinstance(raw, str):
         return None
     text = raw.strip()
@@ -310,7 +329,7 @@ def _parse_json_response(raw: str) -> "dict | None":
             candidate = json.loads(substring)
         except (json.JSONDecodeError, ValueError):
             continue  # not valid JSON on its own -- e.g. a stray "{" in prose
-        if _has_plan_shape(candidate):
+        if has_shape(candidate):
             candidates.append(candidate)
 
     if len(candidates) == 1:
@@ -2855,7 +2874,7 @@ def generate_remediation_strategy(
     except Exception:
         return _EMPTY_STRATEGY_RESULT
 
-    plan = _parse_json_response(raw)
+    plan = _parse_json_response(raw, has_shape=_has_strategy_shape)
     if plan is None:
         return _EMPTY_STRATEGY_RESULT
 
@@ -4061,13 +4080,18 @@ def _render_usage_window_block(path: str, label: str, ranges: "list[tuple[int, i
     prev_end = None
     for start, end in ranges:
         if prev_end is not None:
+            # Counted from the last line actually shown (trailing blank lines
+            # are stripped below), with the exact range, so every shown line
+            # keeps its file line number.
             gap = start - prev_end - 1
-            pieces.append(f"# ... ({gap} line(s) omitted) ...")
+            pieces.append(f"# ... ({gap} line(s) omitted: lines {prev_end + 1}-{start - 1}) ...")
         text = index.read_file_section(path, start, end)
         if text is None:
             return None
-        pieces.append(text.rstrip("\n"))
-        prev_end = end
+        shown = text.rstrip("\n")
+        if shown:
+            pieces.append(shown)
+        prev_end = start + len(shown.splitlines()) - 1
     body = "\n".join(pieces)
     lo, hi = ranges[0][0], ranges[-1][1]
     return (

@@ -260,16 +260,16 @@ class TestPairedReplayComparison:
 
     def test_baseline_result_is_the_parsed_archived_response(self):
         """Item 1 + 3: the replay stub is what's called, and the baseline
-        result is exactly what production parsing derives from it --
-        matching the fixture's own `blocked` reachability / `VERIFIED_FIXED`
-        status, not some other value."""
+        result is exactly what production parsing derives from it. The
+        fixture is a legacy concerns_v1 response asserting `blocked`, which
+        production fails closed to `unresolved` (a single unscoped quote)."""
         result, baseline_llm, _tree_llm = self._run()
         assert baseline_llm._called is True
-        assert result["baseline_verification_status"] == "VERIFIED_FIXED"
+        assert result["baseline_verification_status"] == "INSUFFICIENT_EVIDENCE"
         assert result["concern_count"] == 1
         concern = result["concerns"][0]
-        assert concern["baseline"]["default_execution_reachability"] == "blocked"
-        assert concern["baseline"]["consequence"] == "NON_BLOCKING"
+        assert concern["baseline"]["default_execution_reachability"] == "unresolved"
+        assert concern["baseline"]["consequence"] == "UNRESOLVED"
 
     def test_tree_receives_only_proposition_and_repo_evidence(self):
         """Item 7: inspect the ACTUAL prompts the tree LLM received."""
@@ -354,7 +354,7 @@ class TestMainStillWorksEndToEnd:
 
         result = json.loads(output.read_text())
         assert result["baseline_source"] == "archived_challenger_response"
-        assert result["concerns"][0]["baseline"]["default_execution_reachability"] == "blocked"
+        assert result["concerns"][0]["baseline"]["default_execution_reachability"] == "unresolved"
 
 
 class TestExtractArchivedConcerns:

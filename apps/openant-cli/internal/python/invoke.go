@@ -101,8 +101,9 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	// prepends the CWD, and this engine inherits the user's shell CWD — which in the
 	// standard `git clone X && cd X && openant ...` flow is inside the scanned,
 	// untrusted repository. A hostile `openant/` package there would shadow the real
-	// one and execute on import. -P closes that; it also propagates via the
-	// environment to the report subprocesses the engine spawns.
+	// one and execute on import. -P closes that for this process only (it is a
+	// flag, not an environment setting): the report subprocesses the engine
+	// spawns pass -P themselves (core/reporter.py).
 	cmdArgs := append([]string{"-P", "-m", "openant"}, args...)
 
 	// Bound the subprocess with an automatic deadline so a hung parser

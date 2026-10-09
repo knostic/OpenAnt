@@ -139,15 +139,47 @@ class TestCitationAuthorityBoundary:
         "```\n"
     )
 
+    # The repository section WITHOUT the operation: with _REPO_SECTION the
+    # repository's own occurrence of the operation (guarded by a different
+    # guard than the narrative one) already fails the claim closed through
+    # call-site identity (PR #763), so the control below could no longer
+    # show what the boundary alone prevents.
+    _REPO_SIGNATURE_ONLY = (
+        "#### Target definition: `m.py:process` (lines 1-2)\n"
+        "```python\n"
+        "def process(item, allow_external: bool = False):\n"
+        "    log(item)\n"
+        "```\n"
+    )
+
     def test_b_control_same_quote_was_accepted_without_the_boundary(self):
         """The defect being fixed: with no boundary (legacy default), the
         narrative-only quote validated and produced NON_BLOCKING."""
         block = _v2_block(guard_prov="if narrative_only_flag: raise AccessError()")
         result = challenge_patch(
             "vuln", "diff", _llm(_v2_response(block)),
-            code_context=self._NARRATIVE_WITH_FENCED_QUOTE + "\n" + _REPO_SECTION,
+            code_context=self._NARRATIVE_WITH_FENCED_QUOTE + "\n" + self._REPO_SIGNATURE_ONLY,
         )
         assert _primary(result)["consequence"] == "NON_BLOCKING"
+
+    def test_b_control_narrative_quote_fails_with_the_boundary(self):
+        block = _v2_block(guard_prov="if narrative_only_flag: raise AccessError()")
+        result = challenge_patch(
+            "vuln", "diff", _llm(_v2_response(block)),
+            code_context=self._NARRATIVE_WITH_FENCED_QUOTE + "\n" + self._REPO_SIGNATURE_ONLY,
+            provenance_context=self._REPO_SIGNATURE_ONLY,
+        )
+        assert _primary(result)["consequence"] == "UNRESOLVED"
+
+    def test_b_narrative_quote_without_boundary_still_fails_against_the_repository_call_site(self):
+        """Even without the boundary, the repository's own occurrence of the
+        operation is preceded by a different guard than the cited one."""
+        block = _v2_block(guard_prov="if narrative_only_flag: raise AccessError()")
+        result = challenge_patch(
+            "vuln", "diff", _llm(_v2_response(block)),
+            code_context=self._NARRATIVE_WITH_FENCED_QUOTE + "\n" + _REPO_SECTION,
+        )
+        assert _primary(result)["consequence"] == "UNRESOLVED"
 
     def test_b_same_fenced_narrative_quote_fails_with_the_boundary(self):
         block = _v2_block(guard_prov="if narrative_only_flag: raise AccessError()")

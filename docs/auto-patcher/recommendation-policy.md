@@ -167,13 +167,107 @@ matters after a fully cited `blocked` chain. Code then does the following:
    repository-derived context the Challenger was actually shown, in the
    post-change side of the diff (context and added lines, never removed lines
    or diff headers), or (for scope facts) in the vulnerability report. Context
-   lines that the patch removes are excluded too, so a removed guard can never
-   be cited as present. A quote must contain an identifier character, be at
+   lines whose text the patch removes, and that do not survive anywhere in the
+   diff, are excluded too. A quote must contain an identifier character, be at
    least 3 non-whitespace characters, and match on token boundaries (not
    inside a longer identifier). Planner and Strategy prose is not citation
    authority. A fact with an ungrounded citation is treated as `unresolved`.
    The check proves a quote is real and comes from the patched code, not that
    it supports the fact; that remains the model's judgment.
+
+   Because a quote does not say *where* it comes from, the one fact that can
+   lead to `blocked` (a guard that precedes the operation) is checked per
+   occurrence of the cited operation, never by text alone
+   (`_post_change_guard_holds`). Three kinds of evidence count:
+
+   - **Complete post-patch functions.** The pipeline reads the complete
+     post-change source of each changed function from the patched copy and
+     passes it to the Challenger as structured records, separately from the
+     context text. Only these records count as complete functions that can
+     support the guard, and only when the Challenger was actually shown
+     them. A block in the context text headed `Post-patch definition` is
+     never trusted as support, because repository content can imitate the
+     heading. Such a block can still count against the guard.
+   - **Diff hunks**, read with their removed lines in place.
+   - **Repository evidence blocks**, each placed by its own heading (file
+     and pre-change line range).
+
+   Within one unit, the guard must appear before the operation, and a
+   protective effect (`raise`, `return`, sanitizing) must sit between them.
+   The guard counts only for an operation in the same function, judged by
+   indentation: if a line between them is indented less than both (for
+   example the header of the next function or method, or a closing brace),
+   the guard does not cover the operation. A guard and operation at column
+   0 count only if every line between them is at column 0 too, and an
+   indented guard never covers an operation at column 0.
+
+   Matching text cannot say *which* occurrence of the cited operation is the
+   vulnerable one, so every occurrence shown must be accounted for:
+
+   - An occurrence in a hunk is judged by its own changed function's
+     complete record when one covers its line (matched by file, hunk line
+     number and line text); otherwise inside the hunk.
+   - An occurrence in a repository evidence block is located through its
+     heading. If a hunk spans that line, the hunk decides it. Otherwise its
+     line is mapped through the diff to its post-change line, and the
+     complete record covering that line decides it. Otherwise it is judged
+     inside its own block, and a guard there counts only if no changed
+     region lies between the guard and the operation.
+   - A block without a usable location that shares a line with the patched
+     code may be a pre-change copy, so it never supports the guard, and an
+     unguarded occurrence in it still counts against the guard.
+
+   Wherever it is judged, an occurrence with no guard visible before it
+   counts against the guard. The check fails when any occurrence counts
+   against the guard, or when none supports it. It also fails when the
+   patch adds an occurrence with no guard before it in its hunk, when a
+   complete post-patch function runs the operation with no guard before
+   it, or when a hunk removes the guard and does not add it back later in
+   that hunk. When the evidence cannot settle the question, the guard is
+   `unresolved` and the result is Manual Review Required.
+
+   These ordering rules apply only to a chain that could lead to `blocked`.
+   A chain the Challenger reports as still reachable (the guard is false by
+   default, has no effect, or is reset on re-entry) is not demoted by them:
+   it can only make the result stricter. Each of its facts still needs a
+   valid citation, exactly as above.
+
+   This rules out a removed guard validating through identical text
+   elsewhere, a guard of another function, hunk or file vouching for the
+   operation, and a guarded call site vouching for an unguarded call site
+   of the same operation that the evidence shows. It is still textual
+   order, not control flow, and these limits remain:
+
+   - The check verifies the operation the Challenger *cites*, not that it
+     is the vulnerable one. If the vulnerable call site is not shown at all,
+     or the Challenger cites text that occurs only at a different, guarded
+     call site, nothing counts against the guard.
+   - Scope comes from indentation, and it is function scope only. A guard
+     inside a conditional block, or an operation inside a closure defined
+     after the guard, is accepted: whether that code runs is control flow,
+     which the Challenger must judge. Code without meaningful indentation
+     (unformatted or minified code, or several functions on consecutive
+     column-0 lines) can hide a function boundary. Misleading indentation
+     (a dedented comment or string between guard and operation) only causes
+     a rejection.
+   - Discovered-usage windows rendered before PR #763's exact
+     omitted-range marker do not number lines after a gap reliably. In such
+     archived evidence those lines never support the guard, and an
+     unguarded occurrence there counts against it.
+   - Text that merely looks like a guard before the operation (in a comment,
+     a string, or documentation) is not told apart from code.
+
+   **Legacy `concerns_v1` responses** (a single `Default execution
+   reachability:` value with one quote, found only in archived traces; the
+   current prompt does not ask for it) cannot tie that quote to the
+   operation, so a v1 `blocked` claim is always treated as `unresolved` and
+   can never reach `VERIFIED_FIXED`. A v1 `reachable` claim is still
+   `BLOCKING`.
+
+   A patch that deletes the vulnerable operation entirely does not verify:
+   the operation can no longer be cited from post-change evidence, and the
+   Challenger has no way to state "absent" (it saw only a slice of the
+   repository). Such a patch stays at Manual Review Required.
 2. **Assigns each concern a consequence**: `BLOCKING`, `UNRESOLVED`, or
    `NON_BLOCKING` (`_concern_consequence`). A missing, invalid or ungrounded
    fact can never lead to `NON_BLOCKING`; a malformed concern is

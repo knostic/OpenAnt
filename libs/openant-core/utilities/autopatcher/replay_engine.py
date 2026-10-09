@@ -905,6 +905,10 @@ def _run_replay_patch_generation_and_investigation(
             s4_locals.get("_recovered_rendered") or "",
             _post_patch_ctx,
         ],
+        "challenger_post_patch_definitions": (
+            list(s4_locals.get("_post_patch_definitions") or [])
+            if _post_patch_ctx.strip() and patch == s4_locals.get("_investigated_patch") else []
+        ),
         "vulnerability_text": vulnerability_text,
     }
     artifact_path = output_dir / "patch_generation_and_post_patch_investigation.json"
@@ -941,11 +945,16 @@ def _run_replay_challenger(
     # only the patch can validate a citation), never fall back to the
     # full shown context.
     provenance_parts = s4.get("challenger_provenance_parts") or ()
+    # An S4 artifact predating `challenger_post_patch_definitions` recorded
+    # no trusted post-change functions -- fail closed (none), never re-derive
+    # them from the rendered context text.
+    post_patch_definitions = s4.get("challenger_post_patch_definitions") or []
 
     with LLMCallCapture() as capture:
         challenger = challenge_patch(
             vulnerability_text, patch, llm, code_context=challenger_context,
             provenance_context=_challenger_provenance_context(provenance_parts, challenger_context),
+            post_patch_definitions=post_patch_definitions,
         )
 
     llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)

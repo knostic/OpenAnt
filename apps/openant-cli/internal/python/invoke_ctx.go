@@ -157,8 +157,8 @@ func invokeCtxInner(ctx context.Context, pythonPath string, args []string, workD
 	// -P keeps the process working directory off sys.path so a hostile openant/
 	// package inside the scanned, untrusted repo can't shadow the real module on
 	// import. The web UI is the untrusted-repo-scanning path, so it needs the same
-	// guard the CLI's Invoke uses (see invoke.go); it also propagates to the report
-	// subprocesses the engine spawns.
+	// guard the CLI's Invoke uses (see invoke.go). It does not propagate: the report
+	// subprocesses the engine spawns pass -P themselves (core/reporter.py).
 	cmdArgs := append([]string{"-P", "-m", "openant"}, args...)
 	cmd := exec.CommandContext(ctx, pythonPath, cmdArgs...)
 

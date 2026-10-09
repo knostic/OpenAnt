@@ -248,9 +248,15 @@ def _collect_repo_constants(repo_root: Path, index: RepositoryIndex) -> dict:
     failure is isolated to that file (skipped, never aborts the whole
     table); there is no dedicated error channel here because this mirrors
     ``list_functions_in_file``'s own best-effort, per-file posture."""
+    from utilities.autopatcher.repo_locator import _safe_under
+
     constants: dict = {}
+    resolved_root = Path(repo_root).resolve()
     for file_path in index.by_file.keys():
         if not file_path.endswith((".py", ".pyi")):
+            continue
+        # Never read through a symlink (or `..`) resolving outside the repo.
+        if not _safe_under(repo_root / file_path, resolved_root):
             continue
         try:
             file_text = (repo_root / file_path).read_text(encoding="utf-8")
