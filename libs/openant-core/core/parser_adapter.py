@@ -663,8 +663,11 @@ def apply_reachability_filter(
     # already claim the slot. call_graph/reverse_call_graph are the UN-pruned graphs.
     _rf = dataset["metadata"]["reachability_filter"]
     _pruned_ids = [u.get("id", "") for u in units if u.get("id", "") not in reachable_ids]
+    # #741: original_count is the PARSED total — the denominator the orphan-rate
+    # advisory needs to stay readable when the prune set is small (library mode).
     _extra, _asym_warning, _orphan_advisory = compute_prune_telemetry(
-        reachable_ids, sorted(_pruned_ids), call_graph, reverse_call_graph, output_dir)
+        reachable_ids, sorted(_pruned_ids), call_graph, reverse_call_graph, output_dir,
+        total_parsed_units=original_count)
     _rf.update(_extra)
     # #520 (the fable+astra fold): with the advisory on its own key, the
     # reserved ``warning`` slot belongs to the correctness signals — the

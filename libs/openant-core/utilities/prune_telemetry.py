@@ -27,7 +27,7 @@ ORPHAN_MIN_PRUNED_FOR_ADVISORY = 10
 
 
 def compute_prune_telemetry(reachable_ids, pruned_ids, call_graph, reverse_call_graph,
-                            output_dir=None):
+                            output_dir=None, total_parsed_units=None):
     """Classify every pruned unit + enforce the forward-asymmetry invariant.
 
     Classifies each prune as ``orphan`` (no non-self caller => missing-edge ROOT
@@ -44,6 +44,13 @@ def compute_prune_telemetry(reachable_ids, pruned_ids, call_graph, reverse_call_
         to a manufactured 0 — silently disabling it. This is the single highest-risk arg.
       - When ``output_dir`` is given and something was pruned, writes ``pruned_units.json``
         (best-effort; a telemetry failure never propagates).
+      - ``total_parsed_units`` is the caller's PARSED total (its ``original_units``).
+        It cannot be derived here: ``reachable_ids`` is the closure over the call
+        graph's functions while ``pruned_ids`` is over the caller's units, so
+        ``len(reachable_ids) + len(pruned_ids)`` over-counts by every graph-only
+        node. Supply it and the advisory also carries ``orphan_rate_parsed`` (the
+        coverage signal) and the prune fraction; omit it and the advisory text is
+        byte-identical to before (#741).
 
     Returns ``(extra_rf_keys, asym_warning_or_None, orphan_advisory_or_None)`` — the caller merges the keys into
     its own base rf (original_units/entry_points/... stay caller-owned) and applies its
@@ -111,13 +118,55 @@ def compute_prune_telemetry(reachable_ids, pruned_ids, call_graph, reverse_call_
     if (len(pruned_ids) >= ORPHAN_MIN_PRUNED_FOR_ADVISORY
             and orphan_ct / len(pruned_ids) > ORPHAN_RATE_WARN_THRESHOLD):
         rate = round(100 * orphan_ct / len(pruned_ids), 1)
+        # #741: the denominator inverts the advisory's meaning on a SMALL prune
+        # set. ``rate`` is a share of the PRUNED set, so when the filter keeps
+        # almost everything (the library-mode shape) the denominator shrinks
+        # toward the orphan count and the rate explodes — the advisory reads
+        # scariest exactly where coverage is best (measured: 76 of 80 = 95% on a
+        # run that pruned only 80 of 359 units and KEPT the library core,
+        # 164/172; the unflagged run, which really did drop the core, read a
+        # LOWER 84% because its pruned denominator was 315). So print all three
+        # numbers, each NAMED: the per-pruned rate is only readable next to the
+        # prune fraction, and the per-parsed rate is the coverage signal.
+        # PRESENTATION ONLY — the fire condition above is untouched; promoting
+        # this advisory to a decision input is #722's policy ask, not this.
+        extra["orphan_rate_pruned"] = rate
+        # A caller that cannot supply the parsed total keeps the pruned rate
+        # alone rather than a denominator this helper guessed (see the contract
+        # note above). A total below the pruned count is a caller bug — stay
+        # silent rather than render a rate above 100%.
+        _denoms = ""
+        if isinstance(total_parsed_units, int) and total_parsed_units >= len(pruned_ids):
+            # F1+F2 (fable T1 r1/r2): every printed percentage over this
+            # denominator uses ONE float path — round((1 - kept/total) * 100, 1),
+            # the formula behind the recorded reduction_percentage
+            # (core/parser_adapter.py:598). The naive round(100 * n/total, 1)
+            # is algebraically equal but rounds differently on hundreds of
+            # (total, n) pairs, which put the printed prune_fraction out of step
+            # with the record (F1, 819 pairs) and the two printed rates out of
+            # step with EACH OTHER in the same sentence (F2: 809 pairs where the
+            # same fraction rendered two ways; 423 pairs where orphan_rate_parsed
+            # read HIGHER than prune_fraction — all counts over [1, 3000]).
+            _prune_fraction = round(
+                (1 - (total_parsed_units - len(pruned_ids)) / total_parsed_units) * 100, 1)
+            _parsed_rate = round(
+                (1 - (total_parsed_units - orphan_ct) / total_parsed_units) * 100, 1)
+            extra["orphan_rate_parsed"] = _parsed_rate
+            _denoms = (
+                f" DENOMINATORS: orphan_rate_pruned={rate}% "
+                f"({orphan_ct}/{len(pruned_ids)}) is a share of the PRUNED set only "
+                f"— prune_fraction={_prune_fraction}% "
+                f"({len(pruned_ids)}/{total_parsed_units}) of parsed units was pruned, "
+                f"so the coverage signal is orphan_rate_parsed={_parsed_rate}% "
+                f"({orphan_ct}/{total_parsed_units}). A high orphan_rate_pruned over a "
+                "small prune_fraction means a SMALL PRUNE SET, not worse coverage.")
         orphan_advisory = (
             f"{orphan_ct} of {len(pruned_ids)} pruned units ({rate}%) are ORPHANS: "
             "no non-self caller, so each is a missing-edge ROOT candidate (genuinely "
             "dead code is also an orphan — a rate above "
             f"{int(ORPHAN_RATE_WARN_THRESHOLD * 100)}% is a call-graph health "
             "signal, not a proven defect count; dispatch-table targets prune "
-            "as orphans). Check call-graph edge coverage; top files: "
+            f"as orphans).{_denoms} Check call-graph edge coverage; top files: "
             + ", ".join(f"{f} ({c})" for f, c in sorted(
                 orphan_by_file.items(), key=lambda kv: (-kv[1], kv[0]))[:3]))
     return extra, asym_warning, orphan_advisory
