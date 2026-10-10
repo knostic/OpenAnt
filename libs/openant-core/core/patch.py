@@ -340,7 +340,9 @@ def _run_engine_and_write_artifacts(
     os.makedirs(patch_dir, exist_ok=True)
 
     # Remove any trust report left behind by a previous failed run for this
-    # artifact_label *before* doing any work that can fail. The trust report
+    # artifact_label before the pipeline does any work (input and LLM
+    # configuration checks that reject a run outright come earlier and leave
+    # the output directory untouched). The trust report
     # is only written on success, at the very end of this function -- if a
     # stale one from an earlier run were left in place, a failed run could
     # look like it succeeded with a report that doesn't match the fresh

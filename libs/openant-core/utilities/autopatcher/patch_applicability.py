@@ -102,19 +102,41 @@ checkout (``core.autocrlf=true``, the Git for Windows system default)."""
 def _line_ending_settings(repo: Path) -> "list[tuple[str, str]]":
     """The analyzed checkout's effective line-ending settings, each value
     checked against git's own vocabulary. ``git config --get`` only reads
-    configuration; it runs no filter, hook or other configured command."""
+    configuration; it runs no filter, hook or other configured command.
+    A ``core.autocrlf`` value outside the canonical spellings (``yes``,
+    ``on``, ``1``, an empty value, a bare key ...) is read as git itself
+    reads it, through ``git config --type=bool`` (PR #763 HUNT B-4)."""
     settings = []
     for key, allowed in _LINE_ENDING_SETTINGS.items():
-        try:
-            found = subprocess.run(
-                ["git", "config", "--get", key], cwd=str(repo), capture_output=True, timeout=_TIMEOUT_SECONDS,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        value = found.stdout.decode("utf-8", errors="replace").strip().lower()
-        if found.returncode == 0 and value in allowed:
+        value = _git_config_value(repo, key)
+        if key == "core.autocrlf" and value is not None and value not in allowed:
+            value = _git_config_value(repo, key, "--type=bool")
+        if value in allowed:
             settings.append((key, value))
     return settings
+
+
+def _git_config_value(repo: Path, key: str, *options: str) -> "str | None":
+    """``git config [options] --get key`` in `repo`, lower-cased, or None when
+    unset, invalid for `options`, or git cannot run."""
+    try:
+        found = subprocess.run(
+            ["git", "config", *options, "--get", key], cwd=str(repo), capture_output=True, timeout=_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if found.returncode != 0:
+        return None
+    return found.stdout.decode("utf-8", errors="replace").strip().lower()
+
+
+def _set_config(env: "dict[str, str]", settings: "list[tuple[str, str]]") -> None:
+    """Pass `settings` to git through ``GIT_CONFIG_COUNT``/``_KEY_n``/``_VALUE_n``
+    (the only configuration an isolated run reads besides its own empty
+    files)."""
+    env["GIT_CONFIG_COUNT"] = str(len(settings))
+    for i, (key, value) in enumerate(settings):
+        env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"] = key, value
 
 
 def _empty_git_dir(path: Path) -> Path:
@@ -150,10 +172,7 @@ def _run_git_apply(extra_args: "list[str]", raw_diff: str, cwd: Path) -> "tuple[
         env = _isolated_git_env(Path(scratch))
         env["GIT_DIR"] = str(_empty_git_dir(Path(scratch) / "isolated.git"))
         env["GIT_WORK_TREE"] = str(cwd)
-        settings = _line_ending_settings(cwd)
-        env["GIT_CONFIG_COUNT"] = str(len(settings))
-        for i, (key, value) in enumerate(settings):
-            env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"] = key, value
+        _set_config(env, _line_ending_settings(cwd))
         result = run_utf8(
             ["git", "apply", *extra_args, "--whitespace=nowarn", "-"],
             input=payload,

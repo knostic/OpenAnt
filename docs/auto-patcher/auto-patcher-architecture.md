@@ -254,7 +254,13 @@ inherited `GIT_*` environment and no system or global configuration, so no
 configuration the analyzed repository controls -- a filter driver in its
 `.git/config`, say -- can run a command; only its built-in line-ending
 settings (`core.autocrlf`, `core.eol`) are carried over
-(`patch_applicability._run_git_apply`).
+(`patch_applicability._run_git_apply`). Run metadata is read the same way
+(`run_metadata`): the commit with `git rev-parse` and no system, global or
+inherited configuration, and, for tracing and replay, whether the tree is
+clean with `git status` against a fresh repository holding only a copy of the
+index (plus the line-ending settings and ignore patterns), so the analyzed
+repository's configuration can neither run a command nor hide untracked files,
+and its `.git/index` is never written.
 
 ### S5 — `challenger`
 
@@ -491,8 +497,12 @@ its citations. It does not verify that the model's reasoning is sound.
 - an LLM call fails in a stage that is not best-effort: Patch Generation,
   Challenger, Patch Review, or Confidence Scoring.
 
-Any stale trust report for the same id is deleted before the run starts, so a
-failed run never leaves an earlier report looking current.
+Any stale trust report for the same id is deleted as soon as the run has
+passed its input and configuration checks and created the output's `patch/`
+directory, before the pipeline does any work, so a run that fails from then on
+never leaves an earlier report looking current. A run rejected by those
+earlier checks (the exit-2 failures above) does not touch the output directory,
+so an earlier report there is left as it was.
 
 **Generation is withheld** (the run completes with NO PATCH PRODUCED) when:
 

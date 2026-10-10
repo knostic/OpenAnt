@@ -72,15 +72,27 @@ def _module_bound_names(text: str) -> "set[str]":
     except (SyntaxError, ValueError):
         return set()
     names: "set[str]" = set()
-    for node in tree.body:
+    pending = list(tree.body)
+    while pending:
+        node = pending.pop()
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
                 names.add(alias.asname or (alias.name.split(".")[0] if isinstance(node, ast.Import) else alias.name))
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(node.name)
         elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            # `loads, dumps = ...` binds both names (PR #763 HUNT B-2).
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            names.update(t.id for t in targets if isinstance(t, ast.Name))
+            names.update(n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name))
+        elif isinstance(node, (ast.If, ast.Try, ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While)):
+            # Module-level code inside a compound statement (`try: from x
+            # import y` / `except ImportError: ...`) binds module names too.
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                names.update(n.id for n in ast.walk(node.target) if isinstance(n, ast.Name))
+            for field in ("body", "orelse", "finalbody"):
+                pending.extend(getattr(node, field, None) or [])
+            for handler in getattr(node, "handlers", None) or []:
+                pending.extend(handler.body)
     return names
 
 
@@ -311,10 +323,17 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         has a single symbol whose callers capture the effect, so the caller
         records it as unattributed. Adding an import of a new name, or
         moving an import, changes no existing binding."""
-        removed = {l[1:].rstrip() for l in hunk_lines if l[:1] == "-" and _IMPORT_LINE_RE.match(l[1:].rstrip())}
-        added = {l[1:].rstrip() for l in hunk_lines if l[:1] == "+" and _IMPORT_LINE_RE.match(l[1:].rstrip())}
+        removed_order = [l[1:].rstrip() for l in hunk_lines if l[:1] == "-" and _IMPORT_LINE_RE.match(l[1:].rstrip())]
+        added_order = [l[1:].rstrip() for l in hunk_lines if l[:1] == "+" and _IMPORT_LINE_RE.match(l[1:].rstrip())]
+        removed, added = set(removed_order), set(added_order)
         if removed - added:
             return "an import the module's code may use was removed or changed"
+        if removed_order and removed_order != [s for s in added_order if s in removed]:
+            # Reordering imports that bind the same name changes which one
+            # wins (`from json import loads` / `from pickle import loads`).
+            bound = [_import_bound_names(s) or {"*"} for s in removed_order]
+            if any(a & b for i, a in enumerate(bound) for b in bound[i + 1:]):
+                return "a reordered import changes which binding of a name wins"
         for statement in added - removed:
             bound = _import_bound_names(statement)
             if bound is None or "*" in bound or bound & module_names:

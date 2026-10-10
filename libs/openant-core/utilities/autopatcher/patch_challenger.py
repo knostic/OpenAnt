@@ -308,6 +308,13 @@ only: a match `_SECTION_HEADER_RE` does not also make is a header
 `_split_sections` would not see (see `_unaccounted_response_content`)."""
 
 
+_STATUS_VALUE_LINE_RE = re.compile(
+    r"^[\s*_`]*(?:" + "|".join(VERIFICATION_STATUSES) + r")[\s*_`]*\.?[\s*_`]*$", re.IGNORECASE,
+)
+"""A `Verification status:` value that is one status token and nothing else
+(Markdown emphasis, backticks and a closing period allowed)."""
+
+
 def _unaccounted_response_content(text: str, concerns_body: str) -> "Optional[str]":
     """What part of a structured (`Concerns:`) response no recognized section
     or concern field accounts for, or None when every non-blank line is
@@ -338,10 +345,13 @@ def _unaccounted_response_content(text: str, concerns_body: str) -> "Optional[st
 
     parts = _SECTION_HEADER_RE.split(text or "")
     for header, body in zip(parts[1::2], parts[2::2]):
-        if header.lower() in ("verification status:", "still vulnerable:") and sum(
-            1 for line in body.splitlines() if line.strip()
-        ) > 1:
+        values = [line for line in body.splitlines() if line.strip()]
+        if header.lower() in ("verification status:", "still vulnerable:") and len(values) > 1:
             return f"more than one line under {header}"
+        if header.lower() == "verification status:" and values and not _STATUS_VALUE_LINE_RE.match(values[0]):
+            # "VERIFIED_FIXED. The bulk endpoint remains exploitable." -- the
+            # token alone is read; anything beside it is unaccounted (HUNT A-3).
+            return "text beside the Verification status value"
 
     first_block = _CONCERN_BLOCK_HEADER_RE.search(concerns_body or "")
     if (concerns_body or "")[:first_block.start() if first_block else None].strip():
@@ -1089,6 +1099,29 @@ _INLINE_SCOPE_OPENER_RE = re.compile(r"\blambda\b|=>|\bfunction\b|\bfunc\b|\bdef
 """Text that opens a separate execution scope within one line (a lambda, an
 arrow function, an inline function)."""
 
+_BLOCK_HEADER_END_RE = re.compile(
+    r"(?:[:{)(\[,\\]|&&|\|\||\b(?:and|or|then|do|begin|else|try|finally|ensure|rescue|loop|default))\s*$",
+    re.IGNORECASE,
+)
+"""How a line that opens a block ends: `:` (Python family), `{` or `)`
+(brace family, condition then a brace or a next-line brace), a header
+keyword (`then`, `do`, `begin`, ...), or a continuation of a header that
+wraps onto the next line (`(`, `[`, `,`, `\\`, `and`/`or`/`&&`/`||`)."""
+
+
+def _is_control_block_opener(text: str) -> bool:
+    """Whether `text` opens a control-flow block of its own function: it
+    starts with a control keyword, ends like a block header, and opens no
+    callback or nested function on the same line (`if (hooks)
+    hooks.push(function () {` opens a callback; a string line that merely
+    starts with "if" is not a header). Anything else is treated as a
+    separate scope, failing closed (PR #763 HUNT A-4)."""
+    head = _CONTROL_BLOCK_HEADER_RE.match(text)
+    if not head or _INLINE_SCOPE_OPENER_RE.search(text[head.end():]):
+        return False
+    code = re.sub(r"\s(?://|#).*$", "", text.rstrip())
+    return bool(_BLOCK_HEADER_END_RE.search(code))
+
 
 def _guard_text_start(line: str, guard: "Optional[str]") -> int:
     """Where the (normalized) guard quote starts within `line`, normalized:
@@ -1135,7 +1168,7 @@ def _guard_in_separate_scope(
             # that holds the guard there: irregular indentation (string
             # content, odd formatting) hides it. Fail closed.
             return True
-        if not _CONTROL_BLOCK_HEADER_RE.match(text):
+        if not _is_control_block_opener(text):
             return True  # a nested function, class, callback, or an unrecognized block
         if depth == op_depth:
             return False  # a control-flow block beside the operation, in its own scope
@@ -2230,9 +2263,17 @@ _NEGATED_PREDICATE_RE = re.compile(
 )
 """A negation that governs the predicate directly ("is not still
 vulnerable", "does not remain exploitable", "isn't still vulnerable")."""
-_NEGATIVE_SUBJECT_RE = re.compile(r"^\W*(?:no|nothing|none|neither|nobody)\b", re.IGNORECASE)
-"""A clause whose subject is negative ("Nothing remains exploitable", "No
-request path remains exploitable", "None of the callers ...")."""
+_NEGATIVE_SUBJECT_RE = re.compile(
+    r"^\W*(?:nothing|nobody|none(?:\s+of\s+(?:the|its|these|those)?\s*\w+)?|no(?:\s+\w+){1,2}|neither(?:\s+\w+){1,2})"
+    r"(?:\s+(?:is|are|was|were|be|been|can|could|may|might|will|would|should|do|does|did))?\W*$",
+    re.IGNORECASE,
+)
+"""A clause whose whole subject is negative and immediately precedes the
+predicate ("Nothing remains exploitable", "No request path remains
+exploitable", "None of the callers ..."). The negative phrase must be all
+that comes before the predicate: in "No check on the bulk endpoint means
+account deletion is still exploitable" the negative word belongs to
+another verb, so the sentence still asserts (PR #763 HUNT A-2/B-3)."""
 
 
 def _asserts_still_exploitable(text: "Optional[str]") -> bool:

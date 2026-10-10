@@ -73,7 +73,7 @@ func assertEnvEquals(t *testing.T, env []string, want map[string]string) {
 
 // ---------------------------------------------------------------------------
 // Invoke: extraEnv reaches the subprocess, overrides win, unrelated env is
-// preserved, no global mutation, stdin is connected, secrets never leak into
+// preserved, no global mutation, stdin is not inherited, secrets never leak into
 // returned error text.
 // ---------------------------------------------------------------------------
 

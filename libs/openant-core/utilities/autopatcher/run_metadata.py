@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from utilities.autopatcher.patch_applicability import (
+    _empty_git_dir, _isolated_git_env, _line_ending_settings, _set_config,
+)
 from utilities.file_io import run_utf8
 
 
@@ -37,15 +43,12 @@ def collect_git_info(path: Path) -> str:
     """Return the short HEAD SHA for the git repo at path.
 
     Returns 'unknown' on any failure — missing git, non-repo path, etc.
+    ``rev-parse`` reads the SHA without ``git log``'s formatting machinery,
+    which honours repository settings that run commands (``log.showSignature``
+    makes it run ``gpg.program``; PR #763 HUNT B-1); see ``_isolated_git``.
     """
     try:
-        result = run_utf8(
-            ["git", "log", "-1", "--format=%h"],
-            cwd=str(path),
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        result = _isolated_git(path, "rev-parse", "--short", "HEAD")
         if result.returncode == 0:
             return result.stdout.strip() or "unknown"
     except Exception:
@@ -87,13 +90,7 @@ def collect_full_commit_sha(path: Path) -> "str | None":
     (if oddly-named) commit-ish.
     """
     try:
-        result = run_utf8(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(path),
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        result = _isolated_git(path, "rev-parse", "HEAD")
         if result.returncode == 0:
             sha = result.stdout.strip()
             return sha or None
@@ -107,24 +104,104 @@ def is_worktree_clean(path: Path) -> "bool | None":
     (tracked or untracked), False if it does, or None if this could not be
     determined (missing git, non-repo path, ...).
 
-    Used only by single-stage replay's target-repository safety gate (see
-    ``utilities.autopatcher.stage_replay.validate_target_repository``) --
-    never by report rendering, and never for the OpenAnt development
-    checkout itself (which may intentionally be dirty during replay).
+    Used by single-stage replay's target-repository safety gate
+    (``stage_replay.validate_target_repository``), by ``run_traced`` to
+    record whether the analyzed tree was clean, and by replay provenance
+    to note whether the OpenAnt checkout itself is dirty -- never by report
+    rendering.
+
+    The analyzed repository's own configuration is never read (PR #763
+    HUNT B-1/B-5): ``git status`` runs against a fresh repository directory
+    holding only a copy of the index, the HEAD commit (its objects reached
+    through ``alternates``) and ``info/exclude``, with no configuration but
+    the line-ending policy and ``core.filemode``. So nothing the repository configures can run
+    (``core.fsmonitor``, filter drivers) or hide untracked files
+    (``status.showUntrackedFiles``), and the repository's ``.git/index`` is
+    never refreshed or written. A filter-converted file whose raw content
+    differs from the index reads as changed (fails toward "dirty").
+    Submodule contents are not inspected (``--ignore-submodules=dirty``),
+    since that would run git inside each submodule with its own
+    configuration; a submodule moved to another commit still counts.
     """
     try:
-        result = run_utf8(
-            ["git", "status", "--porcelain"],
-            cwd=str(path),
-            capture_output=True,
-            text=True,
-            timeout=5,
+        paths = _isolated_git(
+            path, "rev-parse", "--path-format=absolute",
+            "--git-path", "objects", "--git-path", "index", "--git-path", "info/exclude",
         )
+        if paths.returncode != 0:
+            return None
+        objects, index, exclude = (Path(p) for p in paths.stdout.splitlines()[:3])
+        head = _isolated_git(path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+        with tempfile.TemporaryDirectory(prefix="openant-git-") as scratch:
+            git_dir = _empty_git_dir(Path(scratch) / "status.git")
+            (git_dir / "objects" / "info").mkdir()
+            (git_dir / "objects" / "info" / "alternates").write_text(f"{objects}\n", encoding="utf-8")
+            if head.returncode == 0 and head.stdout.strip():
+                (git_dir / "HEAD").write_text(head.stdout.strip() + "\n", encoding="utf-8")
+            if index.is_file():
+                shutil.copyfile(index, git_dir / "index")
+            if exclude.is_file():
+                (git_dir / "info").mkdir()
+                shutil.copyfile(exclude, git_dir / "info" / "exclude")
+            env = _isolated_git_env(Path(scratch))
+            env.update({"GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(path)})
+            _set_config(env, _line_ending_settings(Path(path)) + _filemode_setting(path) + _user_excludes())
+            result = run_utf8(
+                ["git", "-c", "core.fsmonitor=false", "--no-optional-locks", "status", "--porcelain",
+                 "--untracked-files=all", "--ignore-submodules=dirty"],
+                cwd=str(path), env=env, capture_output=True, text=True, timeout=30,
+            )
         if result.returncode == 0:
             return result.stdout.strip() == ""
     except Exception:
         pass
     return None
+
+
+def _isolated_git(path: Path, *args: str):
+    """Run a read-only ``git`` metadata command in the repository at `path`
+    with no inherited ``GIT_*`` environment and no system or global
+    configuration (``patch_applicability._isolated_git_env``) and with
+    ``core.fsmonitor`` off. ``rev-parse`` runs no filter, hook, signature
+    program or other configured command."""
+    with tempfile.TemporaryDirectory(prefix="openant-git-") as scratch:
+        return run_utf8(
+            ["git", "-c", "core.fsmonitor=false", *args],
+            cwd=str(path), env=_isolated_git_env(Path(scratch)), capture_output=True, text=True, timeout=5,
+        )
+
+
+def _filemode_setting(path: Path) -> "list[tuple[str, str]]":
+    """The checkout's ``core.filemode`` (``false`` where the filesystem cannot
+    record the executable bit, the Git for Windows default), carried into the
+    isolated status so a lost executable bit is not read as a change. A
+    boolean read with ``--type=bool``, never a command."""
+    found = _isolated_git(path, "config", "--type=bool", "--get", "core.filemode")
+    value = found.stdout.strip().lower() if found.returncode == 0 else ""
+    return [("core.filemode", value)] if value in ("true", "false") else []
+
+
+def _user_excludes() -> "list[tuple[str, str]]":
+    """The invoking user's own global ignore file, carried into the isolated
+    status as plain ignore patterns (the isolated run reads no global
+    configuration, so files the user ignores everywhere -- ``.DS_Store``,
+    say -- would otherwise read as untracked). The analyzed repository's
+    own ``core.excludesFile`` setting is deliberately not carried: it could
+    hide files from the cleanliness check."""
+    try:
+        found = run_utf8(
+            ["git", "config", "--global", "--path", "--get", "core.excludesFile"],
+            cwd=tempfile.gettempdir(), capture_output=True, text=True, timeout=5,
+        )
+        configured = found.stdout.strip() if found.returncode == 0 else ""
+    except Exception:
+        configured = ""
+    if configured:
+        candidate = Path(configured).expanduser()
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+        candidate = Path(base) / "git" / "ignore"
+    return [("core.excludesFile", str(candidate))] if candidate.is_file() else []
 
 
 def auto_output_path(

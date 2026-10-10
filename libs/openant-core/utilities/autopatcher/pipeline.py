@@ -2217,9 +2217,9 @@ def accept_repair(
 #        security_improvement   IN {High, Medium}
 #        deployment_safety       IN {Low Risk, Medium Risk}
 #      "Minor Issues" is deliberately excluded from the integrity allowlist:
-#      it reports an actual observed hygiene defect in the patch (currently
-#      only "unused_import" — a real, if low-severity, code-quality problem,
-#      not a missing-evidence placeholder), and the report itself already
+#      it reports a MEDIUM hygiene finding (an observed "unused_import" or
+#      "duplicate_assignment" defect, or "hygiene_check_failed" when a check
+#      itself raised -- never a verified-clean result), and the report itself already
 #      renders it as "⚠️ Needs review", never "✅ Good" — so treating it as
 #      verified-positive here would contradict what the system already tells
 #      the reader. Every condition above must be spelled out as an explicit
@@ -2569,8 +2569,9 @@ def _compute_trust_signals(
 # Unknown/Not Verified/any future value.
 #
 # _POSITIVE_INTEGRITY is deliberately {"Clean"} only — "Minor Issues" means
-# _compute_trust_signals found a real hygiene defect (currently only
-# "unused_import"), not a verified-clean patch; it is excluded even though
+# _compute_trust_signals found a MEDIUM hygiene finding ("unused_import",
+# "duplicate_assignment", or "hygiene_check_failed"), not a verified-clean
+# patch; it is excluded even though
 # it does not hard-block via _BLOCKING_INTEGRITY. Not-blocked is not the
 # same claim as positive-evidence; see I3 above _compute_trust_signals.
 _POSITIVE_INTEGRITY = frozenset({"Clean"})

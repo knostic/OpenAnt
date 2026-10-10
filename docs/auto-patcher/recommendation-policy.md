@@ -433,8 +433,9 @@ if (patch_integrity == "Clean"
         and deployment_safety in {"Low Risk", "Medium Risk"}):
     return "Deploy After Validation"                         # I3: explicit whitelist
 
-if security_improvement == "Low" and deployment_safety == "Low Risk":
-    return "Deploy With Caution"
+if (patch_integrity == "Clean"
+        and security_improvement == "Low" and deployment_safety == "Low Risk"):
+    return "Deploy With Caution"                             # also needs positive integrity
 
 if deployment_safety == "High Risk":
     return "Manual Review Required"
