@@ -49,6 +49,41 @@ _DELETED_FILE_HEADER_RE = re.compile(r"^\+\+\+ /dev/null\s*$", re.MULTILINE)
 _IMPORT_LINE_RE = re.compile(r"^(?:from\s+[\w.]+\s+)?import\s+[\w.*]+(?:\s+as\s+\w+)?(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*\s*$")
 
 
+def _import_bound_names(statement: str) -> "Optional[set[str]]":
+    """The names a single import statement binds (`*` for a star import),
+    or None when it does not parse."""
+    try:
+        node = ast.parse(statement).body[0]
+    except (SyntaxError, ValueError, IndexError):
+        return None
+    if isinstance(node, ast.Import):
+        return {(alias.asname or alias.name.split(".")[0]) for alias in node.names}
+    if isinstance(node, ast.ImportFrom):
+        return {(alias.asname or alias.name) for alias in node.names}
+    return None
+
+
+def _module_bound_names(text: str) -> "set[str]":
+    """Every name the module binds at its top level: imports, functions,
+    classes and assigned names. Empty when the file does not parse (the
+    caller has already abstained on such a file)."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return set()
+    names: "set[str]" = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                names.add(alias.asname or (alias.name.split(".")[0] if isinstance(node, ast.Import) else alias.name))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names.update(t.id for t in targets if isinstance(t, ast.Name))
+    return names
+
+
 @dataclass
 class UsageMatch:
     symbol: str
@@ -252,32 +287,63 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         added = [self._normalize(l) for l in hunk_lines if l[:1] == "+"]
         return added, [True for _ in added]
 
-    def _is_whitespace_only_hunk(self, hunk_lines: List[str]) -> bool:
-        """True when a hunk's removed and added lines are identical once
-        each is whitespace-normalized — a purely cosmetic change that must
-        not be attributed to any symbol."""
-        removed = [self._normalize(l) for l in hunk_lines if l[:1] == "-"]
-        added = [self._normalize(l) for l in hunk_lines if l[:1] == "+"]
+    def _is_whitespace_only_hunk(self, hunk_lines: List[str], semantic_indentation: bool = True) -> bool:
+        """True when a hunk's removed and added lines are identical apart from
+        trailing whitespace — a purely cosmetic change that must not be
+        attributed to any symbol. Leading indentation is compared exactly: in
+        Python it decides which block a statement belongs to (PR #763 HUNT
+        N6), so a re-indented line is a behavior change.
+        `semantic_indentation=False` (a language where it is not) compares
+        whitespace-normalized lines instead."""
+        clean = (lambda l: l[1:].rstrip()) if semantic_indentation else self._normalize
+        removed = [clean(l) for l in hunk_lines if l[:1] == "-"]
+        added = [clean(l) for l in hunk_lines if l[:1] == "+"]
         if not removed or not added:
             return False
         return removed == added
+
+    def _import_binding_change(self, hunk_lines: List[str], module_names: "set[str]") -> Optional[str]:
+        """Why a hunk's module-level (column-0) import lines change what an
+        existing module-level name is bound to, or None (PR #763 HUNT N6).
+        An import statement the hunk removes (and does not re-add) unbinds or
+        rebinds its names for every function of the module that uses them; an
+        added one rebinds a name the module already binds (or `*`). Neither
+        has a single symbol whose callers capture the effect, so the caller
+        records it as unattributed. Adding an import of a new name, or
+        moving an import, changes no existing binding."""
+        removed = {l[1:].rstrip() for l in hunk_lines if l[:1] == "-" and _IMPORT_LINE_RE.match(l[1:].rstrip())}
+        added = {l[1:].rstrip() for l in hunk_lines if l[:1] == "+" and _IMPORT_LINE_RE.match(l[1:].rstrip())}
+        if removed - added:
+            return "an import the module's code may use was removed or changed"
+        for statement in added - removed:
+            bound = _import_bound_names(statement)
+            if bound is None or "*" in bound or bound & module_names:
+                return "an import rebinds an existing module-level name"
+        return None
 
     def _is_import_or_comment_only_hunk(self, hunk_lines: List[str]) -> bool:
         """True when every added/removed line is blank, a comment, or a
         single-line import statement -- changes with no symbol to attribute
         and no callers to search, so not an attribution failure (RB-3)."""
-        changed = [self._normalize(l) for l in hunk_lines if l[:1] in ("+", "-")]
+        changed = [l[1:].rstrip() for l in hunk_lines if l[:1] in ("+", "-")]
+        # An indented import is a statement inside a function or class body:
+        # it is that symbol's code, not a module-level binding.
         return bool(changed) and all(
-            not c or c.startswith("#") or _IMPORT_LINE_RE.match(c) for c in changed
+            not c.strip() or c.strip().startswith("#") or _IMPORT_LINE_RE.match(c) for c in changed
         )
 
-    def _locate_hunk(self, anchors: List[str], file_lines: List[str]) -> Optional[int]:
+    def _locate_hunk(
+        self, anchors: List[str], file_lines: List[str], old_start: Optional[int] = None,
+    ) -> Optional[int]:
         """Find the 0-indexed start line in file_lines where `anchors` best
         matches, using difflib.SequenceMatcher over whitespace-normalized
-        text. The hunk header's claimed line number is never consulted here
-        — only content match. Returns None when no sufficiently confident
-        match exists (e.g. the anchor text appears nowhere in the file),
-        rather than guessing.
+        text. Content decides the location; the hunk header's claimed line
+        (`old_start`) is consulted only when the matched content occurs at
+        several places in the file, to pick the one `git apply` uses: the
+        candidate starting exactly at the header line (PR #763 HUNT N8).
+        Returns None when no sufficiently confident match exists (e.g. the
+        anchor text appears nowhere in the file), or when it matches several
+        places and the header names none of them, rather than guessing.
         """
         if not anchors:
             return None
@@ -290,7 +356,15 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         # shared line, before trusting the location.
         if match.size < min(len(anchors), 2):
             return None
-        return max(0, match.a - match.b)
+        block = anchors[match.b:match.b + match.size]
+        starts = [
+            a - match.b for a in range(len(normalized_file) - match.size + 1)
+            if normalized_file[a:a + match.size] == block
+        ]
+        if len(starts) == 1:
+            return max(0, starts[0])
+        header = old_start - 1 if old_start is not None else None
+        return header if header in starts and header >= 0 else None
 
     # ---- structural symbol resolution via ast (never a text/regex scan) ----
     def _build_symbol_index(self, file_text: str) -> Optional[List[Tuple[int, int, str, str]]]:
@@ -347,15 +421,22 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         return index
 
     def _resolve_symbol_at_line(self, index: List[Tuple[int, int, str, str]], line: int) -> Optional[Tuple[str, str]]:
-        """Return (name, kind) of the smallest span in `index` containing
-        `line` — i.e. the innermost enclosing symbol. Nested scopes always
-        have strictly smaller spans than their containers, so this
-        naturally prefers a directly-changed function/assignment over its
-        enclosing class/module without any separate special case."""
+        """Return (name, kind) of the symbol whose callers a change on `line`
+        reaches. Normally the innermost enclosing symbol (nested scopes have
+        strictly smaller spans than their containers, so a directly-changed
+        method or class-level assignment wins over its class). But a
+        function, or class, defined inside another function is local to it:
+        only that enclosing function's callers can reach it, so the change is
+        attributed to the OUTERMOST enclosing function (PR #763 HUNT N7) --
+        a method's nested helper to the method, a module function's closure
+        to the module function."""
         candidates = [(end - lineno, name, kind) for lineno, end, name, kind in index if lineno <= line <= end]
         if not candidates:
             return None
         candidates.sort(key=lambda c: c[0])
+        functions = [c for c in candidates if c[2] == "function"]
+        if functions and functions[-1] is not candidates[0]:
+            return functions[-1][1], functions[-1][2]
         return candidates[0][1], candidates[0][2]
 
     def _extract_symbols(
@@ -400,18 +481,22 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
             record(f"{file_path}: does not parse")
             return symbols
 
+        module_names = _module_bound_names(text)
         for hunk in hunks:
             if self._is_whitespace_only_hunk(hunk.lines):
                 continue
+            rebinding = self._import_binding_change(hunk.lines, module_names)
+            if rebinding is not None:
+                record(f"{file_path}: {rebinding}")
             if self._is_import_or_comment_only_hunk(hunk.lines):
                 # No symbol to attribute and no callers to search -- not an
                 # abstention (RB-3), same as a whitespace-only hunk.
                 continue
 
             anchors, changed_flags = self._anchor_lines(hunk.lines)
-            start_idx = self._locate_hunk(anchors, file_lines)
+            start_idx = self._locate_hunk(anchors, file_lines, getattr(hunk, "old_start", None))
             if start_idx is None:
-                record(f"{file_path}: hunk could not be located")
+                record(f"{file_path}: hunk could not be located unambiguously")
                 continue
 
             changed_positions = [start_idx + i for i, is_changed in enumerate(changed_flags) if is_changed]

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import progress
+from .debug_output import debug_dir as _autopatcher_debug_dir
 from .confidence_scorer import score_confidence
 from .finding_calibration import calibrate_findings
 from .llm_client import LLMClient, ModelUnavailableError
@@ -263,6 +264,12 @@ class PipelineResult:
     # _build_recommendation_v1; not a Recommendation Policy signal, matching
     # every other observability-only field in this dataclass.
     security_invariant: "str | None" = None
+    # Repository files whose verified-source excerpts (the Planner evidence
+    # route, which has no Repository Grounding location of its own) reached
+    # a completed LLM call: the Final Strategy call that returned an
+    # evaluated result, or Patch Generation when it ran. Report display only
+    # (Repository Context), never a Recommendation Policy signal.
+    verified_source_files: "tuple[str, ...]" = ()
 
 
 # ---------------------------------------------------------------------------
@@ -1763,8 +1770,27 @@ def _selected_reason_kind(candidate: "RepositoryCandidate | None") -> "str | Non
     return candidate.evidence[0].pass_name
 
 
+def _verified_source_files(*contexts: str) -> "tuple[str, ...]":
+    """Repository files named by the `#### Verified source:` excerpt headings
+    in `contexts` (prompt text actually sent to a model), in first-seen
+    order."""
+    from .remediation_planner import _VERIFIED_SOURCE_LABEL_RE
+
+    files: "list[str]" = []
+    for text in contexts:
+        for line in (text or "").splitlines():
+            match = _VERIFIED_SOURCE_LABEL_RE.match(line)
+            if match:
+                label = match.group(1)
+                path = label[:label.rfind(":")] if ":" in label else label
+                if path not in files:
+                    files.append(path)
+    return tuple(files)
+
+
 def _render_repository_context_section(
     grounding: "RepositoryGroundingResult | None", *, no_patch: bool = False,
+    verified_source_files: "tuple[str, ...]" = (),
 ) -> str:
     """Render the Repository Context section (own leading rule).
 
@@ -1781,6 +1807,14 @@ def _render_repository_context_section(
     lines: list[str] = ["---\n", "## Repository Context\n"]
 
     selected = [d for d in (grounding.decisions if grounding else []) if d.outcome != "rejected"]
+    if not selected and verified_source_files:
+        lines.append(
+            "Repository location discovery identified no locations for this "
+            "vulnerability. The model was still given repository source, as "
+            "verified source excerpts from these files:\n"
+        )
+        lines.append("\n".join(f"- `{path}`" for path in verified_source_files) + "\n")
+        return "\n".join(lines) + "\n"
     if not selected:
         lines.append(
             "No repository locations were identified to provide context for "
@@ -4696,7 +4730,9 @@ def _build_report(result: PipelineResult) -> str:
             "*Not evaluated — no repository root was provided.*\n\n"
         )
     else:
-        report += _render_repository_context_section(result.grounding, no_patch=no_patch)
+        report += _render_repository_context_section(
+            result.grounding, no_patch=no_patch, verified_source_files=result.verified_source_files,
+        )
 
     # §9c: Post-Patch Investigation
     if no_patch:
@@ -6213,7 +6249,7 @@ def _run_patch_generation_and_investigation(
         if os.environ.get("AUTOPATCHER_DEBUG") and _relocation_telemetry is not None:
             import datetime as _dt
             import json as _json
-            _debug_dir = Path("reports") / "debug"
+            _debug_dir = _autopatcher_debug_dir()
             _debug_dir.mkdir(parents=True, exist_ok=True)
             _ts = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
             (_debug_dir / f"relocation_telemetry_{_ts}.json").write_text(
@@ -6492,7 +6528,7 @@ def _run_patch_generation_and_investigation(
             except Exception:
                 _initial_changed_files, _initial_file_hunks = [], {}
 
-            _debug_dir4 = Path("reports") / "debug"
+            _debug_dir4 = _autopatcher_debug_dir()
             _debug_dir4.mkdir(parents=True, exist_ok=True)
             _ts4 = _dt4.datetime.now().strftime("%Y%m%dT%H%M%S")
             _post_patch_doc = {
@@ -6830,6 +6866,10 @@ def _run_patch_generation_and_investigation(
                         )
                     _post_patch_observations = evaluate_anchors(
                         _all_anchors, _post_patch_context, unavailable_reason=_post_patch_unavailable_reason,
+                        # Each function is followed through the diff that was
+                        # applied, never re-looked-up by its id (PR #763 HUNT
+                        # N9/N10).
+                        patch_diff=_investigated_patch, pre_patch_context=_pre_patch_resolution_context,
                     )
                     # Coverage Analysis reuses the PRE-patch InvestigationContext (the
                     # diff's context/removed lines describe that state) and the same
@@ -7218,6 +7258,92 @@ def _calibrate_findings_with_evidence_acquisition(
     return result
 
 
+_DIFF_OLD_PATH_RE = re.compile(r"^--- (?:a/(?P<path>.+)|(?P<devnull>/dev/null)|(?P<other>.*))$")
+_DIFF_RENAME_COPY_RE = re.compile(r"^(?:rename|copy) (?:from|to) (?P<path>.+)$")
+
+
+def _canonical_repo_path(raw: str) -> "str | None":
+    """`raw` as a canonical repository-relative path, or None when it is not
+    one: quoted, absolute, with `.`/`..` segments, doubled separators, or a
+    trailing tab-separated timestamp git never writes in a/ b/ headers."""
+    from .patch_challenger import _normalize_repo_path
+
+    raw = raw.split("\t", 1)[0].rstrip()
+    if not raw or raw.startswith('"') or "\x00" in raw:
+        return None
+    path = raw.replace("\\", "/")
+    if path.startswith("/") or any(part in ("", ".", "..") for part in path.split("/")):
+        return None
+    return _normalize_repo_path(path) if _normalize_repo_path(path) == path else None
+
+
+def _patch_changed_files(patch: str) -> "frozenset[str] | None":
+    """Every repository-relative path `patch` changes -- the files it
+    modifies, adds or deletes (both sides of every `---`/`+++` pair) and
+    renames or copies -- or None when that set cannot be established: no
+    file at all, a path that is not plain and canonical (see
+    `_canonical_repo_path`), a header without the git a/ b/ prefixes, or a
+    `+++` side the existing diff parser does not report for a hunk-bearing
+    file. Fail closed: None never counts as contained."""
+    from .diff_parsing import parse_diff
+    from .patch_applicability import _strip_fences
+
+    body = _strip_fences(patch or "")
+    files: "set[str]" = set()
+    for line in body.split("\n"):
+        line = line.rstrip("\r")
+        if line.startswith("--- "):
+            old = _DIFF_OLD_PATH_RE.match(line)
+            if old.group("other") is not None:
+                return None
+            if old.group("path") is not None:
+                path = _canonical_repo_path(old.group("path"))
+                if path is None:
+                    return None
+                files.add(path)
+        elif line.startswith("+++ "):
+            target = line[4:]
+            if target.split("\t", 1)[0].rstrip() == "/dev/null":
+                continue
+            if not target.startswith("b/"):
+                return None
+            path = _canonical_repo_path(target[2:])
+            if path is None:
+                return None
+            files.add(path)
+        elif _DIFF_RENAME_COPY_RE.match(line):
+            path = _canonical_repo_path(_DIFF_RENAME_COPY_RE.match(line).group("path"))
+            if path is None:
+                return None
+            files.add(path)
+        elif line.startswith("diff --git ") and not line.startswith("diff --git a/"):
+            return None
+    if not files:
+        return None
+    changed, file_hunks = parse_diff(body)
+    # The existing parser's view of the post-change files must be part of
+    # this set; any disagreement is an ambiguous diff.
+    if not all((_canonical_repo_path(f) in files) for f in changed):
+        return None
+    if "@@" in body and not any(file_hunks.get(f) for f in changed) and not any(
+        line.startswith("+++ /dev/null") for line in body.split("\n")
+    ):
+        return None
+    return frozenset(files)
+
+
+def _repair_within_original_files(original_patch: str, repair_patch: str) -> bool:
+    """PR #763 HUNT FABLE-R1-1 (off-target repair), Option A: whether a
+    regenerated repair changes only files the original patch changes. The
+    original patch is the one S4 settled after Patch Target Conformance;
+    the repair path has no conformance check of its own, so a repair that
+    reaches any other file is never considered. Containment, not
+    conformance: a repair inside those files can still change unrelated
+    code there (see recommendation-policy.md)."""
+    original, repair = _patch_changed_files(original_patch), _patch_changed_files(repair_patch)
+    return original is not None and repair is not None and repair <= original
+
+
 def _run_patch_repair_and_calibration(
     *, vulnerability_text, llm, repo_root, code_context, challenger_context,
     patch, challenger, applicability_result, hygiene_findings, _final_repair_meta,
@@ -7298,6 +7424,9 @@ def _run_patch_repair_and_calibration(
     repair_eligible_defect_count = 0
     _r_behavioral_defect_count = 0
     repair_rechallenged = False
+    # Set when a regenerated repair changed a file the original patch does
+    # not (see _repair_within_original_files): rejected before re-challenge.
+    repair_off_target = False
     finding_calibration: list[dict] | None = None
     # Batch B3: pre-initialized (not previously read outside the repair
     # try/except block, so never previously needed a default) purely so
@@ -7430,7 +7559,20 @@ def _run_patch_repair_and_calibration(
                 _r_app = _r_processed.applicability_result
                 repair_patch_content = _r_raw
                 _r_applicable = _r_app.get("applicable") is True
-                if _r_applicable:
+                if _r_applicable and not _repair_within_original_files(patch, _r_raw):
+                    # Off-target repair containment (PR #763 HUNT
+                    # FABLE-R1-1): never re-challenged, never accepted. The
+                    # original patch and every piece of its own evidence
+                    # (Challenger result, applicability, hygiene,
+                    # calibration, repair metadata) stay exactly as they
+                    # were, because none of them is reassigned here.
+                    repair_off_target = True
+                    progress.warning("Patch repair rejected — it changes files the original patch does not")
+                    progress.verbose(
+                        "[pipeline] Repair rejected – the regenerated patch changes a file outside the "
+                        "original patch's files (or its files could not be established); keeping original."
+                    )
+                elif _r_applicable:
                     _r_challenger = challenge_patch(
                         vulnerability_text, _r_raw, llm, code_context=code_context,
                         provenance_context=_challenger_provenance_context(_challenger_provenance_parts, code_context),
@@ -8546,7 +8688,7 @@ def _run_guided_context_acquisition(
                             ],
                         }
 
-                    _debug_dir = Path("reports") / "debug"
+                    _debug_dir = _autopatcher_debug_dir()
                     _debug_dir.mkdir(parents=True, exist_ok=True)
                     _ts = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
                     _doc = {
@@ -9549,7 +9691,7 @@ def run(
         try:
             import datetime as _dt
             import json as _json
-            _debug_dir = Path("reports") / "debug"
+            _debug_dir = _autopatcher_debug_dir()
             _debug_dir.mkdir(parents=True, exist_ok=True)
             _ts = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
             (_debug_dir / f"patch_generation_context_{_ts}.json").write_text(_json.dumps({
@@ -9881,6 +10023,8 @@ def run(
             _repair_outcome = "attempted_failed"  # never even completed applicability check
         elif _r_applicable is False:
             _repair_outcome = "attempted_inapplicable"
+        elif _s6.get("repair_off_target"):
+            _repair_outcome = "attempted_off_target_rejected"
         elif repair_succeeded:
             _repair_outcome = "attempted_applicable_accepted"
         elif repair_rechallenged:
@@ -10367,5 +10511,11 @@ def run(
         patch_target_conformance=_patch_target_conformance,
         post_patch_recovery=_post_patch_recovery,
         security_invariant=(_strategy_result.security_invariant if _strategy_result else None),
+        # Only context a completed call actually carried: the Strategy's input
+        # when it returned an evaluated result, Patch Generation's when it ran.
+        verified_source_files=_verified_source_files(
+            _planner_evidence_ctx if _strategy_result is not None and _strategy_result.evaluated else "",
+            code_context if _patch_generation_status is not None else "",
+        ),
     )
     return _build_report(result)

@@ -98,7 +98,8 @@ def _write_full_run_trace(
     lineage.py's module docstring), never synthesized placeholder rows."""
     trace_dir.mkdir(parents=True, exist_ok=True)
     manifest = lineage.new_full_run_manifest(
-        target_repository={"repo_root": str(repo_root), "repo_commit": _head_sha(repo_root)},
+        # run_traced records whether the source working tree was clean (HUNT N13)
+        target_repository={"repo_root": str(repo_root), "repo_commit": _head_sha(repo_root), "worktree_clean": True},
         openant={"patcher_commit": "1234567890abcdef1234567890abcdef12345678"},
         llm={"provider": llm_provider, "model": llm_model},
         executions=executions or [],

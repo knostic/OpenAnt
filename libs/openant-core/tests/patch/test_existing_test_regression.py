@@ -226,11 +226,14 @@ class TestCompareRunsCountOnlyFallback:
         assert r.newly_failing_tests == []
         assert "could not be identified" in r.reason
 
-    def test_no_increase_is_pre_existing(self):
+    def test_no_increase_without_identities_is_not_verified(self):
+        """PR #763 HUNT N12: equal counts cannot tell a pre-existing failure
+        from a different test failing in its place (previously asserted
+        PRE_EXISTING_FAILURES_ONLY)."""
         b = _run(100, level="COUNTS_ONLY"); b.failed = 2
         p = _run(100, level="COUNTS_ONLY"); p.failed = 2
         r = etr.compare_runs(("cmd",), b, p)
-        assert r.status == etr.STATUS_PRE_EXISTING_FAILURES_ONLY
+        assert r.status == etr.STATUS_NOT_VERIFIED
 
     def test_weaker_side_governs_mixed_ok_and_counts_only(self):
         """If baseline has full IDs but patched only has counts, the
@@ -239,7 +242,8 @@ class TestCompareRunsCountOnlyFallback:
         b = _run(100, failed_ids=["t::a"], level="OK")
         p = _run(99, level="COUNTS_ONLY"); p.failed = 1
         r = etr.compare_runs(("cmd",), b, p)
-        assert r.status == etr.STATUS_PRE_EXISTING_FAILURES_ONLY
+        # count-only on the weaker side: no "pre-existing" claim (HUNT N12)
+        assert r.status == etr.STATUS_NOT_VERIFIED
         assert r.newly_failing_tests == []  # never asserted at ID level
 
 
@@ -666,7 +670,8 @@ class TestCompareByIdsFromRunnerSummary:
         assert baseline.failed_test_ids is None
         assert patched.failed_test_ids is None
         r = etr.compare_runs(_EXIT_CODE_PLAN.test_command, baseline, patched)
-        assert r.status == etr.STATUS_PRE_EXISTING_FAILURES_ONLY
+        # aggregate-only, equal counts: unverified, never "pre-existing" (HUNT N12)
+        assert r.status == etr.STATUS_NOT_VERIFIED
         assert r.newly_failing_tests == []
 
     def test_both_sides_worse_and_unresolvable_stays_not_verified(self):

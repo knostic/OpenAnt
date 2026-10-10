@@ -391,6 +391,21 @@ def _run_engine_and_write_artifacts(
     _prev_parser_quiet = os.environ.get("AUTOPATCHER_PARSER_QUIET")
     if not _progress.is_verbose():
         os.environ["AUTOPATCHER_PARSER_QUIET"] = "1"
+    # AUTOPATCHER_DEBUG prompts carry repository source: when the default
+    # ./reports/debug would land inside the analyzed repository (the
+    # `cd <repo> && openant patch` flow), this run writes them under its own
+    # output directory instead. Saved/restored like the variable above.
+    _relocated_debug_dir = None
+    if os.environ.get("AUTOPATCHER_DEBUG"):
+        from utilities.autopatcher.debug_output import DEBUG_DIR_ENV, debug_dir, resolve_debug_dir
+        _resolved_debug_dir = resolve_debug_dir(repo_root, output_dir)
+        if _resolved_debug_dir != debug_dir():
+            _relocated_debug_dir = _resolved_debug_dir
+            os.environ[DEBUG_DIR_ENV] = str(_relocated_debug_dir)
+            _progress.info(
+                "Debug artifacts written outside the analyzed repository",
+                detail=str(_relocated_debug_dir),
+            )
     try:
         report_body = _run_pipeline(
             vulnerability_text=vulnerability_text,
@@ -406,6 +421,8 @@ def _run_engine_and_write_artifacts(
             os.environ.pop("AUTOPATCHER_PARSER_QUIET", None)
         else:
             os.environ["AUTOPATCHER_PARSER_QUIET"] = _prev_parser_quiet
+        if _relocated_debug_dir is not None:
+            os.environ.pop(DEBUG_DIR_ENV, None)  # set above only when it was unset
 
     # The provider is already authoritatively resolved by this point --
     # _require_llm_provider() (above) ran the canonical resolver before any

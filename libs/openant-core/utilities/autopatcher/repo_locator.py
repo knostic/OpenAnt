@@ -43,6 +43,7 @@ import re
 from pathlib import Path
 from typing import NamedTuple
 
+from .debug_output import debug_dir as _autopatcher_debug_dir
 from .repository_grounding_models import (
     DiscoveryEvidence,
     GroundingDecision,
@@ -221,7 +222,7 @@ def _write_debug_artifact(record: dict) -> None:
     if not os.environ.get("AUTOPATCHER_DEBUG"):
         return
     try:
-        debug_dir = Path("reports") / "debug"
+        debug_dir = _autopatcher_debug_dir()
         debug_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         path = debug_dir / f"context_selection_{ts}.json"

@@ -411,6 +411,39 @@ class TestDebugArtifactManifest:
         assert str(stale) not in found
 
 
+class TestDebugArtifactsFromInsideTheRepository:
+    """PR #763 review: run from inside the analyzed repository, a traced run's
+    AUTOPATCHER_DEBUG artifacts land in its own output directory -- never in
+    the repository -- and the manifest still points at them."""
+
+    def test_manifest_points_at_debug_artifacts_outside_the_repository(self, run_traced, tmp_path, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        monkeypatch.delenv("AUTOPATCHER_DEBUG_DIR", raising=False)
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        output_dir = tmp_path / "out"
+        monkeypatch.chdir(repo_root)
+
+        import utilities.autopatcher.pipeline as pipeline_module
+        from utilities.autopatcher.repo_locator import _write_debug_artifact
+
+        def _write_then_fail(**kwargs):
+            _write_debug_artifact({"probe": True})  # the production writer
+            raise RuntimeError("simulated pipeline failure")
+
+        monkeypatch.setattr(pipeline_module, "run", _write_then_fail)
+        argv = ["--cve", "CVE-2021-12345", "--repo-root", str(repo_root), "--output", str(output_dir)]
+        with _mock_fetch_cve_at_source():
+            with pytest.raises(RuntimeError, match="simulated pipeline failure"):
+                run_traced.main(argv)
+
+        manifest = json.loads((output_dir / "trace" / "run_manifest.json").read_text())
+        artifacts = manifest["autopatcher_debug_artifacts"]
+        assert len(artifacts) == 1
+        assert Path(artifacts[0]).resolve().is_relative_to((output_dir / "debug").resolve())
+        assert not (repo_root / "reports").exists()
+
+
 class TestFailedRunManifest:
     """Covers requirement 2: a run_patch_cve()/run_patch() failure must
     still leave checkpoints.jsonl and a failed run_manifest.json behind,

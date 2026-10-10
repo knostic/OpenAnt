@@ -1030,6 +1030,8 @@ def _run_replay_patch_repair_and_calibration(
         repair_outcome = "attempted_failed"
     elif s6_locals["_r_applicable"] is False:
         repair_outcome = "attempted_inapplicable"
+    elif s6_locals.get("repair_off_target"):
+        repair_outcome = "attempted_off_target_rejected"
     elif s6_locals["repair_succeeded"]:
         repair_outcome = "attempted_applicable_accepted"
     elif s6_locals["repair_rechallenged"]:
@@ -1840,6 +1842,9 @@ def replay_stage(
         target_repository={
             "repo_root": str(repo_root) if repo_root else provenance.repo_root,
             "repo_commit": provenance.repo_commit,
+            # Carried forward, so a replay of this replay passes the same
+            # source-state gate (PR #763 HUNT N13).
+            "worktree_clean": provenance.repo_worktree_clean,
         },
         openant={
             "source_patcher_commit": provenance.patcher_commit,

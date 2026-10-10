@@ -947,11 +947,16 @@ def _compare_by_aggregate_counts(
             ),
         )
     if p_bad > 0:
+        # Counts cannot tell a pre-existing failure from a different test
+        # failing in its place (one fixed, another broken: equal counts) --
+        # never report "pre-existing only" without test identities (PR #763
+        # HUNT N12).
         return ExistingTestComparisonResult(
-            status=STATUS_PRE_EXISTING_FAILURES_ONLY, command=command, baseline=baseline, patched=patched,
+            status=STATUS_NOT_VERIFIED, command=command, baseline=baseline, patched=patched,
             reason=(
-                f"{p_bad} failure(s)/error(s), not more than baseline ({b_bad}); "
-                "count-based comparison only; no new failures indicated."
+                f"{p_bad} failure(s)/error(s) after the patch, not more than baseline ({b_bad}), but the "
+                "failing tests could not be identified (count-based evidence only), so a new failure "
+                "replacing a fixed one cannot be ruled out."
             ),
         )
     return ExistingTestComparisonResult(
@@ -1016,6 +1021,17 @@ def compare_runs(
     return result
 
 
+def _ids_account_for_failures(r: TestRunResult) -> bool:
+    """Whether `failed_test_ids` names every failure/error the run reports.
+    An aggregate-only parse (e.g. a JUnit `<testsuite failures="2">` with no
+    `<testcase>` children) yields `[]` alongside a non-zero count: that empty
+    list is not evidence of no failures, so identity comparison must not use
+    it (PR #763 HUNT N11)."""
+    if r.failed_test_ids is None:
+        return False
+    return len(set(r.failed_test_ids)) >= (r.failed or 0) + (r.errors or 0)
+
+
 def _reports_zero_tests(r: TestRunResult) -> bool:
     """True when a counts-bearing run (not bare exit-code evidence) reports
     that no test executed at all."""
@@ -1029,7 +1045,7 @@ def _compare_by_evidence(
     command, baseline: TestRunResult, patched: TestRunResult, effective_rank: int,
 ) -> ExistingTestComparisonResult:
     """compare_runs' evidence-tier dispatch (see its docstring)."""
-    if baseline.failed_test_ids is not None and patched.failed_test_ids is not None:
+    if _ids_account_for_failures(baseline) and _ids_account_for_failures(patched):
         return _compare_by_ids(command, baseline, patched)
 
     if effective_rank == 1:

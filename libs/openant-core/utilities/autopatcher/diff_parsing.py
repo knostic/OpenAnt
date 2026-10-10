@@ -19,10 +19,14 @@ class DiffHunk:
     """One hunk's raw body lines, each still prefixed with its diff marker
     (' ', '+', or '-'). `new_start`/`new_count` are kept only for
     diagnostic/debugging purposes — symbol resolution does not use them,
-    by design (see impact_surface.py's module docstring)."""
+    by design (see impact_surface.py's module docstring). `old_start` (the
+    header's pre-change line, None when absent) is used only to choose
+    between several places the hunk's content matches identically, as
+    `git apply` does -- never to place content that does not match."""
     new_start: int
     new_count: int
     lines: List[str] = field(default_factory=list)
+    old_start: Optional[int] = field(default=None, compare=False)
 
 
 def parse_diff(diff: str) -> Tuple[List[str], Dict[str, List[DiffHunk]]]:
@@ -74,7 +78,8 @@ def parse_diff(diff: str) -> Tuple[List[str], Dict[str, List[DiffHunk]]]:
             if m:
                 start = int(m.group(1))
                 count = int(m.group(2)) if m.group(2) else 1
-                cur_hunk = DiffHunk(new_start=start, new_count=count)
+                old = re.match(r"@@ -([0-9]+)", line)
+                cur_hunk = DiffHunk(new_start=start, new_count=count, old_start=int(old.group(1)) if old else None)
             continue
         if cur_hunk is not None and line[:1] in (" ", "+", "-"):
             cur_hunk.lines.append(line)

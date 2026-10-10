@@ -11,7 +11,7 @@ from __future__ import annotations
 import bisect
 import re
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
 from .llm_client import get_call_history
 from .run_metadata import _TRUNCATION_STOP_REASONS
@@ -231,6 +231,26 @@ _CONCERN_FIELD_LABELS = (
 schemas, so each concern carries exactly one; see
 `_concern_structure_ambiguous`."""
 
+_CONCERN_FIELD_LINE_RE = re.compile(
+    r"^[ \t]*(?:\d+\.\s*)?(" + "|".join(re.escape(label) for label in _CONCERN_FIELD_LABELS) + r"):",
+    re.IGNORECASE,
+)
+"""A line that starts one of the concern fields, in the exact form
+`_extract_concern_field` reads; group 1 is the label."""
+
+
+def _field_takes_continuation(label: str, first_line_value: str = "") -> bool:
+    """Whether a field's value may continue on the following lines: the
+    free-text fields (`Description`, `Hypothesized outcome`, every
+    `... provenance` quote) can wrap. A closed-vocabulary field (`Role`,
+    `Preceding guard`, ...) is one line, and so is a `none`/`n/a`
+    placeholder (the field is empty); a line after either belongs to no
+    field."""
+    label = label.lower()
+    if first_line_value.strip().lower() in ("none", "n/a"):
+        return False
+    return label in ("description", "hypothesized outcome") or label.endswith(" provenance")
+
 
 def _lenient_label_re(label: str) -> "re.Pattern":
     """A `label:` field line in any Markdown dress (`**Label:**`, `- Label:`,
@@ -271,13 +291,79 @@ _LENIENT_CONCERNS_HEADER_RE = re.compile(
 )
 
 
+_SECTION_HEADER_RE = re.compile(
+    r"^(Verification status:|Still vulnerable:|Edge cases:|Potential issues:|Concerns:|Summary:)",
+    re.IGNORECASE | re.MULTILINE,
+)
+"""The section headers `_split_sections` recognizes: plain, at column 0."""
+
+_LENIENT_SECTION_HEADER_RE = re.compile(
+    r"^[ \t>#*_-]*(?:verification status|still vulnerable|edge cases|potential issues|concerns|summary)"
+    r"[*_ \t]*(?::|$)",
+    re.IGNORECASE,
+)
+"""A line that is one of those section headers in any Markdown dress
+(`**Summary:**`, `### Potential issues`, an indented `Concerns:`). Detection
+only: a match `_SECTION_HEADER_RE` does not also make is a header
+`_split_sections` would not see (see `_unaccounted_response_content`)."""
+
+
+def _unaccounted_response_content(text: str, concerns_body: str) -> "Optional[str]":
+    """What part of a structured (`Concerns:`) response no recognized section
+    or concern field accounts for, or None when every non-blank line is
+    accounted for. `_split_sections` reads only plain column-0 section
+    headers, keeps the last body of a repeated one and only the first line
+    of `Verification status:`/`Still vulnerable:`; `_split_concern_blocks`
+    starts at the first `N. Role:` line; and `_extract_concern_field` reads
+    a field plus its contiguous continuation lines. Text any of these would
+    skip -- possibly a BLOCKING concern -- must never vanish silently, so
+    `challenge_patch` fails such a response closed. The Edge cases /
+    Potential issues / Summary bodies are already checked by the
+    structural-violation gate there."""
+    lines = (text or "").splitlines()
+    seen: set = set()
+    first_header: "Optional[int]" = None
+    for i, line in enumerate(lines):
+        strict = _SECTION_HEADER_RE.match(line)
+        if _LENIENT_SECTION_HEADER_RE.match(line) and not strict:
+            return "a section header in an unsupported format"
+        if strict:
+            name = strict.group(1).lower()
+            if name in seen:
+                return f"a repeated {strict.group(1)} header"
+            seen.add(name)
+            first_header = i if first_header is None else first_header
+    if first_header is not None and any(line.strip() for line in lines[:first_header]):
+        return "text before the first section header"
+
+    parts = _SECTION_HEADER_RE.split(text or "")
+    for header, body in zip(parts[1::2], parts[2::2]):
+        if header.lower() in ("verification status:", "still vulnerable:") and sum(
+            1 for line in body.splitlines() if line.strip()
+        ) > 1:
+            return f"more than one line under {header}"
+
+    first_block = _CONCERN_BLOCK_HEADER_RE.search(concerns_body or "")
+    if (concerns_body or "")[:first_block.start() if first_block else None].strip():
+        return "text in Concerns before its first numbered concern"
+    for span in _split_concern_blocks(concerns_body or "").values():
+        continues = False  # the block's first line is its one-line `Role:` field
+        for line in (span or "").splitlines()[1:]:
+            field = _CONCERN_FIELD_LINE_RE.match(line)
+            if not line.strip():
+                continues = False
+            elif field:
+                continues = _field_takes_continuation(field.group(1), line[field.end():])
+            elif not continues or any(_lenient_label_re(label).match(line) for label in _CONCERN_FIELD_LABELS):
+                return "text inside a concern block that belongs to none of its fields"
+    if len(_LENIENT_ROLE_MARKER_RE.findall(text or "")) != len(_CONCERN_BLOCK_HEADER_RE.findall(concerns_body or "")):
+        return "a concern block outside the Concerns section"
+    return None
+
+
 def _split_sections(text: str) -> Dict[str, str]:
     # Look for section headers used in the prompt and capture their bodies.
-    pattern = re.compile(
-        r"^(Verification status:|Still vulnerable:|Edge cases:|Potential issues:|Concerns:|Summary:)",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    parts = pattern.split(text)
+    parts = _SECTION_HEADER_RE.split(text)
     # parts will be: [pre, header1, body1, header2, body2, ...]
     sections = {
         "verification_status": "", "still_vulnerable": "",
@@ -419,16 +505,34 @@ def _split_concern_blocks(text: str) -> "Dict[int, Optional[str]]":
 
 
 def _extract_concern_field(block: str, label: str) -> "Optional[str]":
-    """First line matching `<label>: <value>` within an already-isolated
-    concern block span -- block-local by construction, so this can never
-    read a value belonging to a different concern.
+    """The value of the first `<label>: <value>` field line within an
+    already-isolated concern block span -- block-local by construction, so
+    this can never read a value belonging to a different concern.
+
+    A free-text field's value (`_field_takes_continuation`) continues on the
+    following lines up to the next field line or blank line (a wrapped
+    description, a multi-line code quote); continuation lines are joined
+    with single spaces. Text after a blank line, or after a one-line field,
+    belongs to no field (`_unaccounted_response_content` fails such a
+    response closed).
 
     `Role:` shares its line with the block's own leading "N." (see
     `_CONCERN_BLOCK_HEADER_RE`, e.g. "1. Role: primary") -- the optional
     `\\d+\\.\\s*` prefix here accounts for that one line without requiring
     every other field's line to tolerate it too."""
-    m = re.search(rf"^[ \t]*(?:\d+\.\s*)?{re.escape(label)}:\s*(.+?)\s*$", block, re.IGNORECASE | re.MULTILINE)
-    return m.group(1).strip() if m else None
+    label_re = re.compile(rf"^[ \t]*(?:\d+\.\s*)?{re.escape(label)}:[ \t]*(.*?)[ \t]*$", re.IGNORECASE)
+    lines = (block or "").splitlines()
+    for i, line in enumerate(lines):
+        m = label_re.match(line)
+        if not m:
+            continue
+        parts = [m.group(1)] if m.group(1) else []
+        for continuation in lines[i + 1:] if _field_takes_continuation(label, m.group(1)) else ():
+            if not continuation.strip() or _CONCERN_FIELD_LINE_RE.match(continuation):
+                break
+            parts.append(continuation.strip())
+        return " ".join(parts).strip() or None
+    return None
 
 
 def _strip_quote_wrapping(s: "Optional[str]") -> str:
@@ -477,9 +581,60 @@ _DIFF_METADATA_LINE_RE = re.compile(
 )
 
 
+def _diff_structure(diff: "Optional[str]") -> "Iterator[Tuple[str, str, bool]]":
+    """`(kind, line, well_formed)` for every line of `diff` that is diff
+    structure, in order: `kind` is `"file"` (a file header), `"hunk"` (an
+    `@@` header) or `"body"` (a line inside a hunk). A hunk's body is the
+    `+`/`-`/space/blank/`\\` lines after its header, up to the line counts
+    the header declares, or up to the first line that is none of these.
+    Everything else -- text before the first header, after a hunk's
+    declared span, or a non-diff line inside one (generator prose) -- is
+    not part of the patch and is not yielded. `well_formed` is False for an
+    `@@` header without the line numbers and counts git applies by, and
+    for its body (whose extent is then bounded only by its own lines).
+
+    Text with no diff structure at all (no file header, no `@@` line) is
+    yielded whole as one body, as before: it is no diff `git apply` could
+    accept, so it can never pass the applicability check."""
+    lines = (diff or "").splitlines()
+    if not any(line.startswith("@@") or _DIFF_FILE_HEADER_RE.match(line) for line in lines):
+        for line in lines:
+            yield "body", line, True
+        return
+    in_hunk, well_formed, old_left, new_left = False, False, 0, 0
+    for line in lines:
+        if _DIFF_FILE_HEADER_RE.match(line):
+            in_hunk = False
+            yield "file", line, True
+            continue
+        if line.startswith("@@"):
+            header = _HUNK_HEADER_RE.match(line)
+            in_hunk, well_formed = True, header is not None
+            if header:
+                old_left, new_left = int(header.group(2) or 1), int(header.group(4) or 1)
+            yield "hunk", line, well_formed
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith("\\"):
+            yield "body", line, well_formed  # "\ No newline at end of file"
+            continue
+        if line[:1] not in ("+", "-", " ") and line.strip():
+            in_hunk = False  # not a diff line: the hunk ended
+            continue
+        yield "body", line, well_formed
+        if well_formed:
+            old_left -= line[:1] != "+"
+            new_left -= line[:1] != "-"
+            if old_left <= 0 and new_left <= 0:
+                in_hunk = False
+
+
 def _patch_citation_view(patch: str) -> "Tuple[str, set]":
-    """The post-change side of `patch` as a citation haystack: context and
-    added lines only. File headers and removed (`-`) lines are dropped, and
+    """The post-change side of `patch` as a citation haystack: the context
+    and added lines inside its well-formed hunks only (`_diff_structure`).
+    File headers, removed (`-`) lines and any text outside a hunk's
+    declared span -- prose around or between the hunks -- are dropped, and
     each `@@ ... @@` header is reduced to a bare `@@ @@` separator (it keeps
     the per-hunk ordering units of `_ordering_blocks` but carries nothing
     citable). Also returns the text of every line the patch removes and
@@ -488,35 +643,57 @@ def _patch_citation_view(patch: str) -> "Tuple[str, set]":
     out: "List[str]" = []
     removed: set = set()
     kept: set = set()
-    for line in (patch or "").splitlines():
-        if _DIFF_FILE_HEADER_RE.match(line):
+    for kind, line, well_formed in _diff_structure(patch):
+        if kind == "file":
             continue
-        if line.startswith("@@"):
+        if kind == "hunk":
             out.append("@@ @@")
             continue
         if line.startswith("-"):
             removed.add(line[1:].strip())
             continue
-        if line.startswith("\\"):
-            continue  # "\ No newline at end of file"
+        if line.startswith("\\") or not well_formed:
+            continue
         kept.add(line[1:].strip() if line[:1] in ("+", " ") else line.strip())
         out.append(line)
     return "\n".join(out), {r for r in removed - kept if r}
 
 
-def _without_removed_lines(corpus: str, removed_only: set) -> str:
+_REMOVED_LINE_MARK = "\x00"
+"""Stands in for a line excluded from the citation corpus: never part of a
+model's quote, so no citation can match across it (see
+`_without_removed_lines`)."""
+
+
+def _without_removed_lines(corpus: str, removed_only: set, plain_lines: bool = True) -> str:
     """`corpus` with diff metadata lines and every line whose text the patch
     removes (a pre-change copy of the target, or a `-`-prefixed rendering of
     it) blanked: such a line can never ground a post-change fact. Blanked,
     not dropped, so an evidence block's lines keep their file line numbers
-    (see `_located_blocks`)."""
+    (see `_located_blocks`).
+
+    `plain_lines=False` keeps plain source lines (blanking only metadata and
+    `+`/`-`-prefixed renderings): the corpus `_post_change_guard_holds`
+    counts operation occurrences in. Matching text cannot say whether a
+    line is the removed one or an identical, unpatched line elsewhere
+    (PR #763 HUNT N4); a located copy of the removed line is already
+    decided by the hunk spanning it, and any other copy must still be
+    accounted for.
+
+    In citation mode (`plain_lines=True`) a blanked line becomes
+    `_REMOVED_LINE_MARK`, not an empty line: whitespace normalization would
+    otherwise join the lines around it, so a quote that skips a line
+    another copy of which the patch removes (an unpatched `True` / `and
+    False` / `)` sequence read as `True )`) would validate text that occurs
+    nowhere contiguously."""
+    blank = _REMOVED_LINE_MARK if plain_lines else ""
     out: "List[str]" = []
     for line in (corpus or "").splitlines():
         stripped = line.strip()
-        if _DIFF_METADATA_LINE_RE.match(stripped) or stripped in removed_only or (
+        if _DIFF_METADATA_LINE_RE.match(stripped) or (plain_lines and stripped in removed_only) or (
             stripped[:1] in "+-" and stripped[1:].strip() in removed_only
         ):
-            out.append("")
+            out.append(blank)
             continue
         out.append(line)
     return "\n".join(out)
@@ -805,14 +982,14 @@ def _diff_target_path(header: str) -> "Optional[str]":
 def _diff_hunks(diff: "Optional[str]") -> "List[_Hunk]":
     """Each hunk of `diff`: its post-change file path and new-side start line
     (None when the headers do not state them) and its ordered `(tag, text)`
-    lines, tag one of `' '`, `'+'`, `'-'`. A diff without any `@@` header is
-    a single hunk."""
+    lines, tag one of `' '`, `'+'`, `'-'`. Only diff structure counts
+    (`_diff_structure`): text outside every hunk is never a hunk line."""
     hunks: "List[_Hunk]" = []
     current: "List[Tuple[str, str]]" = []
     path: "Optional[str]" = None
     span: "Tuple" = (None, None, 0, 0)  # (new_start, old_start, old_len, new_len)
-    for line in (diff or "").splitlines():
-        if line.startswith("@@") or _DIFF_FILE_HEADER_RE.match(line):
+    for kind, line, _well_formed in _diff_structure(diff):
+        if kind != "body":
             if current:
                 hunks.append(_Hunk(path, span[0], current, span[1], span[2], span[3]))
             current = []
@@ -896,24 +1073,101 @@ def _indentation(text: str) -> int:
     return len(expanded) - len(expanded.lstrip())
 
 
-def _guard_scope_covers(unit: "List[Tuple[str, str]]", guard_line: int, op_line: int) -> bool:
+_CONTROL_BLOCK_HEADER_RE = re.compile(
+    r"^\s*(?:\}\s*)?(?:if|elif|else|for|while|try|except|finally|with|async\s+(?:with|for)|switch|case|default|"
+    r"do|unless|until|match|catch|loop|select|when|guard|begin|rescue|ensure)\b"
+)
+"""A line opening a control-flow block that runs in its enclosing function's
+own execution (`if`, `else`, `for`, `try`, `with`, `switch` ...)."""
+
+_NOT_A_BLOCK_OPENER_RE = re.compile(r"^\s*(?:#|//|/\*|\*|[)\]}])")
+"""A comment line, or one that only closes brackets (`):` ending a
+multi-line `if (...` header, `}` ending an earlier block): never the line
+that opens the block enclosing what follows."""
+
+_INLINE_SCOPE_OPENER_RE = re.compile(r"\blambda\b|=>|\bfunction\b|\bfunc\b|\bdef\b|\bclass\b")
+"""Text that opens a separate execution scope within one line (a lambda, an
+arrow function, an inline function)."""
+
+
+def _guard_text_start(line: str, guard: "Optional[str]") -> int:
+    """Where the (normalized) guard quote starts within `line`, normalized:
+    the guard is the line's suffix that begins the quote, or a whole
+    occurrence of it. -1 when not found."""
+    normalized = _normalize_for_provenance(line)
+    if not guard:
+        return -1
+    for start in range(len(normalized)):
+        rest = normalized[start:]
+        if rest.startswith(guard) or (guard.startswith(rest) and rest.strip()):
+            return start
+    return -1
+
+
+def _guard_in_separate_scope(
+    unit: "List[Tuple[str, str]]", guard_line: int, op_depth: int, guard: "Optional[str]",
+) -> bool:
+    """Whether the guard on `guard_line` runs in an execution scope that does
+    not also contain an operation at indentation `op_depth`: written inside
+    a lambda or inline function on its own line, or inside a block that
+    contains the guard but not the operation (indented at or beyond
+    `op_depth`) and is not a control-flow block of the same function -- a
+    nested function, method, class or callback, possibly never called.
+    Comment lines and lines that only close brackets are never an opening
+    line. Fails closed (True) when the opening line of the block holding
+    the guard at the operation's level is not in the unit, or is hidden by
+    irregular indentation: nothing shows it is a control-flow block."""
+    start = _guard_text_start(unit[guard_line][1], guard)
+    if start > 0 and _INLINE_SCOPE_OPENER_RE.search(_normalize_for_provenance(unit[guard_line][1])[:start]):
+        return True
+    threshold = _indentation(unit[guard_line][1])
+    if threshold <= op_depth:
+        return False  # no block holds the guard without also holding the operation
+    for tag, text in reversed(unit[:guard_line]):
+        if tag == "-" or not text.strip():
+            continue
+        depth = _indentation(text)
+        if depth >= threshold or (_NOT_A_BLOCK_OPENER_RE.match(text) and not _CONTROL_BLOCK_HEADER_RE.match(text)):
+            continue
+        # `text` opens a block that encloses the guard
+        if depth < op_depth:
+            # Skipped past the operation's level without seeing the block
+            # that holds the guard there: irregular indentation (string
+            # content, odd formatting) hides it. Fail closed.
+            return True
+        if not _CONTROL_BLOCK_HEADER_RE.match(text):
+            return True  # a nested function, class, callback, or an unrecognized block
+        if depth == op_depth:
+            return False  # a control-flow block beside the operation, in its own scope
+        threshold = depth
+    return True
+
+
+def _guard_scope_covers(
+    unit: "List[Tuple[str, str]]", guard_line: int, op_line: int, guard: "Optional[str]" = None,
+) -> bool:
     """Whether the guard line and the operation line lie in one function by
     indentation: on the same line, or with no post-change line in between
     (blank lines aside) dedented below both. Such a line is a boundary
     neither sits inside -- the next function or method's header, or a
-    closing brace. A guard or operation nested in a block (the other one
-    outside it) is not rejected: whether that block runs is control flow,
-    not textual order. At column 0 no dedent can show a boundary, so there
-    the guard and operation must both stay at column 0, with every line in
-    between."""
+    closing brace. A guard or operation nested in a control-flow block (the
+    other one outside it) is not rejected: whether that block runs is
+    control flow, not textual order. A guard nested in a separate execution
+    scope the operation is not in -- a nested function, class, lambda or
+    callback -- is rejected (`_guard_in_separate_scope`). At column 0 no
+    dedent can show a boundary, so there the guard and operation must both
+    stay at column 0, with every line in between."""
     if guard_line == op_line:
         return True
     guard_depth, op_depth = _indentation(unit[guard_line][1]), _indentation(unit[op_line][1])
     between = [_indentation(text) for tag, text in unit[guard_line + 1:op_line] if tag != "-" and text.strip()]
     depth = min(guard_depth, op_depth)
     if depth == 0:
-        return guard_depth == 0 and op_depth == 0 and all(d == 0 for d in between)
-    return all(d >= depth for d in between)
+        if not (guard_depth == 0 and op_depth == 0 and all(d == 0 for d in between)):
+            return False
+    elif not all(d >= depth for d in between):
+        return False
+    return not _guard_in_separate_scope(unit, guard_line, op_depth, guard)
 
 
 def _unit_verdicts(
@@ -949,7 +1203,7 @@ def _unit_verdicts(
             state = "removed"
         elif kind == 1:
             state, guard_off, guard_line = "in_force", off, line
-        elif state == "in_force" and not _guard_scope_covers(unit, guard_line, line):
+        elif state == "in_force" and not _guard_scope_covers(unit, guard_line, line, guard):
             # the guard seen belongs to another scope: as if none were seen
             verdicts.append((line, "contradicting" if complete or added else "neutral", None))
         elif state == "in_force" and (effect is None or any(guard_off <= e < off for e in effect_offsets)):
@@ -1242,7 +1496,7 @@ _MECHANICALLY_VERIFIED_COMPLETE_BLOCK_RE = re.compile(
     r"Full file \(last resort\)"
     r"|Target definition"
     r"|Related definition \(context only, not an approved edit target\)"
-    r")[ \t]*:[ \t]*`[^`\n]*`[ \t]*\([^)\n]*\)\n\n```python\n(.*?)\n```",
+    r")[ \t]*:[ \t]*`[^`\n]*`[ \t]*\([^)\n]*\)\n\n```[^\n`]*\n(.*?)\n```",
     re.MULTILINE | re.DOTALL,
 )
 
@@ -1597,7 +1851,7 @@ def _normalize_v2_override_scope(
 
 def _parse_concern_block_v2(
     block: str, code_context: str, patch: str, vulnerability_text: str, diff: "Optional[str]" = None,
-    definitions: "Sequence[_Definition]" = (),
+    definitions: "Sequence[_Definition]" = (), ordering_context: "Optional[str]" = None,
 ) -> dict:
     """Parse and deterministically validate ONE already-isolated
     `concerns_v2` concern block: five atomic reachability facts (each
@@ -1733,6 +1987,11 @@ def _parse_concern_block_v2(
         )
     )
 
+    # Occurrences are counted in evidence where removed text was blanked
+    # only as diff renderings (see `_without_removed_lines`), never by
+    # matching a plain line elsewhere (PR #763 HUNT N4).
+    ordering_corpus = code_context if ordering_context is None else ordering_context
+
     effective_guard = guard
     if effective_op_present != "present":
         effective_guard = "not_applicable"
@@ -1740,7 +1999,7 @@ def _parse_concern_block_v2(
         if not _point_citation_valid(guard_prov, code_context, patch):
             effective_guard = "unresolved"
         elif not reports_reachable_chain and not _post_change_guard_holds(
-            guard_prov, op_prov, code_context, patch if diff is None else diff, definitions=definitions,
+            guard_prov, op_prov, ordering_corpus, patch if diff is None else diff, definitions=definitions,
         ):
             # Necessary-but-not-sufficient ordering check, scoped per
             # occurrence to post-change evidence (see _post_change_guard_holds):
@@ -1777,7 +2036,7 @@ def _parse_concern_block_v2(
         if not _point_citation_valid(effect_prov, code_context, patch):
             effective_effect = "unresolved"
         elif effect != "no_effect" and not reports_reachable_chain and not _post_change_guard_holds(
-            guard_prov, op_prov, code_context, patch if diff is None else diff, effect_raw=effect_prov,
+            guard_prov, op_prov, ordering_corpus, patch if diff is None else diff, effect_raw=effect_prov,
             definitions=definitions,
         ):
             # A protective effect must be the cited guard's own: present in
@@ -1857,6 +2116,7 @@ def _response_uses_v2_schema(concerns_body: "Optional[str]") -> bool:
 def _parse_concerns(
     concerns_body: "Optional[str]", code_context: str, patch: str, vulnerability_text: str,
     diff: "Optional[str]" = None, definitions: "Sequence[_Definition]" = (),
+    ordering_context: "Optional[str]" = None,
 ) -> "List[dict]":
     if not concerns_body:
         return []
@@ -1868,7 +2128,9 @@ def _parse_concerns(
         if span is None:
             concerns.append(_malformed_concern("duplicate_concern_number"))
         elif use_v2:
-            concerns.append(_parse_concern_block_v2(span, code_context, patch, vulnerability_text, diff, definitions))
+            concerns.append(_parse_concern_block_v2(
+                span, code_context, patch, vulnerability_text, diff, definitions, ordering_context,
+            ))
         else:
             concerns.append(_parse_concern_block(span, code_context, patch, vulnerability_text))
     return concerns
@@ -1957,22 +2219,42 @@ _QUESTION_LEAD_RE = re.compile(
     r"^[\W_]*(?:whether|if|when|unless|does|do|is|are|can|could|would|will|should|has|have)\b",
     re.IGNORECASE,
 )
-_NEGATION_RE = re.compile(r"\b(?:not|no|never|nothing|none|cannot)\b|n't\b", re.IGNORECASE)
+_CLAUSE_BOUNDARY_RE = re.compile(
+    r"[,:()–—]|\s-\s|\b(?:and|but|however|although|though|whereas|yet|so|because|since|while)\b",
+    re.IGNORECASE,
+)
+"""Where one clause of a sentence ends and the next begins: a negation in an
+earlier clause ("It isn't fixed: ...") says nothing about a later one."""
+_NEGATED_PREDICATE_RE = re.compile(
+    r"(?:\b(?:not|never|cannot)|n't)\s+(?:(?:be|been|being|is|are|was|were|do|does|did)\s+)?$", re.IGNORECASE,
+)
+"""A negation that governs the predicate directly ("is not still
+vulnerable", "does not remain exploitable", "isn't still vulnerable")."""
+_NEGATIVE_SUBJECT_RE = re.compile(r"^\W*(?:no|nothing|none|neither|nobody)\b", re.IGNORECASE)
+"""A clause whose subject is negative ("Nothing remains exploitable", "No
+request path remains exploitable", "None of the callers ...")."""
 
 
 def _asserts_still_exploitable(text: "Optional[str]") -> bool:
     """Whether `text` contains a DECLARATIVE sentence asserting the
     vulnerability still occurs. A question or conditional ("Whether the
     issue is still exploitable ...", "If a caller passes ...") and a
-    negated form ("no longer exploitable", "is not still vulnerable") are
-    not such assertions. A lexical presence check, used only to fail a run
-    closed (`_self_contradiction`), never to establish anything."""
+    negated form ("no longer exploitable", "is not still vulnerable",
+    "Nothing remains exploitable") are not such assertions. A negation
+    counts only within the assertion's own clause, either directly before
+    the predicate or as the clause's subject: in "It isn't fixed: the path
+    remains exploitable" the negation belongs to another clause. A lexical
+    presence check, used only to fail a run closed (`_self_contradiction`),
+    never to establish anything."""
     for sentence in re.split(r"(?<=[.!?;])\s+", text or ""):
         sentence = sentence.strip()
         if not sentence or sentence.endswith("?") or _QUESTION_LEAD_RE.match(sentence):
             continue
         for match in _STILL_EXPLOITABLE_RE.finditer(sentence):
-            if not _NEGATION_RE.search(sentence[max(0, match.start() - 24):match.start()]):
+            prefix = sentence[:match.start()]
+            boundaries = list(_CLAUSE_BOUNDARY_RE.finditer(prefix))
+            clause = prefix[boundaries[-1].end():] if boundaries else prefix
+            if not (_NEGATED_PREDICATE_RE.search(clause) or _NEGATIVE_SUBJECT_RE.match(clause)):
                 return True
     return False
 
@@ -2177,6 +2459,7 @@ def challenge_patch(
             concerns_body, _without_removed_lines(citation_corpus, removed_only),
             citation_patch, vulnerability_text, diff=patch,
             definitions=_trusted_post_patch_definitions(post_patch_definitions, code_context, citation_corpus),
+            ordering_context=_without_removed_lines(citation_corpus, removed_only, plain_lines=False),
         )
         # A legacy `concerns_v1` `blocked` claim rests on ONE quote with no
         # operation or ordering, so it cannot be tied to the vulnerable code
@@ -2216,8 +2499,13 @@ def challenge_patch(
             _concern_structure_ambiguous(concerns_body)
             or len(_LENIENT_CONCERNS_HEADER_RE.findall(resp)) > 1
         )
+        # PR #763 HUNT N1: content outside every recognized section and
+        # field (a preamble, a second status line, a Markdown-dressed or
+        # repeated header, a concern block outside `Concerns:`) fails
+        # closed rather than being dropped unread.
+        unaccounted = _unaccounted_response_content(resp, concerns_body)
         verification_status, still = _derive_status_from_concerns(
-            concerns, structural_violation or concerns_ambiguous or truncated,
+            concerns, structural_violation or concerns_ambiguous or truncated or unaccounted is not None,
         )
         # A response that itself concludes the vulnerability is not fixed is
         # never read as VERIFIED_FIXED (see `_self_contradiction`).
@@ -2240,6 +2528,12 @@ def challenge_patch(
                 "Truncated Challenger response: the provider reported the output was cut off "
                 "at its length limit, so concerns may be missing; this run failed closed and is "
                 "not summarized further."
+            )
+        elif unaccounted is not None and not structural_violation:
+            summary = (
+                f"Unaccounted Challenger response content ({unaccounted}): the response contained "
+                "content outside its recognized sections and concern fields; this run failed closed "
+                "and is not summarized further."
             )
         elif concerns_ambiguous and not structural_violation:
             summary = (

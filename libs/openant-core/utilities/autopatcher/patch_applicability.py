@@ -5,6 +5,11 @@ via stdin against the target repository. Never modifies the working tree
 — --check is read-only. Returns a plain dict (established, existing API —
 not migrated by this module's later addition of a typed result type).
 
+Both run git with a configuration the analyzed repository does not control
+(``_isolated_git_env``): its ``.git/config`` can define filter drivers --
+shell commands git runs when it reads (clean) or writes (smudge) a file --
+and nothing from an analyzed repository may execute (PR #763 HUNT U1).
+
 ``apply_patch`` runs the same diff through `git apply` (no --check) and
 DOES mutate the working tree — callers must pass a disposable workspace,
 e.g. from ``utilities.autopatcher.patch_workspace.temporary_repo_copy``,
@@ -21,8 +26,10 @@ check_applicability result dict schema:
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -59,6 +66,68 @@ def _truncate_stderr(stderr: str) -> str:
     return result
 
 
+def _isolated_git_env(scratch: Path) -> "dict[str, str]":
+    """An environment in which git reads no configuration the analyzed
+    repository (or the inherited environment) controls: every inherited
+    ``GIT_*`` variable is dropped (``GIT_CONFIG_PARAMETERS``,
+    ``GIT_CONFIG_COUNT``/``_KEY_n``/``_VALUE_n``, ``GIT_DIR``, ...), system
+    and global configuration and system attributes are off, and the global
+    configuration is an empty file. The caller then points ``GIT_DIR`` at a
+    fresh, empty repository, so the analyzed repository's ``.git/config``
+    and ``.git/info/attributes`` are never read. An in-tree
+    ``.gitattributes`` can still name a filter driver, but no configuration
+    defines one, so git passes the content through unchanged."""
+    empty_config = scratch / "empty.gitconfig"
+    empty_config.write_bytes(b"")
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": str(empty_config),
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    return env
+
+
+_LINE_ENDING_SETTINGS = {
+    "core.autocrlf": {"true", "false", "input"},
+    "core.eol": {"lf", "crlf", "native"},
+}
+"""The only configuration carried from the analyzed repository into the
+isolated run: git's built-in line-ending policy (a closed vocabulary, never
+a command). Without it a canonical LF patch would stop matching a CRLF
+checkout (``core.autocrlf=true``, the Git for Windows system default)."""
+
+
+def _line_ending_settings(repo: Path) -> "list[tuple[str, str]]":
+    """The analyzed checkout's effective line-ending settings, each value
+    checked against git's own vocabulary. ``git config --get`` only reads
+    configuration; it runs no filter, hook or other configured command."""
+    settings = []
+    for key, allowed in _LINE_ENDING_SETTINGS.items():
+        try:
+            found = subprocess.run(
+                ["git", "config", "--get", key], cwd=str(repo), capture_output=True, timeout=_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        value = found.stdout.decode("utf-8", errors="replace").strip().lower()
+        if found.returncode == 0 and value in allowed:
+            settings.append((key, value))
+    return settings
+
+
+def _empty_git_dir(path: Path) -> Path:
+    """A minimal empty repository directory (what ``git init`` writes, minus
+    hooks and templates): an unborn ``HEAD``, empty ``objects``/``refs`` and
+    an empty ``config``. Written directly, so no command runs to create it."""
+    for sub in ("objects", "refs/heads", "refs/tags"):
+        (path / sub).mkdir(parents=True)
+    (path / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (path / "config").write_bytes(b"")
+    return path
+
+
 def _run_git_apply(extra_args: "list[str]", raw_diff: str, cwd: Path) -> "tuple[int, str]":
     """Run ``git apply [extra_args] --whitespace=nowarn -`` with the diff on stdin.
 
@@ -68,15 +137,31 @@ def _run_git_apply(extra_args: "list[str]", raw_diff: str, cwd: Path) -> "tuple[
     against the working tree is left to git's own autocrlf/attributes.
     Strict encoding: an unencodable diff raises (caller fails closed)
     rather than being silently altered. Returns (returncode, stderr).
+
+    Git runs in ``_isolated_git_env`` against a fresh, empty repository
+    (``GIT_DIR``, see ``_empty_git_dir``) with ``cwd`` as its work tree,
+    never with the analyzed repository's own ``.git``; only its line-ending
+    policy is carried over (``_line_ending_settings``). If that environment
+    cannot be created this raises; callers report an error -- the check is
+    never skipped.
     """
     payload = (raw_diff if raw_diff.endswith("\n") else raw_diff + "\n").encode("utf-8")
-    result = run_utf8(
-        ["git", "apply", *extra_args, "--whitespace=nowarn", "-"],
-        input=payload,
-        cwd=str(cwd),
-        capture_output=True,
-        timeout=_TIMEOUT_SECONDS,
-    )
+    with tempfile.TemporaryDirectory(prefix="openant-git-") as scratch:
+        env = _isolated_git_env(Path(scratch))
+        env["GIT_DIR"] = str(_empty_git_dir(Path(scratch) / "isolated.git"))
+        env["GIT_WORK_TREE"] = str(cwd)
+        settings = _line_ending_settings(cwd)
+        env["GIT_CONFIG_COUNT"] = str(len(settings))
+        for i, (key, value) in enumerate(settings):
+            env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"] = key, value
+        result = run_utf8(
+            ["git", "apply", *extra_args, "--whitespace=nowarn", "-"],
+            input=payload,
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            timeout=_TIMEOUT_SECONDS,
+        )
     return result.returncode, result.stderr.decode("utf-8", errors="replace")
 
 

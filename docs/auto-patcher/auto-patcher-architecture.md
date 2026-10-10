@@ -248,7 +248,13 @@ Executor: `pipeline._run_patch_generation_and_investigation`.
    to the Challenger's context as far as they fit.
 
 The repository itself is never written. `git apply --check` is read-only, and
-patching happens only inside temporary copies.
+patching happens only inside temporary copies. Both run git against a fresh,
+empty repository with the checkout (or its copy) as the work tree, with no
+inherited `GIT_*` environment and no system or global configuration, so no
+configuration the analyzed repository controls -- a filter driver in its
+`.git/config`, say -- can run a command; only its built-in line-ending
+settings (`core.autocrlf`, `core.eol`) are carried over
+(`patch_applicability._run_git_apply`).
 
 ### S5 — `challenger`
 
@@ -285,9 +291,18 @@ Executor: `pipeline._run_patch_repair_and_calibration`.
     repair-eligible finding is calibrated outside `observed`.
 
   The repair path is a narrower contract than S4: there is no contract retry,
-  conformance gate, applicability retry or Post-Patch Investigation. If the
-  repair is accepted, the report shows "Not shown" for Post-Patch
-  Investigation, because that evidence described the replaced patch.
+  conformance gate, applicability retry or Post-Patch Investigation. It does
+  have a file containment rule: a regenerated repair is considered only when
+  every file it changes (modified, added, deleted, renamed or copied, by its
+  normalized repository-relative path) is a file the original, S4-settled
+  patch changes. A repair that reaches any other file, or whose files cannot
+  be established (an aliased, absolute, quoted or malformed path), is
+  rejected before any re-challenge, and the original patch keeps all of its
+  own evidence (`repair_outcome: attempted_off_target_rejected`). This is
+  containment, not target conformance: a repair inside those same files can
+  still change unrelated code there. If the repair is accepted, the report
+  shows "Not shown" for Post-Patch Investigation, because that evidence
+  described the replaced patch.
 - **Fallback calibration:** when the repair path did not run, calibration runs
   once over the non-`confirmed_defect` findings, if there are any. With today's
   structured Challenger output there are usually no free-text findings, so this
@@ -614,7 +629,7 @@ Executions are numbered in finish order, `NNN_<canonical_stage>`. S1–S6 are
 contains:
 
 - `schema_version: 3`, `kind`, `parent: null`;
-- `target_repository {repo_root, repo_commit}`, `openant {patcher_commit}`,
+- `target_repository {repo_root, repo_commit, worktree_clean}`, `openant {patcher_commit}`,
   `llm {provider, model}`, `executions`;
 - flat run fields: `status`, input and output paths, `compare_existing_tests`,
   the raw values of the deprecated budget flags, `llm_call_count`,
@@ -743,7 +758,12 @@ repo_root_override=None)` runs these steps in order:
 3. Build the chain, and resolve every declared handler dependency. Fail
    closed on anything not RESOLVED.
 4. Run the capability-aware preflight from the stage's `StageSpec`:
-   - repository SHA and clean-tree check when `requires_repo_access`;
+   - repository SHA and clean-tree check when `requires_repo_access`. The
+     source run must also have recorded a clean working tree
+     (`target_repository.worktree_clean`): a run made on uncommitted
+     changes, or a trace written before that was recorded, is refused,
+     since no checkout of the commit reproduces what it analyzed. Replay
+     manifests carry the recorded value forward;
    - LLM configuration when `requires_llm_provider`. Replays use the
      *current* configuration;
    - a Docker probe when `requires_docker`. Its result is not acted on, so a
@@ -803,7 +823,10 @@ None of the following is used by `openant patch`.
 Debug artifacts: when `AUTOPATCHER_DEBUG` is set (`run_traced.py` sets it),
 the pipeline writes `reports/debug/*.json` and `prompt_*.txt` relative to the
 **current working directory**. That is why the batch runner gives every case
-its own CWD.
+its own CWD. When that directory is inside the analyzed repository, an
+`openant patch` run writes them to `<output>/debug` instead, so prompts that
+carry repository source never land in the analyzed working copy. An explicit
+`AUTOPATCHER_DEBUG_DIR` overrides both.
 
 ## Architectural invariants
 

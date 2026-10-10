@@ -223,6 +223,10 @@ def _replay_provenance(repo_root: "str | None", executions: "list[dict] | None" 
     openant_root = _rm.find_openant_root()
     patcher_commit = _rm.collect_full_commit_sha(openant_root) if openant_root else None
     repo_commit = _rm.collect_full_commit_sha(Path(repo_root)) if repo_root else None
+    # Whether the analyzed working tree had uncommitted changes: a clean
+    # checkout of `repo_commit` is the analyzed state only when it did not
+    # (PR #763 HUNT N13; stage_replay refuses anything else).
+    worktree_clean = _rm.is_worktree_clean(Path(repo_root)) if repo_root else None
 
     # _cached_provider/_cached_model are the SAME session-lifetime cache
     # core.patch.py's own post-hoc provider/model lookup reads (see
@@ -243,7 +247,7 @@ def _replay_provenance(repo_root: "str | None", executions: "list[dict] | None" 
         "schema_version": _REPLAY_SCHEMA_VERSION,
         "kind": "full_run",
         "parent": None,
-        "target_repository": {"repo_root": repo_root, "repo_commit": repo_commit},
+        "target_repository": {"repo_root": repo_root, "repo_commit": repo_commit, "worktree_clean": worktree_clean},
         "openant": {"patcher_commit": patcher_commit},
         "llm": {"provider": provider, "model": model},
         # HONEST, not fabricated -- see the docstring above. Whatever the
@@ -645,7 +649,11 @@ def main(argv: "list[str] | None" = None) -> int:
     trace_dir.mkdir(parents=True, exist_ok=True)
 
     budget_controller = resolve_budget_controller(args)
-    debug_dir = Path.cwd() / "reports" / "debug"
+    # The same location core.patch writes this run's AUTOPATCHER_DEBUG
+    # artifacts to (./reports/debug, or the run output when that would be
+    # inside the analyzed repository -- see debug_output.resolve_debug_dir).
+    from utilities.autopatcher.debug_output import resolve_debug_dir
+    debug_dir = Path.cwd() / resolve_debug_dir(args.repo_root, output_dir)
     run_started = datetime.now(timezone.utc).timestamp()
 
     # Traced run => the existing debug artifacts must fire. Saved/restored

@@ -51,6 +51,7 @@ future, separately-scoped change.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -144,6 +145,187 @@ def _observation(
 
 
 _RESOLVED_FUNCTION_EVALUATED_VIA = "agentic_enhancer.repository_index.RepositoryIndex.get_function"
+_RESOLVED_FUNCTION_BY_DIFF_EVALUATED_VIA = (
+    "post_patch_evaluation._post_change_function (diff line mapping, content-verified)"
+)
+
+
+# ---------------------------------------------------------------------------
+# Post-change identity of a pre-patch function (PR #763 HUNT N9/N10).
+#
+# A function id is not a stable identity across the patch: the parser gives
+# every same-name definition after the first a line-suffixed id
+# (`render#L8`), so once the patch shifts lines that id names a different
+# definition -- an overload stub instead of the implementation (N10). And a
+# span comparison cannot see an edit that keeps the line count (N9). The
+# diff itself states where every unchanged pre-patch line is afterwards, so
+# the post-change function is the one at the mapped position of the
+# pre-patch function's own lines, and it changed iff the diff removed or
+# inserted a line inside its pre-patch span. The mapping comes from the hunk
+# headers the patch was applied with; every identity is checked against the
+# text of both copies, so a hunk `git apply` placed elsewhere (an offset) is
+# caught and fails closed instead of naming the wrong function.
+# ---------------------------------------------------------------------------
+
+_LINE_SUFFIX_RE = re.compile(r"#L\d+$")
+
+
+def _base_label(func_id: str) -> str:
+    return _LINE_SUFFIX_RE.sub("", func_id[func_id.rfind(":") + 1:])
+
+
+class _LineMapping(NamedTuple):
+    new_line: "dict[int, int | None]"  # old line inside a hunk -> new line (None: removed)
+    segments: "list[tuple[int, int, int]]"  # (first old line, end old line exclusive, delta after)
+    removed: "set[int]"
+    inserted_after: "set[int]"  # old line after which the diff inserts lines
+
+    def map(self, line: int) -> "int | None":
+        if line in self.new_line:
+            return self.new_line[line]
+        delta = 0
+        for first, _end, after in self.segments:
+            if line < first:
+                break
+            delta = after
+        return line + delta
+
+
+def _line_mapping(patch_diff: str, file_path: str) -> "_LineMapping | None":
+    """Old-to-new line mapping of `file_path` under `patch_diff`, or None
+    when the diff gives a hunk of that file no position."""
+    _, file_hunks = parse_diff(patch_diff or "")
+    hunks = file_hunks.get(file_path, [])
+    if any(h.old_start is None for h in hunks):
+        return None
+    new_line: "dict[int, int | None]" = {}
+    segments: "list[tuple[int, int, int]]" = []
+    removed: "set[int]" = set()
+    inserted_after: "set[int]" = set()
+    for hunk in sorted(hunks, key=lambda h: h.old_start):
+        old_count = sum(1 for line in hunk.lines if line[:1] in (" ", "-"))
+        # `-k,0` inserts after line k: the hunk's first old line is k + 1.
+        old = hunk.old_start + (1 if old_count == 0 else 0)
+        new = hunk.new_start
+        first = old
+        for line in hunk.lines:
+            tag = line[:1]
+            if tag == " ":
+                new_line[old] = new
+                old, new = old + 1, new + 1
+            elif tag == "-":
+                new_line[old] = None
+                removed.add(old)
+                old += 1
+            elif tag == "+":
+                inserted_after.add(old - 1)
+                new += 1
+        segments.append((first, old, new - old))
+    return _LineMapping(new_line, segments, removed, inserted_after)
+
+
+def _line_text(context: "InvestigationContext", file_path: str, line: int) -> "str | None":
+    try:
+        text = context.index.read_file_section(file_path, line, line)
+    except Exception:  # noqa: BLE001 -- unreadable: no identity, never a guess
+        return None
+    return text.rstrip("\r\n") if isinstance(text, str) else None
+
+
+def _post_change_function(
+    anchor: Anchor, post_context: "InvestigationContext", patch_diff: str,
+    pre_context: "InvestigationContext",
+) -> "tuple[str, dict | None, bool]":
+    """`(outcome, post_function, touched)` for a resolved_function anchor:
+    outcome `"found"` (post_function is the same function after the
+    patch), `"deleted"` (the diff removes every line of its span) or
+    `"unresolved"` (identity cannot be established). `touched`: the diff
+    removes or inserts a line inside the pre-patch span."""
+    func_id = anchor.key.func_id
+    before = anchor.before_value
+    start, end = getattr(before, "start_line", None), getattr(before, "end_line", None)
+    file_path = func_id[:func_id.rfind(":")]
+    mapping = _line_mapping(patch_diff, file_path)
+    if mapping is None or not isinstance(start, int) or not isinstance(end, int) or end < start:
+        return "unresolved", None, False
+    span = range(start, end + 1)
+    touched = any(line in mapping.removed for line in span) or any(start <= line < end for line in mapping.inserted_after)
+    try:
+        functions = [
+            f for f in post_context.index.list_functions_in_file(file_path)
+            if f.get("unitType") != "module_level" and isinstance(f.get("startLine"), int)
+            and isinstance(f.get("endLine"), int)
+        ]
+    except Exception:  # noqa: BLE001
+        return "unresolved", None, touched
+    base = _base_label(func_id)
+    if all(line in mapping.removed for line in span):
+        # Every line is gone. Only when no function of that name remains is
+        # it deleted; a rewritten one cannot be told apart from a new one.
+        if any(_base_label(f.get("id", "")) == base for f in functions):
+            return "unresolved", None, True
+        return "deleted", None, True
+
+    def same_text(old_line: int, new_line: int) -> bool:
+        pre, post = _line_text(pre_context, file_path, old_line), _line_text(post_context, file_path, new_line)
+        return pre is not None and pre == post
+
+    surviving = [(line, mapping.map(line)) for line in span if mapping.map(line) is not None]
+    if not all(same_text(old, new) for old, new in surviving):
+        return "unresolved", None, touched  # the diff does not describe this copy here
+    new_start = mapping.map(start)
+    if new_start is not None:
+        # The definition line itself survives: the function starting there.
+        at_start = [f for f in functions if f["startLine"] == new_start]
+        if len(at_start) == 1 and _base_label(at_start[0]["id"]) == base:
+            return "found", at_start[0], touched
+        return "unresolved", None, touched
+    # The definition line was edited: every surviving line of the span must
+    # lie in one and the same post-change function of that name, its
+    # innermost container.
+    owners = set()
+    for _line, new in surviving:
+        containing = [f for f in functions if f["startLine"] <= new <= f["endLine"]]
+        if not containing:
+            return "unresolved", None, touched
+        owners.add(min(containing, key=lambda f: f["endLine"] - f["startLine"])["id"])
+    if len(owners) != 1:
+        return "unresolved", None, touched
+    owner = next(f for f in functions if f["id"] in owners)
+    if _base_label(owner["id"]) != base:
+        return "unresolved", None, touched
+    return "found", owner, touched
+
+
+def _evaluate_resolved_function_by_diff(
+    anchor: Anchor, context: InvestigationContext, patch_diff: str, pre_context: InvestigationContext,
+) -> AnchorObservation:
+    try:
+        outcome, func, touched = _post_change_function(anchor, context, patch_diff, pre_context)
+    except Exception as exc:  # noqa: BLE001 -- isolate to this anchor, never propagate
+        return _observation(
+            anchor, "evaluation_error", None, f"identity check failed: {type(exc).__name__}: {exc}",
+            _RESOLVED_FUNCTION_BY_DIFF_EVALUATED_VIA,
+        )
+    if outcome == "deleted":
+        return _observation(
+            anchor, "disappeared", None, "the patch removes every line of this function",
+            _RESOLVED_FUNCTION_BY_DIFF_EVALUATED_VIA,
+        )
+    if outcome != "found":
+        return _observation(
+            anchor, "unresolved", None,
+            "its post-change location could not be established from the diff",
+            _RESOLVED_FUNCTION_BY_DIFF_EVALUATED_VIA,
+        )
+    after = ResolvedFunctionValue(start_line=func.get("startLine"), end_line=func.get("endLine"))
+    if after != anchor.before_value:
+        return _observation(anchor, "changed", after, None, _RESOLVED_FUNCTION_BY_DIFF_EVALUATED_VIA)
+    if touched:
+        return _observation(
+            anchor, "changed", after, "edited in place (same lines)", _RESOLVED_FUNCTION_BY_DIFF_EVALUATED_VIA,
+        )
+    return _observation(anchor, "unchanged", after, None, _RESOLVED_FUNCTION_BY_DIFF_EVALUATED_VIA)
 
 
 def _evaluate_resolved_function(anchor: Anchor, context: InvestigationContext) -> AnchorObservation:
@@ -273,6 +455,9 @@ def evaluate_anchors(
     anchors: list[Anchor],
     post_patch_context: "InvestigationContext | None",
     unavailable_reason: "str | None" = None,
+    *,
+    patch_diff: "str | None" = None,
+    pre_patch_context: "InvestigationContext | None" = None,
 ) -> list[AnchorObservation]:
     """Re-evaluate each Anchor against an already-built InvestigationContext
     for the patched repository copy.
@@ -286,6 +471,13 @@ def evaluate_anchors(
     deduplicated (Phase 2 already deduplicated the anchors themselves).
     `unavailable_reason`, when given, names why there is no context (e.g. the
     patch did not apply to the isolated copy) in place of the generic note.
+
+    With `patch_diff` (the diff applied to the patched copy) and
+    `pre_patch_context` (the pre-patch repository's own context), a
+    resolved_function anchor is followed through the diff's line mapping
+    instead of being looked up again by its id, and it is `changed` when the
+    diff edits a line inside it even if its span is unchanged (see
+    `_post_change_function`). Without them, the id lookup is kept.
     """
     observations: list[AnchorObservation] = []
 
@@ -302,7 +494,18 @@ def evaluate_anchors(
             ))
             continue
 
-        if anchor.kind == "resolved_function":
+        # A file's whole-module unit (`<file>:__module__`) is not a function:
+        # its id is unique per file, so it keeps the id lookup (CVE
+        # investigation R1: the by-diff identity, which excludes module
+        # units, reported an untouched one as `unresolved`).
+        if (
+            anchor.kind == "resolved_function" and patch_diff is not None and pre_patch_context is not None
+            and getattr(anchor.key, "unit_type", None) != "module_level"
+        ):
+            observations.append(_evaluate_resolved_function_by_diff(
+                anchor, post_patch_context, patch_diff, pre_patch_context,
+            ))
+        elif anchor.kind == "resolved_function":
             observations.append(_evaluate_resolved_function(anchor, post_patch_context))
         elif anchor.kind == "call_edge":
             observations.append(_evaluate_call_edge(anchor, post_patch_context))
@@ -456,10 +659,13 @@ def _resolve_patch_touched_elements(
         constants = context.constants.get(file_path, {}) if is_python else {}
 
         for hunk in file_hunks.get(file_path, []):
-            if analyzer._is_whitespace_only_hunk(hunk.lines):
+            # Indentation is semantic only in Python (PR #763 HUNT N6).
+            if analyzer._is_whitespace_only_hunk(hunk.lines, semantic_indentation=is_python):
                 continue
             anchor_text, changed_flags = analyzer._anchor_lines(hunk.lines)
-            start_idx = analyzer._locate_hunk(anchor_text, file_lines)
+            # Identical copies are told apart by the header, as git applies
+            # the hunk (PR #763 HUNT N8): never the first copy by default.
+            start_idx = analyzer._locate_hunk(anchor_text, file_lines, hunk.old_start)
             if start_idx is None:
                 unattributed += 1
                 continue
@@ -1057,7 +1263,9 @@ def _post_patch_definition_block(func_id: str, context: "InvestigationContext | 
     return record["block"] if record else None
 
 
-def _post_patch_definition(func_id: str, context: "InvestigationContext | None") -> "dict | None":
+def _post_patch_definition(
+    func_id: str, context: "InvestigationContext | None", after: "ResolvedFunctionValue | None" = None,
+) -> "dict | None":
     """One rendered block, or None (never fabricated or partial text) when
     the patched copy cannot produce the complete source of `func_id`'s
     indexed span. The text is read from the patched workspace for exactly
@@ -1076,6 +1284,22 @@ def _post_patch_definition(func_id: str, context: "InvestigationContext | None")
     file_path, label = func_id[:colon], func_id[colon + 1:]
     try:
         func = index.get_function(func_id)
+        if after is not None and not (
+            func and func.get("startLine") == after.start_line and func.get("endLine") == after.end_line
+        ):
+            # The id now names another unit than the one the observation
+            # identified (PR #763 HUNT N10: a same-name id after a line
+            # shift): read the one post-change unit with exactly that span
+            # and name instead -- never the unit the id now names.
+            matches = [
+                f for f in index.list_functions_in_file(file_path)
+                if f.get("startLine") == after.start_line and f.get("endLine") == after.end_line
+                and f.get("unitType") != "module_level" and _base_label(f.get("id", "")) == _base_label(func_id)
+            ]
+            if len(matches) != 1:
+                return None
+            func = matches[0]
+            label = func["id"][func["id"].rfind(":") + 1:]
         if not func:
             return None
         start, end = func.get("startLine"), func.get("endLine")
@@ -1141,7 +1365,8 @@ def post_patch_definitions(
         if not func_id or func_id in seen:
             continue
         seen.add(func_id)
-        record = _post_patch_definition(func_id, context)
+        after = obs.after_value if isinstance(obs.after_value, ResolvedFunctionValue) else None
+        record = _post_patch_definition(func_id, context, after)
         if record:
             records.append(record)
     if not records:

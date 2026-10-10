@@ -52,6 +52,7 @@ from typing import NamedTuple
 from .content_relocation import find_unique_occurrence, old_side_anchors
 from .context_budget import ContextBudgetController
 from .diff_parsing import parse_diff
+from .language_support import _EXTENSION_LANGUAGE
 from .llm_client import ModelUnavailableError, resolve_active_model, resolve_max_tokens
 from .repository_grounding_models import DiscoveryEvidence, RepositoryCandidate
 from .technical_capacity import compute_source_capacity
@@ -1164,12 +1165,24 @@ def _read_symbol_source(match: "_SymbolMatch", context, pad_lines: int = 0) -> "
     return None
 
 
+# Fence labels for languages OpenAnt parses that `_EXTENSION_LANGUAGE`
+# (repository-language detection, deliberately left unchanged) does not map.
+_FENCE_ONLY_LANGUAGES = {".swift": "swift", ".rs": "rust", ".zig": "zig"}
+
+
+def _fence_language(path: str) -> str:
+    """The Markdown code-fence label for a repository file, from its
+    extension; "" (a bare fence) when the language is unknown."""
+    suffix = Path(path or "").suffix.lower()
+    return _EXTENSION_LANGUAGE.get(suffix) or _FENCE_ONLY_LANGUAGES.get(suffix, "")
+
+
 def _render_source_excerpt(path: str, label: "str | None", start: int, end: int, source: str) -> str:
     if label:
         header = f"#### Verified source: `{path}:{label}` (lines {start}–{end})"
     else:
         header = f"#### Verified source: `{path}` (full file, {end} lines)"
-    return f"{header}\n\n```python\n{source.rstrip()}\n```\n"
+    return f"{header}\n\n```{_fence_language(path)}\n{source.rstrip()}\n```\n"
 
 
 class _SourceExcerptPlan(NamedTuple):
@@ -3819,15 +3832,16 @@ def _extract_source_dot_call_refs(code: str, connected_terms: "list[str]") -> "l
 def _extract_fenced_code(rendered_block: "str | None") -> "str | None":
     """Recovers the raw source text from a block this module itself
     rendered via _render_definition_block/_render_usage_window_block --
-    both use the exact same ```python fence convention, so this is
-    deterministic (fully controlled here), not a general markdown
+    both open with the same code fence (labeled by `_fence_language`), so
+    this is deterministic (fully controlled here), not a general markdown
     parser."""
     if not rendered_block:
         return None
-    start = rendered_block.find("```python\n")
-    if start == -1:
+    fence = rendered_block.find("```")
+    newline = rendered_block.find("\n", fence) if fence != -1 else -1
+    if newline == -1:
         return None
-    start += len("```python\n")
+    start = newline + 1
     end = rendered_block.rfind("```")
     if end == -1 or end <= start:
         return None
@@ -4048,7 +4062,7 @@ def _render_definition_block(
     target in the rendered slice."""
     return (
         f"#### {heading_label}: `{path}:{label}` (lines {start}–{end})\n\n"
-        f"```python\n{source.rstrip()}\n```\n"
+        f"```{_fence_language(path)}\n{source.rstrip()}\n```\n"
     )
 
 
@@ -4056,7 +4070,7 @@ def _render_full_file_block(path: str, source: str) -> str:
     n_lines = len(source.splitlines())
     return (
         f"#### Full file (last resort): `{path}` ({n_lines} lines)\n\n"
-        f"```python\n{source.rstrip()}\n```\n"
+        f"```{_fence_language(path)}\n{source.rstrip()}\n```\n"
     )
 
 
@@ -4097,7 +4111,7 @@ def _render_usage_window_block(path: str, label: str, ranges: "list[tuple[int, i
     return (
         f"#### Discovered consumer: `{path}:{label}` (lines {lo}–{hi}, "
         f"deterministic discovered usage)\n\n"
-        f"```python\n{body}\n```\n"
+        f"```{_fence_language(path)}\n{body}\n```\n"
     )
 
 

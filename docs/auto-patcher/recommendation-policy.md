@@ -124,7 +124,7 @@ Produced by code with no LLM in the loop:
 | Patch Applicability | Whether the diff applies to the target repository (`git apply --check`, read-only). | `patch_applicability.check_applicability` |
 | Source verification | Whether each hunk's old-side content was found in the repository at a unique position. | `source_verification.classify_source_verification` |
 | Test Support | Whether test files that cover the changed file exist on disk. This is a discovery check, not a test run. **Python only.** | `testing_support` |
-| Impact Surface | AST-based usage analysis of changed symbols (blast radius). **Python only.** Other languages report "not applicable". | `impact_surface.LightweightImpactAnalyzer` |
+| Impact Surface | AST-based usage analysis of changed symbols (blast radius). **Python only.** Other languages report "not applicable". A re-indented line is a change to its symbol (only trailing whitespace is cosmetic); a change inside a nested function counts for its outermost enclosing function; a hunk whose content matches several places is placed where its header says `git apply` puts it. An import change that rebinds or removes an existing module-level name, or a hunk that matches several places with no header naming one, leaves the change unattributed, so the level is "unavailable" (Not Verified), never low. | `impact_surface.LightweightImpactAnalyzer` |
 | Post-Patch Investigation | Re-evaluates deterministic "anchors" (resolved functions, call edges, reachability, constant values) against an isolated, patched copy of the repository. | `post_patch_investigation`, `post_patch_evaluation` |
 | Existing Test Comparison (opt-in) | Runs the repository's existing tests in Docker against unpatched and patched copies, and reports newly failing tests. | `existing_test_regression` |
 
@@ -165,10 +165,16 @@ matters after a fully cited `blocked` chain. Code then does the following:
 
 1. **Checks citations.** A quote counts only if it appears in the
    repository-derived context the Challenger was actually shown, in the
-   post-change side of the diff (context and added lines, never removed lines
-   or diff headers), or (for scope facts) in the vulnerability report. Context
-   lines whose text the patch removes, and that do not survive anywhere in the
-   diff, are excluded too. A quote must contain an identifier character, be at
+   post-change side of the diff (context and added lines inside the hunks,
+   never removed lines, diff headers, or text outside a hunk's declared
+   span such as prose around the diff), or (for scope facts) in the
+   vulnerability report. Context lines whose text the patch removes, and that
+   do not survive anywhere in the diff, are excluded from citation too (this
+   exclusion does not hide identical lines from the occurrence count below,
+   and an excluded line never joins the lines around it into one quote).
+   Text with no diff structure at all (no file header and no `@@` hunk) is
+   still read whole as before; such text cannot pass `git apply --check`, so
+   it never reaches a Deploy decision. A quote must contain an identifier character, be at
    least 3 non-whitespace characters, and match on token boundaries (not
    inside a longer identifier). Planner and Strategy prose is not citation
    authority. A fact with an ungrounded citation is treated as `unresolved`.
@@ -183,7 +189,13 @@ matters after a fully cited `blocked` chain. Code then does the following:
    - **Complete post-patch functions.** The pipeline reads the complete
      post-change source of each changed function from the patched copy and
      passes it to the Challenger as structured records, separately from the
-     context text. Only these records count as complete functions that can
+     context text. A function is changed when the diff removes or inserts a
+     line inside it, even if its line count is unchanged, and it is followed
+     to its post-change copy through the diff's own line mapping, checked
+     against the text of both copies -- never by looking its id up again,
+     which for same-name definitions (`name#L<line>`) can name another one
+     after a line shift. When that identity cannot be established, no record
+     is produced. Only these records count as complete functions that can
      support the guard, and only when the Challenger was actually shown
      them. A block in the context text headed `Post-patch definition` is
      never trusted as support, because repository content can imitate the
@@ -199,7 +211,11 @@ matters after a fully cited `blocked` chain. Code then does the following:
    example the header of the next function or method, or a closing brace),
    the guard does not cover the operation. A guard and operation at column
    0 count only if every line between them is at column 0 too, and an
-   indented guard never covers an operation at column 0.
+   indented guard never covers an operation at column 0. A guard inside a
+   block that does not also hold the operation counts only when every such
+   block is a control-flow block (`if`, `for`, `try`, `with`, ...); a guard
+   in a nested function, class, lambda or callback, or under a block whose
+   opening line the unit does not show, does not cover the operation.
 
    Matching text cannot say *which* occurrence of the cited operation is the
    vulnerable one, so every occurrence shown must be accounted for:
@@ -243,13 +259,16 @@ matters after a fully cited `blocked` chain. Code then does the following:
      or the Challenger cites text that occurs only at a different, guarded
      call site, nothing counts against the guard.
    - Scope comes from indentation, and it is function scope only. A guard
-     inside a conditional block, or an operation inside a closure defined
+     inside a control-flow block, or an operation inside a closure defined
      after the guard, is accepted: whether that code runs is control flow,
-     which the Challenger must judge. Code without meaningful indentation
-     (unformatted or minified code, or several functions on consecutive
-     column-0 lines) can hide a function boundary. Misleading indentation
-     (a dedented comment or string between guard and operation) only causes
-     a rejection.
+     which the Challenger must judge. Control-flow blocks are recognized by
+     their opening keyword (`if`, `elif`, `else`, `for`, `while`, `try`,
+     `except`, `finally`, `with`, `switch`, `case`, `match`, `catch`, ...);
+     any other enclosing block counts as a separate scope. Code without
+     meaningful indentation (unformatted or minified code, or several
+     functions on consecutive column-0 lines) can hide a function boundary.
+     Misleading indentation (a dedented comment or string between or above
+     guard and operation) only causes a rejection.
    - Discovered-usage windows rendered before PR #763's exact
      omitted-range marker do not number lines after a gap reliably. In such
      archived evidence those lines never support the guard, and an
@@ -278,7 +297,12 @@ matters after a fully cited `blocked` chain. Code then does the following:
    - all `NON_BLOCKING` → `VERIFIED_FIXED`;
    - fails closed to `INSUFFICIENT_EVIDENCE` if there is not exactly one primary
      concern, or if the response also puts free-form content in its
-     `Edge cases`, `Potential issues` or `Summary` sections;
+     `Edge cases`, `Potential issues` or `Summary` sections, or anywhere no
+     section or concern field accounts for: text before the first section
+     header, a second line under `Verification status:`, a repeated or
+     Markdown-dressed section header, text before the first numbered concern
+     or after a blank line inside one, or a concern block outside `Concerns:`
+     (a free-text field may wrap onto the following lines);
    - fails a `VERIFIED_FIXED` result closed to `INSUFFICIENT_EVIDENCE` if the
      response contradicts itself: its own `Verification status:` line says
      `RESIDUAL_VULNERABILITY` or `INSUFFICIENT_EVIDENCE` (or a legacy
@@ -286,7 +310,9 @@ matters after a fully cited `blocked` chain. Code then does the following:
      `Description` or `Hypothesized outcome` states that the vulnerability
      remains exploitable (a declarative sentence such as "remains
      exploitable", "is still vulnerable" or "can still be bypassed";
-     questions, conditionals and negated forms do not count). The report
+     questions, conditionals and negated forms do not count, and a negation
+     counts only in the claim's own clause, so "It isn't fixed: the path
+     remains exploitable" is a contradiction). The report
      names the contradiction. Additional concerns' text is not read: it
      often describes non-default or out-of-scope paths that the override
      and scope rules classify as non-blocking by design.
@@ -298,15 +324,15 @@ it does not mean a defect was independently verified. `VERIFIED_FIXED` means
 no concern met the blocking or unresolved rules; it does not mean the fix was
 proven.
 
-**Legacy free-form response.** A response without a `Concerns:` section is
-still supported. Its `Verification status:` header (or an older
-`Still vulnerable:` header) is parsed directly, and an unrecognized value fails
-closed. Its free-text findings are sorted by a deterministic lexical classifier
+**Legacy free-form response.** A response without a `Concerns:` section carries
+no citation-checked evidence, so it always fails closed: its `Verification
+status:` (or older `Still vulnerable:`) header is not used for the decision,
+whatever it states, and the run has no verification status
+(`verification_status` is empty, `still_vulnerable` is true). Such a response
+can never lead to Deploy After Validation. Its free-text findings are still
+sorted for the report by a deterministic lexical classifier
 (`_classify_finding`) into `confirmed_defect`, `behavioral_defect`,
-`plausible_risk`, `validation_gap` or `generic`. A legacy
-`RESIDUAL_VULNERABILITY` claim with no `confirmed_defect` or
-`behavioral_defect` finding behind it is downgraded to `INSUFFICIENT_EVIDENCE`
-(`_classify_challenger`).
+`plausible_risk`, `validation_gap` or `generic`.
 
 `still_vulnerable` is true for every status except `VERIFIED_FIXED`, including
 an unknown or unparseable one.
@@ -614,6 +640,12 @@ an input-source disclosure.
 
 ## Current limitations
 
+- **Repair containment is file-level.** A Challenger-driven repair is accepted
+  only when it changes no file outside the original patch's files (see the
+  [architecture document](auto-patcher-architecture.md#s6--patch_repair_and_calibration)).
+  It is not re-checked against the approved edit targets, so a repair inside
+  those files can still change unrelated code there; the re-challenge is the
+  only check of what it changes.
 - **Python-only signals.** Impact Surface and Test Support work only on Python
   repositories; elsewhere they report "not applicable". As a result, other
   languages cannot reach Deploy After Validation.

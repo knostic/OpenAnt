@@ -139,7 +139,9 @@ def _write_structured_source_trace(
     }
     if schema_version is not None:
         manifest["schema_version"] = schema_version
-        manifest["target_repository"] = {"repo_root": str(repo_root), "repo_commit": repo_commit}
+        # run_traced records whether the source working tree was clean (HUNT N13)
+        manifest["target_repository"] = {"repo_root": str(repo_root), "repo_commit": repo_commit,
+                                         "worktree_clean": True}
         manifest["openant"] = {"patcher_commit": patcher_commit}
         manifest["llm"] = {"provider": llm_provider, "model": llm_model}
     (trace_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

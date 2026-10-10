@@ -819,7 +819,10 @@ first — before assuming an LLM stage reasoned incorrectly.
 These exist only when `AUTOPATCHER_DEBUG=1` is set (automatically, by
 `run_traced.py`; or manually, for a plain `openant patch` run). They are
 written under `./reports/debug/` **relative to the process's current
-working directory**, not `--output` and not the trace directory.
+working directory**, not `--output` and not the trace directory -- unless
+that directory is inside the analyzed repository: then the run writes them
+to `<--output>/debug` (never into the analyzed working copy), and
+`AUTOPATCHER_DEBUG_DIR`, when set, overrides both.
 `run_traced.py` never copies them. It records the absolute paths of the
 first four kinds below, if they appeared during the run, in
 `run_manifest.json`'s `autopatcher_debug_artifacts` list.

@@ -24,6 +24,7 @@ import re
 from pathlib import Path
 from typing import NamedTuple
 
+from .debug_output import debug_dir as _autopatcher_debug_dir
 from .llm_client import LLMClient
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "patch_generator.md"
@@ -85,7 +86,9 @@ class PatchResponseClassification(NamedTuple):
                                before and after it. `diff` is the body,
                                normalised to a ```diff fence.
       "no_diff"            -- no recognised fenced opener anywhere in the
-                               response. `diff` is raw.strip() -- the
+                               response, and no unfenced diff mixed with
+                               other text (that is "contract_violation").
+                               `diff` is raw.strip() -- the
                                response may be a genuine unfenced diff, or
                                plain prose (e.g. an honest "no patch is
                                possible"); downstream repair/hygiene/
@@ -110,7 +113,10 @@ class PatchResponseClassification(NamedTuple):
                                complete blocks (`block_count` > 1 -- e.g.
                                alternative candidates), or exactly one block
                                with non-whitespace text before and/or after
-                               it. `diff` is "" -- callers must not treat
+                               it, or (`block_count` 0) an unfenced diff
+                               with other text around or after it
+                               (`_unfenced_diff_with_surrounding_text`).
+                               `diff` is "" -- callers must not treat
                                any candidate body as a patch. This is the
                                ONLY status eligible for a bounded,
                                orchestration-level regeneration retry.
@@ -121,6 +127,29 @@ class PatchResponseClassification(NamedTuple):
     status: str
     diff: str
     block_count: int
+
+
+_UNFENCED_DIFF_START_RE = re.compile(r"^(?:diff --git |--- (?:a/|/dev/null)|@@ -\d)")
+_UNFENCED_DIFF_LINE_RE = re.compile(
+    r"^(?:[ +\-\\]|@@|diff --git |index |new file mode |deleted file mode |similarity index |rename (?:from|to) |"
+    r"old mode |new mode |Binary files )"
+)
+
+
+def _unfenced_diff_with_surrounding_text(raw: str) -> bool:
+    """Whether an unfenced response holds a diff AND other text: anything
+    before the diff's first header, or a later line that is not diff
+    syntax. Such text (an explanation, a claim about callers) is not part
+    of the patch, yet `git apply` skips it and would accept the response
+    as-is (PR #763 HUNT N3). A response with no diff structure at all (an
+    honest "no patch is possible") is not this."""
+    lines = (raw or "").strip().splitlines()
+    first = next((i for i, line in enumerate(lines) if _UNFENCED_DIFF_START_RE.match(line)), None)
+    if first is None:
+        return False
+    if any(line.strip() for line in lines[:first]):
+        return True
+    return any(line.strip() and not _UNFENCED_DIFF_LINE_RE.match(line) for line in lines[first:])
 
 
 def classify_patch_response(raw: str) -> PatchResponseClassification:
@@ -175,6 +204,8 @@ def classify_patch_response(raw: str) -> PatchResponseClassification:
         i = closer_idx + 1
 
     if not blocks:
+        if _unfenced_diff_with_surrounding_text(raw):
+            return PatchResponseClassification("contract_violation", "", 0)
         return PatchResponseClassification("no_diff", raw.strip(), 0)
 
     if len(blocks) > 1:
@@ -250,7 +281,7 @@ def generate_patch_raw(
         user_message += _RETRY_HEADER + retry_hint
 
     if os.environ.get("AUTOPATCHER_DEBUG"):
-        _debug_dir = Path("reports") / "debug"
+        _debug_dir = _autopatcher_debug_dir()
         _debug_dir.mkdir(parents=True, exist_ok=True)
         _ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         (_debug_dir / f"prompt_{_ts}.txt").write_text(user_message, encoding="utf-8")

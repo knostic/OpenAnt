@@ -364,7 +364,11 @@ class TestSymbolKindRendering:
 
 
 class TestWhitespaceOnlyChanges:
-    def test_reindentation_only_produces_no_symbol_and_low_impact(self, tmp_path):
+    def test_reindentation_is_attributed_to_its_symbol(self, tmp_path):
+        """PR #763 HUNT N6: in Python, leading indentation decides which
+        block a statement belongs to, so a re-indented line is a change to
+        its symbol, never cosmetic (only trailing whitespace is; see below).
+        This test previously asserted no symbol and low impact."""
         repo = _write_retry_repo(tmp_path)
         diff = (
             "--- a/retry.py\n+++ b/retry.py\n"
@@ -374,8 +378,7 @@ class TestWhitespaceOnlyChanges:
             "+        DEFAULT_REMOVE_HEADERS = frozenset(['Authorization'])\n"
         )
         report = LightweightImpactAnalyzer().analyze(diff, repo_context=TargetRepoContext(repo))
-        assert report.changed_symbols == []
-        assert report.impact_level == "low"
+        assert report.changed_symbols == ["DEFAULT_REMOVE_HEADERS"]
 
     def test_trailing_whitespace_only_produces_no_symbol(self, tmp_path):
         repo = _write_retry_repo(tmp_path)

@@ -156,6 +156,9 @@ class SourceProvenance:
     input_type: "str | None"
     input_id: "str | None"
     source: str  # "structured_manifest" | "legacy_trust_report_fallback"
+    # Whether the source run's working tree was clean (True), dirty (False),
+    # or not recorded (None: a trace predating the field, or a legacy one).
+    repo_worktree_clean: "bool | None" = None
 
 
 def resolve_source_provenance(trace_dir: Path, manifest: dict) -> SourceProvenance:
@@ -209,6 +212,7 @@ def resolve_source_provenance(trace_dir: Path, manifest: dict) -> SourceProvenan
         input_type=manifest.get("input_type"),
         input_id=manifest.get("input_id"),
         source="structured_manifest",
+        repo_worktree_clean=target_repository.get("worktree_clean"),
     )
 
 
@@ -325,6 +329,18 @@ def validate_target_repository(
             f"Cannot replay {stage}: target repository HEAD does not match source trace.\n"
             f"Expected: {expected}\n"
             f"Actual:   {actual_sha}"
+        )
+
+    # PR #763 HUNT N13: HEAD identifies the analyzed content only when the
+    # source run's working tree was clean. A dirty source -- or one whose
+    # state was never recorded (a trace written before run_traced recorded
+    # it) -- cannot be reproduced by any clean checkout of that commit.
+    if provenance.repo_worktree_clean is not True:
+        state = "had uncommitted changes" if provenance.repo_worktree_clean is False else "was not recorded"
+        raise StageReplayError(
+            f"Cannot replay {stage}: the source run's target working tree {state}, so no checkout at "
+            f"the recorded commit is known to reproduce the analyzed source. Re-run the traced run "
+            f"from a clean checkout to replay it."
         )
 
     clean = is_worktree_clean(repo_root)
@@ -479,7 +495,10 @@ def replay_test_plan_discovery(
         "source_trace": str(trace_dir),
         "source_provenance_origin": provenance.source,
         "source_run": {"input_type": provenance.input_type, "input_id": provenance.input_id},
-        "target_repository": {"repo_root": str(repo_root), "repo_commit": provenance.repo_commit},
+        "target_repository": {
+            "repo_root": str(repo_root), "repo_commit": provenance.repo_commit,
+            "worktree_clean": provenance.repo_worktree_clean,
+        },
         "openant": {
             "source_patcher_commit": provenance.patcher_commit,
             "replay_patcher_commit": replay_patcher_commit,
