@@ -135,9 +135,12 @@ def is_worktree_clean(path: Path) -> "bool | None":
         with tempfile.TemporaryDirectory(prefix="openant-git-") as scratch:
             git_dir = _empty_git_dir(Path(scratch) / "status.git")
             (git_dir / "objects" / "info").mkdir()
-            (git_dir / "objects" / "info" / "alternates").write_text(f"{objects}\n", encoding="utf-8")
+            # Bytes, not text mode: on Windows text mode writes "\r\n", and git
+            # reads the "\r" as part of the alternate's path ("objects\r does
+            # not exist"), so status fails and cleanliness reads as unknown.
+            (git_dir / "objects" / "info" / "alternates").write_bytes(f"{objects}\n".encode("utf-8"))
             if head.returncode == 0 and head.stdout.strip():
-                (git_dir / "HEAD").write_text(head.stdout.strip() + "\n", encoding="utf-8")
+                (git_dir / "HEAD").write_bytes((head.stdout.strip() + "\n").encode("utf-8"))
             if index.is_file():
                 shutil.copyfile(index, git_dir / "index")
             if exclude.is_file():

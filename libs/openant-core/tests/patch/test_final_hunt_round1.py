@@ -189,6 +189,23 @@ class TestWorktreeCleanSemantics:
         assert plain_clean is (filemode == "false")
         assert rm.is_worktree_clean(repo) is plain_clean
 
+    def test_windows_text_mode_newlines_do_not_break_the_check(self, tmp_path, monkeypatch):
+        """Windows text mode writes "\\r\\n" for "\\n"; git reads that "\\r" as
+        part of the alternates path, so status failed and every check read
+        None on Windows CI. Emulate the translation on any platform."""
+        original = Path.write_text
+
+        def windows_write_text(self, data, encoding=None, errors=None, newline=None):
+            if newline is None:
+                data = data.replace("\n", "\r\n")
+            return original(self, data, encoding=encoding, errors=errors, newline="")
+
+        monkeypatch.setattr(Path, "write_text", windows_write_text)
+        repo = _commit_repo(tmp_path)
+        assert rm.is_worktree_clean(repo) is True
+        (repo / "extra.py").write_bytes(b"y = 1\n")
+        assert rm.is_worktree_clean(repo) is False
+
     def test_not_a_repository(self, tmp_path):
         assert rm.is_worktree_clean(tmp_path) is None
         assert rm.collect_git_info(tmp_path) == "unknown"
