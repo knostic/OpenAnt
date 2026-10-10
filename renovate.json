@@ -70,6 +70,14 @@
   ],
   "packageRules": [
     {
+      "description": "#698 httpx2 + httpcore2 travel as ONE branch. httpx2 pins its httpcore2 peer EXACTLY (httpx2 2.13.1 requires httpcore2==2.13.1), and libs/openant-core/requirements.txt pins both, so renovate's one-branch-per-package default produces two branches that each break the pin resolution the other half satisfies: `pip install -r requirements.txt` dies with ResolutionImpossible on BOTH (#631/#632 was the first firing, #694/#695 the second — 6 of 19 checks red each; #632 had to be hand-assembled as one commit). groupName makes renovate carry both bumps on one branch, which installs. CONSTRAINTS BOUGHT WITH INCIDENTS: (1) a renovate.json config error halts renovate for the WHOLE repository as a precaution (#476/#480), and a packageRules change cannot be validated by branch CI — it takes effect only after merge — so this entry uses only the two keys already proven on this config: matchPackageNames (the tailwindcss cap entry below) plus a plain string groupName. (2) It deliberately adds NO customManager and NO packageNameTemplate: the #485 silent-override trap lives on that surface, not here. The pair's shape is guarded in-repo by libs/openant-core/tests/test_issue698_renovate_peer_pair.py, which asserts this entry still covers both halves and still carries a groupName — a SHAPE guard, since the real consumer is the renovate app and no in-repo code reads this file.",
+      "matchPackageNames": [
+        "httpx2",
+        "httpcore2"
+      ],
+      "groupName": "httpx2 + httpcore2 (exact peer pair)"
+    },
+    {
       "description": "#540 landed the prebuilt-CSS migration: the npm CLI channel is now LIVE for tailwind v3 (a v3 security bump = a valid regen per the SOURCES.txt recipe). The cap exists only to prevent a v4 bump arriving as a config-format migration disguised as a version bump — v4 changes the config format (JS->@theme CSS) and the artifact channel; it must be a deliberate migration, not a renovate branch.",
       "matchPackageNames": [
         "tailwindcss"
