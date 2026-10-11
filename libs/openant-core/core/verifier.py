@@ -284,7 +284,10 @@ def run_verification(
           file=sys.stderr)
 
     # Set up progress reporter
-    progress = ProgressReporter("Verify", findings_input, tracker=tracker)
+    # #685: as in enhancer.py — the step-scoped cost lines read the same
+    # mutable phase holder, so they inherit the #281 post-injection refresh.
+    progress = ProgressReporter("Verify", findings_input, tracker=tracker,
+                                cost_baseline=_phase_baseline)
 
     def _on_finding_done(unit_id: str, detail: str, unit_elapsed: float):
         progress.report(

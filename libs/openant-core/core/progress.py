@@ -44,6 +44,12 @@ class ProgressReporter:
         tracker: Optional TokenTracker for cost reporting.
         summary_interval: Print a summary line every N units.
             Defaults to every 50 units or 10% of total, whichever is smaller.
+        cost_baseline: Optional MUTABLE ``{"usage": UsageInfo}`` holder — the
+            caller's start-of-phase snapshot (``core.tracking.get_usage()``).
+            Read LATE, at print time, so the #281 re-snapshot at the
+            checkpoint-injection site is picked up without a second callback.
+            Omitted (Detect, and every tracker-less test) falls back to a
+            snapshot taken here, at construction (#685).
     """
 
     def __init__(
@@ -53,6 +59,7 @@ class ProgressReporter:
         tracker=None,
         summary_interval: int | None = None,
         completed: int = 0,
+        cost_baseline: dict | None = None,
     ):
         self.step_name = step_name
         self.total = total
@@ -63,7 +70,18 @@ class ProgressReporter:
         # they must be excluded from the per-unit rate (#218).
         self._initial_completed = completed
         self._lock = threading.Lock()
-        self._last_cost = self._get_cost()  # snapshot for per-unit delta
+        _start_cost = self._get_cost()
+        self._last_cost = _start_cost  # snapshot for per-unit delta
+        # #685: the STEP's own baseline. The tracker is per-SCAN
+        # (``get_global_tracker()``), so every step-scoped cost line that
+        # printed ``_get_cost()`` raw summed the prior steps — the same
+        # defect #214 fixed for ``tracking.log_usage`` and #333/PR #458 for
+        # the dynamic-test step. ``_start_cost`` is immutable (unlike
+        # ``_last_cost``, which every unit overwrites) so repeated
+        # ``finish()`` calls — analyzer.py calls it at four sites — keep
+        # reporting the same step total.
+        self._cost_baseline = cost_baseline
+        self._start_cost = _start_cost
 
         # Width for the counter so alignment stays consistent
         self._width = len(str(total))
@@ -89,6 +107,49 @@ class ProgressReporter:
         from core.tracking import cost_marker
         return cost_marker(self.tracker.get_totals())
 
+    def _baseline_cost(self) -> float:
+        """The scan-cumulative cost at THIS step's start (#685).
+
+        The caller's holder wins and is read HERE, not at construction: the
+        enhance/verify reporters are built before their callee injects the
+        restored checkpoints' spend (``add_prior_usage`` in
+        context_enhancer.py, reached after the reporter exists), and #281
+        refreshes the holder at that injection site. ``restored_callback``
+        cannot serve as the hook — it fires before the injection.
+        A missing/malformed holder falls back to the construction snapshot
+        rather than to a fabricated zero (#605's shape) — and never raises:
+        this runs inside ``finish()``, at the very end of a step that has
+        already paid for its work, so a bad holder must degrade the line,
+        never kill the step.
+        """
+        holder = self._cost_baseline
+        if isinstance(holder, dict):
+            cost = getattr(holder.get("usage"), "total_cost_usd", None)
+            if isinstance(cost, (int, float)):
+                return float(cost)
+        return self._start_cost
+
+    def _as_step_cost(self, total_cost: float) -> float:
+        """Turn an already-read cumulative total into THIS step's own spend.
+
+        Rounded to 6 decimals exactly as ``step_report.py`` rounds its own
+        baseline delta, for two reasons: the two figures then agree digit for
+        digit (the issue's point — the step report is the correct one), and
+        the raw subtraction's float residue would otherwise flip
+        ``_fmt_cost``'s $0.01 precision threshold (a $0.01 step printed
+        "$0.0100" because the delta landed at 0.00999999999999999).
+
+        Deliberately NOT floored at zero. A negative would mean the baseline
+        was taken after some of the step's spend — an ordering regression
+        that must stay visible, not a cosmetic artifact like the retry
+        double-count ``_estimate_remaining`` floors.
+        """
+        return round(total_cost - self._baseline_cost(), 6)
+
+    def _step_cost(self) -> float:
+        """This step's own spend, read fresh from the tracker."""
+        return self._as_step_cost(self._get_cost())
+
     def mark_restored(self, count: int) -> None:
         """Rebase progress to a checkpoint-restored count AFTER construction.
 
@@ -97,6 +158,13 @@ class ProgressReporter:
         live counter and the session baseline, so restored units are excluded
         from the per-unit rate exactly as ``completed=`` does — the callback
         path previously set only ``completed`` and left the rate diluted (#218).
+
+        Deliberately does NOT rebase the COST baseline (#685): this callback
+        fires before the checkpoint ``add_prior_usage`` injection
+        (context_enhancer.py restores units, calls back, and only then
+        injects), so rebasing here would capture a pre-injection total. The
+        cost baseline's rebase is the ``cost_baseline`` holder's job, refreshed
+        at the injection site itself by #281.
         """
         with self._lock:
             self.completed = count
@@ -183,12 +251,16 @@ class ProgressReporter:
             line = "  ".join(parts)
             print(line, file=sys.stderr, flush=True)
 
-            # Periodic summary — shows cumulative total
+            # Periodic summary — the step's running total, not per-unit
+            # (#685: and not the scan's — it fed _print_summary the raw
+            # global total, so a step's interval lines summed every prior
+            # step exactly as its Done line did; fixing only one of the two
+            # would make the cost appear to DROP between them).
             if (
                 self.completed % self._summary_interval == 0
                 and self.completed < self.total
             ):
-                self._print_summary(elapsed, total_cost)
+                self._print_summary(elapsed, self._as_step_cost(total_cost))
 
     def _print_summary(self, elapsed: float, cost: float) -> None:
         """Print a highlighted summary line."""
@@ -212,7 +284,9 @@ class ProgressReporter:
         """Print a final summary line when the step is done."""
         with self._lock:
             elapsed = time.monotonic() - self.start_time
-            cost = self._get_cost()
+            # #685: this step's own spend. The issue's four stress runs each
+            # showed the enhance Done line reporting enhance + app-context.
+            cost = self._step_cost()
             session_done = self._session_done()
             avg = elapsed / session_done if session_done > 0 else 0
 

@@ -320,6 +320,11 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
     # same 3/2 shape, a different trigger. (finding_verifier.py computes the
     # same quantity the same way: remaining = len(results_to_verify).)
     _done = total - len(units_to_process)
+    # #685: no cost_baseline holder here BY CALL ORDER, not by omission —
+    # run_analysis takes the #281 post-injection re-snapshot before it
+    # invokes _run_detection, so this reporter's own construction-time
+    # snapshot is already past the restored spend. Pinned by
+    # tests/test_issue685_progress_step_own_cost.py.
     progress = ProgressReporter("Detect", total, tracker=tracker, completed=_done)
 
     mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
