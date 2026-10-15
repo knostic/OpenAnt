@@ -1909,6 +1909,22 @@ def _write_scan_report(
     total_output = sum(
         sr.get("token_usage", {}).get("output_tokens", 0) for sr in step_reports
     )
+    # #626/PR#661 hunt F3: the per-step cache deltas (step_report.py writes
+    # them present-only under these names) and the cache-unpriced model ids.
+    # Both were absent from the rebuild, so the scan-level artifact lost the
+    # cache token volume AND the attribution for a cache-only incompleteness.
+    _cache_read = sum(
+        sr.get("token_usage", {}).get("cache_read", 0) or 0
+        for sr in step_reports
+    )
+    _cache_write = sum(
+        sr.get("token_usage", {}).get("cache_write", 0) or 0
+        for sr in step_reports
+    )
+    _unpriced_cache = {
+        m for sr in step_reports
+        for m in (sr.get("token_usage", {}).get("unpriced_cache_models") or [])
+    }
 
     # #285: carry the derived status/errors onto the ScanResult so the
     # envelope and downstream consumers see the degraded scan.
@@ -2006,14 +2022,36 @@ def _write_scan_report(
             "input_tokens": total_input,
             "output_tokens": total_output,
             "total_tokens": total_input + total_output,
+            # #626/PR#661 hunt F3: the cache line items are real traffic
+            # and the rebuild dropped them, so the operator's aggregate read
+            # 11 000 tokens for a step that moved 101 000. Summed across the
+            # step reports under the step reports' own key names, present-only
+            # (a no-cache scan's token_usage keeps exactly the three keys
+            # above). Deliberately NOT folded into input_tokens/total_tokens:
+            # the uncached/cached split is the billing-reconciliation shape
+            # the tracker, the call record and UsageInfo all keep (#626).
+            **({"cache_read": _cache_read} if _cache_read else {}),
+            **({"cache_write": _cache_write} if _cache_write else {}),
             # #216: the aggregate rebuilds token_usage from the step
             # reports — OR-aggregate the incomplete-cost marker across them
             # (a rebuild must not drop the advisory).
+            #
+            # PR#661 hunt F3: ``unpriced_cache_models`` is OR-aggregated the
+            # same way. It was dropped here, one hop downstream of the
+            # F661-2 fix that added it to the step report, so a
+            # cache-only-incomplete scan shipped
+            # {"cost_incomplete": true, "unpriced_models": []} — incomplete
+            # with NO model named, the exact shape F661-2 deleted upstream.
+            # The e2e harness reads this artifact and printed
+            # "cost INCOMPLETE — unpriced: [unknown]" for it. Present-only,
+            # so a #216-only incomplete scan is byte-identical to before.
             **({
                 "cost_incomplete": True,
                 "unpriced_models": sorted({m for sr in step_reports
                                            for m in (sr.get("token_usage", {})
                                                      .get("unpriced_models") or [])}),
+                **({"unpriced_cache_models": sorted(_unpriced_cache)}
+                   if _unpriced_cache else {}),
             } if any(sr.get("token_usage", {}).get("cost_incomplete")
                      for sr in step_reports) else {}),
             # #605: the accounting-drop marker OR-aggregates across the step

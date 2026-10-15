@@ -75,6 +75,19 @@ def _output_json(data: dict):
     sys.stdout.write("\n")
 
 
+def _positive_int(value: str) -> int:
+    """argparse `type=` validator for --max-context-budget-windows -- a
+    positive integer only, no unbounded sentinel (e.g. 0/-1/"unlimited")
+    accepted."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return parsed
+
+
 from core.verdict_taxonomy import (SEVERITIES as _SEVERITY_ORDER, SEVERITY_FINDING_VERDICTS,
                                    severity_display_verdict)
 
@@ -866,6 +879,108 @@ def cmd_dynamic_test(args):
 
         if result.confirmed > 0:
             return 1
+        return 0
+
+    except Exception as e:
+        _output_json(error(str(e)))
+        return 2
+
+
+def cmd_patch(args):
+    """Generate and evaluate a candidate remediation for a Finding or a known CVE."""
+    from core.patch import run_patch, run_patch_cve
+    from core.schemas import success, error
+    from core.step_report import step_context
+    from utilities.autopatcher import progress
+    from utilities.autopatcher.context_budget import ContextBudgetController
+
+    # Presentation only -- configured once, at the very top, before any
+    # pipeline work: --quiet wins over --verbose (see progress.configure's
+    # own docstring), matching the Go CLI's own --quiet/--verbose
+    # precedence. Read by pipeline.py/llm_client.py/the repository parser
+    # as module-global state for the rest of this process -- see
+    # utilities/autopatcher/progress.py's module docstring for why a
+    # global, not a threaded parameter, is the smallest correct design
+    # here.
+    progress.configure(
+        verbose=bool(getattr(args, "verbose", False)),
+        quiet=bool(getattr(args, "quiet", False)),
+    )
+
+    finding_id = getattr(args, "finding_id", None)
+    cve = getattr(args, "cve", None)
+
+    if bool(finding_id) == bool(cve):
+        _output_json(error("exactly one of --finding-id or --cve is required"))
+        return 2
+
+    if cve and not args.repo_root:
+        _output_json(error("--cve requires --repo-root"))
+        return 2
+
+    if finding_id and not args.pipeline_output:
+        _output_json(error("pipeline_output is required when using --finding-id"))
+        return 2
+
+    output_dir = args.output or tempfile.mkdtemp(prefix="openant_patch_")
+
+    # Fix B: --context-budget-policy/--max-context-budget-windows no longer
+    # gate whether resolved repository evidence reaches an LLM call -- that
+    # is now always bounded by the real per-call technical capacity of the
+    # active model (see utilities.autopatcher.technical_capacity), never by
+    # an arbitrary "budget window" count. Both flags are still ACCEPTED
+    # (so an existing script/CI invocation that already passes them keeps
+    # working) but are otherwise inert here -- see patch_p.add_argument(...)
+    # above for the full deprecation help text. A single, one-time notice
+    # fires on this process's stderr whenever either was explicitly passed,
+    # so a caller relying on the old numeric behavior finds out immediately
+    # rather than silently getting different (correct) behavior.
+    if getattr(args, "context_budget_policy", None) is not None or getattr(
+        args, "max_context_budget_windows", None
+    ) is not None:
+        print(
+            "warning: --context-budget-policy/--max-context-budget-windows no longer "
+            "control whether repository evidence reaches an LLM call -- that is now "
+            "always bounded by the model's real technical context capacity. Both "
+            "flags are accepted for compatibility but have no further effect.",
+            file=sys.stderr,
+        )
+    budget_controller = ContextBudgetController()
+    compare_existing_tests = bool(getattr(args, "compare_existing_tests", False))
+
+    try:
+        if cve:
+            with step_context("patch", output_dir, inputs={"cve": cve}) as ctx:
+                result = run_patch_cve(
+                    cve_id=cve,
+                    repo_root=args.repo_root,
+                    output_dir=output_dir,
+                    budget_controller=budget_controller,
+                    compare_existing_tests=compare_existing_tests,
+                )
+                ctx.outputs = {
+                    "vulnerability_path": result.vulnerability_path,
+                    "trust_report_path": result.trust_report_path,
+                }
+        else:
+            with step_context("patch", output_dir, inputs={
+                "pipeline_output_path": os.path.abspath(args.pipeline_output),
+                "finding_id": finding_id,
+            }) as ctx:
+                result = run_patch(
+                    pipeline_output_path=args.pipeline_output,
+                    finding_id=finding_id,
+                    output_dir=output_dir,
+                    repo_root=args.repo_root,
+                    budget_controller=budget_controller,
+                    compare_existing_tests=compare_existing_tests,
+                )
+                ctx.outputs = {
+                    "vulnerability_path": result.vulnerability_path,
+                    "trust_report_path": result.trust_report_path,
+                }
+
+        _output_json(success(result.to_dict()))
         return 0
 
     except Exception as e:
@@ -1908,6 +2023,95 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     dt_p.set_defaults(func=cmd_dynamic_test)
+
+    # ---------------------------------------------------------------
+    # patch — generate and evaluate a candidate remediation for a finding
+    # ---------------------------------------------------------------
+    patch_p = subparsers.add_parser(
+        "patch", help="Generate and evaluate a candidate remediation for a finding or a known CVE"
+    )
+    patch_p.add_argument(
+        "pipeline_output", nargs="?", default=None,
+        help="Path to pipeline_output.json (required unless --cve is given)",
+    )
+    patch_p.add_argument(
+        "--finding-id", help="ID of the finding to remediate (mutually exclusive with --cve)"
+    )
+    patch_p.add_argument(
+        "--cve", help="CVE identifier to fetch from NVD and remediate (mutually exclusive with --finding-id)"
+    )
+    patch_p.add_argument(
+        "--repo-root", help="Path to the target repository root (required when using --cve)"
+    )
+    patch_p.add_argument("--output", "-o", help="Output directory (default: temp dir)")
+    patch_p.add_argument(
+        "--context-budget-policy",
+        choices=["ask", "always", "never"],
+        default=None,
+        help=(
+            "DEPRECATED, accepted for compatibility only: no longer controls "
+            "whether repository evidence reaches an LLM call. That is now "
+            "always bounded by the active model's real technical context "
+            "capacity (see the Fix B release notes), never by an arbitrary "
+            "'budget window' count. Passing this has no further effect "
+            "beyond a one-time deprecation notice."
+        ),
+    )
+    patch_p.add_argument(
+        "--max-context-budget-windows",
+        type=_positive_int,
+        default=None,
+        help=(
+            "DEPRECATED, accepted for compatibility only: no longer caps "
+            "anything -- see --context-budget-policy's own help text. "
+            "Passing this has no further effect beyond a one-time "
+            "deprecation notice."
+        ),
+    )
+    patch_p.add_argument(
+        "--compare-existing-tests",
+        action="store_true",
+        help=(
+            "Opt-in, off by default: after the candidate patch settles, "
+            "discover how this repository prepares/runs its existing "
+            "tests and run that same test plan once against an isolated, "
+            "unpatched copy and once against an isolated, patched copy, "
+            "then report which tests newly fail after the patch (a "
+            "factual delta -- OpenAnt does not judge whether that change "
+            "is intended). This builds an isolated Docker test "
+            "environment and may download the repository's own "
+            "dependencies as part of that (Docker required -- never "
+            "falls back to running tests on the host). Supported "
+            "runtimes only (currently Python, Node, Go); anything else "
+            "reports Not Verified. Adds a new, observability-only Trust "
+            "Signal and report section -- does not change the "
+            "Recommendation."
+        ),
+    )
+    patch_p.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Show detailed progress: the repository parser's full "
+            "Phase 1-4 report, per-stage diagnostic telemetry (hunk "
+            "repair, relocation, applicability retries, evidence "
+            "acquisition rounds, etc.), and any fatal error's full "
+            "traceback. Default output is a concise, structured summary; "
+            "this adds the underlying detail without changing anything "
+            "that gets decided."
+        ),
+    )
+    patch_p.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Suppress this run's human-readable progress narration on "
+            "stderr entirely (the JSON envelope on stdout is unaffected). "
+            "Set automatically by the Go CLI when its own --quiet or "
+            "--json flag is used; can also be passed directly here."
+        ),
+    )
+    patch_p.set_defaults(func=cmd_patch)
 
     # ---------------------------------------------------------------
     # report — generate reports from results
