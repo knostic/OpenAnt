@@ -472,6 +472,21 @@ class ContextEnhancer:
             )
             os.makedirs(checkpoint_dir, exist_ok=True)
             processed_ids = self._load_completed_units(checkpoint_dir, context_key="llm_context")
+            # #748 (the sibling of the agentic path's fix): the raw dir scan
+            # counts stale ids (units from a prior dataset / outside a diff
+            # scope / manual strays) as restored, inflating the #218 baseline
+            # rebase and the skip set's counts — intersect with THIS dataset.
+            _dataset_ids = {u.get("id") for u in units}
+            _stale_restored = processed_ids - _dataset_ids
+            if _stale_restored:
+                # the sample is capped: a diff-scope resume over a shared
+                # checkpoint dir (core/enhancer.py's {output_dir}/enhance_
+                # checkpoints) can carry ~1800 stale ids — the count rides
+                # the message, the units kwarg carries the first 20.
+                self._log("info",
+                          f"Ignoring {len(_stale_restored)} checkpoint id(s) not in this run's unit set",
+                          units=sorted(str(s) for s in _stale_restored)[:20])
+                processed_ids = processed_ids & _dataset_ids
             _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
             # Restore llm_context for already-completed units.
             for unit in units:
@@ -675,6 +690,28 @@ class ContextEnhancer:
 
             # Load completed unit IDs from per-unit checkpoint files
             processed_ids = self._load_completed_units(checkpoint_dir)
+            # #748: the raw dir scan counts whatever a checkpoint file names
+            # — a stale id (a unit from a prior dataset, an unchanged unit
+            # outside a diff scope, a manual stray) is not a member of THIS
+            # dataset, but it inflated the restored count, _summary_completed
+            # past total_units (the corpus's `Done: 1825/1819`), and the
+            # remaining-unit count. The counters key on DATASET membership:
+            # intersect once, here, and every count downstream (the restore
+            # log, restored_callback, _summary_completed, remaining) is
+            # dataset-scoped. The restore loop and units_to_process were
+            # already dataset-keyed (they iterate units) — only the COUNTS
+            # were raw.
+            _dataset_ids = {u.get("id") for u in units}
+            _stale_restored = processed_ids - _dataset_ids
+            if _stale_restored:
+                # the sample is capped: a diff-scope resume over a shared
+                # checkpoint dir (core/enhancer.py's {output_dir}/enhance_
+                # checkpoints) can carry ~1800 stale ids — the count rides
+                # the message, the units kwarg carries the first 20.
+                self._log("info",
+                          f"Ignoring {len(_stale_restored)} checkpoint id(s) not in this run's unit set",
+                          units=sorted(str(s) for s in _stale_restored)[:20])
+                processed_ids = processed_ids & _dataset_ids
             _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
 
             # Restore agent_context from checkpoint files into units
@@ -707,6 +744,16 @@ class ContextEnhancer:
         _summary_incomplete = _restored_incomplete
         _summary_errors = 0
         _summary_error_breakdown = {}
+        # #748: the dataset units the resume seed counted as errors, with the
+        # error TYPE each carried. The seed keys on units whose checkpoint is
+        # errored; those units are re-attempted by this run's main loop, so
+        # _update_summary must RETIRE the seed when one lands non-error (the
+        # corpus's `errors: 528` with zero errored checkpoints on disk) —
+        # and it retires the BREAKDOWN type too: the retry round decrements
+        # errors only because it cannot know which type it re-covers; the
+        # seed knows. The dict is also what keeps a re-errored seed from
+        # double-counting: one unit, one error.
+        _seeded_error_types: dict[str, str] = {}
         _summary_input_tokens = 0
         _summary_output_tokens = 0
         _summary_cost_usd = 0.0
@@ -786,6 +833,13 @@ class ContextEnhancer:
                         _summary_errors += 1
                         err = cp_data["agent_context"]["error"]
                         err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
+                        # #748: remember WHICH dataset units the seed counted
+                        # and the error TYPE each carried — the main loop
+                        # re-attempts them and _update_summary retires the
+                        # seed (errors AND the type) on a non-error landing,
+                        # or refuses a second count on a re-error (one unit,
+                        # one error).
+                        _seeded_error_types[uid] = err_type
                         _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
                         # #609: an errored unit is re-attempted by this run
                         # and its checkpoint OVERWRITTEN — seed the run-1
@@ -908,16 +962,44 @@ class ContextEnhancer:
 
             return unit_id or "?", classification, unit_elapsed, worker
 
+        def _retire_seeded_error(uid: str) -> None:
+            """#748: retire a seeded error EXACTLY — errors and the breakdown
+            type the seed recorded for this unit. The retry round cannot
+            know which type it re-covers, so its own decrement (unchanged
+            here) leaves the breakdown stale for a unit it recovers — a
+            pre-existing divergence this closure does not touch; the seed
+            KNOWS, so it retires both, and a zeroed count drops the key."""
+            nonlocal _summary_errors, _summary_error_breakdown
+            _summary_errors = max(0, _summary_errors - 1)
+            _t = _seeded_error_types.pop(uid, None)
+            if _t is None:
+                return
+            _n = max(0, _summary_error_breakdown.get(_t, 0) - 1)
+            if _n:
+                _summary_error_breakdown[_t] = _n
+            else:
+                _summary_error_breakdown.pop(_t, None)
+
         def _update_summary(classification, unit):
             """Update summary counters after a unit completes. Called from main thread."""
             nonlocal _summary_completed, _summary_incomplete, _summary_errors
             nonlocal _summary_error_breakdown
             nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
+            uid = unit.get("id", "unknown")
             if classification == "error":
-                _summary_errors += 1
                 err = unit.get("agent_context", {}).get("error", {})
-                err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
-                _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
+                if uid in _seeded_error_types:
+                    # #748: the resume seed already counted this unit's error
+                    # (the checkpoint it restored WAS the error) — one unit,
+                    # one error, and the breakdown keeps the SEEDED type (the
+                    # unit is still one error; a re-errored landing does not
+                    # re-count or re-type it — the retry round's contract).
+                    # Fold the new attempt's spend only.
+                    _seeded_error_types.pop(uid, None)
+                else:
+                    _summary_errors += 1
+                    err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
+                    _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
                 # #609: fold the failed attempt's spend — the error path's
                 # agent_state (attached by agent.py alongside its record_call)
                 # is the ONLY place it exists: agent_metadata is absent on
@@ -936,8 +1018,17 @@ class ContextEnhancer:
             elif classification == INCOMPLETE_CLASSIFICATION:
                 # #293: the agent's degenerate exit (no completed finish call)
                 # is the third state — not a completion, not an error.
+                if uid in _seeded_error_types:
+                    # #748: retire the seed — the unit landed incomplete, not
+                    # errored (the retry round's flip, mirrored for the main
+                    # loop's landing).
+                    _retire_seeded_error(uid)
                 _summary_incomplete += 1
             else:
+                if uid in _seeded_error_types:
+                    # #748: retire the seed — the re-attempted unit landed a
+                    # verdict; the errored checkpoint it restored is gone.
+                    _retire_seeded_error(uid)
                 _summary_completed += 1
             # Accumulate per-unit usage
             meta = unit.get("agent_context", {}).get("agent_metadata", {})
