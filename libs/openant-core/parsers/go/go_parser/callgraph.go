@@ -927,14 +927,30 @@ func (c *CallGraphBuilder) resolveSimpleCall(funcName, currentFile, currentPkg s
 	}
 
 	// Priority 2: Same package (different file)
+	//
+	// #777: the first-match-wins over c.functionsByFile's map iteration
+	// flipped //go:build-tagged twins — two same-named functions in two
+	// same-dir files (procgroup_unix.go / procgroup_other.go), where the
+	// build-constraint-correct target is decided by build tags the parser
+	// never reads. Scan ALL the same-dir candidates and keep the
+	// lexicographically smallest funcID: a strict total order over distinct
+	// funcIDs — the same tie-break class resolveMethodCall's funcID < best
+	// pick already ships in-tree — so the edge is stable across runs (a
+	// deterministic wrong-twin beats a coin-flip edge — the reachability
+	// consumer sees one stable graph instead of a different one per parse).
+	best := ""
 	for file, funcs := range c.functionsByFile {
 		if filepath.Dir(file) == filepath.Dir(currentFile) {
 			for _, funcID := range funcs {
-				if strings.HasSuffix(funcID, ":"+funcName) {
-					return funcID
+				if strings.HasSuffix(funcID, ":"+funcName) &&
+					(best == "" || funcID < best) {
+					best = funcID
 				}
 			}
 		}
+	}
+	if best != "" {
+		return best
 	}
 
 	// Priority 3: Unique name match
