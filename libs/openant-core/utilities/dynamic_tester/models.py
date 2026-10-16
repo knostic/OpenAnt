@@ -39,6 +39,11 @@ class DynamicTestResult:
     # incompleteness marker (the resume reader existed; this is the writer
     # it was missing — the reader read a key nothing wrote).
     unpriced_models: list = field(default_factory=list)
+    # #626/PR#661 hunt F4: the cache kind's own field. Without it the
+    # generation spend's cache attribution could not be persisted at all, so
+    # a resumed dynamic-test step restored only the #216 kind and reported a
+    # complete cost after cache-unpriced generation spend.
+    unpriced_cache_models: list = field(default_factory=list)
     retry_count: int = 0
     # #314: the run-stable identity from the pipeline finding — the join
     # key the report merge verifies (VULN-NNN is positional, not stable).
@@ -60,6 +65,14 @@ class DynamicTestResult:
             # #598: flat, sibling to the generation_* fields — the resume
             # reader's key (run_dynamic_tests reads _cp["unpriced_models"]).
             "unpriced_models": list(self.unpriced_models),
+            # #626: PRESENT-ONLY, deliberately unlike its unconditional
+            # #598 sibling above — a no-cache row's record must stay
+            # byte-identical to the pre-#626 shape (the #626 envelope rule
+            # the tracker, the call record, UsageInfo and the step report all
+            # follow). The sibling's unconditional [] is the pre-existing
+            # #598 contract and is not changed here.
+            **({"unpriced_cache_models": list(self.unpriced_cache_models)}
+               if self.unpriced_cache_models else {}),
             "retry_count": self.retry_count,
         }
         if self.identity_key:
