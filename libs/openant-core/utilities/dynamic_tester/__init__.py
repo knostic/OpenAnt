@@ -19,7 +19,8 @@ from utilities.dynamic_tester.test_generator import generate_test, regenerate_te
 from utilities.dynamic_tester.docker_executor import run_single_container
 from utilities.dynamic_tester.result_collector import collect_result
 from utilities.dynamic_tester.reporter import generate_report
-from utilities.llm_client import get_global_tracker
+from utilities.llm_client import (get_global_tracker,
+                                  unpriced_kinds_from)
 from utilities.llm import (
     PhaseRegistry,
     build_phase_registry,
@@ -267,18 +268,25 @@ def run_dynamic_tests(
     _prior_output = 0
     _prior_cost = 0.0
     _prior_unpriced: set[str] = set()  # #598: forward the marker on resume
+    # #626/PR#661 hunt F4: the cache kind, forwarded the same way.
+    _prior_unpriced_cache: set[str] = set()
     for _cp in checkpointed.values():
         _prior_cost += _cp.get("generation_cost_usd", 0) or 0
         _prior_input += _cp.get("generation_input_tokens", 0) or 0
         _prior_output += _cp.get("generation_output_tokens", 0) or 0
-        _prior_unpriced.update(_cp.get("unpriced_models") or [])
+        _u, _c = unpriced_kinds_from(_cp)
+        _prior_unpriced.update(_u)
+        _prior_unpriced_cache.update(_c)
     if _prior_cost > 0 or _prior_input > 0 or _prior_output > 0 \
-            or _prior_unpriced:
+            or _prior_unpriced or _prior_unpriced_cache:
         # (#598 review: the unpriced term keeps this guard in agreement
         # with its three sibling resume blocks — a zero-token unpriced
-        # checkpoint must still forward the marker.)
-        tracker.add_prior_usage(_prior_input, _prior_output, _prior_cost,
-                             unpriced_models=sorted(_prior_unpriced) or None)
+        # checkpoint must still forward the marker. #626: the cache term
+        # joins it for the same reason.)
+        tracker.add_prior_usage(
+            _prior_input, _prior_output, _prior_cost,
+            unpriced_models=sorted(_prior_unpriced) or None,
+            unpriced_cache_models=sorted(_prior_unpriced_cache) or None)
         # #333 (wave r1 opus): refresh the caller's phase-line baseline AT
         # the injection — the restored checkpoints' spend was reported by
         # their ORIGINAL run's console line, and a pre-injection snapshot
@@ -321,6 +329,10 @@ def run_dynamic_tests(
             if t.get("cost_incomplete"):
                 u["cost_incomplete"] = True
                 u["unpriced_models"] = t.get("unpriced_models") or []
+                # #626/PR#661 hunt F4: the cache kind, present-only (the
+                # llr sibling carries the identical pair).
+                if t.get("unpriced_cache_models"):
+                    u["unpriced_cache_models"] = t["unpriced_cache_models"]
             if t.get("accounting_errors"):
                 u["accounting_errors"] = t.get("accounting_errors")
             return u
@@ -375,6 +387,11 @@ def run_dynamic_tests(
                 # rows carry them; a resumed run's results JSON must not
                 # contradict its own checkpoint rows.
                 unpriced_models=list(cp_data.get("unpriced_models") or []),
+                # #626: the cache kind too — a resumed run's results JSON
+                # must not contradict its own checkpoint rows for either
+                # kind.
+                unpriced_cache_models=list(
+                    cp_data.get("unpriced_cache_models") or []),
                 retry_count=cp_data.get("retry_count", 0),
                 test_code=cp_data.get("test_code", ""),
                 dockerfile=cp_data.get("dockerfile", ""),
@@ -445,9 +462,11 @@ def run_dynamic_tests(
                 result.details = f"Test generation raised {_gen_exc_message[:2000]}"
             result.generation_input_tokens = unit_usage["input_tokens"]
             result.generation_output_tokens = unit_usage["output_tokens"]
-            # #598: persist the generation spend's unpriced ids — the
-            # resume reader was wired for this key; nothing wrote it.
-            result.unpriced_models = list(unit_usage.get("unpriced_models") or [])
+            # #598 + #626: persist the generation spend's unpriced ids,
+            # BOTH kinds (the resume reader was wired for the first key and
+            # nothing wrote it; the second key had no field at all).
+            (result.unpriced_models,
+             result.unpriced_cache_models) = unpriced_kinds_from(unit_usage)
             results.append(result)
             if checkpoint:
                 checkpoint.save(finding_id, result.to_dict())
@@ -535,9 +554,10 @@ def run_dynamic_tests(
         result.retry_count = retry_count
         result.generation_input_tokens = unit_usage["input_tokens"]
         result.generation_output_tokens = unit_usage["output_tokens"]
-        # #598: persist the generation spend's unpriced ids — the resume
-        # reader was wired for this key; nothing wrote it.
-        result.unpriced_models = list(unit_usage.get("unpriced_models") or [])
+        # #598 + #626: persist the generation spend's unpriced ids, BOTH
+        # kinds (see the sibling fold above).
+        (result.unpriced_models,
+         result.unpriced_cache_models) = unpriced_kinds_from(unit_usage)
         results.append(result)
 
         # Save checkpoint and update summary after each finding.
