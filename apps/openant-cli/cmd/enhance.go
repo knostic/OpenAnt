@@ -115,7 +115,7 @@ func runEnhance(cmd *cobra.Command, args []string) {
 		pyArgs = append(pyArgs, "--limit", fmt.Sprintf("%d", enhanceLimit))
 	}
 
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey(), nil)
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)

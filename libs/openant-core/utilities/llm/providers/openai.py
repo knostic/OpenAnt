@@ -651,11 +651,13 @@ def _extract_usage_details_chat(usage: Any) -> Optional[dict]:
     Copies ``completion_tokens_details.reasoning_tokens`` and
     ``prompt_tokens_details.cached_tokens`` / ``cache_write_tokens``
     VERBATIM when present; ``None`` when the provider reported none
-    (absent ≠ 0). NEVER feeds the cost formula: OpenAI documents
+    (absent ≠ 0). The reasoning fields stay OUT of the cost formula: OpenAI documents
     ``completion_tokens`` as already INCLUDING reasoning tokens, so
-    summing would double-count — the captured fields exist for
-    reconciliation against a provider bill, and OpenRouter (which
-    reuses this unifier) surfaces the same detail fields.
+    summing would double-count — those stay captured for
+    reconciliation only. #626: the CACHE fields DO price — as INCLUSIVE
+    subsets of ``prompt_tokens`` (the tracker subtracts the priced
+    portion, never billing twice). OpenRouter (which reuses this
+    unifier) surfaces the same detail fields.
     """
     if usage is None:
         return None
@@ -864,6 +866,12 @@ def _response_to_unified(
             input_tokens=getattr(_usage, "prompt_tokens", 0) if _usage else 0,
             output_tokens=(getattr(_usage, "completion_tokens", 0)
                            if _usage else 0),
+            # F-A1: and the DETAIL fields, from the same extractor the
+            # successful return uses. On this INCLUSIVE shape the cached
+            # portion is already inside prompt_tokens, so the cost figure
+            # barely moves — what was lost was the cost_incomplete
+            # disclosure and both cache line items (the #598 masquerade).
+            usage_details=_extract_usage_details_chat(_usage),
         )
     choice = choices[0]
     message = choice.message
@@ -947,6 +955,9 @@ def _response_to_unified(
             input_tokens=getattr(_usage, "prompt_tokens", 0) if _usage else 0,
             output_tokens=(getattr(_usage, "completion_tokens", 0)
                            if _usage else 0),
+            # F-A1: the DETAIL fields travel with it (see the no-choices
+            # sibling above) — #626's cache accounting lives only here.
+            usage_details=_extract_usage_details_chat(_usage),
         )
 
     if raw_finish not in _OPENAI_FINISH_REASONS:

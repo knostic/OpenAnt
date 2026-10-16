@@ -18,7 +18,8 @@ import sys
 import threading
 from typing import Optional
 
-from ..llm_client import TokenTracker, get_global_tracker
+from ..llm_client import (TokenTracker, get_global_tracker,
+                          normalize_cache_usage)
 from .adapter import CompletionResult, LLMResponseError, Message, TextBlock
 from .registry import PhaseBinding
 
@@ -92,12 +93,27 @@ def simple_completion(
         # (what the provider actually charged is unknowable from the
         # artifact and stays unclaimed; the token counts are what the
         # response carried).
-        if exc.input_tokens or exc.output_tokens:
+        #
+        # F-A1 (#626 on the error path): the guard consults the CACHE counts
+        # as well, through the same shared ``normalize_cache_usage`` the
+        # recorder and the pricer use — on the EXCLUSIVE (anthropic) shape
+        # the cached read is NOT inside ``input_tokens``, so a full cache
+        # hit can arrive as 0/0 with a 90k billed read. Gating only on
+        # input/output would drop that call whole, and threading the detail
+        # past a guard that never runs would fix nothing.
+        _cache = normalize_cache_usage(exc.usage_details)
+        if exc.input_tokens or exc.output_tokens or _cache.any:
             used_tracker.record_call(
                 model=binding.model,
                 input_tokens=exc.input_tokens,
                 output_tokens=exc.output_tokens,
                 pricing=lookup_pricing(binding),
+                # F-A1: the SAME record_call the success path below uses,
+                # with the SAME detail channel — so the rejected call goes
+                # through the one ``price_usage`` formula. There is
+                # deliberately no error-path cost arithmetic here: a second
+                # formula is exactly what #598 was.
+                usage_details=exc.usage_details,
             )
         raise
     # Pricing lives on the adapter (issue #65 §9). Pass it through
