@@ -113,11 +113,11 @@ type EnhanceData struct {
 
 // VerifyData is returned by the `verify` command.
 type VerifyData struct {
-	VerifiedResultsPath      string    `json:"verified_results_path"`
-	FindingsInput            int       `json:"findings_input"`
-	FindingsVerified         int       `json:"findings_verified"`
-	Agreed                   int       `json:"agreed"`
-	Disagreed                int       `json:"disagreed"`
+	VerifiedResultsPath string `json:"verified_results_path"`
+	FindingsInput       int    `json:"findings_input"`
+	FindingsVerified    int    `json:"findings_verified"`
+	Agreed              int    `json:"agreed"`
+	Disagreed           int    `json:"disagreed"`
 	// #622: BOTH reclassification siblings — the Python VerifyResult.to_dict
 	// envelope carries them (the "Disagreed (eliminated)" display's source);
 	// without them the companion lines are unrenderable.
@@ -154,4 +154,29 @@ type UsageInfo struct {
 	// complete figure it is not.
 	CostIncomplete bool     `json:"cost_incomplete,omitempty"`
 	UnpricedModels []string `json:"unpriced_models,omitempty"`
+	// #626: the cache line items. Without these the typed path silently
+	// DROPPED them — the terminal renderer survived only because it reads
+	// map[string]any. omitempty mirrors the Python side's present-only
+	// envelope (core/schemas.py UsageInfo.to_dict), so a no-cache run
+	// round-trips to exactly the pre-#626 key set.
+	//
+	// UnpricedCacheModels is NOT interchangeable with UnpricedModels: the
+	// former is a PRICED model whose cache multipliers are absent, the
+	// latter has no pricing record at all (its spend attributed $0 — a
+	// lower bound). Never merge the two lists.
+	//
+	// PR#661 hunt F1: this doc used to add "(its cached traffic billed at
+	// the full input rate — an upper bound)". That holds only for the
+	// INCLUSIVE field shapes (openai cached_tokens, google
+	// cached_content_token_count), whose cached tokens are already inside
+	// the input count. For the EXCLUSIVE shapes (anthropic/bedrock
+	// cache_read_input_tokens, DISJOINT from input_tokens) an absent
+	// multiplier contributes $0 and the figure is a LOWER bound — and the
+	// whole shipped bedrock census (11/11 priced, no cache block, exclusive
+	// fields emitted) is in that case. These fields carry no
+	// inclusion-shape discriminator, so no consumer may assert a direction
+	// from them; see internal/output.renderCostBlock.
+	TotalCacheReadTokens  int      `json:"total_cache_read_tokens,omitempty"`
+	TotalCacheWriteTokens int      `json:"total_cache_write_tokens,omitempty"`
+	UnpricedCacheModels   []string `json:"unpriced_cache_models,omitempty"`
 }
