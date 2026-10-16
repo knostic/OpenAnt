@@ -124,15 +124,15 @@ def _relativize_home(path_str: str) -> str:
 
 
 def _promotable_skip_count(by_class: dict, promote_set) -> int:
-    """#602: the skipped signals that COULD have promoted — an UPPER
-    BOUND: entry_point skips whose confidence is in THIS run's promote
-    set (the promote gate at apply_signals). Upper bound because the
-    skipped signal's target is outside its batch by construction — the
-    count cannot know whether the id exists in another batch (a real
-    lost promotion candidate) or nowhere in the dataset (a hallucinated
-    id, promotable by no gate), nor whether the target was already an
-    entry point. Factored for testability: the guard tolerates malformed
-    keys (never a report-assembly crash)."""
+    """#602/#798: the skipped signals of the promotable CLASS —
+    entry_point skips whose confidence is in THIS run's promote set
+    (the promote gate at apply_signals). #798 changed the meaning: the
+    validation universe is the DATASET, so a skipped id is ABSENT from
+    the dataset by construction — these are promotable-class model
+    INVENTIONS that could never promote, not an upper bound on lost
+    promotions (the in-dataset out-of-batch class it used to bound is
+    carried as a real signal since #798). Factored for testability: the
+    guard tolerates malformed keys (never a report-assembly crash)."""
     total = 0
     for k, v in (by_class or {}).items():
         if (not isinstance(k, str) or not isinstance(v, int)
@@ -989,6 +989,14 @@ def scan_repository(
                         # the resume provenance (they were reviewed; their
                         # signals replay under THIS run's promote set).
                         "units_adopted": reach_stats.get("units_adopted", 0),
+                        # #798: how many signals came from the checkpoint
+                        # cache — the resume-comparability companion to
+                        # signals_skipped_unknown_unit (a resume adopts
+                        # cached signals without parsing, so its parse-time
+                        # skip count reads 0 BY CONSTRUCTION; this key
+                        # explains the zero).
+                        "signals_cache_adopted": reach_stats.get(
+                            "signals_cache_adopted", 0),
                         "post_filter_units": post_filter_count,
                         "refilter_supported": refilter_supported,
                         # #294: the honest coverage numbers — units_reviewed
@@ -1017,34 +1025,47 @@ def scan_repository(
                         # step to partial wrongly.
                         "checkpoint_summary_write_failures": reach_stats.get(
                             "checkpoint_summary_write_failures", 0),
-                        # #602: the skip-class telemetry — unknown-ID signal
-                        # occurrences in ACCEPTED responses (the diagnostic
-                        # log may carry discarded attempts; the counter is
-                        # the accepted-response metric). A skipped signal is
+                        # #602/#798: the skip-class telemetry —
+                        # unknown-ID signal occurrences in ACCEPTED
+                        # responses (the diagnostic log may carry
+                        # discarded attempts; the counter is the
+                        # accepted-response metric). A skipped signal is
                         # NOT a coverage failure: error_count stays
-                        # dropped+failed batches only. Two known exclusions:
-                        # adopted units bypass parse on resume (their skips
-                        # were never persisted); a SPLIT batch narrows
-                        # valid_unit_ids per half, so a cross-half reference
-                        # reads as a skip — the metric is not batch-geometry-
-                        # invariant, and split-recovered runs read higher.
+                        # dropped+failed batches only. #798: the
+                        # validation universe is the DATASET, so a skip
+                        # means absent-from-dataset by construction (a
+                        # genuine model invention) — the metric IS
+                        # batch-geometry-invariant now (the old
+                        # cross-half/cross-batch skip class is a real
+                        # signal since #798), and adopted units bypassing
+                        # parse on resume remains the one exclusion.
                         "signals_skipped_unknown_unit": reach_stats.get(
                             "signals_skipped_unknown_unit", 0),
                         "signals_skipped_unknown_unit_by_class": reach_stats.get(
                             "signals_skipped_unknown_unit_by_class", {}),
-                        # #602: the promotable subset — sized at REPORT
+                        # #602/#798: the promotable subset — sized at REPORT
                         # time from this run's own promote_set (the promote
                         # gate: kind=entry_point, confidence in promote_set),
                         # never by parse_response (which must stay
-                        # policy-free). An UPPER BOUND: the skipped id is
-                        # outside its batch by construction — it may exist
-                        # in another batch or nowhere in the dataset.
+                        # policy-free). #798 changed its meaning: the
+                        # skipped id is ABSENT FROM THE DATASET by
+                        # construction now, so this counts promotable-
+                        # class INVENTIONS that could never promote — not
+                        # an upper bound on lost promotions (the in-dataset
+                        # out-of-batch class it used to bound is carried
+                        # as a real signal since #798).
                         "signals_skipped_promotable":
                             _promotable_skip_count(
                                 reach_stats.get(
                                     "signals_skipped_unknown_unit_by_class",
                                     {}) or {},
                                 summary.get("promote_set") or []),
+                        # #798: the apply-time counterpart — how many
+                        # signals referenced a unit absent from THIS
+                        # dataset (the stale-id class: a checkpoint-adopted
+                        # signal replayed against a changed dataset).
+                        "signals_dropped_unknown_unit": summary.get(
+                            "signals_dropped_unknown_unit", 0),
                         # #541 (the refute round): the #285/#376 partial-
                         # status contract — dropped + failed batches make
                         # the STEP read partial, never success/0/0.
