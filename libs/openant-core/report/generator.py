@@ -44,17 +44,29 @@ def _extract_usage(
     pricing (#598: the legacy MODEL_PRICING substitution deleted) and
     the usage dict marks cost_incomplete — never a substituted rate.
     """
+    # #626/F661-3: ONE cost formula. This path used to re-derive
+    # input+output only, so it silently dropped every cache line item —
+    # under-billing an anthropic priced-cache call by 45% and flipping
+    # cost_incomplete True -> False on the openai/google implicit-cache
+    # path (the #598 masquerade). It now calls the SAME pure
+    # price_usage()/normalize_cache_usage() the tracker calls; there is no
+    # second formula left to drift. Never re-add per-million arithmetic
+    # here (pinned by test_price_usage_is_the_only_formula).
+    from utilities.llm_client import normalize_cache_usage, price_usage
+
+    cache_counts = normalize_cache_usage(usage_details)
     if pricing is None:
         # Same one-time warning record_call emits, so an unknown model's
         # $0 cost isn't silently inconsistent between the two paths.
         from utilities.llm_client import _warn_unknown_pricing
 
         _warn_unknown_pricing(model)
+        priced = None
         total_cost = 0.0
     else:
-        input_cost = (input_tokens / 1_000_000) * pricing["input"]
-        output_cost = (output_tokens / 1_000_000) * pricing["output"]
-        total_cost = input_cost + output_cost
+        priced = price_usage(input_tokens, output_tokens, pricing,
+                             cache_counts=cache_counts)
+        total_cost = priced.cost_usd
     usage = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -68,6 +80,24 @@ def _extract_usage(
         # unpriced ids (parity with the tracker path).
         usage["cost_incomplete"] = True
         usage["unpriced_models"] = [model]
+    elif priced is not None:
+        # #626: the cache line items, PRESENT-ONLY (a no-cache call keeps
+        # exactly the four pre-#626 keys). The cache-unpriced kind is its
+        # OWN key and is never folded into unpriced_models: this model IS
+        # priced, only its cache multipliers are missing, which is a
+        # different condition from having no pricing record at all.
+        # PR#661 hunt F1: do NOT state a direction for the cache kind here —
+        # it is opposite for the two field shapes (exclusive ⇒ the cached
+        # tokens contribute $0, a LOWER bound; inclusive ⇒ they bill at the
+        # full input rate, an UPPER bound). See
+        # utilities.llm_client.PricedUsage.unpriced_cache.
+        if priced.cache_read_tokens:
+            usage["cache_read_tokens"] = priced.cache_read_tokens
+        if priced.cache_write_tokens:
+            usage["cache_write_tokens"] = priced.cache_write_tokens
+        if priced.unpriced_cache:
+            usage["cost_incomplete"] = True
+            usage["unpriced_cache_models"] = [model]
     if usage_details is not None:
         # #211 pass-through capture: verbatim, informational only.
         usage["usage_details"] = usage_details
@@ -87,6 +117,12 @@ def _merge_usage(usages: list[dict]) -> dict:
     """
     merged = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
     _unpriced: list[str] = []
+    # #626: the cache line items aggregate too (present-only below) and the
+    # cache-unpriced ids union SEPARATELY from _unpriced — merging the two
+    # kinds would assert that a priced model has no pricing record.
+    _unpriced_cache: list[str] = []
+    _cache_read = 0
+    _cache_write = 0
     # #624: the completions the merged spend covers — the report phase
     # records ONE aggregate tracker record; this count is its turn figure.
     merged["completions"] = len(usages)
@@ -98,6 +134,11 @@ def _merge_usage(usages: list[dict]) -> dict:
         for m in (u.get("unpriced_models") or []):
             if m not in _unpriced:
                 _unpriced.append(m)
+        for m in (u.get("unpriced_cache_models") or []):
+            if m not in _unpriced_cache:
+                _unpriced_cache.append(m)
+        _cache_read += int(u.get("cache_read_tokens") or 0)
+        _cache_write += int(u.get("cache_write_tokens") or 0)
         merged["input_tokens"] += u["input_tokens"]
         merged["output_tokens"] += u["output_tokens"]
         merged["total_tokens"] += u["total_tokens"]
@@ -110,6 +151,15 @@ def _merge_usage(usages: list[dict]) -> dict:
         # surfaces incomplete, never complete-with-ids.
         merged["unpriced_models"] = sorted(_unpriced)
         merged["cost_incomplete"] = True
+    if _unpriced_cache:
+        # the same determinism + flag-hardening rule, for the cache kind
+        merged["unpriced_cache_models"] = sorted(_unpriced_cache)
+        merged["cost_incomplete"] = True
+    # present-only: a merge of no-cache usages keeps the pre-#626 key set
+    if _cache_read:
+        merged["cache_read_tokens"] = _cache_read
+    if _cache_write:
+        merged["cache_write_tokens"] = _cache_write
     details = [u.get("usage_details") for u in usages if u.get("usage_details") is not None]
     if details:
         merged["usage_details"] = details

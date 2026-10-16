@@ -85,7 +85,7 @@ def test_direct_anthropic_records_resolve_at_sourced_rates():
     every row's exact-rate assert fails (the #601/#610 gap)."""
     direct = pricing_map("anthropic")
     for model_id, price_in, price_out, _alias in _DIRECT_ANTHROPIC_CURRENT:
-        assert direct[model_id] == {"input": price_in, "output": price_out}, (
+        assert (direct[model_id]["input"], direct[model_id]["output"]) == (price_in, price_out), (  # 626: pair-compare (cache keys are additive)
             f"{model_id} must carry the independently-sourced direct rate "
             f"({price_in}/{price_out} $/MTok)")
 
@@ -100,7 +100,7 @@ def test_two_number_ids_emit_dotted_aliases():
     direct = pricing_map("anthropic")
     for model_id, price_in, price_out, dotted in _DIRECT_ANTHROPIC_CURRENT:
         if dotted is not None:
-            assert direct[dotted] == {"input": price_in, "output": price_out}, (
+            assert (direct[dotted]["input"], direct[dotted]["output"]) == (price_in, price_out), (  # 626: pair-compare
                 f"the #434 dotted alias {dotted} must carry {model_id}'s rate")
             assert _alias_spellings(model_id) == [dotted]
         else:
@@ -130,7 +130,7 @@ def test_openrouter_twins_agree_with_direct_records():
     direct = pricing_map("anthropic")
     router = pricing_map("openrouter")
     for bare, prefixed in _TWIN_LINKS:
-        assert direct[bare] == router[prefixed], (
+        assert (direct[bare]["input"], direct[bare]["output"]) == (router[prefixed]["input"], router[prefixed]["output"]), (  # 626: pair-compare (cache rates may differ)
             f"the {bare} family must agree across providers "
             f"(direct vs {prefixed})")
 
