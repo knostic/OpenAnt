@@ -165,10 +165,11 @@ def _extract_usage_details(usage: Any) -> Optional[dict]:
 
     Copies ``thoughts_token_count`` / ``cached_content_token_count``
     VERBATIM when present; ``None`` otherwise (absent ≠ 0). Never feeds
-    the cost formula — note ``thoughts_token_count`` is ALREADY summed
+    the reasoning cost formula — note ``thoughts_token_count`` is ALREADY summed
     into ``output_tokens`` above (Gemini bills candidates + thoughts as
-    output), so these captured fields are informational for bill
-    reconciliation, not additional billed tokens.
+    output), so that field is informational for bill reconciliation. #626:
+    ``cached_content_token_count`` DOES price — an INCLUSIVE subset of
+    ``prompt_token_count`` (the tracker subtracts the priced portion).
     """
     if usage is None:
         return None

@@ -1,0 +1,10652 @@
+"""Tests for the experimental remediation_planner module, including the
+deterministic Planner -> enrichment bridge."""
+
+from __future__ import annotations
+
+import json
+import re
+from unittest import mock
+
+import pytest
+
+from utilities.autopatcher.remediation_planner import RemediationPlanResult
+
+_EMPTY = RemediationPlanResult(rendered="", target_files=[], target_symbols=[])
+
+_WELL_FORMED = {
+    "remediation_mechanism": "Strip sensitive headers before following a cross-origin redirect.",
+    "target_files": ["src/urllib3/util/retry.py", "src/urllib3/poolmanager.py"],
+    "target_symbols": ["Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"],
+    "security_invariant": "Sensitive request headers must not cross origins on redirect.",
+    "required_edits": ["Add 'Cookie' to DEFAULT_REMOVE_HEADERS_ON_REDIRECT."],
+    "approaches_to_avoid": ["Do not add a separate ad-hoc header-stripping mechanism."],
+    "explicit_unknowns": [],
+}
+
+
+def _make_context(functions=None, constants=None, repo_path=None):
+    """A real (not mocked) InvestigationContext, built from a minimal real
+    RepositoryIndex/ReachabilityAnalyzer -- so symbol-resolution tests
+    exercise the actual lookup code, not a stand-in. `repo_path` is
+    required for RepositoryIndex.read_file_section to work at all (it
+    returns None with no repo_path set), so pass it whenever a test needs
+    a constant's source read back."""
+    from utilities.agentic_enhancer.reachability_analyzer import ReachabilityAnalyzer
+    from utilities.agentic_enhancer.repository_index import RepositoryIndex
+    from utilities.autopatcher.candidate_enrichment import InvestigationContext
+
+    functions = functions or {}
+    index = RepositoryIndex({"functions": functions}, repo_path=str(repo_path) if repo_path else None)
+    reachability = ReachabilityAnalyzer(functions, {}, set())
+    return InvestigationContext(
+        index=index, call_graph={}, reverse_call_graph={},
+        reachability=reachability, constants=constants or {},
+    )
+
+
+# ---------------------------------------------------------------------------
+# generate_remediation_plan() -- rendered Markdown (unchanged in spirit,
+# now returned inside RemediationPlanResult.rendered)
+# ---------------------------------------------------------------------------
+
+class TestParsing:
+    def test_parses_well_formed_json(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        result = generate_remediation_plan("some vuln", llm, code_context="some evidence")
+
+        assert "Security invariant:" in result.rendered
+        assert "Sensitive request headers must not cross origins on redirect." in result.rendered
+        assert "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in result.rendered
+
+    def test_parses_fenced_json(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = "```json\n" + json.dumps(_WELL_FORMED) + "\n```"
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert "Likely remediation mechanism:" in result.rendered
+
+    def test_malformed_json_returns_empty(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = "not json at all, just prose."
+
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+    def test_non_dict_json_returns_empty(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(["a", "list", "not", "a", "dict"])
+
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+    def test_empty_response_returns_empty(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = ""
+
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+    def test_non_string_response_returns_empty_without_raising(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = mock.MagicMock()
+
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+    def test_llm_error_returns_empty_without_raising(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = RuntimeError("boom")
+
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+    def test_all_empty_fields_returns_empty_not_bare_heading(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            "remediation_mechanism": None, "target_files": [], "target_symbols": [],
+            "security_invariant": None, "required_edits": [], "approaches_to_avoid": [],
+            "explicit_unknowns": [],
+        })
+
+        assert generate_remediation_plan("some vuln", llm).rendered == ""
+
+    def test_partial_fields_only_render_present_sections(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            "remediation_mechanism": None, "target_files": [], "target_symbols": [],
+            "security_invariant": None, "required_edits": [], "approaches_to_avoid": [],
+            "explicit_unknowns": ["Could not determine which file owns the fix."],
+        })
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert "Explicit unknowns:" in result.rendered
+        assert "Could not determine which file owns the fix." in result.rendered
+        assert "Security invariant:" not in result.rendered
+        assert "Required edits:" not in result.rendered
+
+
+# ---------------------------------------------------------------------------
+# Prose-around-JSON extraction (real minimist Planner-revision regression).
+#
+# A real bounded Planner revision response was a fully valid, complete
+# Planner JSON object, prefaced with several paragraphs of exploit-tracing
+# prose the prompt explicitly says not to include ("Output exactly one JSON
+# object. Nothing before it, nothing after it."). Strict whole-response
+# json.loads() rejected the entire response -- including several literal
+# `{}` snippets in that same prose (e.g. "`o[key] = {}`"), which a naive
+# first-`{`-to-last-`}` extraction would also have mis-selected -- see
+# remediation_planner.py's _find_balanced_json_objects/_has_plan_shape
+# docstrings for the full incident writeup. Mirrors
+# test_remediation_verifier.py's own TestGenericProseWithBraceNoise/
+# TestTrueAmbiguityStillFailsClosed/TestNoVerifierShapedCandidate coverage
+# for the sibling verifier module's identical fallback pattern.
+# ---------------------------------------------------------------------------
+
+def _plan_shaped(**overrides) -> dict:
+    """A minimal, fully Planner-shaped dict (all 5 _PLAN_SHAPE_FIELDS
+    present) for the prose-extraction tests below -- kept separate from
+    _WELL_FORMED (which omits narrower_alternative_decision and is used by
+    many pre-existing fast-path tests this module must not disturb)."""
+    plan = {
+        "remediation_mechanism": "a narrower, evidence-backed mechanism",
+        "target_files": ["target.py"], "target_symbols": ["target.py:foo"],
+        "security_invariant": "the unsafe condition must not occur",
+        "narrower_alternative_decision": "SELECTED",
+        "narrower_alternative_considered": "considered and selected",
+        "required_edits": ["edit one"], "approaches_to_avoid": [], "explicit_unknowns": [],
+    }
+    plan.update(overrides)
+    return plan
+
+
+class TestLeadingAndTrailingProseExtraction:
+    def test_leading_prose_before_valid_json_is_extracted(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        plan = _plan_shaped()
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "Let me trace through the exploit path carefully before "
+            "committing to a final answer.\n\n" + json.dumps(plan)
+        )
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.target_files == plan["target_files"]
+        assert result.target_symbols == plan["target_symbols"]
+        assert result.narrower_alternative_decision == "SELECTED"
+
+    def test_valid_json_with_trailing_prose_is_extracted(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        plan = _plan_shaped()
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            json.dumps(plan) + "\n\nLet me know if any of this needs clarification."
+        )
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.target_files == plan["target_files"]
+        assert result.narrower_alternative_decision == "SELECTED"
+
+
+class TestGenericProseWithBraceNoise:
+    """Repository-agnostic version of the real trace's own failure shape:
+    explanatory prose containing several literal `{}` snippets (as inline
+    code notation), followed by exactly one real Planner JSON object."""
+
+    def test_recovers_the_one_real_candidate_among_brace_noise(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        plan = _plan_shaped()
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "Let me walk through this claim step by step.\n\n"
+            "At the first step, the code does `state = {}` to create a fresh object.\n"
+            "At the second step, another branch also does `target[key] = {}` before continuing.\n"
+            "A third, unrelated example elsewhere in the codebase uses `{}` as a default argument.\n\n"
+            "Given all of that, here is my conclusion:\n\n" + json.dumps(plan)
+        )
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.target_files == plan["target_files"]
+        assert result.remediation_mechanism == plan["remediation_mechanism"]
+
+
+class TestMultipleJsonObjectsDisambiguation:
+    def test_one_planner_shaped_object_among_a_non_planner_shaped_one_is_accepted(self):
+        """A second, unrelated JSON object (e.g. verifier-shaped, no
+        Planner fields at all) must never block extraction of the one
+        genuine Planner-shaped candidate."""
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        plan = _plan_shaped()
+        other_object = {"status": "SUPPORTED", "reason": "an unrelated verifier-shaped object"}
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "Here is an unrelated analysis first:\n\n" + json.dumps(other_object)
+            + "\n\nAnd here is the actual plan:\n\n" + json.dumps(plan)
+        )
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.target_files == plan["target_files"]
+        assert result.narrower_alternative_decision == "SELECTED"
+
+    def test_two_planner_shaped_objects_reject_without_selecting_either(self):
+        """Genuine ambiguity, not brace noise: two separate, independently
+        Planner-shaped JSON objects. No arbitrary selection -- must fail
+        closed exactly like an unparseable response, never pick the
+        first/last/either one."""
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        plan_one = _plan_shaped(target_files=["one.py"])
+        plan_two = _plan_shaped(target_files=["two.py"])
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "Here is one analysis:\n\n" + json.dumps(plan_one)
+            + "\n\nActually, let me reconsider and give a second analysis instead:\n\n"
+            + json.dumps(plan_two)
+        )
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+
+class TestMalformedOrNoPlannerShapedCandidate:
+    def test_malformed_json_candidate_in_prose_rejects(self):
+        """A balanced-brace substring that is NOT valid JSON on its own
+        (single-quoted keys/strings) must be skipped as a candidate, not
+        repaired -- with no other candidate present, this rejects."""
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "Here is my plan, informally:\n\n"
+            "{'remediation_mechanism': 'x', 'target_files': [], 'target_symbols': [], "
+            "'security_invariant': 'y', 'narrower_alternative_decision': 'SELECTED'}"
+        )
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+    def test_only_incidental_braces_with_no_planner_shaped_object_rejects(self):
+        """Brace noise only, with no object that even looks like a Planner
+        response (none of the 5 required fields present anywhere) -- must
+        degrade exactly like today's existing malformed-response behavior,
+        never attempt to promote an empty `{}` fragment."""
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "Consider the expression x = {} and note that y = {} as well; "
+            "walking through the logic step by step does not yield a concrete plan yet."
+        )
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+
+# ---------------------------------------------------------------------------
+# Direct unit coverage for the extraction primitives themselves, mirroring
+# test_remediation_verifier.py's own depth for its analogous functions.
+# ---------------------------------------------------------------------------
+
+class TestFindBalancedJsonObjects:
+    def test_finds_single_top_level_object(self):
+        from utilities.autopatcher.remediation_planner import _find_balanced_json_objects
+        text = 'prose before {"a": 1} prose after'
+        assert _find_balanced_json_objects(text) == ['{"a": 1}']
+
+    def test_braces_inside_string_literals_do_not_confuse_depth(self):
+        from utilities.autopatcher.remediation_planner import _find_balanced_json_objects
+        text = '{"note": "contains a brace { and } inside a string"}'
+        assert _find_balanced_json_objects(text) == [text]
+
+    def test_finds_every_top_level_object_including_empty_ones(self):
+        from utilities.autopatcher.remediation_planner import _find_balanced_json_objects
+        text = 'a {} b {"x": 1} c {}'
+        assert _find_balanced_json_objects(text) == ["{}", '{"x": 1}', "{}"]
+
+    def test_no_braces_returns_empty_list(self):
+        from utilities.autopatcher.remediation_planner import _find_balanced_json_objects
+        assert _find_balanced_json_objects("no braces here at all") == []
+
+    def test_unbalanced_opening_brace_yields_no_candidate(self):
+        from utilities.autopatcher.remediation_planner import _find_balanced_json_objects
+        assert _find_balanced_json_objects('prose { "a": 1') == []
+
+
+class TestHasPlanShape:
+    def test_full_planner_object_matches(self):
+        from utilities.autopatcher.remediation_planner import _has_plan_shape
+        assert _has_plan_shape(_plan_shaped()) is True
+
+    def test_empty_dict_does_not_match(self):
+        from utilities.autopatcher.remediation_planner import _has_plan_shape
+        assert _has_plan_shape({}) is False
+
+    def test_non_dict_does_not_match(self):
+        from utilities.autopatcher.remediation_planner import _has_plan_shape
+        assert _has_plan_shape(["not", "a", "dict"]) is False
+        assert _has_plan_shape(None) is False
+
+    def test_a_single_known_field_alone_is_not_sufficient(self):
+        """The fingerprint is a COMBINATION, not "any one known field" --
+        this is what disambiguates a genuine Planner object from a
+        coincidental single-field fragment in prose."""
+        from utilities.autopatcher.remediation_planner import _has_plan_shape
+        assert _has_plan_shape({"target_files": ["x.py"]}) is False
+        assert _has_plan_shape({"remediation_mechanism": "x"}) is False
+
+    def test_missing_narrower_alternative_decision_does_not_match(self):
+        from utilities.autopatcher.remediation_planner import _has_plan_shape
+        incomplete = _plan_shaped()
+        del incomplete["narrower_alternative_decision"]
+        assert _has_plan_shape(incomplete) is False
+
+    def test_null_or_empty_field_values_still_match_key_presence_only(self):
+        """This is a structural (key-presence) check, not a value/type
+        check -- a null or empty value for a required key still counts as
+        present, since value validity remains generate_remediation_plan's
+        own separate, unchanged job."""
+        from utilities.autopatcher.remediation_planner import _has_plan_shape
+        plan = _plan_shaped(
+            remediation_mechanism=None, target_files=[], target_symbols=[],
+            security_invariant=None, narrower_alternative_decision=None,
+        )
+        assert _has_plan_shape(plan) is True
+
+
+class TestNarrowerAlternativeConsideredField:
+    """`narrower_alternative_considered` -- additive, optional scalar field.
+    Like `security_invariant`/`remediation_mechanism` before it, it is
+    rendering-only: RemediationPlanResult carries no new attribute for it
+    (see RemediationPlanResult's own docstring), so it flows through the
+    same generic _SECTIONS render loop every other scalar field already
+    uses -- no new parsing/coercion code was needed."""
+
+    def test_well_formed_response_with_field_renders_it(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_WELL_FORMED,
+            "narrower_alternative_considered": "NARROWER_MECHANISM_MARKER",
+        })
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert "Narrower alternative considered:" in result.rendered
+        assert "NARROWER_MECHANISM_MARKER" in result.rendered
+
+    def test_field_rendered_between_security_invariant_and_mechanism(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_WELL_FORMED,
+            "narrower_alternative_considered": "NARROWER_MECHANISM_MARKER",
+        })
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        # Mirrors the reasoning order the prompt now requires: the condition
+        # to restore, then the comparison that produced the choice, then the
+        # choice itself.
+        assert (
+            result.rendered.index("Security invariant:")
+            < result.rendered.index("Narrower alternative considered:")
+            < result.rendered.index("Likely remediation mechanism:")
+        )
+
+    def test_null_field_renders_no_heading(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_considered": None})
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert "Narrower alternative considered:" not in result.rendered
+        assert "Security invariant:" in result.rendered  # other sections unaffected
+
+    def test_missing_field_is_backward_compatible(self):
+        # _WELL_FORMED has no narrower_alternative_considered key at all --
+        # a response shaped exactly like one from before this field existed.
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert "Narrower alternative considered:" not in result.rendered
+        assert "Security invariant:" in result.rendered
+
+
+class TestNarrowerAlternativeDecisionField:
+    """`narrower_alternative_decision` -- the explicit, machine-readable
+    enum the Planner Claim Verifier orchestration (pipeline.py) dispatches
+    on. Fail-closed normalization, never inference: only the exact three
+    schema values are trusted; anything else (missing, wrong type, or an
+    unrecognized string) collapses to `None`, which the orchestration's own
+    `_dispatch_narrower_mode` then substitutes a fixed, conservative
+    default for -- never by re-parsing this field's or
+    `narrower_alternative_considered`'s prose."""
+
+    def test_selected_is_retained(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_decision": "SELECTED"})
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision == "SELECTED"
+
+    def test_rejected_is_retained(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_decision": "REJECTED"})
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision == "REJECTED"
+
+    def test_none_identified_is_retained(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_decision": "NONE_IDENTIFIED"})
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision == "NONE_IDENTIFIED"
+
+    def test_missing_field_normalizes_to_none(self):
+        # _WELL_FORMED has no narrower_alternative_decision key at all --
+        # the exact shape a pre-this-change (or otherwise non-compliant)
+        # response takes. Never inferred from narrower_alternative_considered.
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision is None
+
+    def test_invalid_string_value_normalizes_to_none(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_decision": "MAYBE"})
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision is None
+
+    def test_wrong_type_normalizes_to_none(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_decision": 1})
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision is None
+
+    def test_case_and_whitespace_tolerant(self):
+        # Ordinary response normalization (case/whitespace), never semantic
+        # inference: "selected"/" SELECTED " are the same schema value
+        # spelled differently, not a different claim to interpret.
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_decision": " selected "})
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision == "SELECTED"
+
+    def test_wording_that_implies_selected_is_never_treated_as_the_enum(self):
+        # The critical non-inference guarantee: prose that clearly SOUNDS
+        # like a selection claim must NOT be treated as if the enum field
+        # itself said "SELECTED" when that field is absent.
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_WELL_FORMED,
+            "narrower_alternative_considered": "I select it as the mechanism.",
+        })
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision is None
+
+    def test_rendered_between_security_invariant_and_narrower_alternative_considered(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_WELL_FORMED,
+            "narrower_alternative_decision": "REJECTED",
+            "narrower_alternative_considered": "NARROWER_MECHANISM_MARKER",
+        })
+        result = generate_remediation_plan("some vuln", llm)
+        assert (
+            result.rendered.index("Security invariant:")
+            < result.rendered.index("Narrower alternative decision:")
+            < result.rendered.index("Narrower alternative considered:")
+        )
+
+
+class TestStructuralFieldRetention:
+    """`security_invariant`/`remediation_mechanism`/
+    `narrower_alternative_decision`/`narrower_alternative_considered`/
+    `required_edits`/`approaches_to_avoid`/`explicit_unknowns` are the SAME
+    already-parsed JSON values `_render_plan` already renders -- these
+    tests confirm they are ALSO retained structurally on
+    RemediationPlanResult (consumed by the Planner Claim Verifier
+    orchestration in pipeline.py), not just rendered to Markdown."""
+
+    def test_all_seven_fields_retained(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_WELL_FORMED,
+            "narrower_alternative_decision": "REJECTED",
+            "narrower_alternative_considered": "considered X, rejected because Y",
+        })
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert result.security_invariant == _WELL_FORMED["security_invariant"]
+        assert result.remediation_mechanism == _WELL_FORMED["remediation_mechanism"]
+        assert result.narrower_alternative_decision == "REJECTED"
+        assert result.narrower_alternative_considered == "considered X, rejected because Y"
+        assert result.required_edits == _WELL_FORMED["required_edits"]
+        assert result.approaches_to_avoid == _WELL_FORMED["approaches_to_avoid"]
+        assert result.explicit_unknowns == []
+
+    def test_null_scalar_fields_retained_as_none(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            "remediation_mechanism": None, "target_files": [], "target_symbols": [],
+            "security_invariant": None, "narrower_alternative_decision": None,
+            "narrower_alternative_considered": None,
+            "required_edits": [], "approaches_to_avoid": [], "explicit_unknowns": [],
+        })
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert result.security_invariant is None
+        assert result.remediation_mechanism is None
+        assert result.narrower_alternative_decision is None
+        assert result.narrower_alternative_considered is None
+        assert result.required_edits == []
+
+    def test_non_string_scalar_is_dropped_to_none(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "security_invariant": 12345})
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert result.security_invariant is None
+
+    def test_empty_plan_result_has_safe_defaults(self):
+        from utilities.autopatcher.remediation_planner import _EMPTY_PLAN_RESULT
+
+        assert _EMPTY_PLAN_RESULT.security_invariant is None
+        assert _EMPTY_PLAN_RESULT.remediation_mechanism is None
+        assert _EMPTY_PLAN_RESULT.narrower_alternative_decision is None
+        assert _EMPTY_PLAN_RESULT.narrower_alternative_considered is None
+        assert _EMPTY_PLAN_RESULT.required_edits == []
+        assert _EMPTY_PLAN_RESULT.approaches_to_avoid == []
+        assert _EMPTY_PLAN_RESULT.explicit_unknowns == []
+
+    def test_malformed_json_still_returns_empty_plan_result(self):
+        # Backward-compatibility guard: a response shaped exactly like one
+        # from before these fields existed (or a malformed one) must still
+        # produce a RemediationPlanResult with every new field at its safe
+        # default -- never a crash, never a partially-populated object.
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan, _EMPTY_PLAN_RESULT
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = "not json at all"
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert result == _EMPTY_PLAN_RESULT
+
+
+class TestRetryHint:
+    """`retry_hint` -- the Planner Claim Verifier orchestration's ONE
+    bounded revision call uses this exact idiom, mirroring
+    `generate_patch()`/`generate_patch_raw()`'s own `retry_hint` parameter."""
+
+    def test_default_empty_hint_preserves_exact_prior_user_message(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm, code_context="ctx")
+
+        _system, user_message = llm.complete.call_args[0]
+        assert "## Retry instruction" not in user_message
+
+    def test_hint_appended_as_retry_instruction_section(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm, retry_hint="RETRY_HINT_MARKER")
+
+        _system, user_message = llm.complete.call_args[0]
+        assert "## Retry instruction" in user_message
+        assert "RETRY_HINT_MARKER" in user_message
+
+    def test_still_makes_exactly_one_llm_call(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm, retry_hint="hint")
+
+        llm.complete.assert_called_once()
+
+    def test_custom_stage_label(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm, retry_hint="hint", stage="remediation_plan_revision")
+
+        _args, kwargs = llm.complete.call_args
+        assert kwargs.get("stage") == "remediation_plan_revision"
+
+    def test_default_stage_label_unchanged(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm)
+
+        _args, kwargs = llm.complete.call_args
+        assert kwargs.get("stage") == "remediation_planning"
+
+
+class TestStageLabel:
+    def test_stage_label_is_remediation_planning(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm, code_context="ctx")
+
+        _args, kwargs = llm.complete.call_args
+        assert kwargs.get("stage") == "remediation_planning"
+
+
+class TestUserMessageContent:
+    def test_code_context_included_when_present(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm, code_context="EVIDENCE_MARKER")
+
+        _system, user_message = llm.complete.call_args[0]
+        assert "## Repository evidence" in user_message
+        assert "EVIDENCE_MARKER" in user_message
+
+    def test_no_evidence_section_when_code_context_empty(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm)
+
+        _system, user_message = llm.complete.call_args[0]
+        assert "## Repository evidence" not in user_message
+
+
+# ---------------------------------------------------------------------------
+# generate_remediation_plan() -- parsed (unverified) target_files/target_symbols
+# ---------------------------------------------------------------------------
+
+class TestPlanResultParsing:
+    def test_well_formed_response_preserves_target_files_and_symbols(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert result.target_files == ["src/urllib3/util/retry.py", "src/urllib3/poolmanager.py"]
+        assert result.target_symbols == ["Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"]
+
+    def test_malformed_json_has_no_proposals(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = "not json"
+
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.target_files == []
+        assert result.target_symbols == []
+
+    def test_llm_error_has_no_proposals(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = RuntimeError("boom")
+
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.target_files == []
+        assert result.target_symbols == []
+
+    def test_non_list_target_files_coerced_to_empty_list(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "target_files": "not-a-list"})
+
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.target_files == []
+
+    def test_non_string_items_in_target_files_are_dropped(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "target_files": ["a.py", 123, None, "b.py"]})
+
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.target_files == ["a.py", "b.py"]
+
+
+# ---------------------------------------------------------------------------
+# _verify_file() -- path safety
+# ---------------------------------------------------------------------------
+
+class TestVerifyFile:
+    def test_valid_relative_file_canonicalized(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _verify_file
+
+        target = tmp_path / "src" / "foo.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("pass\n", encoding="utf-8")
+
+        assert _verify_file("src/foo.py", tmp_path) == "src/foo.py"
+
+    def test_absolute_path_rejected(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _verify_file
+        assert _verify_file("/etc/passwd", tmp_path) is None
+
+    def test_traversal_path_rejected(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _verify_file
+        assert _verify_file("../outside.py", tmp_path) is None
+        assert _verify_file("src/../../outside.py", tmp_path) is None
+
+    def test_missing_file_rejected(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _verify_file
+        assert _verify_file("does/not/exist.py", tmp_path) is None
+
+    def test_directory_rejected(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _verify_file
+        (tmp_path / "src").mkdir()
+        assert _verify_file("src", tmp_path) is None
+
+    def test_non_string_input_rejected(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _verify_file
+        assert _verify_file(123, tmp_path) is None
+        assert _verify_file(None, tmp_path) is None
+
+    def test_empty_string_rejected(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _verify_file
+        assert _verify_file("", tmp_path) is None
+        assert _verify_file("   ", tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# _resolve_symbol() -- symbol verification
+# ---------------------------------------------------------------------------
+
+class TestResolveSymbol:
+    def test_file_symbol_pair_resolves_correct_line(self, tmp_path):
+        target = tmp_path / "src" / "util" / "retry.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("class Retry:\n    pass\n", encoding="utf-8")
+
+        context = _make_context(functions={
+            "src/util/retry.py:Retry.method": {
+                "name": "method", "startLine": 12, "endLine": 20, "className": "Retry",
+            },
+        })
+
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        result = _resolve_symbol("src/util/retry.py:Retry.method", tmp_path, context)
+
+        assert result == ("src/util/retry.py", "Retry.method", 12)
+
+    def test_symbol_resolving_only_in_another_file_is_rejected(self, tmp_path):
+        (tmp_path / "a.py").write_text("class A:\n    pass\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("class B:\n    pass\n", encoding="utf-8")
+
+        context = _make_context(functions={
+            "b.py:B.method": {"name": "method", "startLine": 5, "endLine": 8, "className": "B"},
+        })
+
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        # Planner claims the symbol lives in a.py; it only really exists in b.py.
+        assert _resolve_symbol("a.py:A.method", tmp_path, context) is None
+
+    def test_symbol_resolves_via_constants_table_when_not_a_function(self, tmp_path):
+        target = tmp_path / "src" / "util" / "retry.py"
+        target.parent.mkdir(parents=True)
+        target.write_text(
+            "class Retry:\n    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(['Authorization'])\n",
+            encoding="utf-8",
+        )
+
+        context = _make_context(constants={
+            "src/util/retry.py": {
+                "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": {
+                    "qualified_name": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                    "class_name": "Retry", "name": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                    "line": 2, "end_line": 2,
+                },
+            },
+        })
+
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        result = _resolve_symbol(
+            "src/util/retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", tmp_path, context
+        )
+
+        assert result == ("src/util/retry.py", "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", 2)
+
+    def test_bare_symbol_no_file_hint_resolves_via_index(self, tmp_path):
+        (tmp_path / "retry.py").write_text("class Retry:\n    pass\n", encoding="utf-8")
+        context = _make_context(functions={
+            "retry.py:Retry.method": {"name": "method", "startLine": 3, "endLine": 4, "className": "Retry"},
+        })
+
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        result = _resolve_symbol("method", tmp_path, context)
+
+        assert result == ("retry.py", "method", 3)
+
+    def test_unresolvable_symbol_returns_none(self, tmp_path):
+        context = _make_context()
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        assert _resolve_symbol("does_not_exist_anywhere", tmp_path, context) is None
+
+    def test_no_context_returns_none(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        assert _resolve_symbol("anything", tmp_path, None) is None
+
+    def test_stated_file_that_fails_verification_rejects_pairing(self, tmp_path):
+        context = _make_context(functions={
+            "real.py:real.method": {"name": "method", "startLine": 1, "endLine": 2},
+        })
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        assert _resolve_symbol("/etc/passwd:method", tmp_path, context) is None
+
+
+# ---------------------------------------------------------------------------
+# _resolve_symbol_details() -- class-qualifier disambiguation regression
+# (same bare method name on two different classes, no file hint given --
+# the exact urllib3 PoolManager.urlopen / HTTPConnectionPool.urlopen shape)
+# ---------------------------------------------------------------------------
+
+class TestClassQualifiedSymbolResolution:
+    def _urlopen_context(self):
+        return _make_context(functions={
+            "poolmanager.py:PoolManager.urlopen": {
+                "name": "urlopen", "startLine": 10, "endLine": 20, "className": "PoolManager",
+            },
+            "connectionpool.py:HTTPConnectionPool.urlopen": {
+                "name": "urlopen", "startLine": 100, "endLine": 150, "className": "HTTPConnectionPool",
+            },
+        })
+
+    def test_poolmanager_urlopen_resolves_to_poolmanager(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        result = _resolve_symbol("PoolManager.urlopen", tmp_path, self._urlopen_context())
+        assert result == ("poolmanager.py", "PoolManager.urlopen", 10)
+
+    def test_httpconnectionpool_urlopen_resolves_to_httpconnectionpool(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        result = _resolve_symbol("HTTPConnectionPool.urlopen", tmp_path, self._urlopen_context())
+        assert result == ("connectionpool.py", "HTTPConnectionPool.urlopen", 100)
+
+    def test_bare_urlopen_still_matches_first_result_as_before(self, tmp_path):
+        # Unqualified proposals are unaffected by the class check -- bare
+        # search_by_name behavior (whichever match comes first) is
+        # unchanged, matching pre-fix semantics exactly.
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        result = _resolve_symbol("urlopen", tmp_path, self._urlopen_context())
+        assert result is not None
+        assert result[1] == "urlopen"
+        assert result[0] in ("poolmanager.py", "connectionpool.py")
+
+    def test_qualified_symbol_for_nonexistent_class_fails_safely(self, tmp_path):
+        # "SomeOtherClass.urlopen" -- the bare name exists, but never under
+        # that class -- must fail closed, not fall back to a same-named
+        # method on a different class.
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        assert _resolve_symbol("SomeOtherClass.urlopen", tmp_path, self._urlopen_context()) is None
+
+    def test_class_qualifier_rejects_cross_class_match_with_no_file_hint(self, tmp_path):
+        # The exact bug shape: no file hint at all, so only the class
+        # qualifier can disambiguate. Before the fix this returned
+        # whichever match search_by_name happened to return first.
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+        context = self._urlopen_context()
+        match = _resolve_symbol_details("PoolManager.urlopen", tmp_path, context)
+        assert match is not None
+        assert match.file == "poolmanager.py"
+        assert match.func_id == "poolmanager.py:PoolManager.urlopen"
+
+    def test_module_level_function_has_no_class_and_qualified_lookup_fails(self, tmp_path):
+        # A function with no className at all (module-level) must not
+        # match a qualified proposal -- None != "SomeClass" is a rejection,
+        # never a class-qualifier bypass.
+        context = _make_context(functions={
+            "utils.py:helper": {"name": "helper", "startLine": 1, "endLine": 2},
+        })
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        assert _resolve_symbol("SomeClass.helper", tmp_path, context) is None
+        # bare (unqualified) lookup for the same function still works
+        assert _resolve_symbol("helper", tmp_path, context) == ("utils.py", "helper", 1)
+
+    def test_existing_file_hint_disambiguation_unaffected(self, tmp_path):
+        # Pre-existing behavior: a file hint alone already disambiguated
+        # this case correctly (regardless of class). The class-qualifier
+        # check must not change this outcome.
+        (tmp_path / "poolmanager.py").write_text("class PoolManager:\n    pass\n", encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        result = _resolve_symbol(
+            "poolmanager.py:PoolManager.urlopen", tmp_path, self._urlopen_context()
+        )
+        assert result == ("poolmanager.py", "PoolManager.urlopen", 10)
+
+    def test_planner_symbols_bridge_resolves_correct_class_end_to_end(self, tmp_path):
+        # End-to-end through the same bridge build_planner_evidence uses --
+        # both target_symbols proposed bare (no file hint), each must
+        # resolve to its OWN file/class, not collapse onto one.
+        (tmp_path / "poolmanager.py").write_text("class PoolManager:\n    pass\n", encoding="utf-8")
+        (tmp_path / "connectionpool.py").write_text("class HTTPConnectionPool:\n    pass\n", encoding="utf-8")
+        context = self._urlopen_context()
+        from utilities.autopatcher.remediation_planner import _resolve_planner_symbols
+
+        plan = RemediationPlanResult(
+            rendered="", target_files=["poolmanager.py", "connectionpool.py"],
+            target_symbols=["PoolManager.urlopen", "HTTPConnectionPool.urlopen"],
+        )
+        resolved = _resolve_planner_symbols(plan, tmp_path, context)
+
+        assert resolved["poolmanager.py"].label == "PoolManager.urlopen"
+        assert resolved["connectionpool.py"].label == "HTTPConnectionPool.urlopen"
+
+
+# ---------------------------------------------------------------------------
+# _resolve_symbol_details() -- deterministic identifier fallback (Fix A)
+#
+# Regression shape: a JavaScript function declared INSIDE another
+# function's body (e.g. `module.exports = function (...) { function
+# setKey (...) { ... } }`) is real, verified repository source that the
+# upstream analyzer's structured function index never captured -- so
+# RepositoryIndex.search_by_name("setKey") finds nothing even though a
+# sibling top-level function (hasKey) resolves normally. Without a
+# fallback this gets dropped as "unverified target_symbol removed" and
+# the pipeline ends in "NO PATCH PRODUCED" despite the source existing.
+# ---------------------------------------------------------------------------
+
+# A reduced version of the real minimist/CVE-2021-44906 structural shape:
+# setKey nested inside the exported function expression (not indexed by
+# the fake analyzer below), hasKey top-level (indexed normally).
+_NESTED_JS_FIXTURE = """module.exports = function (args, opts) {
+    var flags = {};
+
+    function setKey (obj, keys, value) {
+        var o = obj;
+        for (var i = 0; i < keys.length - 1; i++) {
+            var key = keys[i];
+            if (key === '__proto__') return;
+            o = o[key];
+        }
+        var key = keys[keys.length - 1];
+        if (key === '__proto__') return;
+        o[key] = value;
+    }
+
+    setKey(flags, ['a'], 1);
+
+    return flags;
+};
+
+function hasKey (obj, keys) {
+    var o = obj;
+    keys.forEach(function (key) {
+        o = (o[key] || {});
+    });
+    return true;
+}
+"""
+
+
+class TestDeterministicIdentifierFallback:
+    def test_nested_function_not_structurally_indexed_is_recovered(self, tmp_path):
+        # hasKey is indexed by the fake analyzer output below; setKey
+        # (nested inside the exported function expression) deliberately
+        # is not -- reproducing the exact structural gap from the real
+        # minimist regression.
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(
+            functions={"index.js:hasKey": {"name": "hasKey", "startLine": 21, "endLine": 27}},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"])
+        assert match is not None
+        assert match.file == "index.js"
+
+        lines = _NESTED_JS_FIXTURE.splitlines()
+        window = "\n".join(lines[match.line - 1:match.end_line])
+        assert "function setKey" in window
+        assert window.count("__proto__") == 2  # both existing guards recovered
+        assert "function hasKey" not in window  # hasKey never mistakenly selected
+
+    def test_bounded_window_does_not_inject_whole_file(self, tmp_path):
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(
+            functions={"index.js:hasKey": {"name": "hasKey", "startLine": 21, "endLine": 27}},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"])
+        assert match is not None
+        total_lines = len(_NESTED_JS_FIXTURE.splitlines())
+        window_size = match.end_line - match.line + 1
+        assert window_size < total_lines
+
+    def test_top_level_symbol_already_resolved_fallback_not_used(self, tmp_path):
+        # hasKey resolves through the normal structured lookup -- the
+        # exact indexed span must come back unchanged, proving the
+        # fallback never even ran for it.
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(
+            functions={"index.js:hasKey": {"name": "hasKey", "startLine": 21, "endLine": 27}},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("hasKey", tmp_path, context, verified_files=["index.js"])
+        assert match is not None
+        assert match.kind == "function"
+        assert match.func_id == "index.js:hasKey"
+        assert (match.line, match.end_line) == (21, 27)  # the indexed span, not a synthesized window
+
+    def test_identifier_in_comment_plus_one_real_declaration_prefers_declaration(self, tmp_path):
+        (tmp_path / "index.js").write_text(
+            "// setKey is called below to store a value\n"
+            "function setKey (obj, key, value) {\n"
+            "    obj[key] = value;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"])
+        assert match is not None
+        assert match.line == 2  # the real declaration, never the comment mention on line 1
+
+    def test_two_ambiguous_declarations_fail_closed(self, tmp_path):
+        (tmp_path / "index.js").write_text(
+            "function setKey (obj, key, value) { obj[key] = value; }\n"
+            "\n"
+            "function setKey (obj, key, value) { obj[key] = value; }\n",
+            encoding="utf-8",
+        )
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        assert _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"]) is None
+
+    def test_identifier_not_found_fails_closed(self, tmp_path):
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        assert _resolve_symbol_details("neverDefined", tmp_path, context, verified_files=["index.js"]) is None
+
+    def test_identifier_only_in_other_file_is_not_used(self, tmp_path):
+        # setKey only exists in other.js -- index.js (the ONLY verified
+        # file passed) has no such identifier at all. The fallback must
+        # not reach into other.js just because it happens to be on disk.
+        (tmp_path / "index.js").write_text(
+            "function hasKey(obj, key) { return key in obj; }\n", encoding="utf-8",
+        )
+        (tmp_path / "other.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        assert _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"]) is None
+
+    def test_unverified_target_file_forbids_fallback(self, tmp_path):
+        # Same repository, same identifier -- but the caller passes no
+        # verified_files at all (simulating a target file that never
+        # independently verified). No verified_files -> no fallback,
+        # matching every existing caller's exact prior behavior.
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        assert _resolve_symbol_details("setKey", tmp_path, context) is None
+
+    def test_no_llm_parameter_anywhere_in_the_fallback(self, tmp_path):
+        import inspect
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_symbol_details, _deterministic_identifier_fallback,
+        )
+
+        assert "llm" not in inspect.signature(_resolve_symbol_details).parameters
+        assert "llm" not in inspect.signature(_deterministic_identifier_fallback).parameters
+
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        match = _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"])
+        assert match is not None  # succeeds with no LLM involved anywhere
+
+    def test_class_qualified_request_rejects_unrelated_variable_of_same_bare_name(self, tmp_path):
+        # FALLBACK-01: the requested member ("Widget.target") is a
+        # class-qualified proposal -- neither structured lookup resolves it
+        # (not indexed), so this reaches the fallback. The only text in the
+        # verified file that matches one of _FALLBACK_DECLARATION_RE_PARTS is
+        # an UNRELATED top-level `var target = ...` in a different function --
+        # a plain variable declaration, not a class member. Accepting it would
+        # present that variable's source as if it were Widget.target's own
+        # definition. The fallback must abstain instead.
+        (tmp_path / "index.js").write_text(
+            "class Widget {\n"
+            "  target(x) {\n"
+            "    return x;\n"
+            "  }\n"
+            "}\n"
+            "\n"
+            "function helper() {\n"
+            "  var target = 1;\n"
+            "  return target;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("Widget.target", tmp_path, context, verified_files=["index.js"])
+        assert match is None
+
+    def test_class_qualified_request_rejects_tier_2_token_only_match(self, tmp_path):
+        # FALLBACK-01 (Tier 2 bypass): the requested member ("Widget.target")
+        # is class-qualified -- neither structured lookup resolves it (not
+        # indexed). The verified file has NO declaration-shaped text for
+        # `target` at all (no _FALLBACK_DECLARATION_RE_PARTS match), only a
+        # single unrelated bare-token occurrence (a property access inside an
+        # unrelated function) -- a shape only Tier 2's token search can see.
+        # Tier 2 has no declaration or ownership information capable of
+        # establishing that this token belongs to Widget.target, so a
+        # class-qualified request must fail closed here too, exactly as the
+        # Tier 1 case above already does.
+        (tmp_path / "index.js").write_text(
+            "function helper(order) {\n"
+            "  return order.target;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("Widget.target", tmp_path, context, verified_files=["index.js"])
+        assert match is None
+
+
+# ---------------------------------------------------------------------------
+# _declaration_is_brace_scoped() -- the small syntactic pre-check that
+# routes a fallback-resolved declaration to _bounded_declaration_block's
+# brace-depth scan (brace-scoped languages) or straight to the existing
+# fixed window (indentation-scoped languages, e.g. Python). Fixes a real
+# bug: a Python class whose docstring happens to contain a balanced pair
+# of literal `{`/`}` characters (a format-string documentation example)
+# made the brace-depth counter -- written with no notion of
+# indentation-scoped languages at all -- return to depth zero right there,
+# long before the class's real body, mis-truncating the fallback source
+# window.
+# ---------------------------------------------------------------------------
+
+class TestDeclarationFormClassification:
+    def test_python_class_declaration_is_indentation_scoped(self):
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["class Retry:", '    """docstring"""', "    ATTR = 1"]
+        assert _declaration_is_brace_scoped(lines, 0) is False
+
+    def test_python_def_declaration_is_indentation_scoped(self):
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["def foo(x, y):", "    return x + y"]
+        assert _declaration_is_brace_scoped(lines, 0) is False
+
+    def test_multiline_python_signature_is_indentation_scoped(self):
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["def foo(", "    x,", "    y,", "):", "    return x + y"]
+        assert _declaration_is_brace_scoped(lines, 0) is False
+
+    def test_dict_default_value_in_signature_does_not_confuse_classification(self):
+        """A `{}`/dict-shaped default argument value inside the
+        signature's own parentheses must not be mistaken for a
+        block-opening brace -- the declaration is still indentation-scoped."""
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["def foo(x: dict = {}):", "    return x"]
+        assert _declaration_is_brace_scoped(lines, 0) is False
+
+    def test_js_function_declaration_is_brace_scoped(self):
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["function foo(x, y) {", "    return x + y;", "}"]
+        assert _declaration_is_brace_scoped(lines, 0) is True
+
+    def test_js_class_declaration_is_brace_scoped(self):
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["class Foo {", "    bar() { return 1; }", "}"]
+        assert _declaration_is_brace_scoped(lines, 0) is True
+
+    def test_neither_brace_nor_colon_within_scan_window_defaults_to_brace_scoped(self):
+        """Ambiguous/unclear input preserves _bounded_declaration_block's
+        existing behavior completely unchanged -- this check only ever
+        ADDS a new early-exit, it never removes the existing brace-scan
+        path for anything it can't confidently classify."""
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["some_identifier"] * 6  # exceeds the bounded scan window; no `{` or trailing `:` anywhere
+        assert _declaration_is_brace_scoped(lines, 0) is True
+
+
+class TestBoundedDeclarationBlockUnchangedForBraceScoped:
+    """_bounded_declaration_block's own brace-counting semantics must be
+    completely untouched by this fix -- proven by calling it directly."""
+
+    def test_brace_scoped_block_end_still_found_by_brace_counting(self):
+        from utilities.autopatcher.remediation_planner import _bounded_declaration_block
+        lines = ["function foo() {", "    return 1;", "}", "function bar() {}"]
+        assert _bounded_declaration_block(lines, 0) == 2  # the matching `}`, unchanged
+
+
+class TestPythonDocstringBraceRegressionFix:
+    """End-to-end regression for the real bug, through the full
+    _resolve_symbol_details -> _deterministic_identifier_fallback path: a
+    bare Python class name resolves via the deterministic identifier
+    fallback (no function/constant-table entry for the class name itself
+    -- only its own attributes are indexed as separate constants), and its
+    docstring contains a balanced `{`/`}` pair (a realistic format-string
+    documentation example, modeled on urllib3's real Retry docstring).
+    Before this fix, the brace-depth counter mistook that docstring
+    content for the class's own closing brace. After the fix, the
+    declaration is recognized as indentation-scoped and the window comes
+    from the existing fixed +/-40-line fallback instead -- which, for a
+    docstring short enough to fit within that window (unlike this fix's
+    real motivating case, whose docstring spans ~140 lines), reaches real
+    class-body content beyond the docstring."""
+
+    _FIXTURE = (
+        'class Example:\n'
+        '    """Configuration object.\n'
+        "\n"
+        "    Some sleeps are computed as::\n"
+        "\n"
+        "        {backoff factor} * (2 ** ({number of previous retries}))\n"
+        "\n"
+        "    See the module documentation for more detail.\n"
+        '    """\n'
+        "\n"
+        '    DEFAULT_ALLOWED_METHODS = frozenset(["GET"])\n'
+        "\n"
+        '    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])\n'
+        "\n"
+        "    def __init__(self):\n"
+        "        pass\n"
+    )
+
+    def test_class_name_not_bounded_by_brace_depth_scanning(self, tmp_path):
+        (tmp_path / "example.py").write_text(self._FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("Example", tmp_path, context, verified_files=["example.py"])
+        assert match is not None
+        assert match.kind == "constant"
+
+        lines = self._FIXTURE.splitlines()
+        # The OLD (buggy) behavior truncated the window exactly at the
+        # docstring's own "{backoff factor}..." line -- assert the window
+        # extends past it.
+        brace_example_line = next(i for i, l in enumerate(lines, start=1) if "{backoff factor}" in l)
+        assert match.end_line > brace_example_line
+
+    def test_fallback_source_window_reaches_class_body_beyond_docstring(self, tmp_path):
+        (tmp_path / "example.py").write_text(self._FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("Example", tmp_path, context, verified_files=["example.py"])
+        assert match is not None
+
+        lines = self._FIXTURE.splitlines()
+        window = "\n".join(lines[match.line - 1:match.end_line])
+        assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in window
+
+
+class TestJsBraceScopedRegressionUnchanged:
+    """Companion regression: a brace-scoped (JS-style) class declaration
+    must retain the EXISTING brace-depth-scan behavior unchanged -- this
+    fix must never disable brace-aware extraction for a language that
+    actually uses it."""
+
+    _FIXTURE = (
+        "class Example {\n"
+        "    constructor() {\n"
+        "        this.value = 1;\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        "function unrelated() {}\n"
+    )
+
+    def test_brace_scoped_class_still_uses_brace_depth_scan(self, tmp_path):
+        (tmp_path / "example.js").write_text(self._FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("Example", tmp_path, context, verified_files=["example.js"])
+        assert match is not None
+        lines = self._FIXTURE.splitlines()
+        window = "\n".join(lines[match.line - 1:match.end_line])
+        # The brace-depth scan finds the class's own closing brace -- not
+        # the padded fixed window, which would also reach "unrelated"
+        # below it.
+        assert "constructor" in window
+        assert "unrelated" not in window
+
+
+# ---------------------------------------------------------------------------
+# build_planner_candidates() -- the adapter into RepositoryCandidate shape
+# ---------------------------------------------------------------------------
+
+class TestBuildPlannerCandidates:
+    def test_no_target_files_returns_empty(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_planner_candidates
+        plan = RemediationPlanResult(rendered="", target_files=[], target_symbols=[])
+        assert build_planner_candidates(plan, tmp_path, None) == []
+
+    def test_unverifiable_files_produce_no_candidates(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_planner_candidates
+        plan = RemediationPlanResult(
+            rendered="", target_files=["/etc/passwd", "../outside.py", "missing.py"], target_symbols=[],
+        )
+        assert build_planner_candidates(plan, tmp_path, None) == []
+
+    def test_order_matches_planner_order_and_dedups(self, tmp_path):
+        (tmp_path / "b.py").write_text("pass\n", encoding="utf-8")
+        (tmp_path / "a.py").write_text("pass\n", encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import build_planner_candidates
+        plan = RemediationPlanResult(rendered="", target_files=["b.py", "a.py", "b.py"], target_symbols=[])
+
+        candidates = build_planner_candidates(plan, tmp_path, None)
+
+        assert [c.path for c in candidates] == ["b.py", "a.py"]
+
+    def test_cap_matches_existing_candidate_selection_cap(self, tmp_path):
+        from utilities.autopatcher.candidate_selection import DEFAULT_MAX_CANDIDATES
+        from utilities.autopatcher.remediation_planner import build_planner_candidates
+
+        names = []
+        for i in range(DEFAULT_MAX_CANDIDATES + 3):
+            fname = f"f{i}.py"
+            (tmp_path / fname).write_text("pass\n", encoding="utf-8")
+            names.append(fname)
+
+        plan = RemediationPlanResult(rendered="", target_files=names, target_symbols=[])
+        candidates = build_planner_candidates(plan, tmp_path, None)
+
+        assert len(candidates) == DEFAULT_MAX_CANDIDATES
+        assert [c.path for c in candidates] == names[:DEFAULT_MAX_CANDIDATES]
+
+    def test_verified_symbol_used_as_hit_line(self, tmp_path):
+        (tmp_path / "retry.py").write_text("class Retry:\n    pass\n", encoding="utf-8")
+        context = _make_context(functions={
+            "retry.py:Retry.method": {"name": "method", "startLine": 7, "endLine": 9, "className": "Retry"},
+        })
+        from utilities.autopatcher.remediation_planner import build_planner_candidates
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=["retry.py:Retry.method"])
+
+        candidates = build_planner_candidates(plan, tmp_path, context)
+
+        assert len(candidates) == 1
+        ev = candidates[0].evidence[0]
+        assert ev.hit_line == 7
+        assert ev.resolution_strategy == "planner_symbol_verified"
+        assert ev.pass_name == "planner_proposed"
+
+    def test_unresolved_symbol_does_not_suppress_file_candidate(self, tmp_path):
+        (tmp_path / "retry.py").write_text("class Retry:\n    pass\n", encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import build_planner_candidates
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=["nonexistent_symbol_xyz"])
+
+        candidates = build_planner_candidates(plan, tmp_path, None)
+
+        assert len(candidates) == 1
+        ev = candidates[0].evidence[0]
+        assert ev.hit_line == 0
+        assert ev.resolution_strategy == "planner_file_only"
+
+    def test_candidate_has_no_grounding_tier(self, tmp_path):
+        # best_tier (what render_repository_understanding's "best tier"
+        # line actually reads) must stay None -- a Planner-origin candidate
+        # must never claim an ordinary Repository Grounding tier.
+        (tmp_path / "retry.py").write_text("pass\n", encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import build_planner_candidates
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=[])
+
+        candidates = build_planner_candidates(plan, tmp_path, None)
+
+        assert candidates[0].best_tier is None
+        assert candidates[0].evidence[0].pass_name == "planner_proposed"
+
+
+# ---------------------------------------------------------------------------
+# build_planner_source_excerpts() -- verified real source, bounded
+# ---------------------------------------------------------------------------
+
+class TestBuildPlannerSourceExcerpts:
+    def _candidate(self, path):
+        from utilities.autopatcher.remediation_planner import DiscoveryEvidence, RepositoryCandidate
+        return RepositoryCandidate(
+            path=path,
+            evidence=[DiscoveryEvidence(pass_name="planner_proposed", tier=0, matched_tokens=None,
+                                         total_occurrences=None, hit_line=0, resolution_strategy="planner_file_only")],
+            best_tier=None,
+        )
+
+    def test_function_symbol_renders_exact_source_with_path_and_line_range(self, tmp_path):
+        target = tmp_path / "poolmanager.py"
+        func_src = (
+            "def urlopen(self, method, url, redirect=True, **kw):\n"
+            "    # strip headers unsafe to forward on redirect\n"
+            "    pass\n"
+        )
+        target.write_text("class PoolManager:\n" + "\n".join("    " + l for l in func_src.splitlines()) + "\n",
+                           encoding="utf-8")
+        context = _make_context(
+            functions={
+                "poolmanager.py:PoolManager.urlopen": {
+                    "name": "urlopen", "startLine": 409, "endLine": 486, "className": "PoolManager",
+                    "code": func_src,
+                },
+            },
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_planner_symbols, build_planner_candidates, build_planner_source_excerpts,
+        )
+
+        plan = RemediationPlanResult(
+            rendered="", target_files=["poolmanager.py"], target_symbols=["poolmanager.py:PoolManager.urlopen"],
+        )
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+
+        result = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert "#### Verified source: `poolmanager.py:PoolManager.urlopen` (lines 409–486)" in result
+        assert "def urlopen(self, method, url, redirect=True, **kw):" in result
+        assert "strip headers unsafe to forward on redirect" in result
+
+    def test_constant_symbol_renders_exact_defining_line(self, tmp_path):
+        target = tmp_path / "retry.py"
+        target.write_text(
+            "class Retry:\n"
+            "    DEFAULT_ALLOWED_METHODS = frozenset(['GET'])\n"
+            "    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            constants={
+                "retry.py": {
+                    "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": {
+                        "qualified_name": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "class_name": "Retry", "name": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "line": 3, "end_line": 3,
+                    },
+                },
+            },
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_planner_symbols, build_planner_candidates, build_planner_source_excerpts,
+        )
+
+        plan = RemediationPlanResult(
+            rendered="", target_files=["retry.py"],
+            target_symbols=["retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"],
+        )
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+
+        result = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert "#### Verified source: `retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT` (lines 3–3)" in result
+        # exact repository capitalization/literal value -- not invented or normalized
+        assert 'DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])' in result
+        assert '"authorization"' not in result  # lowercase variant must never appear
+
+    def test_file_only_candidate_does_not_use_module_level_as_symbol(self, tmp_path):
+        target = tmp_path / "solo.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+        candidate = self._candidate("solo.py")
+
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        result = build_planner_source_excerpts([candidate], {}, tmp_path, None)
+
+        assert "__module__" not in result
+        assert "(full file, 1 lines)" in result
+
+    def test_full_file_fallback_used_when_no_symbol_resolves(self, tmp_path):
+        target = tmp_path / "solo.py"
+        target.write_text("line1\nline2\nline3\n", encoding="utf-8")
+        candidate = self._candidate("solo.py")
+
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        result = build_planner_source_excerpts([candidate], {}, tmp_path, None)
+
+        assert "#### Verified source: `solo.py` (full file, 3 lines)" in result
+        assert "line1\nline2\nline3" in result
+
+    def test_oversized_full_file_omitted_not_truncated(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        target = tmp_path / "huge.py"
+        target.write_text("x = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8")
+        candidate = self._candidate("huge.py")
+
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        result = build_planner_source_excerpts([candidate], {}, tmp_path, None)
+
+        # nothing fit, so no partial/truncated block -- but the omission is
+        # stated explicitly rather than silently returning nothing at all.
+        assert "#### Verified source" not in result
+        assert "huge.py" in result
+        assert "omitted to stay within" in result
+
+    def test_oversized_first_excerpt_does_not_suppress_later_excerpt(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        (tmp_path / "huge.py").write_text("x = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8")
+        (tmp_path / "small.py").write_text("y = 2\n", encoding="utf-8")
+        candidates = [self._candidate("huge.py"), self._candidate("small.py")]
+
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        result = build_planner_source_excerpts(candidates, {}, tmp_path, None)
+
+        assert "#### Verified source: `small.py`" in result
+        assert "y = 2" in result
+        assert "huge.py" in result  # named in the omission note
+        assert "omitted to stay within" in result
+
+    def test_duplicate_candidate_paths_emit_once(self, tmp_path):
+        (tmp_path / "solo.py").write_text("x = 1\n", encoding="utf-8")
+        candidates = [self._candidate("solo.py"), self._candidate("solo.py")]
+
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        result = build_planner_source_excerpts(candidates, {}, tmp_path, None)
+
+        assert result.count("#### Verified source") == 1
+
+    def test_excerpt_order_matches_candidate_order(self, tmp_path):
+        (tmp_path / "b.py").write_text("b = 1\n", encoding="utf-8")
+        (tmp_path / "a.py").write_text("a = 1\n", encoding="utf-8")
+        candidates = [self._candidate("b.py"), self._candidate("a.py")]
+
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        result = build_planner_source_excerpts(candidates, {}, tmp_path, None)
+
+        assert result.index("b.py") < result.index("a.py")
+
+    def test_no_candidates_returns_empty(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        assert build_planner_source_excerpts([], {}, tmp_path, None) == ""
+
+    def test_unreadable_file_omitted_not_raising(self, tmp_path):
+        # Missing/unreadable is a distinct category from "omitted for
+        # budget reasons" -- see test_omission_categories_distinguished.
+        candidate = self._candidate("does_not_exist_on_disk.py")
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        result = build_planner_source_excerpts([candidate], {}, tmp_path, None)
+        assert "#### Verified source" not in result
+        assert "does_not_exist_on_disk.py" in result
+        assert "source could not be read" in result
+
+    def test_subheading_and_disclaimer_present(self, tmp_path):
+        (tmp_path / "solo.py").write_text("x = 1\n", encoding="utf-8")
+        candidate = self._candidate("solo.py")
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        result = build_planner_source_excerpts([candidate], {}, tmp_path, None)
+
+        assert result.startswith("### Verified source from Planner-proposed candidates")
+        assert "loaded from the target repository" in result
+        assert "proposed by the Remediation Planner" in result
+        assert "does not prove" in result
+
+
+# ---------------------------------------------------------------------------
+# build_planner_source_excerpts() -- optional `max_chars` override (Evidence-
+# Gap Strategy Fallback follow-up). `max_chars=None` (every existing caller)
+# must remain byte-for-byte unchanged; an explicit override widens ONLY the
+# shared budget for that one call, never introducing an unbounded/full-repo
+# read.
+# ---------------------------------------------------------------------------
+
+class TestBuildPlannerSourceExcerptsMaxCharsOverride:
+    def _candidate(self, path):
+        from utilities.autopatcher.remediation_planner import DiscoveryEvidence, RepositoryCandidate
+        return RepositoryCandidate(
+            path=path,
+            evidence=[DiscoveryEvidence(pass_name="planner_proposed", tier=0, matched_tokens=None,
+                                         total_occurrences=None, hit_line=0, resolution_strategy="planner_file_only")],
+            best_tier=None,
+        )
+
+    def test_default_none_matches_prior_no_max_chars_call_exactly(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        (tmp_path / "medium.py").write_text("x = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8")
+        candidate = self._candidate("medium.py")
+
+        result_no_kwarg = build_planner_source_excerpts([candidate], {}, tmp_path, None)
+        result_explicit_none = build_planner_source_excerpts([candidate], {}, tmp_path, None, max_chars=None)
+        assert result_no_kwarg == result_explicit_none
+
+    def test_larger_max_chars_includes_content_omitted_under_default_budget(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        # Sized to exceed the default 4,000-char budget but fit comfortably
+        # under a larger one -- exactly the shape of the real motivating
+        # gap (a symbol too big for Stage 1's small pre-Strategy budget,
+        # but small enough for the larger Final-Target Slice ceiling).
+        (tmp_path / "medium.py").write_text("x = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8")
+        candidate = self._candidate("medium.py")
+
+        result_default = build_planner_source_excerpts([candidate], {}, tmp_path, None)
+        assert "#### Verified source" not in result_default
+        assert "omitted to stay within" in result_default
+
+        result_bigger = build_planner_source_excerpts(
+            [candidate], {}, tmp_path, None, max_chars=DEFAULT_MAX_CHARS * 3,
+        )
+        assert "#### Verified source: `medium.py`" in result_bigger
+
+    def test_max_chars_override_still_bounded_not_unbounded(self, tmp_path):
+        """An explicit override is still a hard ceiling -- a file bigger
+        than the override is still omitted whole, never truncated or read
+        as a full/unbounded file."""
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        (tmp_path / "huge.py").write_text("x = 1\n" * 5000, encoding="utf-8")
+        candidate = self._candidate("huge.py")
+
+        result = build_planner_source_excerpts([candidate], {}, tmp_path, None, max_chars=100)
+        assert "#### Verified source" not in result
+        assert "omitted to stay within the 100-character budget" in result
+
+
+# ---------------------------------------------------------------------------
+# build_planner_source_excerpts() -- two-pass priority (verified symbols
+# strictly before any full-file fallback), and the _collections.py leak proof
+# ---------------------------------------------------------------------------
+
+class TestBuildPlannerSourceExcerptsPriority:
+    def _candidate(self, path):
+        from utilities.autopatcher.remediation_planner import DiscoveryEvidence, RepositoryCandidate
+        return RepositoryCandidate(
+            path=path,
+            evidence=[DiscoveryEvidence(pass_name="planner_proposed", tier=0, matched_tokens=None,
+                                         total_occurrences=None, hit_line=0, resolution_strategy="planner_file_only")],
+            best_tier=None,
+        )
+
+    def test_fallback_first_in_order_does_not_block_a_later_verified_symbol(self, tmp_path):
+        # This is the exact regression: a symbol-less (fallback-eligible)
+        # candidate appears FIRST in Planner order; a verified symbol
+        # excerpt for a DIFFERENT candidate appears second. The symbol
+        # excerpt must still be included -- pass 1 processes ALL symbols
+        # before pass 2 ever attempts a fallback, regardless of order.
+        (tmp_path / "collections.py").write_text("x = 1\n" * 2000, encoding="utf-8")  # large, no symbol
+        target = tmp_path / "retry.py"
+        target.write_text("class Retry:\n    pass\n", encoding="utf-8")
+        context = _make_context(
+            functions={"retry.py:Retry.method": {"name": "method", "startLine": 2, "endLine": 2,
+                                                  "className": "Retry", "code": "    pass\n"}},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_planner_symbols, build_planner_candidates, build_planner_source_excerpts,
+        )
+        plan = RemediationPlanResult(
+            rendered="", target_files=["collections.py", "retry.py"], target_symbols=["retry.py:Retry.method"],
+        )
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+        assert [c.path for c in candidates] == ["collections.py", "retry.py"]  # fallback-eligible listed first
+
+        result = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert "#### Verified source: `retry.py:Retry.method`" in result
+
+    def test_oversized_fallback_omitted_does_not_consume_budget_from_symbol(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        (tmp_path / "huge.py").write_text("x = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8")
+        (tmp_path / "retry.py").write_text("class Retry:\n    pass\n", encoding="utf-8")
+        context = _make_context(
+            functions={"retry.py:Retry.method": {"name": "method", "startLine": 2, "endLine": 2,
+                                                  "className": "Retry", "code": "    pass\n"}},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_planner_symbols, build_planner_candidates, build_planner_source_excerpts,
+        )
+        plan = RemediationPlanResult(rendered="", target_files=["huge.py", "retry.py"], target_symbols=["retry.py:Retry.method"])
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+
+        result = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert "#### Verified source: `retry.py:Retry.method`" in result
+        assert "huge.py" in result  # named in the fallback omission note
+
+    def test_oversized_symbol_excerpt_omitted_not_upgraded_to_full_file(self, tmp_path):
+        # Requirement #4: if the verified function itself doesn't fit,
+        # omit it explicitly -- never silently fall back to that same
+        # file's whole content instead.
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        target = tmp_path / "big_module.py"
+        huge_body = "\n".join(f"    line_{i} = {i}" for i in range(DEFAULT_MAX_CHARS // 8))
+        target.write_text(f"class C:\n    def method(self):\n{huge_body}\n", encoding="utf-8")
+        context = _make_context(
+            functions={"big_module.py:C.method": {
+                "name": "method", "startLine": 2, "endLine": 2 + DEFAULT_MAX_CHARS // 8, "className": "C",
+                "code": f"    def method(self):\n{huge_body}\n",
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_planner_symbols, build_planner_candidates, build_planner_source_excerpts,
+        )
+        plan = RemediationPlanResult(rendered="", target_files=["big_module.py"], target_symbols=["big_module.py:C.method"])
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+
+        result = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert "#### Verified source" not in result  # neither the function nor a "full file" substitute
+        assert "big_module.py:C.method" in result
+        assert "symbol excerpt(s) omitted" in result
+
+    def test_symbol_pass_order_is_deterministic(self, tmp_path):
+        (tmp_path / "b.py").write_text("class B:\n    pass\n", encoding="utf-8")
+        (tmp_path / "a.py").write_text("class A:\n    pass\n", encoding="utf-8")
+        context = _make_context(
+            functions={
+                "b.py:B.m": {"name": "m", "startLine": 2, "endLine": 2, "className": "B"},
+                "a.py:A.m": {"name": "m", "startLine": 2, "endLine": 2, "className": "A"},
+            },
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_planner_symbols, build_planner_candidates, build_planner_source_excerpts,
+        )
+        plan = RemediationPlanResult(rendered="", target_files=["b.py", "a.py"], target_symbols=["b.py:B.m", "a.py:A.m"])
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+
+        result = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert result.index("b.py:B.m") < result.index("a.py:A.m")
+
+    def test_fallback_pass_order_is_deterministic(self, tmp_path):
+        (tmp_path / "b.py").write_text("b = 1\n", encoding="utf-8")
+        (tmp_path / "a.py").write_text("a = 1\n", encoding="utf-8")
+        candidates = [self._candidate("b.py"), self._candidate("a.py")]
+
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        result = build_planner_source_excerpts(candidates, {}, tmp_path, None)
+
+        assert result.index("b.py") < result.index("a.py")
+
+    def test_omission_categories_distinguished(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        # one oversized symbol excerpt, one oversized fallback file, one
+        # unreadable path -- each must land in its own, differently-worded
+        # category, not a single undifferentiated list.
+        huge_body = "\n".join(f"    x{i} = {i}" for i in range(DEFAULT_MAX_CHARS // 4))
+        (tmp_path / "sym.py").write_text(f"class C:\n    def m(self):\n{huge_body}\n", encoding="utf-8")
+        (tmp_path / "fb.py").write_text("y = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8")
+        context = _make_context(
+            functions={"sym.py:C.m": {
+                "name": "m", "startLine": 2, "endLine": 2 + DEFAULT_MAX_CHARS // 4, "className": "C",
+                "code": f"    def m(self):\n{huge_body}\n",
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_planner_symbols, build_planner_candidates, build_planner_source_excerpts,
+        )
+        plan = RemediationPlanResult(
+            rendered="", target_files=["sym.py", "fb.py"], target_symbols=["sym.py:C.m"],
+        )
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+        # A path that never existed is rejected during verification (never
+        # reaches build_planner_source_excerpts at all) -- to exercise the
+        # "source could not be read" category specifically, add a
+        # candidate the same way build_planner_candidates would have, had
+        # the file existed at verification time and then vanished before
+        # this stage ran (e.g. a race), the one case a real read failure
+        # can still occur here.
+        candidates = candidates + [self._candidate("missing.py")]
+
+        result = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert "symbol excerpt(s) omitted to stay within" in result
+        assert "full-file fallback(s) omitted to stay within" in result
+        assert "source could not be read" in result
+        assert "sym.py:C.m" in result
+        assert "fb.py" in result
+        assert "missing.py" in result
+
+    def test_structural_evidence_remains_when_every_excerpt_omitted(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        (tmp_path / "huge.py").write_text("x = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        plan = RemediationPlanResult(rendered="", target_files=["huge.py"], target_symbols=[])
+
+        result = build_planner_evidence(plan, str(tmp_path), "vuln", None)
+
+        assert result.startswith("## Planner-Proposed Candidate Evidence")
+        assert "huge.py" in result
+        assert "full-file fallback(s) omitted" in result
+
+    def test_collections_py_absent_unless_in_target_files(self, tmp_path):
+        # The exact regression from the real run: a file must never enter
+        # the Planner-source block unless it is literally one of the
+        # Planner's OWN (verified) target_files -- never introduced via
+        # symbol resolution, enrichment, or any other path.
+        (tmp_path / "src" / "urllib3").mkdir(parents=True)
+        (tmp_path / "src" / "urllib3" / "_collections.py").write_text("x = 1\n", encoding="utf-8")
+        (tmp_path / "retry.py").write_text("class Retry:\n    pass\n", encoding="utf-8")
+        context = _make_context(
+            functions={"retry.py:Retry.method": {"name": "method", "startLine": 2, "endLine": 2, "className": "Retry"}},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+
+        # _collections.py is NOT in target_files -- only retry.py is.
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=["retry.py:Retry.method"])
+        result = build_planner_evidence(plan, str(tmp_path), "vuln", context)
+
+        assert "_collections.py" not in result
+
+    def test_realistic_constant_and_function_both_fit_default_budget(self, tmp_path):
+        # Sized to match the real urllib3 measurement (constant excerpt
+        # ~192 chars, PoolManager.urlopen excerpt ~3111 chars, overhead
+        # ~317 chars -- 3620 total, under the existing 4000 budget once
+        # prioritization is correct).
+        retry_py = tmp_path / "src" / "urllib3" / "util" / "retry.py"
+        retry_py.parent.mkdir(parents=True)
+        retry_py.write_text(
+            "class Retry:\n    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n",
+            encoding="utf-8",
+        )
+        pool_py = tmp_path / "src" / "urllib3" / "poolmanager.py"
+        urlopen_body = "\n".join(f"        line_{i} = {i}" for i in range(90))  # ~78-line-scale function
+        urlopen_src = f"    def urlopen(self, method, url, redirect=True, **kw):\n{urlopen_body}\n"
+        pool_py.write_text("class PoolManager:\n" + urlopen_src, encoding="utf-8")
+
+        context = _make_context(
+            functions={
+                "src/urllib3/poolmanager.py:PoolManager.urlopen": {
+                    "name": "urlopen", "startLine": 409, "endLine": 486, "className": "PoolManager",
+                    "code": urlopen_src,
+                },
+            },
+            constants={
+                "src/urllib3/util/retry.py": {
+                    "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": {
+                        "qualified_name": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "class_name": "Retry", "name": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "line": 2, "end_line": 2,
+                    },
+                },
+            },
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        plan = RemediationPlanResult(
+            rendered="",
+            target_files=["src/urllib3/util/retry.py", "src/urllib3/poolmanager.py"],
+            target_symbols=[
+                "src/urllib3/util/retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                "src/urllib3/poolmanager.py:PoolManager.urlopen",
+            ],
+        )
+
+        result = build_planner_evidence(plan, str(tmp_path), "Cookie header leaked on redirect", context)
+
+        assert 'DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])' in result
+        assert "def urlopen(self, method, url, redirect=True, **kw):" in result
+        assert "omitted" not in result  # both fit; nothing dropped
+        assert len(result) > 0
+
+
+# ---------------------------------------------------------------------------
+# build_planner_source_excerpts() -- fair budget allocation across verified
+# symbol candidates (FIX 3). Three deterministic Pass-1 candidates compete
+# for the shared DEFAULT_MAX_CHARS window: one oversized (cannot fit inside
+# an equal per-candidate share of the budget), two modest siblings sized to
+# each individually fit comfortably within that share, but whose COMBINED
+# size the OLD strict first-come admission cannot accommodate once the
+# oversized candidate -- processed first, per ordinary Planner target order
+# -- has already consumed most of the window. Real-trace shape: a coarse
+# class-level symbol followed by two narrower method-level symbols in
+# sibling files (see the forensic report's Run-3 analysis).
+# ---------------------------------------------------------------------------
+
+class TestBuildPlannerSourceExcerptsFairAllocation:
+    def _context_with_three_candidates(self, tmp_path, huge_lines=533, small_lines=100):
+        """One oversized function (`huge.py:C.huge_method`) ordered FIRST,
+        two modest sibling functions (`small1.py:C.small_method`,
+        `small2.py:C.small_method`) ordered after it -- exactly the
+        "coarse target consumes budget before its siblings get a turn"
+        shape. `huge_lines`/`small_lines` default to sizes empirically
+        confirmed (via `_render_source_excerpt`) to: (a) make the huge
+        candidate exceed an equal three-way share of DEFAULT_MAX_CHARS
+        (4,000 // 3 = 1,333 chars) while still being individually
+        admissible against the full budget in isolation, and (b) make each
+        small candidate comfortably fit its own equal share alone, while
+        the OLD first-come-only algorithm -- huge admitted first, then
+        small1, leaving no room for small2 -- starves exactly one of the
+        two siblings purely because of processing order, not evidence
+        value."""
+        for name in ("huge.py", "small1.py", "small2.py"):
+            (tmp_path / name).write_text("class C:\n    pass\n", encoding="utf-8")
+        huge_body = "x = 1\n" * huge_lines
+        small_body = "x = 1\n" * small_lines
+        context = _make_context(
+            functions={
+                "huge.py:C.huge_method": {
+                    "name": "huge_method", "startLine": 2, "endLine": 2 + huge_lines,
+                    "className": "C", "code": huge_body,
+                },
+                "small1.py:C.small_method": {
+                    "name": "small_method", "startLine": 2, "endLine": 2 + small_lines,
+                    "className": "C", "code": small_body,
+                },
+                "small2.py:C.small_method": {
+                    "name": "small_method", "startLine": 2, "endLine": 2 + small_lines,
+                    "className": "C", "code": small_body,
+                },
+            },
+            repo_path=tmp_path,
+        )
+        plan = RemediationPlanResult(
+            rendered="",
+            target_files=["huge.py", "small1.py", "small2.py"],
+            target_symbols=["huge.py:C.huge_method", "small1.py:C.small_method", "small2.py:C.small_method"],
+        )
+        return context, plan
+
+    def test_fair_allocation_preserves_both_small_siblings(self, tmp_path):
+        """RED-first proof of the corrected invariant (FIX 3): before the
+        fix, the oversized candidate -- processed first, per ordinary
+        Planner target order -- is admitted greedily, small1 still fits
+        after it, but small2 is omitted purely because of processing
+        order (it carries the same evidence value as small1, not less).
+        After the fix, once every verified candidate gets a fair first
+        turn before any one of them is allowed to grow beyond an equal
+        share, ordering can no longer determine which same-sized sibling
+        survives -- BOTH small candidates must be present, regardless of
+        the oversized candidate's position or fate, and the rendered
+        result must never exceed the same hard budget."""
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_planner_symbols, build_planner_candidates, build_planner_source_excerpts,
+        )
+        context, plan = self._context_with_three_candidates(tmp_path)
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+
+        result = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert "#### Verified source: `small1.py:C.small_method`" in result
+        assert "#### Verified source: `small2.py:C.small_method`" in result  # no longer starved by candidate order
+        # The oversized candidate genuinely cannot join both now-guaranteed
+        # siblings within the same hard budget -- it is correctly omitted,
+        # never truncated, never silently upgraded, and the omission is
+        # still reported explicitly (named in the note, not rendered as a
+        # source block).
+        assert "#### Verified source: `huge.py:C.huge_method`" not in result
+        assert "huge.py:C.huge_method" in result
+        assert "symbol excerpt(s) omitted" in result
+        assert len(result) <= DEFAULT_MAX_CHARS + 2000  # generous slack for headers/prose, still hard-bounded
+
+    def test_balanced_candidates_are_unaffected_non_interference(self, tmp_path):
+        """Non-interference control: when every verified candidate already
+        fits comfortably (individually AND combined) within the budget,
+        the fair-allocation pass must produce the exact same outcome as
+        the simple first-come admission it replaces -- nothing is
+        deferred, nothing is omitted, and candidate order is preserved."""
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_planner_symbols, build_planner_candidates, build_planner_source_excerpts,
+        )
+        context, plan = self._context_with_three_candidates(tmp_path, huge_lines=20, small_lines=20)
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+
+        result = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert "huge.py:C.huge_method" in result
+        assert "small1.py:C.small_method" in result
+        assert "small2.py:C.small_method" in result
+        assert "omitted" not in result
+        # Original candidate order preserved end to end.
+        assert result.index("huge.py:C.huge_method") < result.index("small1.py:C.small_method")
+        assert result.index("small1.py:C.small_method") < result.index("small2.py:C.small_method")
+
+
+# ---------------------------------------------------------------------------
+# build_planner_evidence() -- full bridge: verify -> enrich -> fuse -> render
+# ---------------------------------------------------------------------------
+
+class TestBuildPlannerEvidence:
+    def test_no_repo_root_returns_empty(self):
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        plan = RemediationPlanResult(rendered="", target_files=["a.py"], target_symbols=[])
+        assert build_planner_evidence(plan, None, "vuln", None) == ""
+
+    def test_no_proposals_returns_empty(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        plan = RemediationPlanResult(rendered="", target_files=[], target_symbols=[])
+        assert build_planner_evidence(plan, str(tmp_path), "vuln", None) == ""
+
+    def test_no_candidates_survive_verification_returns_empty(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        plan = RemediationPlanResult(rendered="", target_files=["/etc/passwd"], target_symbols=[])
+        assert build_planner_evidence(plan, str(tmp_path), "vuln", None) == ""
+
+    def test_reuses_enrichment_and_renders_with_planner_heading(self, tmp_path):
+        (tmp_path / "retry.py").write_text("class Retry:\n    pass\n", encoding="utf-8")
+        context = _make_context(functions={
+            "retry.py:Retry.method": {"name": "method", "startLine": 2, "endLine": 2, "className": "Retry"},
+        })
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=["retry.py:Retry.method"])
+
+        result = build_planner_evidence(plan, str(tmp_path), "vuln", context)
+
+        assert result.startswith("## Planner-Proposed Candidate Evidence")
+        assert "retry.py" in result
+        # a real fact produced by the EXISTING enrichment/rendering pipeline,
+        # not something this bridge invents itself:
+        assert "Resolved near grounding evidence" in result
+
+    def test_disclaimer_present(self, tmp_path):
+        (tmp_path / "retry.py").write_text("pass\n", encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=[])
+
+        result = build_planner_evidence(plan, str(tmp_path), "vuln", None)
+
+        assert "proposed by the experimental Remediation Planner" in result
+        assert "verified to exist in this repository" in result
+        assert "None of this confirms" in result
+
+    def test_no_confusing_internal_wording_leaked(self, tmp_path):
+        (tmp_path / "retry.py").write_text("pass\n", encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=[])
+
+        result = build_planner_evidence(plan, str(tmp_path), "vuln", None)
+
+        assert "synthetic candidate" not in result.lower()
+
+    def test_ordinary_repository_understanding_heading_not_used(self, tmp_path):
+        (tmp_path / "retry.py").write_text("pass\n", encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=[])
+
+        result = build_planner_evidence(plan, str(tmp_path), "vuln", None)
+
+        assert not result.startswith("## Repository Understanding")
+
+    def test_enrichment_failure_returns_empty_not_raises(self, tmp_path, monkeypatch):
+        (tmp_path / "retry.py").write_text("pass\n", encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+
+        def _boom(*a, **kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr("utilities.autopatcher.candidate_enrichment.enrich_candidates", _boom)
+
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=[])
+        assert build_planner_evidence(plan, str(tmp_path), "vuln", None) == ""
+
+    def test_fusion_failure_returns_empty_not_raises(self, tmp_path, monkeypatch):
+        (tmp_path / "retry.py").write_text("pass\n", encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+
+        def _boom(*a, **kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr("utilities.autopatcher.evidence_fusion.fuse_evidence", _boom)
+
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=[])
+        assert build_planner_evidence(plan, str(tmp_path), "vuln", None) == ""
+
+    def test_investigation_context_not_rebuilt(self, tmp_path, monkeypatch):
+        (tmp_path / "retry.py").write_text("pass\n", encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+
+        called = {"n": 0}
+
+        def _fail_if_called(*a, **kw):
+            called["n"] += 1
+            raise AssertionError("build_investigation_context must not be called by the bridge")
+
+        monkeypatch.setattr(
+            "utilities.autopatcher.candidate_enrichment.build_investigation_context", _fail_if_called
+        )
+
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=[])
+        build_planner_evidence(plan, str(tmp_path), "vuln", None)
+
+        assert called["n"] == 0
+
+    def test_no_context_preserves_structural_evidence(self, tmp_path):
+        # No InvestigationContext at all -- structural evidence still
+        # renders (degraded, file/test-only). The full-file fallback in
+        # build_planner_source_excerpts reads straight from disk and does
+        # not itself need an index, so a small file-only candidate's whole
+        # file is still included -- this is intentional, not a bug: no
+        # context should never mean "no source at all" when a plain file
+        # read is enough.
+        (tmp_path / "retry.py").write_text("pass\n", encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=[])
+
+        result = build_planner_evidence(plan, str(tmp_path), "vuln", None)
+
+        assert result.startswith("## Planner-Proposed Candidate Evidence")
+        assert "### Verified source from Planner-proposed candidates" in result
+        assert "#### Verified source: `retry.py` (full file, 1 lines)" in result
+
+    def test_source_read_failure_preserves_structural_evidence(self, tmp_path, monkeypatch):
+        (tmp_path / "retry.py").write_text("class Retry:\n    pass\n", encoding="utf-8")
+        context = _make_context(
+            functions={"retry.py:Retry.method": {"name": "method", "startLine": 2, "endLine": 2, "className": "Retry"}},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+
+        def _boom(*a, **kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "utilities.autopatcher.remediation_planner._compute_source_excerpt_plan", _boom
+        )
+
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=["retry.py:Retry.method"])
+        result = build_planner_evidence(plan, str(tmp_path), "vuln", context)
+
+        assert result.startswith("## Planner-Proposed Candidate Evidence")
+        assert "Verified source from Planner-proposed candidates" not in result
+
+    def test_urllib3_style_end_to_end_includes_constant_and_function_source(self, tmp_path):
+        # The scenario this whole task exists to fix: a verified constant
+        # AND a verified function, both with real source reaching the
+        # rendered Planner evidence block.
+        retry_py = tmp_path / "src" / "urllib3" / "util" / "retry.py"
+        retry_py.parent.mkdir(parents=True)
+        retry_py.write_text(
+            "class Retry:\n"
+            "    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n",
+            encoding="utf-8",
+        )
+        pool_py = tmp_path / "src" / "urllib3" / "poolmanager.py"
+        pool_py.write_text(
+            "class PoolManager:\n"
+            "    def urlopen(self, method, url, redirect=True, **kw):\n"
+            "        pass\n",
+            encoding="utf-8",
+        )
+        urlopen_src = "    def urlopen(self, method, url, redirect=True, **kw):\n        pass\n"
+
+        context = _make_context(
+            functions={
+                "src/urllib3/poolmanager.py:PoolManager.urlopen": {
+                    "name": "urlopen", "startLine": 2, "endLine": 3, "className": "PoolManager",
+                    "code": urlopen_src,
+                },
+            },
+            constants={
+                "src/urllib3/util/retry.py": {
+                    "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": {
+                        "qualified_name": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "class_name": "Retry", "name": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "line": 2, "end_line": 2,
+                    },
+                },
+            },
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        plan = RemediationPlanResult(
+            rendered="",
+            target_files=["src/urllib3/util/retry.py", "src/urllib3/poolmanager.py"],
+            target_symbols=[
+                "src/urllib3/util/retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                "src/urllib3/poolmanager.py:PoolManager.urlopen",
+            ],
+        )
+
+        result = build_planner_evidence(plan, str(tmp_path), "Cookie header leaked on redirect", context)
+
+        assert 'DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])' in result
+        assert "def urlopen(self, method, url, redirect=True, **kw):" in result
+        assert "### Verified source from Planner-proposed candidates" in result
+        # structural evidence still precedes the source subsection
+        assert result.index("## Planner-Proposed Candidate Evidence") < result.index("### Verified source")
+
+
+def _big_function_fixture(tmp_path, n_lines, name="big_function"):
+    """A single resolved target symbol whose rendered source-excerpt block
+    size is precisely controllable via `n_lines` -- used to prove the
+    deterministic budget-expansion loop in build_planner_evidence_with_budget
+    requests exactly as many windows as are actually needed (and no more),
+    never fewer than are actually reachable."""
+    body = "\n".join(f"    line_{i} = {i}" for i in range(1, n_lines))
+    src = f"def {name}():\n{body}\n    return None\n"
+    (tmp_path / "mod.py").write_text(src, encoding="utf-8")
+    context = _make_context(
+        functions={f"mod.py:{name}": {"name": name, "startLine": 1, "endLine": len(src.splitlines()), "code": src}},
+        repo_path=tmp_path,
+    )
+    plan = RemediationPlanResult(rendered="", target_files=["mod.py"], target_symbols=[f"mod.py:{name}"])
+    return plan, context
+
+
+def _expected_planner_capacity(vulnerability_text="vuln"):
+    """The exact real technical-capacity ceiling `build_planner_evidence_
+    with_budget` computes for "planner_evidence" today, in this test
+    environment -- computed via the SAME production function tests
+    exercise (never a hardcoded, environment-sensitive magic number)."""
+    from utilities.autopatcher.llm_client import resolve_active_model, resolve_max_tokens
+    from utilities.autopatcher.remediation_planner import _planner_evidence_known_overhead_chars
+    from utilities.autopatcher.technical_capacity import compute_source_capacity
+    overhead = _planner_evidence_known_overhead_chars(vulnerability_text)
+    return compute_source_capacity(
+        *resolve_active_model(), reserved_output_tokens=resolve_max_tokens(),
+        known_overhead_chars=overhead,
+    ).source_capacity_chars
+
+
+class TestBuildPlannerEvidenceWithBudget:
+    """build_planner_evidence_with_budget() -- Fix B: the ONE shared,
+    deterministic Planner-evidence construction path used by both Strategy
+    #1's own construction and the evidence-gap Strategy fallback (see
+    pipeline.py). No LLM call happens anywhere in this function. The
+    ceiling is the real per-call technical source-capacity for the
+    "planner_evidence" stage (see utilities.autopatcher.technical_capacity)
+    -- never an arbitrary fixed-size "window" grown on request; there is no
+    more expansion loop to test, only a single real-capacity render."""
+
+    def test_no_controller_still_computes_real_technical_capacity(self, tmp_path):
+        """A small fixture fits comfortably under the real technical
+        ceiling (now two-plus orders of magnitude larger than the old
+        4,000-char base) with no controller at all -- "no controller" has
+        never meant "no ceiling", and it never means "the old, arbitrary,
+        much smaller ceiling" either."""
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan, context = _big_function_fixture(tmp_path, 50)
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=None,
+        )
+        assert not result.excerpt_plan.symbol_omitted
+        assert result.excerpt_plan.capacity is not None
+        assert result.excerpt_plan.capacity.capacity_source in (
+            "model_registry", "conservative_fallback",
+        )
+
+    def test_fits_within_real_capacity_no_omission(self, tmp_path):
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan, context = _big_function_fixture(tmp_path, 320)
+        controller = ContextBudgetController()
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=controller,
+        )
+        assert not result.excerpt_plan.symbol_omitted
+        assert not result.excerpt_plan.omission_reason
+        state = controller.to_trace_dict()["stages"]["planner_evidence"]
+        assert state["capacity_is_approximate"] is True
+        assert "source_capacity_chars" in state
+
+    def test_ceiling_cached_across_calls_on_same_controller(self, tmp_path):
+        """The stage's real capacity is computed ONCE per run and cached --
+        a second call against the same controller (e.g. a later Fix A
+        round) reuses the exact same ceiling, never re-derived."""
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan, context = _big_function_fixture(tmp_path, 50)
+        controller = ContextBudgetController()
+        build_planner_evidence_with_budget(plan, tmp_path, "vuln", context, budget_controller=controller)
+        first = controller.capacity_result("planner_evidence").source_capacity_chars
+        build_planner_evidence_with_budget(plan, tmp_path, "vuln", context, budget_controller=controller)
+        second = controller.capacity_result("planner_evidence").source_capacity_chars
+        assert first == second
+
+    def test_resolved_but_technically_oversized_block_recorded(self, tmp_path):
+        """A single resolved candidate too large to fit even the real
+        (much larger) technical ceiling is omitted, but never silently:
+        `resolved` still holds (build_planner_candidates/symbol resolution
+        succeeded), `included` is False, and the omission carries an
+        explicit `omission_reason == "technical_capacity"` plus its exact
+        size -- never bare prose."""
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        capacity = _expected_planner_capacity()
+        # Comfortably larger than the real ceiling regardless of environment
+        # (chars-per-line ~15; +50% margin over the computed ceiling).
+        n_lines = int((capacity * 1.5) // 15) + 10
+        plan, context = _big_function_fixture(tmp_path, n_lines)
+        result = build_planner_evidence_with_budget(plan, tmp_path, "vuln", context, budget_controller=None)
+        assert result.excerpt_plan.symbol_omitted
+        for label in result.excerpt_plan.symbol_omitted:
+            assert result.excerpt_plan.omission_reason[label] == "technical_capacity"
+            assert result.excerpt_plan.omitted_sizes[label] > 0
+        assert result.excerpt_plan.capacity is not None
+
+    def test_legacy_policy_max_windows_kwargs_accepted_but_inert(self, tmp_path):
+        """Fix B: the pre-existing policy/max_windows constructor kwargs
+        are still accepted (a caller that hasn't migrated doesn't crash)
+        but have zero effect on the computed ceiling."""
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan, context = _big_function_fixture(tmp_path, 320)
+        legacy = ContextBudgetController(policy="never", max_windows=1)
+        plain = ContextBudgetController()
+        result_legacy = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=legacy,
+        )
+        result_plain = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=plain,
+        )
+        assert result_legacy.excerpt_plan.included_labels == result_plain.excerpt_plan.included_labels
+
+    def test_unresolved_target_produces_no_omission(self, tmp_path):
+        """A target that never resolves to any real candidate produces no
+        omission at all (there is nothing to omit) -- and no
+        `technical_capacity` reason is ever attached to something that was
+        never resolved in the first place."""
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan = RemediationPlanResult(
+            rendered="", target_files=["nonexistent.py"], target_symbols=["nonexistent.py:ghost"],
+        )
+        context = _make_context(functions={}, repo_path=tmp_path)
+        controller = ContextBudgetController()
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=controller,
+        )
+        assert result.rendered == ""
+        assert not result.excerpt_plan.omission_reason
+
+
+class TestBuildPlannerEvidenceMaxCharsOverride:
+    """`max_chars=None` (every existing caller) must produce byte-for-byte
+    identical output to before this parameter existed; an explicit
+    override is threaded straight through to build_planner_source_excerpts
+    and can surface source that did not fit under the default budget --
+    used by the Evidence-Gap Strategy Fallback (pipeline.py) to re-run
+    this SAME deterministic bridge at the larger, already-existing
+    Final-Target Slice ceiling instead of a new budget constant."""
+
+    def test_default_none_matches_omitted_call_exactly(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        (tmp_path / "medium.py").write_text("x = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8")
+        plan = RemediationPlanResult(rendered="", target_files=["medium.py"], target_symbols=[])
+
+        result_no_kwarg = build_planner_evidence(plan, str(tmp_path), "vuln", None)
+        result_explicit_none = build_planner_evidence(plan, str(tmp_path), "vuln", None, max_chars=None)
+        assert result_no_kwarg == result_explicit_none
+
+    def test_larger_max_chars_surfaces_more_source_than_default(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        (tmp_path / "medium.py").write_text(
+            "x = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8",
+        )
+        plan = RemediationPlanResult(rendered="", target_files=["medium.py"], target_symbols=[])
+
+        result_default = build_planner_evidence(plan, str(tmp_path), "vuln", None)
+        result_bigger = build_planner_evidence(
+            plan, str(tmp_path), "vuln", None, max_chars=DEFAULT_MAX_CHARS * 3,
+        )
+        assert "#### Verified source" not in result_default
+        assert "#### Verified source: `medium.py`" in result_bigger
+        assert result_bigger != result_default
+
+
+# ---------------------------------------------------------------------------
+# Planner bridge propagates verified_files into symbol resolution
+#
+# Regression: the deterministic identifier fallback (see
+# TestDeterministicIdentifierFallback / TestMinimistNestedFunctionRegression)
+# was wired into Final Strategy verification and the Final Target Slice
+# (both via an explicit `verified_files=` argument to
+# _resolve_symbol_details), but never into the earlier Planner-Proposed
+# Candidate Evidence bridge -- _resolve_planner_symbols called
+# _resolve_symbol_details with no verified_files at all, so a symbol only
+# the fallback can find (present in real source, absent from the
+# structured index) resolved to nothing here even though the exact same
+# fallback succeeds one stage later for the same file/symbol pair.
+# ---------------------------------------------------------------------------
+
+class TestPlannerBridgePropagatesVerifiedFiles:
+    def _context(self, tmp_path):
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        return _make_context(
+            functions={"index.js:hasKey": {"name": "hasKey", "startLine": 21, "endLine": 27}},
+            repo_path=tmp_path,
+        )
+
+    def test_fallback_only_symbol_produces_planner_symbol_verified_evidence(self, tmp_path):
+        # Exercises build_planner_candidates' own 3-argument form
+        # (symbol_locations=None), which now computes verified_files
+        # itself and passes it into _resolve_planner_symbols -- the
+        # second of the two production call sites this fix touches.
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_planner_candidates
+
+        plan = RemediationPlanResult(rendered="", target_files=["index.js"], target_symbols=["setKey"])
+        candidates = build_planner_candidates(plan, tmp_path, context)
+
+        assert len(candidates) == 1
+        ev = candidates[0].evidence[0]
+        assert ev.pass_name == "planner_proposed"
+        # The real, fallback-recovered declaration line -- never the
+        # synthetic 0 placeholder that meant "no symbol resolved".
+        assert ev.resolution_strategy == "planner_symbol_verified"
+        assert ev.hit_line != 0
+        assert ev.matched_tokens == ["setKey"]
+
+    def test_fallback_only_symbol_resolves_through_full_planner_bridge(self, tmp_path):
+        # The production entry point (build_planner_evidence): computes
+        # verified_files itself and passes it into _resolve_planner_symbols
+        # before build_planner_candidates ever runs -- the first of the two
+        # call sites this fix touches, and the one the real pipeline uses.
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+
+        plan = RemediationPlanResult(rendered="", target_files=["index.js"], target_symbols=["setKey"])
+        result = build_planner_evidence(plan, str(tmp_path), "vuln", context)
+
+        # The old, dishonest "hit_line=0 means no symbol resolved" note is
+        # gone -- whatever nearest-function note remains now names a real,
+        # fallback-recovered line.
+        assert "hit_line 0" not in result
+        # Pass 1 of build_planner_source_excerpts now has a verified symbol
+        # location to use -- the exact setKey source excerpt, not a
+        # full-file fallback (see the sibling source-excerpt test below for
+        # the full-file-fallback-avoided assertion).
+        assert "index.js:setKey" in result
+        assert "function setKey" in result
+
+    def test_fallback_only_symbol_source_excerpt_used_instead_of_full_file(self, tmp_path):
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import (
+            build_planner_candidates, build_planner_source_excerpts, _resolve_planner_symbols,
+        )
+
+        plan = RemediationPlanResult(rendered="", target_files=["index.js"], target_symbols=["setKey"])
+        verified_files = ["index.js"]
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context, verified_files=verified_files)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+
+        assert "index.js" in symbol_locations
+        assert symbol_locations["index.js"].label == "setKey"
+
+        excerpts = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert "#### Verified source: `index.js:setKey`" in excerpts
+        # Full-file fallback is Pass 2, reached only when NO symbol
+        # resolved for that path -- must not fire now that one has.
+        assert "full file" not in excerpts
+
+    def test_genuinely_unresolved_symbol_stays_file_only_not_invented(self, tmp_path):
+        # A symbol that truly doesn't exist anywhere in the verified
+        # file -- with a real (non-None) context now reachable via the
+        # fallback's own token-search tier, this must still fail closed
+        # rather than guess, exactly as it did before this fix.
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_planner_candidates
+
+        plan = RemediationPlanResult(
+            rendered="", target_files=["index.js"], target_symbols=["neverDefinedAnywhere"],
+        )
+        candidates = build_planner_candidates(plan, tmp_path, context)
+
+        assert len(candidates) == 1
+        ev = candidates[0].evidence[0]
+        assert ev.resolution_strategy == "planner_file_only"
+        assert ev.hit_line == 0
+        assert ev.matched_tokens is None
+
+
+# ---------------------------------------------------------------------------
+# No additional LLM call anywhere in the bridge
+# ---------------------------------------------------------------------------
+
+class TestNoAdditionalLLMCall:
+    def test_build_planner_evidence_has_no_llm_parameter(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        assert "llm" not in inspect.signature(build_planner_evidence).parameters
+
+    def test_build_planner_candidates_has_no_llm_parameter(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import build_planner_candidates
+        assert "llm" not in inspect.signature(build_planner_candidates).parameters
+
+    def test_resolve_symbol_has_no_llm_parameter(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+        assert "llm" not in inspect.signature(_resolve_symbol).parameters
+
+    def test_build_planner_source_excerpts_has_no_llm_parameter(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        assert "llm" not in inspect.signature(build_planner_source_excerpts).parameters
+
+
+# ---------------------------------------------------------------------------
+# Pipeline wiring
+# ---------------------------------------------------------------------------
+
+class TestPipelineWiring:
+    """The planner's rendered output, and the separate Planner-Proposed
+    Candidate Evidence block, must both reach generate_patch()'s
+    code_context in the required order -- without needing a real
+    repo_root/grounding for the plan-text-only checks, since that call
+    sits right after Repository Understanding regardless of whether
+    grounding found anything."""
+
+    @staticmethod
+    def _strategy_reply(target_files, target_symbols=()):
+        """An LLM `complete` side effect whose Final Strategy reply is a
+        real, successful one naming `target_files`/`target_symbols` -- so
+        Strategy is invoked AND succeeds (an unparseable reply would be an
+        invoked-and-failed Strategy, which now skips Patch Generation)."""
+        def complete(system_prompt, user_message, stage="unknown"):
+            if stage == "remediation_strategy":
+                return json.dumps({
+                    "extended_mechanism": None, "target_files": list(target_files),
+                    "target_symbols": list(target_symbols), "required_edits": ["stub edit"],
+                    "rejected_targets": [], "security_invariant": "stub", "insufficient_evidence": [],
+                })
+            return "{}"
+        return complete
+
+    def _run_with_mocks(self, plan_result, repo_root=None, extra_patches=(), llm_complete=None):
+        # Fix A: these tests are about how plan/evidence TEXT flows into
+        # code_context, not about the evidence-sufficiency gate itself --
+        # force every plan_result passed in here to read as explicitly
+        # grounded so the pre-existing pipeline flow they test is
+        # unaffected by the new gate.
+        plan_result = plan_result._replace(additional_evidence_required="explicit_false")
+        patches = [
+            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch("utilities.autopatcher.remediation_planner.generate_remediation_plan",
+                       return_value=plan_result),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       return_value="```diff\n--- a/f.py\n+++ b/f.py\n```"),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value={"applicable": True, "skipped": False, "stderr": "",
+                                     "exit_code": 0, "skipped_reason": None, "error": None}),
+        ] + list(extra_patches)
+        started = [p.start() for p in patches]
+        try:
+            started[0].return_value = mock.MagicMock()
+            if llm_complete is not None:
+                started[0].return_value.complete.side_effect = llm_complete
+            from utilities.autopatcher.pipeline import run
+            run("some vuln", api_key="", repo_root=repo_root)
+        finally:
+            for p in patches:
+                p.stop()
+        mock_plan, mock_gen = started[1], started[2]
+        return mock_plan, mock_gen
+
+    def test_plan_output_reaches_code_context(self):
+        plan_result = RemediationPlanResult(
+            rendered="## Remediation Plan (experimental — not verified against the repository)\n\nPLAN_MARKER\n",
+            target_files=[], target_symbols=[],
+        )
+        mock_plan, mock_gen = self._run_with_mocks(plan_result)
+
+        assert mock_plan.called
+        code_context = mock_gen.call_args.kwargs.get("code_context", "")
+        assert "PLAN_MARKER" in code_context
+
+    def test_empty_plan_omitted_from_code_context(self):
+        _mock_plan, mock_gen = self._run_with_mocks(_EMPTY)
+
+        code_context = mock_gen.call_args.kwargs.get("code_context", "")
+        assert "Remediation Plan" not in code_context
+        assert "Planner-Proposed Candidate Evidence" not in code_context
+
+    def test_planner_evidence_reaches_code_context_after_plan(self, tmp_path):
+        target = tmp_path / "src" / "urllib3" / "util" / "retry.py"
+        target.parent.mkdir(parents=True)
+        target.write_text(
+            "class Retry:\n    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(['Authorization'])\n",
+            encoding="utf-8",
+        )
+        plan_result = RemediationPlanResult(
+            rendered="## Remediation Plan (experimental — not verified against the repository)\n\nPLAN_MARKER\n",
+            target_files=["src/urllib3/util/retry.py"], target_symbols=[],
+        )
+
+        _mock_plan, mock_gen = self._run_with_mocks(
+            plan_result, repo_root=str(tmp_path),
+            llm_complete=self._strategy_reply(["src/urllib3/util/retry.py"]),
+        )
+
+        code_context = mock_gen.call_args.kwargs.get("code_context", "")
+        assert "PLAN_MARKER" in code_context
+        assert "## Planner-Proposed Candidate Evidence" in code_context
+        assert "src/urllib3/util/retry.py" in code_context
+        assert code_context.index("PLAN_MARKER") < code_context.index("Planner-Proposed Candidate Evidence")
+
+    def test_planner_evidence_failure_preserves_plan_and_pipeline_continues(self, tmp_path):
+        plan_result = RemediationPlanResult(
+            rendered="## Remediation Plan (experimental — not verified against the repository)\n\nPLAN_MARKER\n",
+            target_files=["retry.py"], target_symbols=[],
+        )
+        boom = mock.patch(
+            "utilities.autopatcher.remediation_planner.build_planner_evidence",
+            side_effect=RuntimeError("boom"),
+        )
+
+        _mock_plan, mock_gen = self._run_with_mocks(plan_result, repo_root=str(tmp_path), extra_patches=[boom])
+
+        code_context = mock_gen.call_args.kwargs.get("code_context", "")
+        assert "PLAN_MARKER" in code_context
+        assert "Planner-Proposed Candidate Evidence" not in code_context
+
+    def test_patch_generator_receives_real_verified_symbol_source(self, tmp_path):
+        # The exact scenario this task exists to fix: the Patch Generator's
+        # initial code_context must contain the real repository-verified
+        # constant source, not just structural facts about it.
+        retry_py = tmp_path / "src" / "urllib3" / "util" / "retry.py"
+        retry_py.parent.mkdir(parents=True)
+        retry_py.write_text(
+            "class Retry:\n"
+            "    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            constants={
+                "src/urllib3/util/retry.py": {
+                    "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": {
+                        "qualified_name": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "class_name": "Retry", "name": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "line": 2, "end_line": 2,
+                    },
+                },
+            },
+            repo_path=tmp_path,
+        )
+        plan_result = RemediationPlanResult(
+            rendered="## Remediation Plan (experimental — not verified against the repository)\n\nPLAN_MARKER\n",
+            target_files=["src/urllib3/util/retry.py"],
+            target_symbols=["src/urllib3/util/retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"],
+            additional_evidence_required="explicit_false",
+        )
+        # Names the real path explicitly so ordinary Repository Grounding
+        # also selects it (Pass 1, explicit path) -- that is what makes
+        # CandidateSelection.used_fallback False, which gates whether an
+        # InvestigationContext is even attempted at all.
+        vuln_text = "See src/urllib3/util/retry.py for the affected code."
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
+            mock.patch("utilities.autopatcher.remediation_planner.generate_remediation_plan", return_value=plan_result),
+            mock.patch("utilities.autopatcher.candidate_enrichment.build_investigation_context", return_value=context),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value={"applicable": True, "skipped": False, "stderr": "",
+                                     "exit_code": 0, "skipped_reason": None, "error": None}),
+        ):
+            mock_llm_cls.return_value = mock.MagicMock()
+            mock_llm_cls.return_value.complete.side_effect = self._strategy_reply(
+                ["src/urllib3/util/retry.py"],
+                ["src/urllib3/util/retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"],
+            )
+            from utilities.autopatcher.pipeline import run
+            run(vuln_text, api_key="", repo_root=str(tmp_path), investigation_output_dir=str(tmp_path / "out"))
+
+        code_context = mock_gen.call_args.kwargs.get("code_context", "")
+        assert 'DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])' in code_context
+
+
+# ---------------------------------------------------------------------------
+# Target Discovery relabeling (Call 1's epistemic role is now explicit)
+# ---------------------------------------------------------------------------
+
+class TestTargetDiscoveryRelabeled:
+    def test_still_returns_target_files_and_symbols(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert result.target_files == ["src/urllib3/util/retry.py", "src/urllib3/poolmanager.py"]
+        assert result.target_symbols == ["Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"]
+
+    def test_heading_is_target_discovery_not_remediation_plan(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert result.rendered.startswith("## Target Discovery Plan")
+        assert "exploratory" in result.rendered
+        assert not result.rendered.startswith("## Remediation Plan")
+
+
+# ---------------------------------------------------------------------------
+# generate_remediation_strategy() -- the second, distinct Planner call
+# ---------------------------------------------------------------------------
+
+_STRATEGY_WELL_FORMED = {
+    "extended_mechanism": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+    "target_files": ["src/urllib3/util/retry.py"],
+    "target_symbols": ["src/urllib3/util/retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"],
+    "required_edits": ["Add 'Cookie' to the existing DEFAULT_REMOVE_HEADERS_ON_REDIRECT frozenset."],
+    "rejected_targets": [],
+    "security_invariant": "Sensitive request headers must not cross origins on redirect.",
+    "insufficient_evidence": [],
+}
+
+class TestFinalStrategySkipsWithoutEvidence:
+    def test_skipped_when_planner_evidence_ctx_empty(self):
+        from utilities.autopatcher.remediation_planner import (
+            generate_remediation_strategy, _EMPTY_STRATEGY_RESULT,
+        )
+
+        llm = mock.MagicMock()
+        result = generate_remediation_strategy(
+            "some vuln", llm, None, None, planner_evidence_ctx="",
+        )
+
+        assert result == _EMPTY_STRATEGY_RESULT
+        llm.complete.assert_not_called()
+
+    def test_skipped_when_planner_evidence_ctx_whitespace_only(self):
+        from utilities.autopatcher.remediation_planner import (
+            generate_remediation_strategy, _EMPTY_STRATEGY_RESULT,
+        )
+
+        llm = mock.MagicMock()
+        result = generate_remediation_strategy(
+            "some vuln", llm, None, None, planner_evidence_ctx="   \n  ",
+        )
+
+        assert result == _EMPTY_STRATEGY_RESULT
+        llm.complete.assert_not_called()
+
+
+class TestFinalStrategyStageLabel:
+    def test_stage_label_is_remediation_strategy(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_STRATEGY_WELL_FORMED)
+
+        generate_remediation_strategy(
+            "some vuln", llm, None, None, planner_evidence_ctx="EVIDENCE",
+        )
+
+        _args, kwargs = llm.complete.call_args
+        assert kwargs.get("stage") == "remediation_strategy"
+
+
+class TestFinalStrategyInputs:
+    def test_user_message_contains_all_sections_in_order(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_STRATEGY_WELL_FORMED)
+
+        generate_remediation_strategy(
+            "VULN_MARKER", llm, None, None,
+            repo_grounding_ctx="GROUNDING_MARKER",
+            repository_understanding_ctx="UNDERSTANDING_MARKER",
+            discovery_plan_ctx="DISCOVERY_MARKER",
+            planner_evidence_ctx="EVIDENCE_MARKER",
+        )
+
+        _system, user_message = llm.complete.call_args[0]
+        assert "VULN_MARKER" in user_message
+        assert "GROUNDING_MARKER" in user_message
+        assert "UNDERSTANDING_MARKER" in user_message
+        assert "DISCOVERY_MARKER" in user_message
+        assert "EVIDENCE_MARKER" in user_message
+        # exact required ordering
+        assert (
+            user_message.index("VULN_MARKER")
+            < user_message.index("GROUNDING_MARKER")
+            < user_message.index("UNDERSTANDING_MARKER")
+            < user_message.index("DISCOVERY_MARKER")
+            < user_message.index("EVIDENCE_MARKER")
+        )
+
+    def test_optional_sections_omitted_when_empty(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_STRATEGY_WELL_FORMED)
+
+        generate_remediation_strategy(
+            "VULN_MARKER", llm, None, None, planner_evidence_ctx="EVIDENCE_MARKER",
+        )
+
+        _system, user_message = llm.complete.call_args[0]
+        assert "Original Repository Grounding" not in user_message
+        assert "Ordinary Repository Understanding" not in user_message
+        assert "Initial Target Discovery" not in user_message
+
+    def test_schema_has_no_diff_or_code_field(self):
+        # The OUTPUT SCHEMA itself must never ask for a diff or code field
+        # (the prohibition sentence "you do not write a diff" legitimately
+        # contains the word "diff" -- that is the opposite of a violation,
+        # so this checks the schema block specifically).
+        strategy_prompt = _STRATEGY_PROMPT_PATH_TEXT()
+        schema_start = strategy_prompt.index("## Output schema")
+        schema_block = strategy_prompt[schema_start:].lower()
+        assert '"diff"' not in schema_block
+        assert '"code"' not in schema_block
+        assert '"patch"' not in schema_block
+
+
+def _STRATEGY_PROMPT_PATH_TEXT() -> str:
+    from utilities.autopatcher.remediation_planner import _STRATEGY_PROMPT_PATH
+    return _STRATEGY_PROMPT_PATH.read_text(encoding="utf-8")
+
+
+class TestFinalStrategyPromptRepositoryAgnostic:
+    def test_no_hardcoded_domain_terms_in_universal_prompt(self):
+        text = _STRATEGY_PROMPT_PATH_TEXT().lower()
+        for term in (
+            "urllib3", "cookie", "header", "redirect", "python",
+            "minimist", "cve-2021-44906", "constructor", "prototype", "__proto__",
+            "javascript", "prototype pollution",
+        ):
+            assert term not in text, f"prompt hardcodes domain-specific term: {term!r}"
+
+
+def _STRATEGY_PROMPT_NORMALIZED() -> str:
+    """Whitespace-collapsed, lowercased Strategy prompt text -- same
+    convention as _PLANNER_PROMPT_NORMALIZED below, so a phrase check
+    survives the source .md file's own line wrapping."""
+    return " ".join(_STRATEGY_PROMPT_PATH_TEXT().lower().split())
+
+
+# ---------------------------------------------------------------------------
+# Semantic-narrowness authority check (minimist CVE-2021-44906 real-trace
+# follow-up).
+#
+# Regression shape: the Planner identified a precise runtime condition
+# (danger only when a traversal step resolves to a specific dangerous
+# runtime state) but selected a categorical name/token-based rejection
+# instead, and explicitly recorded the resulting compatibility risk in its
+# own explicit_unknowns. The Final Remediation Strategy's ground rules had
+# no obligation of their own to check this -- Strategy simply adopted the
+# Planner's mechanism as authoritative, "extending" the existing guard by
+# adding more name-equality comparisons alongside it. This is the primary
+# gap: Strategy is the patch-authoritative boundary, yet had no independent
+# semantic-narrowness check of its own to fail.
+#
+# SCOPE NOTE: same limitation as every other prompt-contract test in this
+# file -- reasoning quality remains entirely LLM-judgment based on the
+# prompt text; these tests do NOT and cannot prove an LLM will reason
+# correctly or comply with this contract. What IS testable: (a) the prompt
+# contains the new obligation, worded generically, (b) it is additive to
+# (not a replacement for) the pre-existing ground rules, and (c) it is
+# domain-neutral.
+# ---------------------------------------------------------------------------
+
+class TestFinalStrategySemanticNarrownessContract:
+    def test_categorical_rejection_must_be_justified_for_the_whole_category(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "before finalizing a mechanism that rejects, blocks, filters, or "
+            "sanitizes an entire input, category, name, token, or state class, "
+            "verify from the supplied evidence that the whole category needs "
+            "that treatment" in text
+        )
+
+    def test_state_sensitive_mechanism_preferred_when_it_closes_every_path(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "prefer the narrower state-sensitive mechanism over the categorical "
+            "one" in text
+        )
+        assert (
+            "select the state-sensitive version only when the evidence shows it "
+            "closes every evidence-backed unsafe path" in text
+        )
+
+    def test_structural_similarity_to_existing_guard_is_not_sufficient(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "structural similarity to an existing check" in text
+            and "is not, by itself, evidence that every new category member "
+            "needs identical treatment" in text
+        )
+        assert "extending an existing mechanism is justified only when the extension" in text
+
+    def test_absence_of_known_consumers_is_not_proof_categorical_block_is_safe(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "do not require proof that a real consumer currently relies on a "
+            "safe category member before preferring the narrower mechanism" in text
+        )
+        assert (
+            "the burden is on the evidence to justify treating the whole "
+            "category as unsafe, not on the evidence to justify that a safe "
+            "use exists" in text
+        )
+
+    def test_must_not_invent_unsupported_state_sensitive_predicates(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "never invent a state-sensitive check the supplied source does not "
+            "support merely to appear narrower" in text
+        )
+        assert (
+            "if the evidence cannot determine whether a narrower predicate is "
+            "sufficient, say so in `insufficient_evidence`" in text
+        )
+
+    def test_security_completeness_still_overrides_behavioral_preservation(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert "this preference for a narrower mechanism never overrides security completeness" in text
+        assert (
+            "if the evidence shows the categorical treatment is required for "
+            "every such path, the categorical mechanism remains correct" in text
+        )
+
+    def test_existing_ground_rules_still_present_and_additive(self):
+        """Additive, not a replacement -- every pre-existing ground rule must
+        remain present (whitespace-collapsed, so incidental re-wrapping of
+        the source .md file can never break this check)."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert "every `target_file` you name must already appear in the verified evidence" in text
+        assert "extend that existing policy, validation, filtering, sanitization, or boundary" in text
+        assert "each `required_edit` must identify the existing mechanism it extends or" in text
+        assert "list it in `rejected_targets` with a short reason" in text
+        assert "if the verified evidence is insufficient to select a concrete mechanism," in text
+        assert "do not propose unrelated changes. do not propose a menu of options" in text
+
+    def test_no_new_schema_field_introduced(self):
+        """This is a ground-rules-only change -- the output schema block
+        itself must declare exactly the same seven pre-existing field names,
+        same convention as TestPlannerSchemaFieldSet below (plain regex, not
+        json.loads -- the schema block's type placeholders aren't valid JSON
+        values, only valid JSON keys).
+
+        `target_authority_unresolved` is the one intentional, separately
+        approved exception (scope-v4 Run 5 authority-gap fix): the set below
+        was updated to include it, rather than this test being loosened to
+        stop checking field-set exactness -- any FUTURE unapproved field
+        addition still fails this test exactly as before."""
+        text = _STRATEGY_PROMPT_PATH_TEXT()
+        schema_start = text.index("## Output schema")
+        schema_block = text[schema_start:]
+        found = set(re.findall(r'"([a-zA-Z_]+)":', schema_block))
+        assert found == {
+            "extended_mechanism", "target_files", "target_symbols",
+            "required_edits", "rejected_targets", "security_invariant",
+            "insufficient_evidence", "target_authority_unresolved",
+        }
+
+    def test_new_ground_rules_wording_is_domain_neutral(self):
+        """Scoped tightly to just the new paragraphs added by this follow-up."""
+        text = _STRATEGY_PROMPT_PATH_TEXT()
+        start = text.index("Extending an existing mechanism is justified only")
+        end = text.index("Each `required_edit` must identify")
+        added_text = text[start:end].lower()
+        for forbidden in (
+            "minimist", "cve-2021-44906", "constructor", "prototype", "__proto__",
+            "javascript", "prototype pollution", "urllib3", "cookie", "header",
+            "redirect", "python",
+        ):
+            assert forbidden not in added_text
+
+
+# ---------------------------------------------------------------------------
+# Strategy reasoning-contract fix (urllib3 Fix B regression follow-up):
+# a real trace showed Strategy #2 had sufficient verified evidence to
+# resolve its own stated concern (about a DIFFERENT, unselected code path)
+# but still returned target_authority_unresolved=true, and did not
+# re-examine that concern against the evidence it had actually just been
+# given. The prompt now distinguishes "is my selected target/mechanism
+# justified" (authority-relevant) from "does some other, unselected path
+# also need independent validation" (not authority-relevant on its own),
+# and requires re-evaluating carried-forward uncertainty against current
+# evidence. These tests prove the CONTRACT TEXT states this distinction --
+# they cannot and do not prove a real model will comply (same limitation as
+# every other prompt-contract test in this file; see
+# TestFinalStrategySemanticNarrownessContract above).
+# ---------------------------------------------------------------------------
+
+class TestFinalStrategyAuthorityScopeContract:
+    def test_authority_relevance_tied_to_selected_target_or_mechanism(self):
+        """Proof point 1: true is tied to whether the SELECTED target/
+        symbol/mechanism is the justified remediation location/mechanism
+        for the supplied invariant -- not a general validation signal."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "materially prevents you from determining whether the "
+            "`target_files`/`target_symbols`/mechanism you selected above "
+            "is the justified remediation location/mechanism for the "
+            "supplied security invariant" in text
+        )
+        assert (
+            "this is not a general signal that more validation would be "
+            "useful; it means specifically that you cannot yet stand "
+            "behind your own selected target/mechanism" in text
+        )
+
+    def test_separate_path_uncertainty_is_not_automatically_blocking(self):
+        """Proof point 2: a question about a different, unselected path is
+        not by itself a target-authority blocker, and must still be
+        reported (never silently dropped)."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "a remaining question about a different, unselected code path, "
+            "entry point, calling convention, override, or adjacent "
+            "behavior is not, by itself, a target-authority blocker" in text
+        )
+        assert "keep reporting it in `insufficient_evidence`" in text
+        assert "do not drop it" in text
+
+    def test_separate_path_becomes_blocking_when_invariant_requires_it(self):
+        """Proof point 3: the "unless" clause -- a separate-path question
+        DOES become authority-blocking when resolving it could invalidate
+        or materially change the selected target/mechanism, or when the
+        invariant itself requires that path to be covered."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "unless you can explain why resolving it could invalidate or "
+            "materially change the selected target/mechanism for the "
+            "supplied security invariant" in text
+        )
+        assert (
+            "unless the invariant itself requires that alternate path to "
+            "be covered by the same mechanism" in text
+        )
+        assert (
+            "the supplied invariant does not require your selected "
+            "mechanism to cover" in text
+        )
+
+    def test_prior_uncertainty_must_be_reevaluated_against_current_evidence(self):
+        """Proof point 4: previously raised uncertainty (including from
+        this run's own earlier reasoning) must be checked against
+        currently-supplied evidence before being carried forward
+        unresolved."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "re-evaluate every uncertainty you are about to report -- "
+            "including one that also appeared in your own earlier "
+            "reasoning on this same run -- against all verified evidence "
+            "actually present in this request" in text
+        )
+        assert (
+            "if the evidence now on hand already answers a question "
+            "raised earlier, do not restate it as unresolved merely "
+            "because it was raised before" in text
+        )
+
+    def test_genuinely_unresolved_authority_remains_fail_closed(self):
+        """Proof point 5: the re-evaluation rule is one-directional -- it
+        may CLEAR a concern the evidence answers, but must never be used to
+        force `false` on a concern that remains genuinely open."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "if, after this re-evaluation, evidence genuinely remains "
+            "insufficient to determine whether your selected "
+            "target/mechanism is correct, `target_authority_unresolved` "
+            "must still be `true`" in text
+        )
+        assert (
+            "re-evaluating against current evidence is a reason to clear "
+            "a concern the evidence actually answers, never a reason to "
+            "force `false` on a concern it does not" in text
+        )
+
+    def test_new_authority_scope_wording_is_domain_neutral(self):
+        """Scoped to just this follow-up's own new paragraphs."""
+        text = _STRATEGY_PROMPT_PATH_TEXT()
+        start = text.index("Additionally, set `target_authority_unresolved`")
+        end = text.index("Do not propose unrelated changes")
+        added_text = text[start:end].lower()
+        for forbidden in (
+            "minimist", "cve-2021-44906", "constructor", "prototype", "__proto__",
+            "javascript", "prototype pollution", "urllib3", "cookie", "header",
+            "redirect", "python", "assert_same_host", "is_same_host",
+        ):
+            assert forbidden not in added_text
+
+    def test_existing_ground_rules_and_schema_still_present(self):
+        """Additive only -- the pre-existing ground rules and the schema's
+        field set (checked exhaustively by test_no_new_schema_field_
+        introduced above) must survive this follow-up unchanged."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert "every `target_file` you name must already appear in the verified evidence" in text
+        assert "do not propose unrelated changes. do not propose a menu of options" in text
+        assert "target_authority_unresolved: false` is not a claim that `target_files`/`target_symbols` is correct" in text
+
+
+def _PLANNER_PROMPT_PATH_TEXT() -> str:
+    from utilities.autopatcher.remediation_planner import _PROMPT_PATH
+    return _PROMPT_PATH.read_text(encoding="utf-8")
+
+
+def _PLANNER_PROMPT_NORMALIZED() -> str:
+    """Whitespace-collapsed, lowercased prompt text -- so a multi-word phrase
+    check survives the source .md file's own line wrapping (a phrase that
+    happens to span a line break is still one string of words separated by
+    single spaces, never split by a literal newline)."""
+    return " ".join(_PLANNER_PROMPT_PATH_TEXT().lower().split())
+
+
+class TestPlannerPromptReasoningDiscipline:
+    """Semantic phrase checks for the reasoning-order rewrite -- deliberately
+    a handful of stable substrings, not a whole-prompt snapshot, so the
+    wording can still be refined without every check breaking."""
+
+    def test_requires_identifying_runtime_condition_before_a_mechanism(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "runtime condition" in text
+        assert "before you commit to a mechanism" in text
+
+    def test_distinguishes_exploit_tokens_from_the_dangerous_condition(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "not automatically unsafe in every" in text
+        assert "one exploit example" in text
+
+    def test_requires_minimum_necessary_change_and_behavior_check(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "existing legitimate behavior" in text
+        assert "smallest change that makes that condition impossible" in text
+
+    def test_requires_narrower_mechanism_check_before_broad_rule(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "more conditional mechanism" in text
+        assert "broad rejection, filtering, sanitization, or allow/deny-list" in text
+
+    def test_still_requires_security_completeness_not_under_fixing(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "security completeness is still mandatory" in text
+        assert "must never leave the exploit reachable" in text
+
+    def test_still_requires_exactly_one_mechanism(self):
+        # The narrower-alternative check must not turn into a menu of options
+        # -- the pre-existing single-mechanism rule must survive verbatim.
+        text = _PLANNER_PROMPT_PATH_TEXT()
+        assert "Propose exactly one remediation mechanism, not a menu of options." in text
+
+
+# ---------------------------------------------------------------------------
+# Categorical-vs-state-sensitive self-check (minimist CVE-2021-44906 real-
+# trace follow-up).
+#
+# Regression shape: the Planner correctly derived a precise runtime
+# condition (step 1) but, when selecting its narrower alternative, only
+# compared it against much broader structural rewrites -- never against a
+# state-sensitive version of that SAME candidate derived from the runtime
+# condition it had just identified. This is a deliberately small, targeted
+# addition -- NOT another restatement of the several-paragraph narrower-
+# alternative contract already covered by TestPlannerPromptReasoningDiscipline
+# above, which remains unchanged.
+#
+# SCOPE NOTE: same limitation as every other prompt-contract test in this
+# file -- cannot prove an LLM will reason correctly; proves only that the
+# added self-check exists, is additive, and is domain-neutral.
+# ---------------------------------------------------------------------------
+
+class TestPlannerCategoricalVersusStateSensitiveSelfCheck:
+    def test_self_check_compares_categorical_candidate_against_security_invariant(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert (
+            "if the candidate you are about to select still rejects a name, "
+            "token, input category, operation, or state class categorically, "
+            "compare it once more against the precise `security_invariant` "
+            "you identified in step 1" in text
+        )
+
+    def test_self_check_asks_whether_the_state_can_be_tested_directly(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert (
+            "ask whether the evidence supports checking that unsafe runtime "
+            "state or value directly, instead of rejecting the whole category "
+            "by name" in text
+        )
+        assert (
+            "that state-sensitive version is the narrower candidate you must "
+            "evaluate" in text
+        )
+
+    def test_self_check_is_a_short_addition_not_a_second_narrower_contract(self):
+        """This must remain one short sub-bullet, not a duplicate of the
+        several-paragraph narrower-alternative contract (steps 3-6) already
+        covered elsewhere -- a crude proxy for "kept concise" is that the
+        added bullet is a small fraction of that contract's own length."""
+        text = _PLANNER_PROMPT_PATH_TEXT()
+        start = text.index("If the candidate you are about to select still rejects")
+        end = text.index("None of the following count as a narrower alternative")
+        added = text[start:end]
+        full_narrower_contract_start = text.index("3. **Find the smallest change")
+        full_narrower_contract_end = text.index("## Rules")
+        full_contract = text[full_narrower_contract_start:full_narrower_contract_end]
+        assert len(added) < len(full_contract) / 4
+
+    def test_existing_narrower_alternative_rules_remain_intact(self):
+        """Additive, not a replacement -- the pre-existing genuine-narrower-
+        alternative definition and its companion rules must remain present."""
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert (
+            "a genuine narrower alternative** requires an actual code or logic "
+            "change relative to the vulnerable baseline" in text
+        )
+        assert "preserves more unrelated legitimate behavior than the broader candidate" in text
+        assert "none of the following count as a narrower alternative" in text
+
+    def test_wording_is_domain_neutral(self):
+        """Scoped tightly to just the new self-check sub-bullet."""
+        text = _PLANNER_PROMPT_PATH_TEXT()
+        start = text.index("If the candidate you are about to select still rejects")
+        end = text.index("None of the following count as a narrower alternative")
+        added_text = text[start:end].lower()
+        for forbidden in (
+            "minimist", "cve-2021-44906", "constructor", "prototype", "__proto__",
+            "javascript", "prototype pollution", "urllib3", "cookie", "header",
+            "redirect", "python",
+        ):
+            assert forbidden not in added_text
+
+
+class TestPlannerPromptRepositoryAgnostic:
+    def test_no_hardcoded_domain_terms_in_universal_prompt(self):
+        text = _PLANNER_PROMPT_PATH_TEXT().lower()
+        for term in (
+            "minimist", "cve-2021-44906", "constructor", "prototype", "__proto__",
+            "javascript", "urllib3", "cookie", "header", "redirect", "python",
+        ):
+            assert term not in text, f"prompt hardcodes domain-specific term: {term!r}"
+
+
+class TestPlannerSchemaFieldSet:
+    """Guards against accidental schema drift when the prompt is next edited:
+    the schema block must declare exactly the nine expected field names.
+    Parsed with a plain regex, not `json.loads` -- the schema block uses
+    type placeholders (`string | null`, `[string, ...]`) that are not valid
+    JSON values, only valid JSON *keys*."""
+
+    _EXPECTED_FIELDS = {
+        "remediation_mechanism", "target_files", "target_symbols",
+        "security_invariant", "narrower_alternative_decision",
+        "narrower_alternative_considered",
+        "required_edits", "approaches_to_avoid", "explicit_unknowns",
+        # Fix A: bounded iterative Planning evidence acquisition --
+        # additional_evidence_required/evidence_requests are the top-level
+        # schema fields; request_type/file_hint/symbol/reason are the
+        # nested fields of each evidence_requests entry.
+        "additional_evidence_required", "evidence_requests",
+        "request_type", "file_hint", "symbol", "reason",
+    }
+
+    def test_schema_has_exactly_the_expected_fifteen_fields(self):
+        text = _PLANNER_PROMPT_PATH_TEXT()
+        schema_start = text.index("## Output schema")
+        next_heading = text.index("\n## ", schema_start + 1)
+        schema_block = text[schema_start:next_heading]
+
+        found = set(re.findall(r'"([a-zA-Z_]+)":', schema_block))
+        assert found == self._EXPECTED_FIELDS
+
+
+class TestPlannerPromptNarrowerAlternativeDecisionEnum:
+    """The explicit, structural `narrower_alternative_decision` enum the
+    Planner Claim Verifier orchestration (pipeline.py) dispatches its mode
+    from -- never inferred from `narrower_alternative_considered`'s own
+    prose. Introduced specifically because a real minimist trace showed a
+    Planner response whose `narrower_alternative_considered` said it
+    "selected" a narrower mechanism while `remediation_mechanism`/
+    `required_edits` still described the broader one -- an internal
+    inconsistency no free-text comparison can safely detect."""
+
+    def test_schema_declares_the_three_valid_values(self):
+        text = _PLANNER_PROMPT_PATH_TEXT()
+        schema_start = text.index("## Output schema")
+        next_heading = text.index("\n## ", schema_start + 1)
+        schema_block = text[schema_start:next_heading]
+        assert '"SELECTED"' in schema_block
+        assert '"REJECTED"' in schema_block
+        assert '"NONE_IDENTIFIED"' in schema_block
+
+    def test_field_always_required_when_alternative_considered_is_non_empty(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "this field is always required when you have anything to say" in text
+
+    def test_selected_means_remediation_mechanism_is_the_authoritative_description(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "they become its authoritative description" in text
+        assert "not a separate or broader mechanism" in text
+
+    def test_rejected_means_broader_mechanism_is_authoritative(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "remediation_mechanism`/`required_edits` then describe the".lower() in text
+        assert "broader mechanism you are proposing instead" in text
+
+    def test_none_identified_means_only_mechanism_found(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "no genuine narrower alternative could be identified" in text
+
+    def test_never_leave_decision_to_be_inferred_from_prose(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "never leave the decision to be inferred from this field's prose alone" in text
+
+
+class TestPlannerPromptDecisionRule:
+    """The decision rule is the point of this experiment: recognizing
+    overbreadth (already covered by TestPlannerPromptReasoningDiscipline)
+    is not the same as being required to act on it. These checks target the
+    added must-choose-the-narrower-mechanism language specifically."""
+
+    def test_states_narrower_mechanism_must_be_selected_when_equally_secure(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "narrower_alternative_considered" in text
+        assert "fully restores the security invariant" in text
+        assert "preserving more legitimate behavior" in text
+        assert "is your `remediation_mechanism`" in text
+
+    def test_requires_concrete_evidence_before_choosing_broader_mechanism(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "concrete evidence that the narrower one" in text
+        assert "not, by itself, evidence" in text
+
+    def test_remediation_mechanism_is_the_selected_alternative_when_selected(self):
+        # Superseded by the explicit narrower_alternative_decision enum:
+        # rather than merely forbidding a contradiction between two
+        # separately-worded fields, the prompt now requires
+        # `remediation_mechanism` to directly BE the selected alternative's
+        # description -- a stronger, structurally-enforceable contract than
+        # "must not contradict".
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "this field is the narrower alternative's mechanism" in text
+
+
+class TestPlannerPromptCounterfactualExecutionValidation:
+    """Recognizing overbreadth (TestPlannerPromptReasoningDiscipline) and
+    being required to act on it (TestPlannerPromptDecisionRule) still left a
+    gap: the Planner could reject a narrower alternative on an unverified
+    assertion. These checks target the added requirement that a rejection
+    be backed by a concrete, source-grounded execution trace."""
+
+    def test_requires_a_concrete_remaining_exploit_path_before_rejecting(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "trace the remaining exploit path through the verified source" in text
+        assert "you may reject a narrower alternative as insufficient only if you can walk a concrete" in text
+
+    def test_requires_existing_guards_applied_in_actual_execution_order(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "existing guard, reset, normalization, validation" in text
+        assert "in the actual order the" in text
+
+    def test_forbids_rejection_on_tokens_or_intuition_alone(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "invalid rejection" in text
+        assert "vulnerability-class intuition" in text
+        assert "without showing how" in text
+
+    def test_requires_explicit_unknowns_when_path_cannot_be_demonstrated(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "you may not claim the narrower alternative is insufficient" in text
+        assert "record the gap in `explicit_unknowns`".lower() in text
+        # the field-semantics section reinforces the same rule from the
+        # other direction: don't invent a path to avoid recording the gap.
+        assert "do not invent a" in text
+
+    def test_required_edits_must_not_broaden_beyond_the_validated_trace(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "do not broaden the edits beyond what the" in text
+        assert "execution trace in `narrower_alternative_considered`".lower() in text
+
+    def test_decision_consistency_rule_still_present(self):
+        # Guards against this experiment accidentally regressing the
+        # previous one's central rule while restructuring the same steps --
+        # now expressed via the explicit narrower_alternative_decision enum
+        # rather than a bare "must not contradict" instruction (see
+        # test_remediation_mechanism_is_the_selected_alternative_when_selected).
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "this field is the narrower alternative's mechanism" in text
+        assert "is your `remediation_mechanism`" in text
+
+    def test_no_chain_of_thought_verbosity_required(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "checkable trace, not a narrated deliberation" in text
+
+
+class TestPlannerPromptGenuineNarrowerAlternative:
+    """The counterfactual-trace rule (TestPlannerPromptCounterfactualExecutionValidation)
+    closed the "plausible-looking but wrong trace" gap, but a real trace
+    against a fake alternative (the vulnerable baseline / no-op) is just as
+    meaningless. These checks target the requirement that
+    `narrower_alternative_considered` be a genuine, code-changing mechanism,
+    not the baseline restated."""
+
+    def test_baseline_or_no_op_cannot_satisfy_the_field(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert '"do nothing"' in text
+        assert "leaving the vulnerable code unchanged" in text
+        assert "you have not satisfied this step" in text
+
+    def test_existing_protections_alone_do_not_count(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "relying only on protections already present before any fix" in text
+        assert '"the current behavior already has some guards" is not a valid' in text
+
+    def test_valid_alternative_requires_a_real_code_or_logic_change(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "genuine narrower alternative" in text
+        assert "requires an actual code or logic change relative to the vulnerable baseline" in text
+
+    def test_requires_actively_searching_for_a_conditional_remediation_first(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "actively search for at least one" in text
+        assert "genuine, code-changing conditional" in text
+
+    def test_conditional_remediation_tied_to_runtime_state_not_surface_tokens(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "tied to the actual unsafe runtime state or transition from step 1" in text
+        assert "not the surface form of the exploit" in text
+
+    def test_broad_mechanism_only_wins_after_counterexample_trace_rule_applies(self):
+        # The genuine-alternative requirement (step 3) must feed into, not
+        # bypass, the existing trace-before-rejecting rule (step 4).
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "before rejecting a narrower alternative, trace the remaining exploit" in text
+        assert "step 4 produced" in text
+
+    def test_required_edits_cannot_cite_baseline_vulnerability_as_justification(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "not justified merely because the vulnerable baseline" in text
+        assert "not against doing nothing" in text
+
+    def test_no_fabricating_an_alternative_when_none_is_found(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "no genuine narrower alternative can be identified from the verified source" in text
+        assert "say so plainly" in text
+
+
+class TestTargetAuthorityUnresolvedField:
+    """Direct unit tests for `_parse_target_authority_unresolved` -- the
+    three-way parse rule (absent -> False, valid bool -> itself, malformed-
+    but-explicit -> True) documented on both the function itself and
+    RemediationStrategyResult.target_authority_unresolved. No repo/LLM
+    machinery needed: this is a pure function over a plain dict."""
+
+    def test_absent_key_defaults_false(self):
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        assert _parse_target_authority_unresolved({}) is False
+
+    def test_valid_true_is_trusted(self):
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        assert _parse_target_authority_unresolved({"target_authority_unresolved": True}) is True
+
+    def test_valid_false_is_trusted(self):
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        assert _parse_target_authority_unresolved({"target_authority_unresolved": False}) is False
+
+    def test_malformed_string_value_fails_closed_to_true(self):
+        """Explicit, malformed trust-critical metadata must never be
+        silently coerced to the permissive False -- see this function's
+        own docstring."""
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        assert _parse_target_authority_unresolved({"target_authority_unresolved": "maybe"}) is True
+
+    def test_explicit_null_fails_closed_to_true(self):
+        """Explicit JSON null is grouped with 'wrong type', not with
+        'absent key' -- same convention as remediation_verifier.py's own
+        strict-bool parsing for its trust-critical fields."""
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        assert _parse_target_authority_unresolved({"target_authority_unresolved": None}) is True
+
+    def test_malformed_int_value_fails_closed_to_true(self):
+        """Also proves the check is isinstance(x, bool), never truthiness
+        -- a JSON `0`/`1` deserializes to a plain Python int, never a
+        bool, so `1` must NOT pass as True by truthy coercion; it must
+        fail closed to the conservative True exactly like any other wrong
+        type, not be silently accepted as 'true-ish'."""
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        assert _parse_target_authority_unresolved({"target_authority_unresolved": 1}) is True
+        assert _parse_target_authority_unresolved({"target_authority_unresolved": 0}) is True
+
+    def test_default_result_field_matches_backward_compatible_default(self):
+        from utilities.autopatcher.remediation_planner import RemediationStrategyResult
+        result = RemediationStrategyResult(
+            rendered="", target_files=[], target_symbols=[], warnings=[],
+            extended_mechanism=None, required_edits=[],
+        )
+        assert result.target_authority_unresolved is False
+
+    def test_empty_strategy_sentinel_has_field_false(self):
+        from utilities.autopatcher.remediation_planner import _EMPTY_STRATEGY_RESULT
+        assert _EMPTY_STRATEGY_RESULT.target_authority_unresolved is False
+
+    def test_no_prose_or_keyword_inspection_anywhere_in_the_parser(self):
+        """Regression guard: the parser reads ONLY the
+        `target_authority_unresolved` key -- a non-empty `insufficient_
+        evidence`/`rejected_targets` full of exactly the forbidden keywords
+        must never influence the result on its own."""
+        from utilities.autopatcher.remediation_planner import _parse_target_authority_unresolved
+        plan = {
+            "insufficient_evidence": [
+                "override the default; custom, non-default, low-level, broader, "
+                "narrower, must inspect PoolManager first, upstream did not fix it"
+            ],
+            "rejected_targets": ["some/other/file.py -- override, non-default"],
+        }
+        assert _parse_target_authority_unresolved(plan) is False  # key absent -> backward-compatible default
+
+
+class TestTargetAuthorityUnresolvedEndToEnd:
+    """Mocked-LLM, real-repo-root tests proving the field flows correctly
+    from a Strategy JSON response into the actual, verified
+    RemediationStrategyResult generate_remediation_strategy returns."""
+
+    def _well_formed_with(self, tmp_path, **overrides):
+        (tmp_path / "target.py").write_text("class Target:\n    pass\n", encoding="utf-8")
+        payload = dict(_STRATEGY_WELL_FORMED)
+        payload["target_files"] = ["target.py"]
+        payload["target_symbols"] = ["Target"]
+        payload.update(overrides)
+        return payload
+
+    def test_old_format_response_without_field_defaults_false(self, tmp_path):
+        """Backward compatibility: a response predating this field's
+        existence (the key is simply absent) must parse identically to
+        today -- target_authority_unresolved=False, no new behavior."""
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(self._well_formed_with(tmp_path))
+        result = generate_remediation_strategy(
+            "v", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE_MARKER",
+        )
+        assert result.target_files == ["target.py"]
+        assert result.target_authority_unresolved is False
+
+    def test_explicit_true_is_parsed_through(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(
+            self._well_formed_with(tmp_path, target_authority_unresolved=True)
+        )
+        result = generate_remediation_strategy(
+            "v", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE_MARKER",
+        )
+        assert result.target_files == ["target.py"]  # existence verification unaffected
+        assert result.target_authority_unresolved is True
+
+    def test_explicit_false_is_parsed_through(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(
+            self._well_formed_with(tmp_path, target_authority_unresolved=False)
+        )
+        result = generate_remediation_strategy(
+            "v", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE_MARKER",
+        )
+        assert result.target_authority_unresolved is False
+
+    def test_malformed_value_fails_closed_to_true(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(
+            self._well_formed_with(tmp_path, target_authority_unresolved="unsure")
+        )
+        result = generate_remediation_strategy(
+            "v", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE_MARKER",
+        )
+        assert result.target_files == ["target.py"]  # existence verification still unaffected
+        assert result.target_authority_unresolved is True
+
+
+class TestTargetAuthorityUnresolvedPromptContract:
+    def test_ground_rule_present_with_true_false_criteria(self):
+        # Fix: wording tightened to distinguish authority-relevant
+        # uncertainty from a separate-path validation/scope question (see
+        # TestFinalStrategyAuthorityScopeContract) -- the true/false
+        # criteria still exist, phrased against "the justified remediation
+        # location/mechanism for the supplied security invariant" rather
+        # than the older, less precise "actually the correct remediation
+        # location".
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert "set `target_authority_unresolved` to `true`" in text
+        assert (
+            "materially prevents you from determining whether the "
+            "`target_files`/`target_symbols`/mechanism you selected above "
+            "is the justified remediation location/mechanism for the "
+            "supplied security invariant" in text
+        )
+        assert "set `target_authority_unresolved` to `false` when every remaining gap in `insufficient_evidence` concerns only" in text
+        assert "validation, testing, behavioral confirmation, hardening evidence" in text
+
+    def test_false_is_not_a_certification(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "`target_authority_unresolved: false` is not a claim that "
+            "`target_files`/`target_symbols` is correct" in text
+        )
+        assert "it only means you are not withholding authority" in text
+
+    def test_no_keyword_shortcuts_taught(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "never from whether the target or mechanism happens to be described as an "
+            "override, custom, non-default, low-level, broader, or narrower than some "
+            "alternative" in text
+        )
+        assert "those words alone never determine the value either way" in text
+
+    def test_schema_key_present(self):
+        text = _STRATEGY_PROMPT_PATH_TEXT()
+        schema_start = text.index("## Output schema")
+        schema_block = text[schema_start:]
+        assert '"target_authority_unresolved": boolean' in schema_block
+
+    def test_new_ground_rule_wording_is_domain_neutral(self):
+        text = _STRATEGY_PROMPT_PATH_TEXT()
+        start = text.index("Additionally, set `target_authority_unresolved`")
+        end = text.index("Do not propose unrelated changes.")
+        added_text = text[start:end].lower()
+        for forbidden in (
+            "urllib3", "cookie", "header", "redirect", "python", "poolmanager",
+            "httpconnectionpool", "retry", "minimist", "javascript", "prototype",
+        ):
+            assert forbidden not in added_text
+
+    def test_existing_insufficient_evidence_ground_rule_still_present(self):
+        """Additive, not a replacement."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert "if the verified evidence is insufficient to select a concrete mechanism," in text
+        assert "say so in `insufficient_evidence` rather than guessing" in text
+
+
+class TestFinalStrategyEvidenceBinding:
+    def test_verified_file_and_symbol_retained(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        target = tmp_path / "retry.py"
+        target.write_text("class Retry:\n    X = 1\n", encoding="utf-8")
+        context = _make_context(
+            constants={"retry.py": {"Retry.X": {"qualified_name": "Retry.X", "line": 2, "end_line": 2}}},
+            repo_path=tmp_path,
+        )
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_STRATEGY_WELL_FORMED,
+            "target_files": ["retry.py"],
+            "target_symbols": ["retry.py:Retry.X"],
+        })
+
+        result = generate_remediation_strategy(
+            "vuln", llm, str(tmp_path), context, planner_evidence_ctx="EVIDENCE",
+        )
+
+        assert result.target_files == ["retry.py"]
+        assert result.target_symbols == ["retry.py:Retry.X"]
+        assert result.warnings == []
+        assert "retry.py" in result.rendered
+        # The disclaimer prose mentions this phrase unconditionally; only
+        # the actual rendered SECTION (bold heading) indicates real drops.
+        assert "**Unverified items removed:**" not in result.rendered
+
+    def test_invented_file_removed_with_warning(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_STRATEGY_WELL_FORMED,
+            "target_files": ["does/not/exist.py"],
+            "target_symbols": [],
+        })
+
+        result = generate_remediation_strategy(
+            "vuln", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE",
+        )
+
+        assert result.target_files == []
+        assert any("does/not/exist.py" in w for w in result.warnings)
+        assert "**Unverified items removed:**" in result.rendered
+        assert "does/not/exist.py" in result.rendered
+
+    def test_invented_symbol_removed_with_warning(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        target = tmp_path / "retry.py"
+        target.write_text("class Retry:\n    X = 1\n", encoding="utf-8")
+        context = _make_context(
+            constants={"retry.py": {"Retry.X": {"qualified_name": "Retry.X", "line": 2, "end_line": 2}}},
+            repo_path=tmp_path,
+        )
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_STRATEGY_WELL_FORMED,
+            "target_files": ["retry.py"],
+            "target_symbols": ["retry.py:Retry.DOES_NOT_EXIST"],
+        })
+
+        result = generate_remediation_strategy(
+            "vuln", llm, str(tmp_path), context, planner_evidence_ctx="EVIDENCE",
+        )
+
+        assert result.target_files == ["retry.py"]
+        assert result.target_symbols == []
+        assert any("Retry.DOES_NOT_EXIST" in w for w in result.warnings)
+        assert "**Unverified items removed:**" in result.rendered
+
+    def test_rejected_target_rendered_explicitly(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_STRATEGY_WELL_FORMED,
+            "target_files": [],
+            "target_symbols": [],
+            "rejected_targets": ["src/urllib3/_collections.py — contradicted by verified source"],
+        })
+
+        result = generate_remediation_strategy(
+            "vuln", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE",
+        )
+
+        assert "Rejected discovery targets" in result.rendered
+        assert "src/urllib3/_collections.py" in result.rendered
+
+
+class TestFinalStrategyFailureDegradation:
+    def test_malformed_json_returns_empty(self):
+        from utilities.autopatcher.remediation_planner import (
+            generate_remediation_strategy, _EMPTY_STRATEGY_RESULT,
+        )
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = "not json at all"
+
+        result = generate_remediation_strategy(
+            "vuln", llm, None, None, planner_evidence_ctx="EVIDENCE",
+        )
+        assert result == _EMPTY_STRATEGY_RESULT
+
+    def test_llm_error_returns_empty(self):
+        from utilities.autopatcher.remediation_planner import (
+            generate_remediation_strategy, _EMPTY_STRATEGY_RESULT,
+        )
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = RuntimeError("boom")
+
+        result = generate_remediation_strategy(
+            "vuln", llm, None, None, planner_evidence_ctx="EVIDENCE",
+        )
+        assert result == _EMPTY_STRATEGY_RESULT
+
+    def test_empty_object_response_returns_empty_rendered(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({})
+
+        result = generate_remediation_strategy(
+            "vuln", llm, None, None, planner_evidence_ctx="EVIDENCE",
+        )
+        assert result.rendered == ""
+        assert result.target_files == []
+        assert result.target_symbols == []
+
+    def test_missing_investigation_context_degrades_safely(self, tmp_path):
+        # context=None: file verification (no context needed) still works;
+        # symbol verification (needs context) safely fails closed instead
+        # of raising.
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        target = tmp_path / "retry.py"
+        target.write_text("class Retry:\n    X = 1\n", encoding="utf-8")
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_STRATEGY_WELL_FORMED,
+            "target_files": ["retry.py"],
+            "target_symbols": ["retry.py:Retry.X"],
+        })
+
+        result = generate_remediation_strategy(
+            "vuln", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE",
+        )
+
+        assert result.target_files == ["retry.py"]
+        assert result.target_symbols == []
+        assert any("Retry.X" in w for w in result.warnings)
+
+
+class TestModelUnavailableErrorPropagation:
+    """ModelUnavailableError represents an explicit execution/configuration
+    decision (non-interactive rejection, or a declined/cancelled interactive
+    model reselection) -- not ordinary evidence-acquisition failure. Unlike
+    every other exception these three best-effort Planner stages see, it
+    must propagate and abort the run rather than degrade to an empty
+    result. Ordinary failures (network, malformed JSON, etc.) must keep
+    degrading exactly as before -- see TestPlanResultParsing's and
+    TestFinalStrategyFailureDegradation's existing `RuntimeError("boom")`
+    tests for that half of the contract."""
+
+    def test_generate_remediation_plan_reraises_model_unavailable_error(self):
+        from utilities.autopatcher.llm_client import ModelUnavailableError
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = ModelUnavailableError("model rejected")
+
+        with pytest.raises(ModelUnavailableError):
+            generate_remediation_plan("some vuln", llm)
+
+    def test_generate_remediation_plan_ordinary_error_still_degrades(self):
+        """Confirms the fix didn't make every exception fatal: a plain
+        RuntimeError (what most non-ModelUnavailableError LLM/network
+        failures surface as) still degrades to the empty result."""
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = RuntimeError("ordinary network hiccup")
+
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+    def test_generate_remediation_strategy_reraises_model_unavailable_error(self):
+        from utilities.autopatcher.llm_client import ModelUnavailableError
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = ModelUnavailableError("model rejected")
+
+        with pytest.raises(ModelUnavailableError):
+            generate_remediation_strategy(
+                "vuln", llm, None, None, planner_evidence_ctx="EVIDENCE",
+            )
+
+    def test_generate_remediation_strategy_ordinary_error_still_degrades(self):
+        from utilities.autopatcher.remediation_planner import (
+            generate_remediation_strategy, _EMPTY_STRATEGY_RESULT,
+        )
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = RuntimeError("ordinary network hiccup")
+
+        result = generate_remediation_strategy(
+            "vuln", llm, None, None, planner_evidence_ctx="EVIDENCE",
+        )
+        assert result == _EMPTY_STRATEGY_RESULT
+
+    def test_guided_context_request_reraises_model_unavailable_error(self):
+        """Exercises the third stage via generate_guided_context_requests
+        directly -- this function has no try/except of its own for the
+        happy-path-vs-failure split other than the one added for
+        ModelUnavailableError, so this is the most direct proof."""
+        from utilities.autopatcher.llm_client import ModelUnavailableError
+        from utilities.autopatcher.remediation_planner import generate_guided_context_requests
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = ModelUnavailableError("model rejected")
+        strategy = _make_strategy()
+        slice_result = _make_slice_result()
+
+        with pytest.raises(ModelUnavailableError):
+            generate_guided_context_requests(strategy, "vuln", llm, mock.MagicMock(), slice_result)
+
+    def test_guided_context_request_ordinary_error_still_returns_empty_list(self):
+        from utilities.autopatcher.remediation_planner import generate_guided_context_requests
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = RuntimeError("ordinary network hiccup")
+        strategy = _make_strategy()
+        slice_result = _make_slice_result()
+
+        assert generate_guided_context_requests(strategy, "vuln", llm, mock.MagicMock(), slice_result) == []
+
+    def test_run_guided_acquisition_reraises_model_unavailable_error(self, tmp_path):
+        """End-to-end through run_guided_acquisition (the caller
+        generate_guided_context_requests has no try/except of its own
+        inside) -- proves there's no additional wrapping layer inside
+        run_guided_acquisition that would re-swallow the exception before
+        it reaches pipeline.py's own guard."""
+        from utilities.autopatcher.llm_client import ModelUnavailableError
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = ModelUnavailableError("model rejected")
+
+        with pytest.raises(ModelUnavailableError):
+            run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+
+
+class TestFinalStrategyNoNewAnalysisOrDiff:
+    def test_no_new_investigation_context_built(self, tmp_path, monkeypatch):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        def _fail_if_called(*a, **kw):
+            raise AssertionError("build_investigation_context must not be called")
+
+        monkeypatch.setattr(
+            "utilities.autopatcher.candidate_enrichment.build_investigation_context", _fail_if_called
+        )
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_STRATEGY_WELL_FORMED)
+
+        generate_remediation_strategy(
+            "vuln", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE",
+        )
+        # no exception -- build_investigation_context was never reached
+
+    def test_diff_field_in_response_ignored(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_STRATEGY_WELL_FORMED,
+            "target_files": [],
+            "target_symbols": [],
+            "diff": "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-x\n+y\n",
+        })
+
+        result = generate_remediation_strategy(
+            "vuln", llm, str(tmp_path), None, planner_evidence_ctx="EVIDENCE",
+        )
+        assert "--- a/x.py" not in result.rendered
+        assert "@@" not in result.rendered
+
+
+class TestNoAdditionalLLMCallStrategy:
+    def test_generate_remediation_strategy_has_exactly_one_llm_param(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+        params = inspect.signature(generate_remediation_strategy).parameters
+        assert "llm" in params
+        assert list(params).count("llm") == 1
+
+    def test_verify_strategy_targets_has_no_llm_parameter(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import _verify_strategy_targets
+        assert "llm" not in inspect.signature(_verify_strategy_targets).parameters
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline: exactly two Planner LLM calls, correct context ordering
+# ---------------------------------------------------------------------------
+
+_DISCOVERY_JSON = {
+    "remediation_mechanism": "extend the existing header-removal policy",
+    "target_files": ["retry.py"],
+    "target_symbols": [],
+    "security_invariant": "Sensitive request headers must not cross origins on redirect.",
+    "required_edits": ["(exploratory) possibly add Cookie to the policy set"],
+    "approaches_to_avoid": [],
+    "explicit_unknowns": [],
+    "additional_evidence_required": False,
+    "evidence_requests": [],
+}
+
+_STRATEGY_JSON = {
+    "extended_mechanism": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+    "target_files": ["retry.py"],
+    "target_symbols": [],
+    "required_edits": ["Add 'Cookie' to the existing DEFAULT_REMOVE_HEADERS_ON_REDIRECT frozenset."],
+    "rejected_targets": [],
+    "security_invariant": "Sensitive request headers must not cross origins on redirect.",
+    "insufficient_evidence": [],
+}
+
+
+class TestFullPipelineCallCountAndOrdering:
+    """Real generate_remediation_plan/generate_remediation_strategy (not
+    mocked) -- only the LLM transport (LLMClient) and the unrelated Patch
+    Generator/Challenger/Confidence stages are mocked, so this measures the
+    actual number and stage-labeling of Planner-related LLM calls the
+    pipeline makes end to end."""
+
+    def _run(self, tmp_path, discovery_json, strategy_json, vuln_text="some vulnerability"):
+        target = tmp_path / "retry.py"
+        target.write_text(
+            "class Retry:\n    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(['Authorization'])\n",
+            encoding="utf-8",
+        )
+
+        def side_effect(system_prompt, user_message, stage="unknown"):
+            if stage == "remediation_planning":
+                return json.dumps(discovery_json)
+            if stage == "remediation_strategy":
+                return json.dumps(strategy_json)
+            return "{}"
+
+        mock_llm = mock.MagicMock()
+        mock_llm.complete.side_effect = side_effect
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value={"applicable": True, "skipped": False, "stderr": "",
+                                     "exit_code": 0, "skipped_reason": None, "error": None}),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run(vuln_text, api_key="", repo_root=str(tmp_path))
+
+        return mock_llm, mock_gen
+
+    def test_exactly_two_planner_llm_calls_no_third(self, tmp_path):
+        mock_llm, _mock_gen = self._run(tmp_path, _DISCOVERY_JSON, _STRATEGY_JSON)
+
+        stages = [kwargs.get("stage") for _args, kwargs in mock_llm.complete.call_args_list]
+        assert stages.count("remediation_planning") == 1
+        assert stages.count("remediation_strategy") == 1
+        assert len(stages) == 2
+
+    def test_final_strategy_reaches_code_context_after_planner_evidence(self, tmp_path):
+        _mock_llm, mock_gen = self._run(tmp_path, _DISCOVERY_JSON, _STRATEGY_JSON)
+
+        code_context = mock_gen.call_args.kwargs.get("code_context", "")
+        assert "Target Discovery Plan" in code_context
+        assert "Planner-Proposed Candidate Evidence" in code_context
+        assert "Final Evidence-Backed Remediation Strategy" in code_context
+        assert (
+            code_context.index("Target Discovery Plan")
+            < code_context.index("Planner-Proposed Candidate Evidence")
+            < code_context.index("Final Evidence-Backed Remediation Strategy")
+        )
+
+    def test_only_slice_and_coverage_warning_may_follow_final_strategy_heading(self, tmp_path):
+        # Superseded by the Final-Target Remediation Slice feature: the
+        # Slice (and, when incomplete, its coverage warning) is now
+        # explicitly REQUIRED to render after Final Strategy -- so "no
+        # heading follows" is no longer the invariant. What must still
+        # hold: no OTHER, unrelated heading (e.g. a repeat of an earlier
+        # section) ever appears after it.
+        _mock_llm, mock_gen = self._run(tmp_path, _DISCOVERY_JSON, _STRATEGY_JSON)
+
+        code_context = mock_gen.call_args.kwargs.get("code_context", "")
+        strategy_idx = code_context.index("## Final Evidence-Backed Remediation Strategy")
+        allowed = ("## Final-Target Remediation Slice", "## Final-target source coverage warning")
+        # Level-2 headings only ("## ", not "### "/"#### ") at the start of
+        # a line -- a "#### Target definition" sub-block inside the Slice
+        # section is not itself a top-level section and must not count.
+        later_headings = [
+            m.group(0) + code_context[m.end():m.end() + 60]
+            for m in re.finditer(r"(?:^|\n)(## [^\n]*)", code_context)
+            if m.start() > strategy_idx
+        ]
+        for heading_text in later_headings:
+            assert any(a in heading_text for a in allowed), heading_text
+
+
+class TestExtendExistingMechanismFixture:
+    """Synthetic fixture proving the harness can represent and preserve a
+    correct 'extend the existing policy' answer end to end -- verified
+    source contains an existing policy constant AND a consumer that already
+    enforces it; a mocked Final Strategy response selecting extension of
+    that constant survives verification and renders distinctly from a
+    'new parallel logic' framing. Does not require a live LLM."""
+
+    def test_extension_of_existing_constant_is_preserved(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import (
+            RemediationPlanResult, build_planner_evidence, generate_remediation_strategy,
+        )
+
+        retry_py = tmp_path / "retry.py"
+        retry_py.write_text(
+            "class Retry:\n"
+            "    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n",
+            encoding="utf-8",
+        )
+        pool_py = tmp_path / "poolmanager.py"
+        pool_py.write_text(
+            "class PoolManager:\n"
+            "    def urlopen(self, method, url, redirect=True, **kw):\n"
+            "        # already consults DEFAULT_REMOVE_HEADERS_ON_REDIRECT\n"
+            "        pass\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={
+                "poolmanager.py:PoolManager.urlopen": {
+                    "name": "urlopen", "startLine": 2, "endLine": 4, "className": "PoolManager",
+                },
+            },
+            constants={
+                "retry.py": {
+                    "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": {
+                        "qualified_name": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "class_name": "Retry", "name": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "line": 2, "end_line": 2,
+                    },
+                },
+            },
+            repo_path=tmp_path,
+        )
+
+        discovery = RemediationPlanResult(
+            rendered="", target_files=["retry.py", "poolmanager.py"],
+            target_symbols=["retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "poolmanager.py:PoolManager.urlopen"],
+        )
+        planner_evidence_ctx = build_planner_evidence(discovery, str(tmp_path), "Cookie leaked on redirect", context)
+        assert planner_evidence_ctx  # sanity: real verified evidence exists
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            "extended_mechanism": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+            "target_files": ["retry.py"],
+            "target_symbols": ["retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"],
+            "required_edits": ["Add 'Cookie' to the existing DEFAULT_REMOVE_HEADERS_ON_REDIRECT frozenset."],
+            "rejected_targets": ["poolmanager.py:PoolManager.urlopen — consumer already enforces the policy; no new logic needed there."],
+            "security_invariant": "Sensitive request headers must not cross origins on redirect.",
+            "insufficient_evidence": [],
+        })
+
+        result = generate_remediation_strategy(
+            "Cookie leaked on redirect", llm, str(tmp_path), context,
+            planner_evidence_ctx=planner_evidence_ctx,
+        )
+
+        assert result.target_files == ["retry.py"]
+        assert result.target_symbols == ["retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"]
+        assert result.warnings == []
+        assert "Extended mechanism:** Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in result.rendered
+        assert "Rejected discovery targets" in result.rendered
+        assert "no new logic needed" in result.rendered
+
+
+# ---------------------------------------------------------------------------
+# Final-Target Remediation Slice
+# ---------------------------------------------------------------------------
+
+def _set_slice_budget(monkeypatch, max_chars: int) -> None:
+    """Pin the Final-Target Slice ceiling used when build_final_target_slice
+    is called without max_chars. Since Fix B that ceiling comes from
+    _effective_final_target_max (technical capacity), NOT the historical
+    FINAL_TARGET_SLICE_MAX_CHARS constant -- patching the constant would
+    leave the slice unbudgeted."""
+    from utilities.autopatcher import remediation_planner as rp
+    monkeypatch.setattr(rp, "_effective_final_target_max", lambda *a, **k: max_chars)
+
+
+def _make_strategy(
+    target_files=None, target_symbols=None, extended_mechanism=None, required_edits=None,
+    rejected_target_symbols=None, rejected_targets=None, insufficient_evidence=None,
+):
+    from utilities.autopatcher.remediation_planner import RemediationStrategyResult
+    return RemediationStrategyResult(
+        rendered="", target_files=target_files or [], target_symbols=target_symbols or [],
+        warnings=[], extended_mechanism=extended_mechanism, required_edits=required_edits or [],
+        rejected_target_symbols=rejected_target_symbols or [],
+        rejected_targets=rejected_targets or [], insufficient_evidence=insufficient_evidence or [],
+    )
+
+
+def _make_slice_result(**overrides):
+    """A hand-built FinalTargetSliceResult with every field defaulted to
+    "nothing covered yet" -- shared by Slice 1 and Slice 2 tests that need
+    to simulate a specific initial state (rather than build one for real
+    via build_final_target_slice)."""
+    from utilities.autopatcher.remediation_planner import FinalTargetSliceResult
+    base = dict(
+        rendered="", covered_target_files=[], covered_target_symbols=[],
+        uncovered_target_files=[], uncovered_target_symbols=[],
+        coverage_complete=False, has_any_coverage=False, warning_text="",
+        resolved_target_symbols=[], full_file_fallback_covered=[],
+        edit_target_budget_exhausted=False,
+        resolved_symbol_files={}, identifier_definition_covered=[],
+    )
+    base.update(overrides)
+    return FinalTargetSliceResult(**base)
+
+
+class TestSliceGatingAndNoNewLLM:
+    def test_slice_construction_has_no_llm_parameter(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        assert "llm" not in inspect.signature(build_final_target_slice).parameters
+
+    def test_empty_strategy_produces_empty_slice_without_calling_anything(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy()
+        result = build_final_target_slice(strategy, str(tmp_path), None)
+        assert result.rendered == ""
+        assert result.coverage_complete is True
+        assert result.has_any_coverage is False
+
+    def test_no_repo_root_degrades_safely(self):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["a.py"])
+        result = build_final_target_slice(strategy, None, None)
+        assert result.rendered == "" or "failed" in result.rendered.lower()
+
+    def test_reuses_existing_investigation_context_no_rebuild(self, tmp_path, monkeypatch):
+        (tmp_path / "a.py").write_text("class A:\n    X = 1\n", encoding="utf-8")
+        context = _make_context(
+            constants={"a.py": {"A.X": {"qualified_name": "A.X", "name": "X", "line": 2, "end_line": 2}}},
+            repo_path=tmp_path,
+        )
+
+        # Record rather than raise: build_final_target_slice catches every
+        # Exception (an AssertionError included) into a "construction failed"
+        # result, so a raising guard could never fail this test.
+        calls = []
+        monkeypatch.setattr(
+            "utilities.autopatcher.candidate_enrichment.build_investigation_context",
+            lambda *a, **kw: calls.append(a),
+        )
+
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["a.py"], target_symbols=["a.py:A.X"])
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert calls == []  # build_investigation_context was never reached
+        assert "construction failed" not in result.rendered
+        assert "A.X" in result.rendered
+
+    def test_no_parser_reimport_triggered(self, tmp_path, monkeypatch):
+        (tmp_path / "a.py").write_text("class A:\n    X = 1\n", encoding="utf-8")
+        context = _make_context(
+            constants={"a.py": {"A.X": {"qualified_name": "A.X", "name": "X", "line": 2, "end_line": 2}}},
+            repo_path=tmp_path,
+        )
+
+        calls = []  # recorded, not raised -- see the test above
+        monkeypatch.setattr(
+            "utilities.autopatcher.candidate_enrichment.parse_repository", lambda *a, **kw: calls.append(a)
+        )
+
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["a.py"], target_symbols=["a.py:A.X"])
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert calls == []  # parse_repository was never reached
+        assert "construction failed" not in result.rendered
+        assert "A.X" in result.rendered
+
+
+class TestPaddedLineRange:
+    """Unit tests for _padded_line_range / _rendered_end_line in isolation
+    -- the pure arithmetic behind the patch-ready source window."""
+
+    def test_pads_both_sides_symmetrically(self):
+        from utilities.autopatcher.remediation_planner import _padded_line_range
+        assert _padded_line_range(10, 10, 3) == (7, 13)
+
+    def test_pads_a_multi_line_span(self):
+        from utilities.autopatcher.remediation_planner import _padded_line_range
+        assert _padded_line_range(10, 12, 3) == (7, 15)
+
+    def test_clamps_start_to_1_never_negative_or_zero(self):
+        from utilities.autopatcher.remediation_planner import _padded_line_range
+        assert _padded_line_range(2, 2, 3) == (1, 5)
+        assert _padded_line_range(1, 1, 3) == (1, 4)
+
+    def test_zero_or_negative_pad_is_a_strict_noop(self):
+        from utilities.autopatcher.remediation_planner import _padded_line_range
+        assert _padded_line_range(10, 12, 0) == (10, 12)
+        assert _padded_line_range(10, 12, -1) == (10, 12)
+
+    def test_rendered_end_line_reflects_actual_source_not_the_request(self):
+        """The header-accuracy guarantee: read_file_section may silently
+        clamp past EOF, returning fewer lines than requested -- the header
+        must claim only what was actually returned."""
+        from utilities.autopatcher.remediation_planner import _rendered_end_line
+        assert _rendered_end_line(1, "a\nb\nc\n") == 3
+        assert _rendered_end_line(5, "only one line\n") == 5
+        assert _rendered_end_line(5, "") == 5
+
+    def test_rendered_end_line_matches_unclamped_request_when_within_bounds(self):
+        from utilities.autopatcher.remediation_planner import _padded_line_range, _rendered_end_line
+        start, end = _padded_line_range(10, 10, 3)
+        source = "\n".join(f"line{i}" for i in range(start, end + 1)) + "\n"
+        assert _rendered_end_line(start, source) == end
+
+
+class TestExactConstantDefinition:
+    def test_preserves_repository_text_and_capitalization_exactly(self, tmp_path):
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"ExistingValue\"])\n", encoding="utf-8",
+        )
+        context = _make_context(
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["policy.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"])
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert 'ALLOWED_VALUES = frozenset(["ExistingValue"])' in result.rendered
+        # Patch-ready source window (see _DEFINITION_CONTEXT_LINES): the
+        # constant's own span is line 2-2, padded by 3 lines each side to
+        # 1-5 (max(1, 2-3)=1) -- clamped down to 1-2 here because the
+        # fixture file only HAS 2 lines. The header must reflect what was
+        # actually shown (see _rendered_end_line), not the unclamped request.
+        assert "Target definition: `policy.py:Policy.ALLOWED_VALUES` (lines 1–2)" in result.rendered
+        assert "policy.py:Policy.ALLOWED_VALUES" in result.covered_target_symbols
+
+    def test_padded_with_real_surrounding_lines_when_file_is_large_enough(self, tmp_path):
+        """The case this feature exists for: a short constant in a file
+        with real, distinct neighbors on both sides must render WITH those
+        neighbors -- not just the bare defining line -- so Patch Generation
+        has exact repository text to anchor a unified diff hunk to."""
+        lines = [f"# filler line {i}\n" for i in range(1, 10)]
+        lines[4] = "class Policy:\n"  # line 5
+        lines[5] = '    ALLOWED_VALUES = frozenset(["ExistingValue"])\n'  # line 6
+        (tmp_path / "policy.py").write_text("".join(lines), encoding="utf-8")
+        context = _make_context(
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 6, "end_line": 6,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["policy.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"])
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        # 3 lines before (3-5) and 3 after (7-9) are real, distinct repository
+        # text -- not the bare 1-line span, and not invented.
+        assert "Target definition: `policy.py:Policy.ALLOWED_VALUES` (lines 3–9)" in result.rendered
+        assert "# filler line 3" in result.rendered
+        assert "# filler line 9" in result.rendered
+        assert 'ALLOWED_VALUES = frozenset(["ExistingValue"])' in result.rendered
+
+
+class TestStrategyIdentifierExtraction:
+    def test_dotted_snake_and_verified_identifiers_retained(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        text = "Extend Policy.ALLOWED_VALUES by adding to remove_sensitive_values."
+        found = _extract_identifiers_from_text(text)
+        assert "Policy.ALLOWED_VALUES" in found
+        assert "remove_sensitive_values" in found
+
+    def test_common_english_words_not_extracted(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        text = "Extend the existing policy instead of creating a new parallel mechanism."
+        found = _extract_identifiers_from_text(text)
+        assert found == []
+
+    def test_camelcase_requires_at_least_two_humps(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        assert "PoolManager" in _extract_identifiers_from_text("See PoolManager for details.")
+        # A single-hump capitalized word (sentence-initial or a bare class
+        # name) is deliberately not treated as CamelCase on its own.
+        assert "Retry" not in _extract_identifiers_from_text("Retry handles this case.")
+
+    def test_verified_symbols_extracted_via_strategy_object(self):
+        from utilities.autopatcher.remediation_planner import _extract_strategy_identifiers
+        strategy = _make_strategy(target_symbols=["retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"])
+        found = _extract_strategy_identifiers(strategy)
+        assert "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in found
+        assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in found
+        assert "Retry" in found  # class qualifier of a VERIFIED symbol is trusted, unlike bare prose
+
+    def test_bare_attribute_retained_alongside_dotted_form(self):
+        """A qualified reference (`object.attribute`, typically a consumer/
+        read site) and its bare attribute component (typically the
+        definition/assignment/normalization site, e.g. `self.attribute = ...`)
+        name two DIFFERENT repository locations and must both be kept as
+        independent search targets -- neither is redundant with the other."""
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        found = _extract_identifiers_from_text("Policy.ALLOWED_VALUES is the mechanism.")
+        assert found.count("ALLOWED_VALUES") == 1
+        assert found.count("Policy.ALLOWED_VALUES") == 1
+
+    def test_order_preserving_deduplication(self):
+        from utilities.autopatcher.remediation_planner import _extract_strategy_identifiers
+        strategy = _make_strategy(
+            extended_mechanism="Policy.ALLOWED_VALUES",
+            required_edits=["Extend Policy.ALLOWED_VALUES again."],
+        )
+        found = _extract_strategy_identifiers(strategy)
+        assert found.count("Policy.ALLOWED_VALUES") == 1
+
+
+class TestBareIdentifierRetainedAlongsideDottedForm:
+    """A qualified reference (`object.attribute`) and its bare attribute
+    component name two potentially DIFFERENT repository locations -- a
+    consumer/read site vs. a definition/assignment/normalization/constructor
+    site (`self.attribute = ...`, a bare parameter name, etc.) -- so the
+    bare form must never be discarded merely for being a substring of an
+    already-captured dotted form. Generic examples only; no repository- or
+    CVE-specific identifiers."""
+
+    def test_dotted_and_bare_attribute_both_retained(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        found = _extract_identifiers_from_text(
+            "The client reads client.security_policy; security_policy is normalized at construction."
+        )
+        assert "client.security_policy" in found
+        assert "security_policy" in found
+
+    def test_exact_duplicate_dotted_identifier_still_deduplicated(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        found = _extract_identifiers_from_text(
+            "client.security_policy is read here. Later, client.security_policy is read again."
+        )
+        assert found.count("client.security_policy") == 1
+
+    def test_ordering_remains_deterministic(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        text = "First mention: server.timeout_seconds. Then MAX_RETRY_COUNT constant."
+        first_run = _extract_identifiers_from_text(text)
+        second_run = _extract_identifiers_from_text(text)
+        assert first_run == second_run
+        assert first_run == ["server.timeout_seconds", "timeout_seconds", "MAX_RETRY_COUNT"]
+
+    def test_multiple_dotted_references_share_one_bare_identifier(self):
+        """Two different qualified references to the same underlying
+        attribute must not create duplicate bare-identifier entries."""
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        found = _extract_identifiers_from_text(
+            "client.security_policy and server.security_policy both read "
+            "security_policy, which is defined once."
+        )
+        assert found.count("client.security_policy") == 1
+        assert found.count("server.security_policy") == 1
+        assert found.count("security_policy") == 1
+
+    def test_snake_case_only_extraction_unchanged(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        assert _extract_identifiers_from_text("The MAX_RETRY_COUNT constant controls retries.") == ["MAX_RETRY_COUNT"]
+
+    def test_camelcase_only_extraction_unchanged(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        assert _extract_identifiers_from_text("The RequestHistory class stores metadata.") == ["RequestHistory"]
+
+    def test_dotted_only_extraction_unchanged(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        assert _extract_identifiers_from_text("See obj.attribute for details.") == ["obj.attribute"]
+
+    def test_duplicate_identical_token_represented_once(self):
+        """A genuinely repeated identical token (no dotted form involved at
+        all) remains represented exactly once -- untouched by this change."""
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        found = _extract_identifiers_from_text(
+            "MAX_RETRY_COUNT governs retries. MAX_RETRY_COUNT is read at startup."
+        )
+        assert found.count("MAX_RETRY_COUNT") == 1
+
+    def test_non_dotted_containment_still_deduplicated(self):
+        """A shorter token that is a substring of an already-captured
+        PLAIN (non-dotted) longer token is still treated as redundant --
+        this change narrows the dedup rule to dotted-vs-bare only, it does
+        not disable dedup broadly."""
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        found = _extract_identifiers_from_text(
+            "PolicyAllowedValues is the source of truth. AllowedValues is a shorter alias."
+        )
+        assert found.count("PolicyAllowedValues") == 1
+        assert found.count("AllowedValues") == 0
+
+
+class TestBareIdentifierEnablesConsumerDiscovery:
+    """Composition test: category-3a's consumer-usage scan can only search
+    for terms _extract_strategy_identifiers actually produced. This proves
+    the retained bare identifier makes a definition/constructor -- which
+    only ever uses the bare, self-qualified form -- newly discoverable,
+    using an entirely synthetic, generic scenario (no repository- or
+    CVE-specific names)."""
+
+    def test_definition_only_reachable_via_retained_bare_identifier(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import (
+            _extract_strategy_identifiers, build_final_target_slice,
+        )
+
+        (tmp_path / "widget.py").write_text(
+            "class Widget:\n"
+            "    def __init__(self, allowed_hosts=None):\n"
+            "        self.allowed_hosts = frozenset(h.lower() for h in (allowed_hosts or []))\n"
+            "\n"
+            "    def other_method(self):\n"
+            "        return None\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={
+                "widget.py:Widget.__init__": {
+                    "name": "__init__", "className": "Widget", "startLine": 2, "endLine": 3,
+                    "code": (
+                        "    def __init__(self, allowed_hosts=None):\n"
+                        "        self.allowed_hosts = frozenset(h.lower() for h in (allowed_hosts or []))\n"
+                    ),
+                },
+                "widget.py:Widget.other_method": {
+                    "name": "other_method", "className": "Widget", "startLine": 5, "endLine": 6,
+                    "code": "    def other_method(self):\n        return None\n",
+                },
+            },
+            repo_path=tmp_path,
+        )
+        # The strategy text -- like the real demonstrated case -- only ever
+        # names the QUALIFIED, consumer-side reference; it never mentions
+        # the bare attribute name on its own.
+        strategy = _make_strategy(
+            target_files=["widget.py"], target_symbols=[],
+            extended_mechanism=(
+                "The consumer reads widget.allowed_hosts to decide whether to allow the host."
+            ),
+        )
+
+        terms = _extract_strategy_identifiers(strategy)
+        assert "widget.allowed_hosts" in terms
+        assert "allowed_hosts" in terms  # retained thanks to this fix -- not discarded as redundant
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "Discovered consumer" in result.rendered
+        assert "Widget.__init__" in result.rendered
+        assert "self.allowed_hosts = frozenset" in result.rendered
+        assert "other_method" not in result.rendered
+
+
+class TestMechanismTermsPrioritizedOverTargetSymbol:
+    """Design 2 (provenance-based) category-3a prioritization:
+    _mechanism_terms_first partitions an already-extracted strategy_terms
+    list into mechanism-derived terms (independently derivable from
+    extended_mechanism/required_edits) first, then coarse terms whose only
+    origin is a verified target symbol -- by SOURCE, never by identifier
+    shape. Generic/synthetic names only."""
+
+    def _strategy(self, target_symbols, extended_mechanism, required_edits=None):
+        return _make_strategy(
+            target_files=["widget.py"], target_symbols=target_symbols,
+            extended_mechanism=extended_mechanism, required_edits=required_edits or [],
+        )
+
+    def test_mechanism_derived_terms_placed_before_target_symbol_only(self):
+        from utilities.autopatcher.remediation_planner import (
+            _extract_strategy_identifiers, _mechanism_terms_first,
+        )
+        strategy = self._strategy(
+            target_symbols=["Client"],
+            extended_mechanism=(
+                "RequestPolicy.validate_request reads request.allowed_hosts; "
+                "allowed_hosts is normalized before use. NewTransport also applies it."
+            ),
+        )
+        strategy_terms = _extract_strategy_identifiers(strategy)
+        assert strategy_terms[0] == "Client"  # coarse target symbol is unconditionally first, as always
+
+        reordered = _mechanism_terms_first(strategy_terms, strategy)
+
+        assert reordered[-1] == "Client"  # the only target-symbol-only term ends up last
+        for term in ("RequestPolicy.validate_request", "request.allowed_hosts", "allowed_hosts", "NewTransport"):
+            assert term in reordered
+            assert reordered.index(term) < reordered.index("Client")
+
+    def test_cross_language_shape_protection_camelcase_mechanism_term(self):
+        """A mechanism-derived CamelCase/PascalCase identifier (e.g. a
+        Go-style exported function name) must stay ahead of a
+        target-symbol-only CamelCase name -- proving classification is by
+        SOURCE, not by shape. A shape-based rule would incorrectly lump
+        both together as "coarse"."""
+        from utilities.autopatcher.remediation_planner import (
+            _extract_strategy_identifiers, _mechanism_terms_first,
+        )
+        strategy = self._strategy(
+            target_symbols=["Client"],
+            extended_mechanism="NewTransport already applies the required normalization.",
+        )
+        strategy_terms = _extract_strategy_identifiers(strategy)
+        reordered = _mechanism_terms_first(strategy_terms, strategy)
+
+        assert reordered.index("NewTransport") < reordered.index("Client")
+
+    def test_duplicate_provenance_single_occurrence_in_mechanism_group(self):
+        """A term appearing both as a target symbol AND independently in
+        the mechanism text must appear exactly once, in the higher-priority
+        (mechanism) group -- never duplicated, never left behind in the
+        coarse group. Contrasted against a second, genuinely
+        target-symbol-only term so the reordering is non-trivial."""
+        from utilities.autopatcher.remediation_planner import (
+            _extract_strategy_identifiers, _mechanism_terms_first,
+        )
+        strategy = self._strategy(
+            target_symbols=["NewTransport", "Client"],
+            extended_mechanism="NewTransport already applies the required normalization.",
+        )
+        strategy_terms = _extract_strategy_identifiers(strategy)
+        assert strategy_terms.count("NewTransport") == 1  # already guaranteed by _extract_strategy_identifiers
+
+        reordered = _mechanism_terms_first(strategy_terms, strategy)
+        assert reordered.count("NewTransport") == 1  # still exactly once -- not duplicated
+        # "NewTransport" is both a target symbol AND mechanism-derived --
+        # it must land ahead of "Client", which is target-symbol-only.
+        assert reordered.index("NewTransport") < reordered.index("Client")
+        assert reordered[-1] == "Client"
+
+    def test_stable_ordering_repeated_calls_identical(self):
+        from utilities.autopatcher.remediation_planner import (
+            _extract_strategy_identifiers, _mechanism_terms_first,
+        )
+        strategy = self._strategy(
+            target_symbols=["Client", "Session"],
+            extended_mechanism="RequestPolicy.validate_request reads request.allowed_hosts.",
+            required_edits=["Extend allowed_hosts to include the new value."],
+        )
+        strategy_terms = _extract_strategy_identifiers(strategy)
+        first = _mechanism_terms_first(strategy_terms, strategy)
+        second = _mechanism_terms_first(strategy_terms, strategy)
+        assert first == second
+        # Relative order within each group preserved: both coarse terms
+        # keep their original mutual order at the tail.
+        assert [t for t in first if t in ("Client", "Session")] == ["Client", "Session"]
+
+    def test_category_2_unaffected(self, tmp_path):
+        """Reuses TestClassOnlyTargetDiscovery's own fixture and assertions
+        verbatim -- category 2's constant-lookup behavior/output must be
+        byte-for-byte unchanged by a category-3a-only reordering."""
+        fixture = TestClassOnlyTargetDiscovery()
+        context = fixture._context_with_policy_and_consumer(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=["policy.py"], target_symbols=[],
+            extended_mechanism="Policy.ALLOWED_VALUES",
+            required_edits=["Add 'b' to Policy.ALLOWED_VALUES."],
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert "policy.py" in result.covered_target_files
+        assert (
+            "Related definition (context only, not an approved edit target): "
+            "`policy.py:Policy.ALLOWED_VALUES`" in result.rendered
+        )
+        assert "Target definition: `policy.py:Policy.ALLOWED_VALUES`" not in result.rendered
+
+    def test_category_3b_unaffected(self, tmp_path):
+        """Category-3b regression test, analogous in purpose to
+        test_category_2_unaffected above: category 3a's mechanism-derived
+        reordering must not alter category 3b's own edit-target window
+        selection or commit order.
+
+        Structural guard: 3b's own code (its per-target strategy-term scan
+        AND its outer symbol_matches commit loop, both inside the "3b."
+        section of _build_final_target_slice_inner) never references
+        _mechanism_terms_first -- only category 3a's separate usage scan
+        does.
+
+        Behavioral guard: two verified FUNCTION targets are both 3b
+        candidates. The mechanism text prominently names "method_a" (in
+        addition to "allowed_hosts", found only inside method_a's own
+        body) -- so "method_a" is independently mechanism-derived, while
+        "method_b" (found only via its own target-symbol name, inside its
+        own body's comment) is purely coarse. This is exactly the shape
+        that would rank method_a's own symbol ahead of method_b's under a
+        (hypothetical, incorrect) reuse of category 3a's reordering for
+        3b's own outer commit loop. Category 3b's commit order must still
+        follow strategy.target_symbols' own order (method_b, listed
+        first, before method_a), and each target's own window content
+        must be exactly what its own body's strategy-term occurrences
+        produce -- neither is affected by 3a's local reordering."""
+        import inspect
+        from utilities.autopatcher.remediation_planner import (
+            _build_final_target_slice_inner, build_final_target_slice,
+        )
+
+        source = inspect.getsource(_build_final_target_slice_inner)
+        start = source.index("# 3b. Inside a directly-resolved FUNCTION target itself")
+        end = source.index("# --- Category 4 (EDIT-TARGET role):")
+        assert start < end
+        assert "_mechanism_terms_first" not in source[start:end]
+
+        (tmp_path / "widget.py").write_text(
+            "class Widget:\n"
+            "    def method_b(self):\n"
+            "        # method_b sets the retry budget\n"
+            "        self.retry_budget = 3\n"
+            "        return self.retry_budget\n"
+            "\n"
+            "    def method_a(self):\n"
+            "        # method_a sets the allowed hosts\n"
+            "        self.allowed_hosts = frozenset()\n"
+            "        return self.allowed_hosts\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={
+                "widget.py:Widget.method_b": {
+                    "name": "method_b", "className": "Widget", "startLine": 2, "endLine": 5,
+                    "code": (
+                        "    def method_b(self):\n"
+                        "        # method_b sets the retry budget\n"
+                        "        self.retry_budget = 3\n"
+                        "        return self.retry_budget\n"
+                    ),
+                },
+                "widget.py:Widget.method_a": {
+                    "name": "method_a", "className": "Widget", "startLine": 7, "endLine": 10,
+                    "code": (
+                        "    def method_a(self):\n"
+                        "        # method_a sets the allowed hosts\n"
+                        "        self.allowed_hosts = frozenset()\n"
+                        "        return self.allowed_hosts\n"
+                    ),
+                },
+            },
+            repo_path=tmp_path,
+        )
+        # target_symbols lists method_b FIRST. "method_a" and
+        # "allowed_hosts" both appear in the mechanism text -- both
+        # independently mechanism-derived -- while "method_b" is purely
+        # coarse (target-symbol-derived only, never mentioned in the
+        # mechanism text at all).
+        strategy = _make_strategy(
+            target_files=["widget.py"],
+            target_symbols=["widget.py:Widget.method_b", "widget.py:Widget.method_a"],
+            extended_mechanism="The client reads config.allowed_hosts to decide access; method_a validates it.",
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "self.retry_budget = 3" in result.rendered
+        assert "self.allowed_hosts = frozenset()" in result.rendered
+        assert {"widget.py:Widget.method_b", "widget.py:Widget.method_a"} <= set(result.covered_target_symbols)
+        # Ordering: method_b's own block (first in target_symbols) must
+        # commit before method_a's own block (second) -- even though
+        # method_a's own symbol name is the one independently reinforced
+        # by the mechanism text.
+        assert result.rendered.index("self.retry_budget = 3") < result.rendered.index(
+            "self.allowed_hosts = frozenset()"
+        )
+
+    def test_coarse_term_starvation_prevented_under_tight_budget(self, tmp_path):
+        """Composition test: a coarse, target-symbol-only term ("Widget")
+        matches two consumer functions; a mechanism-derived term
+        ("max_retry_count", from extended_mechanism) matches a third,
+        necessary-to-understand-remediation function. Under a tight
+        budget, the mechanism candidate must never be starved by the
+        coarse term's own matches -- and coarse candidates must still
+        render once enough budget remains. No budget constant is changed;
+        `max_chars` is passed explicitly per-call, exactly as
+        build_final_target_slice's own public signature already allows."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        src = (
+            "class Widget:\n"
+            "    def method_a(self):\n"
+            "        return \"Widget helper A with some padding text to make this block reasonably sized for testing purposes here\"\n"
+            "\n"
+            "    def method_b(self):\n"
+            "        return \"Widget helper B with some padding text to make this block reasonably sized for testing purposes here\"\n"
+            "\n"
+            "    def configure(self, max_retry_count=None):\n"
+            "        self.max_retry_count = int(max_retry_count or 0)\n"
+        )
+        (tmp_path / "widget.py").write_text(src, encoding="utf-8")
+        lines = src.splitlines(keepends=True)
+
+        def code_for(start, end):
+            return "".join(lines[start - 1:end])
+
+        context = _make_context(
+            functions={
+                "widget.py:Widget.method_a": {
+                    "name": "method_a", "className": "Widget", "startLine": 2, "endLine": 3,
+                    "code": code_for(2, 3),
+                },
+                "widget.py:Widget.method_b": {
+                    "name": "method_b", "className": "Widget", "startLine": 5, "endLine": 6,
+                    "code": code_for(5, 6),
+                },
+                "widget.py:Widget.configure": {
+                    "name": "configure", "className": "Widget", "startLine": 8, "endLine": 9,
+                    "code": code_for(8, 9),
+                },
+            },
+            repo_path=tmp_path,
+        )
+        strategy = _make_strategy(
+            target_files=["widget.py"], target_symbols=["Widget"],
+            extended_mechanism="The client reads config.max_retry_count to decide retry behavior.",
+        )
+
+        # Tight budget: only the mechanism-derived candidate (plus whatever
+        # the primary edit-target definition itself always contributes)
+        # fits -- neither coarse consumer does.
+        tight = build_final_target_slice(strategy, str(tmp_path), context, max_chars=900)
+        assert "Discovered consumer: `widget.py:Widget.configure`" in tight.rendered
+        assert "Discovered consumer: `widget.py:Widget.method_a`" not in tight.rendered
+        assert "Discovered consumer: `widget.py:Widget.method_b`" not in tight.rendered
+        # Whole-block-or-omit: the coarse consumer windows are either
+        # rendered as complete "Discovered consumer" blocks (checked above)
+        # or entirely absent -- never partially included. (The primary
+        # edit-target's own full-class definition block legitimately
+        # contains all method bodies verbatim regardless of budget, so
+        # method source text alone is not itself a signal here.)
+
+        # Generous budget: the mechanism candidate AND both coarse
+        # consumers all render -- the fix never excludes coarse evidence,
+        # only deprioritizes its commit order when budget is genuinely tight.
+        loose = build_final_target_slice(strategy, str(tmp_path), context)
+        assert "Discovered consumer: `widget.py:Widget.configure`" in loose.rendered
+        assert "Discovered consumer: `widget.py:Widget.method_a`" in loose.rendered
+        assert "Discovered consumer: `widget.py:Widget.method_b`" in loose.rendered
+
+    def test_no_repository_specific_strings_in_provenance_reordering(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import _mechanism_derived_terms, _mechanism_terms_first
+        source = inspect.getsource(_mechanism_derived_terms) + inspect.getsource(_mechanism_terms_first)
+        for needle in ("urllib3", "Cookie", "Retry", "remove_headers_on_redirect", "PoolManager", "CVE-"):
+            assert needle not in source
+
+
+class TestClassOnlyTargetDiscovery:
+    def _context_with_policy_and_consumer(self, tmp_path):
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        (tmp_path / "consumer.py").write_text(
+            "class Consumer:\n"
+            "    def validate(self, value):\n"
+            "        if value not in Policy.ALLOWED_VALUES:\n"
+            "            raise ValueError(value)\n"
+            "        return True\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={
+                "consumer.py:Consumer.validate": {
+                    "name": "validate", "className": "Consumer", "startLine": 2, "endLine": 5,
+                    "code": (
+                        "    def validate(self, value):\n"
+                        "        if value not in Policy.ALLOWED_VALUES:\n"
+                        "            raise ValueError(value)\n"
+                        "        return True\n"
+                    ),
+                },
+            },
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        return context
+
+    def test_class_only_target_does_not_trigger_immediate_full_file_fallback(self, tmp_path):
+        context = self._context_with_policy_and_consumer(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=["policy.py"], target_symbols=[],
+            extended_mechanism="Policy.ALLOWED_VALUES",
+        )
+
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["consumer.py"],
+        )
+
+        assert "Full file (last resort)" not in result.rendered
+        assert 'ALLOWED_VALUES = frozenset(["a"])' in result.rendered
+
+    def test_class_only_target_discovers_relevant_constant_from_strategy_text(self, tmp_path):
+        context = self._context_with_policy_and_consumer(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=["policy.py"], target_symbols=[],
+            extended_mechanism="Policy.ALLOWED_VALUES",
+            required_edits=["Add 'b' to Policy.ALLOWED_VALUES."],
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "policy.py" in result.covered_target_files
+        # target_symbols is empty -- this is discovered by Category 2
+        # (strategy-prose identifier lookup), never a verified Final
+        # Strategy target, so it must render under Category 2's own
+        # context-only heading, never the EDIT-TARGET "Target definition:"
+        # heading (see _CATEGORY2_HEADING_LABEL / _render_definition_block).
+        assert (
+            "Related definition (context only, not an approved edit target): "
+            "`policy.py:Policy.ALLOWED_VALUES`" in result.rendered
+        )
+        assert "Target definition: `policy.py:Policy.ALLOWED_VALUES`" not in result.rendered
+
+
+class TestDefinitionAndUsageLookupVerification:
+    def test_search_definitions_results_restricted_to_preferred_files(self, tmp_path):
+        (tmp_path / "a.py").write_text("class A:\n    def m(self):\n        pass\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("class B:\n    def m(self):\n        pass\n", encoding="utf-8")
+        context = _make_context(functions={
+            "a.py:A.m": {"name": "m", "className": "A", "startLine": 2, "endLine": 3,
+                         "code": "    def m(self):\n        pass\n"},
+            "b.py:B.m": {"name": "m", "className": "B", "startLine": 2, "endLine": 3,
+                         "code": "    def m(self):\n        pass\n"},
+        }, repo_path=tmp_path)
+
+        from utilities.autopatcher.remediation_planner import _lookup_identifier_definition
+        found = _lookup_identifier_definition("m", ["b.py"], context)
+        assert found is not None
+        assert found.file == "b.py"  # never a.py -- not in preferred_files
+
+    def test_search_usages_results_restricted_to_preferred_files(self, tmp_path):
+        (tmp_path / "a.py").write_text("pass\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("pass\n", encoding="utf-8")
+        context = _make_context(functions={
+            "a.py:unrelated": {"name": "unrelated", "startLine": 1, "endLine": 1,
+                                "code": "target_marker_value\n"},
+            "b.py:consumer": {"name": "consumer", "startLine": 1, "endLine": 1,
+                               "code": "target_marker_value\n"},
+        }, repo_path=tmp_path)
+
+        from utilities.autopatcher.remediation_planner import _lookup_identifier_usages
+        found = _lookup_identifier_usages("target_marker_value", ["b.py"], context)
+        assert [f for (f, *_rest) in found] == ["b.py"]
+
+    def test_final_target_files_preferred_over_unrelated_matches(self, tmp_path):
+        (tmp_path / "target.py").write_text("class T:\n    X = 1\n", encoding="utf-8")
+        (tmp_path / "unrelated.py").write_text("class U:\n    X = 1\n", encoding="utf-8")
+        context = _make_context(
+            constants={
+                "unrelated.py": {"U.X": {"qualified_name": "U.X", "name": "X", "line": 2, "end_line": 2}},
+            },
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import _lookup_identifier_definition
+        # "X" only exists in unrelated.py's constants table -- restricting
+        # preferred_files to target.py alone must find nothing, proving no
+        # whole-repository scan happens.
+        found = _lookup_identifier_definition("X", ["target.py"], context)
+        assert found is None
+
+
+# ---------------------------------------------------------------------------
+# Category 2 target-identity boundary (pygeoapi CVE-2026-42351 regression)
+#
+# Regression shape: a Final Strategy verifies and scopes to
+# "filesystem.py:FileSystemProvider.get_data_path", explicitly REJECTING
+# "azure_.py:AzureBlobStorageProvider.get_data_path" as out of scope. Both
+# files still end up in the Final-Target Slice's own `preferred_files` (the
+# Planner's original, broader proposal, kept for OTHER strategy-derived
+# identifiers' supporting evidence -- see build_final_target_slice's own
+# docstring). _extract_strategy_identifiers always adds a qualified target
+# symbol's own bare suffix ("get_data_path") as a plain strategy term, and
+# category 2 (_lookup_identifier_definition) resolves strategy terms with no
+# class-qualifier check of its own -- so, before the fix, whichever file's
+# search_definitions() hit came back first (analyzer-order, not
+# target-order) silently satisfied the term, even a REJECTED file's own
+# unrelated class. This produced a real observed "Target definition:
+# azure_.py:get_data_path" block for a Strategy that never approved it.
+# ---------------------------------------------------------------------------
+
+def _pygeoapi_shaped_context(tmp_path):
+    (tmp_path / "filesystem.py").write_text(
+        "class FileSystemProvider:\n"
+        "    def get_data_path(self, dirpath):\n"
+        "        return TARGET_SOURCE\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "azure_.py").write_text(
+        "class AzureBlobStorageProvider:\n"
+        "    def get_data_path(self, dirpath):\n"
+        "        return OTHER_SOURCE\n",
+        encoding="utf-8",
+    )
+    return _make_context(
+        functions={
+            # Analyzer (by_name) order deliberately puts azure_.py's match
+            # FIRST -- reproducing the real run's observed ordering, so a
+            # test that happened to pass only by accidental dict order
+            # would be a false negative.
+            "azure_.py:AzureBlobStorageProvider.get_data_path": {
+                "name": "get_data_path", "className": "AzureBlobStorageProvider",
+                "startLine": 2, "endLine": 3,
+                "code": "    def get_data_path(self, dirpath):\n        return OTHER_SOURCE\n",
+            },
+            "filesystem.py:FileSystemProvider.get_data_path": {
+                "name": "get_data_path", "className": "FileSystemProvider",
+                "startLine": 2, "endLine": 3,
+                "code": "    def get_data_path(self, dirpath):\n        return TARGET_SOURCE\n",
+            },
+        },
+        repo_path=tmp_path,
+    )
+
+
+class TestQualifiedTargetIdentityBoundary:
+    def test_target_identity_by_bare_name_built_from_resolved_matches(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import (
+            _SymbolMatch, _target_identity_by_bare_name,
+        )
+        symbol_matches = {
+            "FileSystemProvider.get_data_path": _SymbolMatch(
+                file="filesystem.py", label="FileSystemProvider.get_data_path",
+                kind="function", line=2, end_line=3,
+                func_id="filesystem.py:FileSystemProvider.get_data_path",
+            ),
+        }
+        identity = _target_identity_by_bare_name(symbol_matches)
+        assert identity == {"get_data_path": {("filesystem.py", "FileSystemProvider")}}
+
+    def test_category2_lookup_rejects_cross_file_cross_class_bare_match(self, tmp_path):
+        # The exact bug shape, isolated to _lookup_identifier_definition
+        # itself: with target_identity supplied, azure_.py's own
+        # get_data_path must never satisfy a lookup that is really asking
+        # for FileSystemProvider's.
+        context = _pygeoapi_shaped_context(tmp_path)
+        from utilities.autopatcher.remediation_planner import _lookup_identifier_definition
+
+        target_identity = {"get_data_path": {("filesystem.py", "FileSystemProvider")}}
+        found = _lookup_identifier_definition(
+            "get_data_path", ["filesystem.py", "azure_.py"], context,
+            target_identity=target_identity,
+        )
+        assert found is not None
+        assert found.file == "filesystem.py"
+
+    def test_category2_lookup_without_identity_map_unaffected(self, tmp_path):
+        # target_identity=None (the default) is the exact prior behavior --
+        # every existing caller that doesn't pass it must see no change.
+        context = _pygeoapi_shaped_context(tmp_path)
+        from utilities.autopatcher.remediation_planner import _lookup_identifier_definition
+
+        found = _lookup_identifier_definition("get_data_path", ["filesystem.py", "azure_.py"], context)
+        assert found is not None  # unchanged: still resolves to *a* match
+
+    def test_final_target_slice_never_renders_rejected_file_as_target_definition(self, tmp_path):
+        # End-to-end through build_final_target_slice, exactly reproducing
+        # the pygeoapi shape: Final Strategy verified only filesystem.py /
+        # FileSystemProvider.get_data_path; azure_.py is still passed as
+        # planner_evidence_files (the Planner's own broader, since-rejected
+        # proposal) -- it must never be able to satisfy the target.
+        #
+        # Note: azure_.py's OWN get_data_path can still legitimately appear
+        # elsewhere in `rendered` as a "Discovered consumer" (category 3a's
+        # plain usage scan trivially self-matches any function whose own
+        # `def name(...)` line contains the search term -- true for ANY
+        # same-named sibling, independent of this fix, and already
+        # excluded from target authority by design -- see
+        # _edit_target_source_for_file's own docstring). What must never
+        # happen is azure_.py satisfying the actual EDIT-TARGET role, so
+        # assertions use the exact same extraction
+        # check_patch_target_conformance itself relies on.
+        context = _pygeoapi_shaped_context(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice, _edit_target_source_for_file
+
+        strategy = _make_strategy(
+            target_files=["filesystem.py"],
+            target_symbols=["FileSystemProvider.get_data_path"],
+            required_edits=["Validate get_data_path's resolved path stays inside self.data."],
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["filesystem.py", "azure_.py"],
+        )
+
+        assert "Target definition: `azure_.py" not in result.rendered
+        filesystem_target_source = _edit_target_source_for_file(result.rendered, "filesystem.py")
+        assert "TARGET_SOURCE" in filesystem_target_source
+        assert "OTHER_SOURCE" not in filesystem_target_source
+        assert _edit_target_source_for_file(result.rendered, "azure_.py") == ""
+        assert "filesystem.py" in result.covered_target_files
+        assert "FileSystemProvider.get_data_path" in result.covered_target_symbols
+
+    def test_same_bare_method_two_classes_same_file_qualified_target_selects_correct_class(self, tmp_path):
+        (tmp_path / "mixed.py").write_text(
+            "class A:\n"
+            "    def get_data_path(self):\n"
+            "        return A_SOURCE\n"
+            "\n"
+            "class B:\n"
+            "    def get_data_path(self):\n"
+            "        return B_SOURCE\n",
+            encoding="utf-8",
+        )
+        context = _make_context(functions={
+            "mixed.py:A.get_data_path": {
+                "name": "get_data_path", "className": "A", "startLine": 2, "endLine": 3,
+                "code": "    def get_data_path(self):\n        return A_SOURCE\n",
+            },
+            "mixed.py:B.get_data_path": {
+                "name": "get_data_path", "className": "B", "startLine": 6, "endLine": 7,
+                "code": "    def get_data_path(self):\n        return B_SOURCE\n",
+            },
+        }, repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice, _edit_target_source_for_file
+
+        strategy = _make_strategy(
+            target_files=["mixed.py"], target_symbols=["B.get_data_path"],
+            required_edits=["Fix get_data_path in B."],
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=["mixed.py"])
+
+        mixed_target_source = _edit_target_source_for_file(result.rendered, "mixed.py")
+        assert "B_SOURCE" in mixed_target_source
+        assert "A_SOURCE" not in mixed_target_source
+
+    def test_ambiguous_class_identity_fails_closed_not_wrong_attribution(self, tmp_path):
+        # Neither candidate has className metadata at all (the analyzer
+        # never tracked it for this language/shape) -- a qualified proposal
+        # must fail closed, never silently accept an unproven class.
+        (tmp_path / "a.py").write_text("def get_data_path():\n    return A_SOURCE\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("def get_data_path():\n    return B_SOURCE\n", encoding="utf-8")
+        context = _make_context(functions={
+            "a.py:get_data_path": {"name": "get_data_path", "startLine": 1, "endLine": 2},
+            "b.py:get_data_path": {"name": "get_data_path", "startLine": 1, "endLine": 2},
+        }, repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+
+        assert _resolve_symbol("SomeClass.get_data_path", tmp_path, context) is None
+
+    def test_candidate_in_rejected_file_cannot_satisfy_readiness(self, tmp_path):
+        # check_edit_readiness must not be fooled either: with the fix,
+        # category 2 no longer manufactures a false "covered" signal for
+        # filesystem.py's target out of azure_.py's own source, and the
+        # actual FileSystemProvider.get_data_path definition (small enough
+        # here to fit category 4's compact-render cap) is what satisfies
+        # readiness.
+        context = _pygeoapi_shaped_context(tmp_path)
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+        )
+
+        strategy = _make_strategy(
+            target_files=["filesystem.py"], target_symbols=["FileSystemProvider.get_data_path"],
+        )
+        slice_result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["filesystem.py", "azure_.py"],
+        )
+        edits = build_intended_edits(strategy, slice_result)
+        readiness = check_edit_readiness(edits, slice_result)
+
+        assert readiness.edit_source_ready is True
+        assert readiness.ready_edits[0].file == "filesystem.py"
+
+
+class TestNoInvertedSourceRanges:
+    def test_offset_past_declared_span_never_renders_inverted_range(self, tmp_path):
+        # Reproduces the exact real-world shape from a pygeoapi run: an
+        # analyzer-reported synthetic "__module__" entry whose own `code`
+        # text (40 lines) is longer than its declared startLine/endLine
+        # span (30-40, 11 lines) -- a real observed analyzer-side
+        # inconsistency, not something this module controls. Before the
+        # fix, a term matching near the end of that longer `code` text
+        # produced a literal "(lines 51-40)" (start > end) in rendered
+        # output; the fix drops the offending window instead of emitting
+        # it.
+        lines = [f"# line_{i}\n" for i in range(36)] + ["marker_term\n"] + ["# tail\n"] * 3
+        assert len(lines) == 40  # matches the real observed code/span mismatch exactly
+        code = "".join(lines)
+        (tmp_path / "mod.py").write_text("x = 1\n" * 50, encoding="utf-8")
+        context = _make_context(functions={
+            "mod.py:__module__": {"name": "__module__", "startLine": 30, "endLine": 40, "code": code},
+        }, repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        strategy = _make_strategy(target_files=["mod.py"], extended_mechanism="marker_term")
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=["mod.py"])
+
+        for start_s, end_s in re.findall(r"lines (\d+)[–-](\d+)", result.rendered):
+            assert int(start_s) <= int(end_s), f"invalid source range: lines {start_s}-{end_s}"
+        assert "__module__" not in result.rendered  # the only offending window was correctly dropped
+
+
+class TestFocusedWindows:
+    def test_windows_include_exact_line_numbers(self, tmp_path):
+        (tmp_path / "consumer.py").write_text(
+            "class C:\n    def m(self):\n        marker_term\n        return 1\n", encoding="utf-8",
+        )
+        context = _make_context(functions={
+            "consumer.py:C.m": {
+                "name": "m", "className": "C", "startLine": 2, "endLine": 4,
+                "code": "    def m(self):\n        marker_term\n        return 1\n",
+            },
+        }, repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["consumer.py"], extended_mechanism="marker_term")
+
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=["consumer.py"])
+        assert "lines 2–4" in result.rendered or "lines 2\u20134" in result.rendered
+
+    def test_windows_stay_inside_function_boundaries(self, tmp_path):
+        big_body = "\n".join(f"        line_{i} = {i}" for i in range(60))
+        (tmp_path / "consumer.py").write_text(
+            f"class C:\n    def m(self):\n{big_body}\n        marker_term\n" + "\n".join(
+                f"        after_{i} = {i}" for i in range(60)
+            ) + "\n",
+            encoding="utf-8",
+        )
+        code = (
+            "    def m(self):\n" + big_body + "\n        marker_term\n"
+            + "\n".join(f"        after_{i} = {i}" for i in range(60)) + "\n"
+        )
+        fn_start, fn_end = 2, 2 + len(code.split("\n")) - 1
+        context = _make_context(functions={
+            "consumer.py:C.m": {"name": "m", "className": "C", "startLine": fn_start, "endLine": fn_end, "code": code},
+        }, repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _lookup_identifier_usages, _merge_line_windows
+
+        usages = _lookup_identifier_usages("marker_term", ["consumer.py"], context)
+        assert len(usages) == 1
+        _f, _label, u_fn_start, u_fn_end, offsets = usages[0]
+        window = [
+            (max(u_fn_start, u_fn_start + off - 15), min(u_fn_end, u_fn_start + off + 15))
+            for off in offsets
+        ]
+        merged = _merge_line_windows(window)
+        for start, end in merged:
+            assert start >= u_fn_start
+            assert end <= u_fn_end
+
+    def test_overlapping_windows_merge_deterministically(self):
+        from utilities.autopatcher.remediation_planner import _merge_line_windows
+        merged = _merge_line_windows([(10, 20), (15, 25), (100, 110)])
+        assert merged == [(10, 25), (100, 110)]
+
+    def test_non_contiguous_windows_clearly_separated(self, tmp_path):
+        (tmp_path / "consumer.py").write_text("x = 1\n" * 200, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _render_usage_window_block
+        block = _render_usage_window_block("consumer.py", "C.m", [(1, 3), (50, 52)], context)
+        assert "line(s) omitted" in block
+
+    def test_omitted_marker_counts_stripped_trailing_blank_lines(self, tmp_path):
+        """PR #763: the marker states the exact omitted range, counted from the
+        last line actually shown, so every shown line keeps its file line
+        number (patch_challenger locates call sites by it)."""
+        lines = [f"line_{n} = {n}" for n in range(1, 61)]
+        lines[3] = lines[4] = ""  # window 1 (lines 1-5) ends in two blank lines
+        (tmp_path / "consumer.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _render_usage_window_block
+        block = _render_usage_window_block("consumer.py", "C.m", [(1, 5), (10, 11)], context)
+        body = block.split("```python\n", 1)[1].split("\n```", 1)[0].splitlines()
+        assert body == [
+            "line_1 = 1", "line_2 = 2", "line_3 = 3",
+            "# ... (6 line(s) omitted: lines 4-9) ...",
+            "line_10 = 10", "line_11 = 11",
+        ]
+
+
+class TestOneHopDiscoveredTermsSeedUsageSearch:
+    """FIX: proof-completion for non-callable targets. A bare, unqualified
+    Strategy target_symbol (e.g. a class name, matching the real-trace
+    shape that triggered this) can deterministically resolve to a target
+    whose own already-selected source references a SEPARATE, disambiguated
+    constant (via the existing one-hop dependency expansion) -- but until
+    this fix, that constant's own identifier was never fed back into the
+    existing category-3a usage search, so a same-file consumer/normalizer
+    of it (e.g. a constructor referencing it as a default parameter value)
+    could go undiscovered even though the file was already in
+    `preferred_files` and the existing text-based usage-search machinery
+    was already fully capable of finding it, given the right term."""
+
+    def _context(self, tmp_path):
+        # Realistically sized (the gap does not reproduce in a tiny file,
+        # where padding around any match trivially covers everything) --
+        # the constant sits near the top of the class, the constructor
+        # that normalizes it into an instance attribute sits far below,
+        # separated by filler methods, mirroring the real-trace shape.
+        lines = ["class Widget:", "    DEFAULT_OPTIONS = frozenset([\"a\"])", ""]
+        for i in range(60):
+            lines += [f"    def filler_method_{i}(self):", f"        return {i}", ""]
+        init_start = len(lines) + 1
+        lines += [
+            "    def __init__(self, options=DEFAULT_OPTIONS):",
+            "        self.options = normalize(options)",
+        ]
+        init_end = len(lines)
+        lines.append("")
+        for i in range(60, 120):
+            lines += [f"    def filler_method_{i}(self):", f"        return {i}", ""]
+        (tmp_path / "widget.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        functions = {
+            "widget.py:Widget.__init__": {
+                "name": "__init__", "className": "Widget", "startLine": init_start, "endLine": init_end,
+                "code": "    def __init__(self, options=DEFAULT_OPTIONS):\n        self.options = normalize(options)\n",
+            },
+        }
+        constants = {"widget.py": {"Widget.DEFAULT_OPTIONS": {
+            "qualified_name": "Widget.DEFAULT_OPTIONS", "class_name": "Widget",
+            "name": "DEFAULT_OPTIONS", "line": 2, "end_line": 2,
+        }}}
+        return _make_context(functions=functions, constants=constants, repo_path=tmp_path)
+
+    def test_same_file_constructor_normalizer_of_a_one_hop_discovered_constant_is_found(self, tmp_path):
+        # RED-first regression: the bare "Widget" target_symbol resolves
+        # (via the existing deterministic identifier fallback) without any
+        # help from extended_mechanism/required_edits prose -- neither is
+        # set here, so the ONLY way __init__'s consumer window can be
+        # discovered is via the constant the one-hop pass itself finds.
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        context = self._context(tmp_path)
+        strategy = _make_strategy(target_files=["widget.py"], target_symbols=["Widget"])
+
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=["widget.py"])
+
+        assert "def __init__(self, options=DEFAULT_OPTIONS):" in result.rendered
+        assert "self.options = normalize(options)" in result.rendered
+        assert "Discovered consumer: `widget.py:Widget.__init__`" in result.rendered
+
+    def test_resolved_target_with_no_relevant_same_file_consumer_is_unaffected(self, tmp_path):
+        # Non-interference control: a resolved target whose one-hop
+        # discoveries have no same-file consumer at all must not cause any
+        # unrelated evidence expansion -- no phantom "Discovered consumer"
+        # block, no change to what already renders. Removes __init__
+        # entirely from the fixture's functions (nothing left to find).
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        lines = ["class Widget:", "    DEFAULT_OPTIONS = frozenset([\"a\"])", ""]
+        for i in range(60):
+            lines += [f"    def filler_method_{i}(self):", f"        return {i}", ""]
+        (tmp_path / "widget.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        constants = {"widget.py": {"Widget.DEFAULT_OPTIONS": {
+            "qualified_name": "Widget.DEFAULT_OPTIONS", "class_name": "Widget",
+            "name": "DEFAULT_OPTIONS", "line": 2, "end_line": 2,
+        }}}
+        context = _make_context(functions={}, constants=constants, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["widget.py"], target_symbols=["Widget"])
+
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=["widget.py"])
+
+        assert "Discovered consumer" not in result.rendered
+
+
+class TestFinalTargetSliceEvidenceAdmissionOrderIndependence:
+    """FIX: within category 3a's shared budget, a small consumer window
+    directly connected to the resolved target must not lose its admission
+    slot to a larger, more loosely (mechanism-term-only) connected
+    candidate merely because that larger candidate happened to be scanned
+    first -- a scan order driven by incidental prose-mention position in
+    Strategy's free-text `extended_mechanism`, not by any deliberate
+    priority. Both a resolved target-file constant and a same-file
+    consumer of it are deterministically discoverable here; a separate,
+    unrelated, larger same-file candidate is discoverable only via a
+    mechanism-derived term. Neither candidate's connecting term is itself
+    a verified target symbol (the target is the bare, unqualified class),
+    so under current code the only thing that decides commit order between
+    them is which term happens to appear first in the mechanism prose."""
+
+    def _context(self, tmp_path):
+        # Realistically sized -- the race does not reproduce in a tiny
+        # file, where any window trivially covers everything.
+        lines = ["class Config:", "    THRESHOLD_VALUE = 5", ""]
+        for i in range(30):
+            lines += [f"    def noise_{i}(self):", f"        return {i}", ""]
+        setup_start = len(lines) + 1
+        lines += [
+            "    def setup(self, value=THRESHOLD_VALUE):",
+            "        self.value = normalize(value)",
+        ]
+        setup_end = len(lines)
+        lines.append("")
+        (tmp_path / "config.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        big_body = "\n".join(f"        step_{i} = {i}" for i in range(22))
+        route_code = f"    def dispatch_request(self):\n{big_body}\n        return 1\n"
+        (tmp_path / "dispatcher.py").write_text(f"class Dispatcher:\n{route_code}", encoding="utf-8")
+
+        functions = {
+            "config.py:Config.setup": {
+                "name": "setup", "className": "Config", "startLine": setup_start, "endLine": setup_end,
+                "code": "    def setup(self, value=THRESHOLD_VALUE):\n        self.value = normalize(value)\n",
+            },
+            "dispatcher.py:Dispatcher.dispatch_request": {
+                "name": "dispatch_request", "className": "Dispatcher",
+                "startLine": 2, "endLine": 2 + len(route_code.split("\n")),
+                "code": route_code,
+            },
+        }
+        constants = {"config.py": {"Config.THRESHOLD_VALUE": {
+            "qualified_name": "Config.THRESHOLD_VALUE", "class_name": "Config",
+            "name": "THRESHOLD_VALUE", "line": 2, "end_line": 2,
+        }}}
+        return _make_context(functions=functions, constants=constants, repo_path=tmp_path)
+
+    @pytest.mark.parametrize("order", ["large_candidate_mentioned_first", "small_consumer_mentioned_first"])
+    def test_target_connected_consumer_survives_regardless_of_mention_order(self, tmp_path, monkeypatch, order):
+        from utilities.autopatcher import remediation_planner as rp
+        _set_slice_budget(monkeypatch, 2000)
+        context = self._context(tmp_path)
+        mechanism = {
+            "large_candidate_mentioned_first": (
+                "dispatch_request already performs the relevant check. "
+                "The fix also adjusts THRESHOLD_VALUE."
+            ),
+            "small_consumer_mentioned_first": (
+                "The fix adjusts THRESHOLD_VALUE. "
+                "dispatch_request already performs the relevant check."
+            ),
+        }[order]
+        strategy = _make_strategy(
+            target_files=["config.py"], target_symbols=["Config"], extended_mechanism=mechanism,
+        )
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["dispatcher.py"],
+        )
+
+        # The small, target-connected consumer must always survive the
+        # shared budget -- regardless of which candidate the incidental
+        # prose order caused category 3a to scan first.
+        assert "def setup(self, value=THRESHOLD_VALUE):" in result.rendered
+
+    def test_generous_budget_keeps_both_regardless_of_order_non_interference(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        _set_slice_budget(monkeypatch, 8000)
+        context = self._context(tmp_path)
+        for mechanism in (
+            "dispatch_request already performs the relevant check. The fix also adjusts THRESHOLD_VALUE.",
+            "The fix adjusts THRESHOLD_VALUE. dispatch_request already performs the relevant check.",
+        ):
+            strategy = _make_strategy(
+                target_files=["config.py"], target_symbols=["Config"], extended_mechanism=mechanism,
+            )
+            result = rp.build_final_target_slice(
+                strategy, str(tmp_path), context, planner_evidence_files=["dispatcher.py"],
+            )
+            assert "def setup(self, value=THRESHOLD_VALUE):" in result.rendered
+            assert "def dispatch_request(self):" in result.rendered
+
+
+class TestFinalTargetSliceTargetOwnedClassMemberPriority:
+    """FIX: within category 3a's shared budget, a focused usage window
+    belonging to the SAME class as the resolved (bare, class-shaped)
+    target must not lose its admission slot to a larger, unrelated-class
+    candidate merely because that candidate happened to be scanned first
+    -- an incidental side effect of prose-mention order. This is NOT a
+    constructor-priority rule: the same-class method used here is
+    deliberately not `__init__`, to prove the invariant is genuine
+    class-membership, not a special-cased dunder name."""
+
+    def _context(self, tmp_path):
+        # Realistically sized -- the race does not reproduce in a tiny
+        # file. `Container.MODE` is the deterministic evidence that
+        # confirms "Container" really is a class (not merely a bare
+        # function/constant fallback match) -- without at least one
+        # constant recording class_name == "Container", the target class
+        # identity must never be inferred.
+        lines = ["class Container:", "    MODE = \"default\"", ""]
+        for i in range(20):
+            lines += [f"    def noise_{i}(self):", f"        return {i}", ""]
+        cfg_start = len(lines) + 1
+        lines += ["    def configure(self, value=None):", "        self.batch_limit = value or 10"]
+        cfg_end = len(lines)
+        lines.append("")
+        (tmp_path / "container.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        big_body = "\n".join(f"        step_{i} = {i}" for i in range(22))
+        sched_code = f"    def run_batch_worker(self):\n{big_body}\n        return 1\n"
+        (tmp_path / "scheduler.py").write_text(f"class Scheduler:\n{sched_code}", encoding="utf-8")
+
+        functions = {
+            "container.py:Container.configure": {
+                "name": "configure", "className": "Container", "startLine": cfg_start, "endLine": cfg_end,
+                "code": "    def configure(self, value=None):\n        self.batch_limit = value or 10\n",
+            },
+            "scheduler.py:Scheduler.run_batch_worker": {
+                "name": "run_batch_worker", "className": "Scheduler",
+                "startLine": 2, "endLine": 2 + len(sched_code.split("\n")),
+                "code": sched_code,
+            },
+        }
+        constants = {"container.py": {"Container.MODE": {
+            "qualified_name": "Container.MODE", "class_name": "Container", "name": "MODE", "line": 2, "end_line": 2,
+        }}}
+        return _make_context(functions=functions, constants=constants, repo_path=tmp_path)
+
+    @pytest.mark.parametrize("order", ["large_candidate_mentioned_first", "small_consumer_mentioned_first"])
+    def test_same_class_member_survives_regardless_of_mention_order(self, tmp_path, monkeypatch, order):
+        from utilities.autopatcher import remediation_planner as rp
+        _set_slice_budget(monkeypatch, 2000)
+        context = self._context(tmp_path)
+        mechanism = {
+            "large_candidate_mentioned_first": (
+                "run_batch_worker already performs the relevant check. "
+                "The fix also adjusts batch_limit."
+            ),
+            "small_consumer_mentioned_first": (
+                "The fix adjusts batch_limit. "
+                "run_batch_worker already performs the relevant check."
+            ),
+        }[order]
+        strategy = _make_strategy(
+            target_files=["container.py"], target_symbols=["Container"], extended_mechanism=mechanism,
+        )
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["scheduler.py"],
+        )
+
+        # The same-class consumer must always survive the shared budget --
+        # regardless of which candidate the incidental prose order caused
+        # category 3a to scan first.
+        assert "def configure(self, value=None):" in result.rendered
+
+    def test_generous_budget_keeps_both_regardless_of_order_non_interference(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        _set_slice_budget(monkeypatch, 8000)
+        context = self._context(tmp_path)
+        for mechanism in (
+            "run_batch_worker already performs the relevant check. The fix also adjusts batch_limit.",
+            "The fix adjusts batch_limit. run_batch_worker already performs the relevant check.",
+        ):
+            strategy = _make_strategy(
+                target_files=["container.py"], target_symbols=["Container"], extended_mechanism=mechanism,
+            )
+            result = rp.build_final_target_slice(
+                strategy, str(tmp_path), context, planner_evidence_files=["scheduler.py"],
+            )
+            assert "def configure(self, value=None):" in result.rendered
+            assert "def run_batch_worker(self):" in result.rendered
+
+
+class TestFinalTargetSliceTargetOwnedClassMemberPriorityIndexResolvedClass:
+    """FIX GAP: `_resolve_symbol_details` has TWO independent ways a bare
+    class-shaped target can resolve -- RepositoryIndex.search_by_name
+    (when the upstream analyzer indexed the class itself, e.g. any real
+    parsed repository) and, only as a fallback when the index has no such
+    entry, `_deterministic_identifier_fallback` (a synthetic fixture with
+    no class-shaped index entry always takes this second path). Both
+    return a `_SymbolMatch`, but only the fallback path's `kind` happens
+    to be "constant" -- the index path always reports `kind="function"`
+    regardless of the matched entry's own `unitType` (e.g. "class").
+    `target_class_identities`'s bare-label branch was gated on
+    `match.kind == "constant"`, so a target resolved via the INDEX path --
+    the shape every real repository actually produces for a class name --
+    never reaches `_label_is_confirmed_class` at all, and the target-owned
+    Band-A invariant silently never applies to it. This class reproduces
+    that exact resolution shape (an index entry for the bare class name
+    itself, `unitType="class"`) to prove the gap, distinct from
+    TestFinalTargetSliceTargetOwnedClassMemberPriority above (whose fixture
+    has no such index entry, so it always takes the fallback path and
+    never exercised this gap)."""
+
+    def _context(self, tmp_path):
+        # Category 4 ("compact full target-symbol functions") admits a
+        # kind="function" target's OWN full source whenever it fits under
+        # _PER_TARGET_FULL_FUNCTION_CAP -- a FIXED constant derived from
+        # FINAL_TARGET_SLICE_MAX_CHARS's real default at import time,
+        # unaffected by this test's own monkeypatched budget. The class
+        # body must exceed that fixed cap (comfortably: 100 noise methods,
+        # ~4800 chars, well past the ~3333-char cap) so Category 4 leaves
+        # the bare target itself uncovered -- exactly like the sibling
+        # fixture above, whose kind="constant" fallback resolution only
+        # ever captures a small fixed window near the declaration line,
+        # never the whole class. Without this, the whole class would be
+        # admitted whole via Category 4, incidentally leaving enough
+        # leftover shared budget for both other candidates below to fit
+        # regardless of Band -- masking the exact race this test exists to
+        # reproduce.
+        lines = ["class Container:", "    MODE = \"default\"", ""]
+        for i in range(100):
+            lines += [f"    def noise_{i}(self):", f"        return {i}", ""]
+        cfg_start = len(lines) + 1
+        lines += ["    def configure(self, value=None):", "        self.batch_limit = value or 10"]
+        cfg_end = len(lines)
+        lines.append("")
+        class_source = "\n".join(lines) + "\n"
+        (tmp_path / "container.py").write_text(class_source, encoding="utf-8")
+
+        big_body = "\n".join(f"        step_{i} = {i}" for i in range(22))
+        sched_code = f"    def run_batch_worker(self):\n{big_body}\n        return 1\n"
+        (tmp_path / "scheduler.py").write_text(f"class Scheduler:\n{sched_code}", encoding="utf-8")
+
+        functions = {
+            # The class itself, indexed by its own bare name -- exactly how
+            # a real parsed repository indexes a class (see
+            # RepositoryIndex.search_by_name's own "unitType" field on a
+            # live parse: {"id": "...:Retry", "name": "Retry",
+            # "unitType": "class", "className": None, ...}). This single
+            # entry is what routes _resolve_symbol_details through
+            # `index.search_by_name` instead of the deterministic
+            # identifier fallback.
+            "container.py:Container": {
+                "name": "Container", "className": None, "unitType": "class",
+                "startLine": 1, "endLine": len(lines), "code": class_source,
+            },
+            "container.py:Container.configure": {
+                "name": "configure", "className": "Container", "startLine": cfg_start, "endLine": cfg_end,
+                "code": "    def configure(self, value=None):\n        self.batch_limit = value or 10\n",
+            },
+            "scheduler.py:Scheduler.run_batch_worker": {
+                "name": "run_batch_worker", "className": "Scheduler",
+                "startLine": 2, "endLine": 2 + len(sched_code.split("\n")),
+                "code": sched_code,
+            },
+        }
+        constants = {"container.py": {"Container.MODE": {
+            "qualified_name": "Container.MODE", "class_name": "Container", "name": "MODE", "line": 2, "end_line": 2,
+        }}}
+        return _make_context(functions=functions, constants=constants, repo_path=tmp_path)
+
+    def test_target_resolves_via_index_as_kind_function(self, tmp_path):
+        """Precondition check: confirms this fixture genuinely reproduces
+        the real-world resolution shape (kind="function" via the index
+        path), not merely asserting the bug through a side door."""
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        context = self._context(tmp_path)
+        match = _resolve_symbol_details("Container", tmp_path, context, verified_files=["container.py"])
+        assert match is not None
+        assert match.kind == "function"  # the actual real-world shape -- see class docstring
+
+    def test_same_class_member_survives_when_target_resolves_via_index(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        _set_slice_budget(monkeypatch, 2000)
+        context = self._context(tmp_path)
+        mechanism = (
+            "run_batch_worker already performs the relevant check. "
+            "The fix also adjusts batch_limit."
+        )
+        strategy = _make_strategy(
+            target_files=["container.py"], target_symbols=["Container"], extended_mechanism=mechanism,
+        )
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["scheduler.py"],
+        )
+
+        # Same invariant as TestFinalTargetSliceTargetOwnedClassMemberPriority:
+        # the same-class consumer must survive the shared budget regardless
+        # of which candidate the incidental prose order scans first --
+        # this must hold whichever of the two independent resolution paths
+        # produced the target's _SymbolMatch.
+        #
+        # Asserted against the CHILD's own heading, not merely the text
+        # "def configure" -- the bare "Container" label is itself ALSO a
+        # category-3a candidate here (its own indexed `code` is the whole
+        # class body, a superset that textually contains `configure` too),
+        # so a substring-only assertion would pass even when the child
+        # candidate's OWN admission slot is lost to a different, unrelated
+        # candidate -- exactly the false-positive this exact heading check
+        # exists to rule out.
+        assert "`container.py:Container.configure`" in result.rendered
+
+
+class TestFinalTargetSliceTargetOwnedClassMemberPriorityNoQualifyingConstant:
+    """REMAINING GAP (distinct from, and NOT fixed by, the kind="function"
+    fix in TestFinalTargetSliceTargetOwnedClassMemberPriorityIndexResolvedClass
+    above): that fix made `target_class_identities` reach
+    `_label_is_confirmed_class` for an index-resolved bare class target,
+    but `_label_is_confirmed_class` itself confirms class identity ONLY by
+    finding an existing parsed CONSTANT whose own `class_name` field names
+    the target -- i.e. it still depends on the class happening to own at
+    least one class-level constant the analyzer separately recorded. A
+    class with NO class-level constants at all (a completely ordinary,
+    common shape -- most classes don't have one) is resolved via the
+    IDENTICAL index path (`unitType="class"`, a real func_id, kind=
+    "function") but currently has NO way to be confirmed as a class,
+    because there is no constant anywhere to consult. The analyzer's OWN
+    direct classification of the matched declaration (`unitType="class"`,
+    already returned by `RepositoryIndex.search_by_name` and already
+    reachable via the resolved match's own `func_id` through
+    `context.index.get_function`) is not consulted at all today. This
+    class isolates exactly that remaining gap: the fixture deliberately
+    passes `constants={}` so the existing constants-based confirmation
+    path cannot succeed, while everything else mirrors the sibling fixture
+    above (index-resolved bare class target, an ordinary non-`__init__`
+    same-class member relevant to a strategy term, and a larger unrelated-
+    class candidate competing for the same bounded budget)."""
+
+    def _context(self, tmp_path):
+        lines = ["class Coordinator:", ""]
+        for i in range(100):
+            lines += [f"    def noise_{i}(self):", f"        return {i}", ""]
+        dispatch_start = len(lines) + 1
+        lines += ["    def dispatch(self, value=None):", "        self.queue_depth = value or 5"]
+        dispatch_end = len(lines)
+        lines.append("")
+        class_source = "\n".join(lines) + "\n"
+        (tmp_path / "gateway.py").write_text(class_source, encoding="utf-8")
+
+        big_body = "\n".join(f"        step_{i} = {i}" for i in range(22))
+        worker_code = f"    def process_batch(self):\n{big_body}\n        return 1\n"
+        (tmp_path / "worker.py").write_text(f"class Worker:\n{worker_code}", encoding="utf-8")
+
+        functions = {
+            "gateway.py:Coordinator": {
+                "name": "Coordinator", "className": None, "unitType": "class",
+                "startLine": 1, "endLine": len(lines), "code": class_source,
+            },
+            "gateway.py:Coordinator.dispatch": {
+                "name": "dispatch", "className": "Coordinator", "startLine": dispatch_start, "endLine": dispatch_end,
+                "code": "    def dispatch(self, value=None):\n        self.queue_depth = value or 5\n",
+            },
+            "worker.py:Worker.process_batch": {
+                "name": "process_batch", "className": "Worker",
+                "startLine": 2, "endLine": 2 + len(worker_code.split("\n")),
+                "code": worker_code,
+            },
+        }
+        # Deliberately NO constants at all -- see class docstring: this is
+        # the one difference from the sibling fixture's `Container.MODE`,
+        # and it is what isolates this specific remaining gap.
+        return _make_context(functions=functions, constants={}, repo_path=tmp_path)
+
+    def test_target_resolves_via_index_with_no_qualifying_constant(self, tmp_path):
+        """Precondition check: confirms the fixture reproduces the real
+        resolution shape (index-resolved, kind="function", real func_id)
+        AND that the existing constants-based confirmation genuinely
+        cannot fire here (no constant anywhere names this class)."""
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details, _label_is_confirmed_class
+
+        context = self._context(tmp_path)
+        match = _resolve_symbol_details("Coordinator", tmp_path, context, verified_files=["gateway.py"])
+        assert match is not None
+        assert match.kind == "function"
+        assert match.func_id == "gateway.py:Coordinator"
+        assert _label_is_confirmed_class("Coordinator", context) is False
+
+    def test_same_class_member_currently_lost_with_no_qualifying_constant(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        _set_slice_budget(monkeypatch, 500)
+        context = self._context(tmp_path)
+        mechanism = (
+            "process_batch already performs the relevant check. "
+            "The fix also adjusts queue_depth."
+        )
+        strategy = _make_strategy(
+            target_files=["gateway.py"], target_symbols=["Coordinator"], extended_mechanism=mechanism,
+        )
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"],
+        )
+
+        # The same-class, term-relevant consumer survives the shared
+        # budget exactly like the sibling fixture's `Container.configure`
+        # does: `_label_is_confirmed_class` now also reads the resolved
+        # match's own `func_id` record, whose `unitType == "class"` (the
+        # analyzer's own direct classification) independently confirms
+        # `Coordinator` as a real class even though no qualifying constant
+        # exists and no dotted target-symbol form was ever proposed.
+        assert "`gateway.py:Coordinator.dispatch`" in result.rendered
+
+    def test_ordinary_bare_function_does_not_gain_class_identity(self, tmp_path, monkeypatch):
+        """Control for the `unitType`-based signal: reuses this class's own
+        already-calibrated fixture verbatim (same file, same target, same
+        mechanism text, same competing candidate, same budget -- the exact
+        race already proven above to require Band-A to win) with exactly
+        ONE field changed: the resolved target's own index record reports
+        `unitType="function"` instead of `"class"` -- i.e. an ORDINARY
+        function, not a class, but otherwise indistinguishable (same bare
+        name shape, same real func_id, still no qualifying constant). This
+        must NOT be treated as a class merely because it resolved the same
+        way a class does: `_label_is_confirmed_class` must still return
+        False, and `dispatch` must gain no Band-A authority -- the same
+        race outcome as before this fix existed."""
+        from utilities.autopatcher import remediation_planner as rp
+
+        context = self._context(tmp_path)
+        # Only this one already-parsed structural fact changes.
+        context.index.functions["gateway.py:Coordinator"]["unitType"] = "function"
+
+        match = rp._resolve_symbol_details("Coordinator", tmp_path, context, verified_files=["gateway.py"])
+        assert match is not None
+        assert match.func_id == "gateway.py:Coordinator"
+        assert rp._label_is_confirmed_class("Coordinator", context, func_id=match.func_id) is False
+
+        _set_slice_budget(monkeypatch, 500)
+        mechanism = (
+            "process_batch already performs the relevant check. "
+            "The fix also adjusts queue_depth."
+        )
+        strategy = _make_strategy(
+            target_files=["gateway.py"], target_symbols=["Coordinator"], extended_mechanism=mechanism,
+        )
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"], max_chars=500,
+        )
+        # No class-identity boost: `dispatch` loses the race exactly as it
+        # did before this fix existed, since `Coordinator` is (correctly,
+        # here) not a class.
+        assert "`gateway.py:Coordinator.dispatch`" not in result.rendered
+
+
+class TestFinalTargetSliceEvidenceContinuityAfterRejectedQualifiedTarget:
+    """FIX: a Strategy-proposed QUALIFIED target_symbol (e.g.
+    "Container.runtime_limit") can fail normal target-symbol verification
+    -- correctly, since the member itself may not be a real, independently
+    resolvable declaration (see the forensic investigation this fix comes
+    from: a real member-shaped LLM proposal that named an instance
+    attribute, not any actual declaration). When that happens,
+    `target_symbols` loses the rejected entry entirely, and with it EVERY
+    trace of the class the model was pointing at -- so the SAME target-
+    owned class-member Band-A invariant this module already implements
+    for a successfully-verified target (see
+    TestFinalTargetSliceTargetOwnedClassMemberPriority and its siblings
+    above) silently never applies, even when the class-qualifier portion
+    of the rejected proposal ("Container") is itself a real, independently
+    verifiable class in the Strategy's own already-verified target file.
+
+    This class proves: (1) the rejected member itself stays rejected and
+    unresolvable no matter what (it must never become a patch target),
+    (2) its class-qualifier, independently re-verified through the exact
+    same `_resolve_symbol_details`/`_label_is_confirmed_class` machinery
+    used everywhere else, MAY still earn the same-class Band-A priority
+    for an ordinary, unrelated same-class member (deliberately not
+    `__init__`), and (3) a qualifier that does NOT independently verify as
+    a real class fails closed -- exactly the sibling behavior
+    TestFinalTargetSliceTargetOwnedClassMemberPriorityNoQualifyingConstant
+    already proves for the "class exists but no constant confirms it"
+    case, mirrored here for the "no class-qualifier survived verification
+    at all" case."""
+
+    def _context(self, tmp_path):
+        (tmp_path / "container.py").write_text(
+            'class Container:\n'
+            '    MODE = "default"\n'
+            '\n'
+            '    def configure(self, value=None):\n'
+            '        self.batch_limit = value or 10\n',
+            encoding="utf-8",
+        )
+        big_body = "\n".join(f"        step_{i} = {i}" for i in range(22))
+        worker_code = f"    def process_batch(self):\n{big_body}\n        return 1\n"
+        (tmp_path / "worker.py").write_text(f"class Worker:\n{worker_code}", encoding="utf-8")
+
+        functions = {
+            "container.py:Container.configure": {
+                "name": "configure", "className": "Container", "startLine": 4, "endLine": 5,
+                "code": "    def configure(self, value=None):\n        self.batch_limit = value or 10\n",
+            },
+            "worker.py:Worker.process_batch": {
+                "name": "process_batch", "className": "Worker",
+                "startLine": 2, "endLine": 2 + len(worker_code.split("\n")),
+                "code": worker_code,
+            },
+        }
+        # Container.MODE is what makes "Container" independently
+        # verifiable as a real class via the existing constants-based
+        # `_label_is_confirmed_class` path -- exactly like the sibling
+        # fixtures above; which existing path confirms the class is not
+        # what this test is about.
+        constants = {"container.py": {"Container.MODE": {
+            "qualified_name": "Container.MODE", "class_name": "Container", "name": "MODE", "line": 2, "end_line": 2,
+        }}}
+        return _make_context(functions=functions, constants=constants, repo_path=tmp_path)
+
+    def _strategy(self, rejected_target_symbols):
+        mechanism = (
+            "process_batch already performs the relevant check. "
+            "The fix also adjusts batch_limit."
+        )
+        # target_symbols=[] mirrors the real shape this fix targets: the
+        # proposed qualified member was rejected by target-symbol
+        # verification and therefore never appears in target_symbols at
+        # all -- only target_files survives, plus (additively)
+        # rejected_target_symbols recording what was proposed and dropped.
+        return _make_strategy(
+            target_files=["container.py"], target_symbols=[], extended_mechanism=mechanism,
+            rejected_target_symbols=rejected_target_symbols,
+        )
+
+    def test_rejected_member_itself_never_becomes_resolvable(self, tmp_path):
+        """Safety property A: the rejected member stays rejected --
+        independent of this fix, which never re-resolves the member
+        itself, only extracts a qualifier substring from its own already-
+        rejected proposal string."""
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        context = self._context(tmp_path)
+        match = _resolve_symbol_details(
+            "Container.runtime_limit", tmp_path, context, verified_files=["container.py"],
+        )
+        assert match is None
+
+    def test_qualifier_alone_independently_verifies_as_a_real_class(self, tmp_path):
+        """Precondition: confirms the fixture's qualifier is genuinely,
+        independently verifiable -- not merely assumed true."""
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details, _label_is_confirmed_class
+
+        context = self._context(tmp_path)
+        match = _resolve_symbol_details("Container", tmp_path, context, verified_files=["container.py"])
+        assert match is not None
+        assert _label_is_confirmed_class(match.label, context) is True
+
+    def test_same_class_member_gains_band_a_after_rejected_qualifier_reverification(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        _set_slice_budget(monkeypatch, 500)
+        context = self._context(tmp_path)
+        strategy = self._strategy(rejected_target_symbols=["Container.runtime_limit"])
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"],
+        )
+
+        # The same-class, term-relevant consumer must survive the tight
+        # shared budget once "Container" -- independently re-verified from
+        # the rejected proposal's own qualifier, never trusted as-is --
+        # earns Band-A priority, exactly like a successfully-verified
+        # target's own class members already do.
+        assert "`container.py:Container.configure`" in result.rendered
+        # The rejected member must never appear as an admitted target or
+        # consumer heading -- it was never resolvable and this fix must
+        # not change that.
+        assert "runtime_limit" not in result.rendered
+
+    def test_unverifiable_qualifier_fails_closed(self, tmp_path, monkeypatch):
+        """Safety property C: a rejected proposal whose qualifier does NOT
+        independently verify as a real class (here: not a real symbol at
+        all in the verified target file) must grant no Band-A authority --
+        same tight budget, same competing candidate, no crash, no
+        admission."""
+        from utilities.autopatcher import remediation_planner as rp
+        _set_slice_budget(monkeypatch, 500)
+        context = self._context(tmp_path)
+        strategy = self._strategy(rejected_target_symbols=["Bogus.runtime_limit"])
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"], max_chars=500,
+        )
+
+        assert "`container.py:Container.configure`" not in result.rendered
+        assert "`worker.py:Worker.process_batch`" in result.rendered
+
+    def test_no_rejected_symbols_behaves_exactly_as_before(self, tmp_path, monkeypatch):
+        """Safety property F: when there is nothing rejected at all (the
+        common case), behavior is byte-for-byte unchanged from before this
+        fix -- same tight-budget race, same loser."""
+        from utilities.autopatcher import remediation_planner as rp
+        _set_slice_budget(monkeypatch, 500)
+        context = self._context(tmp_path)
+        strategy = self._strategy(rejected_target_symbols=[])
+
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["worker.py"], max_chars=500,
+        )
+
+        assert "`container.py:Container.configure`" not in result.rendered
+        assert "`worker.py:Worker.process_batch`" in result.rendered
+
+
+class TestFinalTargetSliceResidualConcernEvidenceContinuity:
+    """FIX (Agent 2): a symbol the Final Strategy explicitly considered
+    and REJECTED (`rejected_targets`) or flagged as insufficiently
+    evidenced (`insufficient_evidence`) -- never `target_symbols`/
+    `extended_mechanism`/`required_edits` -- can still surface in the
+    Final-Target Remediation Slice as a Category 2 "related definition,
+    context only, not an approved edit target" block, PROVIDED its own
+    file was already connected via `planner_evidence_files` (in
+    production: pipeline.py's own widened seed, which folds in every file
+    Planning's own bounded evidence-acquisition loop actually INCLUDED,
+    not merely the Final Strategy's own selected `target_files`).
+
+    Maps to the task's required tests A, D, E, G (B/C -- the
+    resolved-vs-included distinction at the pipeline.py seed-construction
+    boundary -- live in test_pipeline.py instead, since that is where the
+    widening itself happens)."""
+
+    def _context(self, tmp_path):
+        (tmp_path / "target.py").write_text("class Handler:\n    LIMIT = 5\n", encoding="utf-8")
+        (tmp_path / "mech.py").write_text(
+            "class Helper:\n    def normalize_value(self):\n        return 1\n", encoding="utf-8",
+        )
+        (tmp_path / "helper.py").write_text(
+            "class Widget:\n    def risky_call(self):\n        return 2\n", encoding="utf-8",
+        )
+        functions = {
+            "mech.py:Helper.normalize_value": {
+                "name": "normalize_value", "className": "Helper", "startLine": 2, "endLine": 3,
+                "code": "    def normalize_value(self):\n        return 1\n",
+            },
+            "helper.py:Widget.risky_call": {
+                "name": "risky_call", "className": "Widget", "startLine": 2, "endLine": 3,
+                "code": "    def risky_call(self):\n        return 2\n",
+            },
+        }
+        constants = {"target.py": {"Handler.LIMIT": {
+            "qualified_name": "Handler.LIMIT", "class_name": "Handler", "name": "LIMIT", "line": 2, "end_line": 2,
+        }}}
+        return _make_context(functions=functions, constants=constants, repo_path=tmp_path)
+
+    def _strategy(self, rejected_targets=None, insufficient_evidence=None, extended_mechanism=None):
+        return _make_strategy(
+            target_files=["target.py"], target_symbols=["target.py:Handler.LIMIT"],
+            extended_mechanism=extended_mechanism,
+            rejected_targets=rejected_targets or [], insufficient_evidence=insufficient_evidence or [],
+        )
+
+    def test_a_rejected_symbol_surfaces_as_category2_supporting_context(self, tmp_path):
+        """Test A: a symbol named only in `rejected_targets` -- whose file
+        was connected via `planner_evidence_files` -- is rendered under
+        the Category-2 heading, never as an approved edit target."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice, _CATEGORY2_HEADING_LABEL
+        context = self._context(tmp_path)
+        strategy = self._strategy(
+            rejected_targets=["Considered Widget.risky_call but rejected because it lacks proof."],
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper.py"], max_chars=100_000,
+        )
+        assert f"#### {_CATEGORY2_HEADING_LABEL}: `helper.py:risky_call`" in result.rendered
+        assert "Target definition: `helper.py" not in result.rendered
+
+    def test_a_insufficient_evidence_symbol_also_surfaces(self, tmp_path):
+        """Test A (sibling): the same continuity applies to
+        `insufficient_evidence`, not only `rejected_targets`."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice, _CATEGORY2_HEADING_LABEL
+        context = self._context(tmp_path)
+        strategy = self._strategy(
+            insufficient_evidence=["Insufficient evidence to confirm Widget.risky_call is exploitable."],
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper.py"], max_chars=100_000,
+        )
+        assert f"#### {_CATEGORY2_HEADING_LABEL}: `helper.py:risky_call`" in result.rendered
+
+    def test_d_residual_concern_never_starves_genuine_category2_candidate(self, tmp_path, monkeypatch):
+        """Test D: under a shared budget tight enough for only ONE of the
+        two Category-2 candidates, the genuine mechanism-derived one
+        (`extended_mechanism` -> Helper.normalize_value) must win -- the
+        residual-concern-derived one (Widget.risky_call) must lose,
+        precisely because it is appended, and therefore committed, at
+        lower priority."""
+        from utilities.autopatcher import remediation_planner as rp
+        context = self._context(tmp_path)
+        strategy = self._strategy(
+            extended_mechanism="Uses Helper.normalize_value to sanitize input.",
+            rejected_targets=["Considered Widget.risky_call but rejected because it lacks proof."],
+        )
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context,
+            planner_evidence_files=["helper.py", "mech.py"], max_chars=350,
+        )
+        assert "normalize_value" in result.rendered
+        assert "risky_call" not in result.rendered
+
+    def test_e_unresolvable_residual_concern_fails_closed(self, tmp_path):
+        """Test E: a residual-concern identifier that resolves nowhere
+        within `preferred_files` produces no candidate at all -- no
+        crash, nothing invented, and normal coverage is unaffected."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        context = self._context(tmp_path)
+        strategy = self._strategy(
+            rejected_targets=["Considered NoSuchThing.completely_unresolvable_symbol but rejected."],
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper.py"], max_chars=100_000,
+        )
+        assert "unresolvable" not in result.rendered.lower()
+        assert "NoSuchThing" not in result.rendered
+        assert "`target.py:Handler.LIMIT`" in result.rendered
+
+    def test_g_no_residual_concern_terms_unaffected(self, tmp_path):
+        """Test G (regression guard): a strategy with empty
+        `rejected_targets`/`insufficient_evidence` (the overwhelmingly
+        common case) renders identically whether or not this fix exists
+        -- no residual-concern content ever appears, and ordinary
+        Category 1/2 (genuine mechanism-derived) content is untouched."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        context = self._context(tmp_path)
+        strategy = self._strategy(extended_mechanism="Uses Helper.normalize_value to sanitize input.")
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper.py", "mech.py"], max_chars=100_000,
+        )
+        assert "risky_call" not in result.rendered
+        assert "normalize_value" in result.rendered
+        assert "`target.py:Handler.LIMIT`" in result.rendered
+
+
+class TestExtractStrategyResidualConcernIdentifiers:
+    """Unit coverage for `_extract_strategy_residual_concern_identifiers`
+    itself: it reads ONLY `rejected_targets`/`insufficient_evidence`, and
+    reuses the exact same `_extract_identifiers_from_text` shape-filtered
+    extraction `_extract_strategy_identifiers` already uses -- no second,
+    different extraction algorithm."""
+
+    def test_reads_only_rejected_targets_and_insufficient_evidence(self):
+        from utilities.autopatcher.remediation_planner import _extract_strategy_residual_concern_identifiers
+        strategy = _make_strategy(
+            target_files=["a.py"], target_symbols=["a.py:Real.target_symbol"],
+            extended_mechanism="Mentions Mechanism.only_term here.",
+            required_edits=["Edit ReuiredEdits.only_term too."],
+            rejected_targets=["Rejected Widget.risky_call as a target."],
+            insufficient_evidence=["Not enough proof about Other.residual_symbol."],
+        )
+        result = _extract_strategy_residual_concern_identifiers(strategy)
+        assert "Widget.risky_call" in result
+        assert "Other.residual_symbol" in result
+        # Never leaks in anything derived from target_symbols/
+        # extended_mechanism/required_edits -- those are
+        # _extract_strategy_identifiers's own domain, not this function's.
+        assert "Real.target_symbol" not in result
+        assert "Mechanism.only_term" not in result
+        assert "ReuiredEdits.only_term" not in result
+
+    def test_empty_when_no_residual_concern_fields(self):
+        from utilities.autopatcher.remediation_planner import _extract_strategy_residual_concern_identifiers
+        strategy = _make_strategy(
+            target_files=["a.py"], target_symbols=["a.py:Real.target_symbol"],
+            extended_mechanism="Mentions Mechanism.only_term here.",
+        )
+        assert _extract_strategy_residual_concern_identifiers(strategy) == []
+
+
+class TestCategoryPriorityAndOrdering:
+    def _context(self, tmp_path):
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        return _make_context(
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+
+    def test_definition_precedes_consumer_in_rendered_output(self, tmp_path):
+        (tmp_path / "consumer.py").write_text(
+            "class C:\n    def m(self):\n        Policy.ALLOWED_VALUES\n        return 1\n",
+            encoding="utf-8",
+        )
+        context = self._context(tmp_path)
+        # rebuild context including the consumer function too
+        context = _make_context(
+            functions={"consumer.py:C.m": {
+                "name": "m", "className": "C", "startLine": 2, "endLine": 4,
+                "code": "    def m(self):\n        Policy.ALLOWED_VALUES\n        return 1\n",
+            }},
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=["policy.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=["consumer.py"])
+        assert result.rendered.index("Target definition") < result.rendered.index("Discovered consumer")
+
+    def test_exact_definitions_never_displaced_by_budget(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        _set_slice_budget(monkeypatch, 60)  # smaller than even one definition block
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        context = self._context(tmp_path)
+        strategy = _make_strategy(target_files=["policy.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"])
+        result = rp.build_final_target_slice(strategy, str(tmp_path), context)
+        # With a tiny budget the definition itself may not fit either --
+        # what matters is that nothing LOWER priority ever appears instead.
+        assert "Full file (last resort)" not in result.rendered
+
+    def test_full_file_used_only_when_nothing_focused_available(self, tmp_path):
+        (tmp_path / "opaque.py").write_text("x = 1\ny = 2\nz = 3\n", encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["opaque.py"], extended_mechanism="NothingMatches.Here")
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert "Full file (last resort): `opaque.py`" in result.rendered
+
+
+class TestBudgetBoundedness:
+    def test_budget_is_bounded(self, tmp_path, monkeypatch):
+        """Fix B: the DEFAULT ceiling (max_chars=None) is now the real
+        per-call technical capacity, not FINAL_TARGET_SLICE_MAX_CHARS --
+        an explicit max_chars still bounds the render exactly as before."""
+        from utilities.autopatcher import remediation_planner as rp
+        big_body = "\n".join(f"    x{i} = {i}" for i in range(2000))
+        (tmp_path / "big.py").write_text(f"class C:\n{big_body}\n", encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["big.py"])
+        result = rp.build_final_target_slice(
+            strategy, str(tmp_path), context, max_chars=rp.FINAL_TARGET_SLICE_MAX_CHARS,
+        )
+        assert len(result.rendered) <= rp.FINAL_TARGET_SLICE_MAX_CHARS
+
+    def test_no_block_truncated_mid_line(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        _set_slice_budget(monkeypatch, 100)
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        context = _make_context(
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        strategy = _make_strategy(target_files=["policy.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"])
+        result = rp.build_final_target_slice(strategy, str(tmp_path), context)
+        if result.rendered:
+            assert result.rendered.rstrip("\n").endswith("```")  # never cut off mid code-fence/line
+
+    def test_duplicate_definitions_render_once(self, tmp_path):
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        context = _make_context(
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        # Same constant proposed twice, once directly and once discoverable
+        # via extended_mechanism -- must render exactly once.
+        strategy = _make_strategy(
+            target_files=["policy.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+            extended_mechanism="Policy.ALLOWED_VALUES",
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert result.rendered.count("Target definition") == 1
+
+
+class TestDeterministicFinalTargetOrder:
+    def test_target_order_matches_strategy_order(self, tmp_path):
+        (tmp_path / "b.py").write_text("class B:\n    Y = 2\n", encoding="utf-8")
+        (tmp_path / "a.py").write_text("class A:\n    X = 1\n", encoding="utf-8")
+        context = _make_context(
+            constants={
+                "b.py": {"B.Y": {"qualified_name": "B.Y", "name": "Y", "line": 2, "end_line": 2}},
+                "a.py": {"A.X": {"qualified_name": "A.X", "name": "X", "line": 2, "end_line": 2}},
+            },
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["b.py", "a.py"], target_symbols=["b.py:B.Y", "a.py:A.X"])
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert result.rendered.index("b.py:B.Y") < result.rendered.index("a.py:A.X")
+
+
+class TestCoverageReporting:
+    def test_complete_coverage_reported_correctly(self, tmp_path):
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        context = _make_context(
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["policy.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"])
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert result.coverage_complete is True
+        assert result.uncovered_target_files == []
+        assert result.uncovered_target_symbols == []
+        assert result.warning_text == ""
+
+    def test_partial_coverage_reported_correctly(self, tmp_path):
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice, FINAL_TARGET_SLICE_MAX_CHARS
+        # Large enough that its full-file fallback cannot fit the
+        # remaining budget after the (tiny) policy.py definition -- a
+        # small opaque file would otherwise trivially get "covered" via
+        # full-file fallback, which is not what this test is checking.
+        (tmp_path / "opaque.py").write_text("x = 1\n" * (FINAL_TARGET_SLICE_MAX_CHARS // 3), encoding="utf-8")
+        context = _make_context(
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        strategy = _make_strategy(
+            target_files=["policy.py", "opaque.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, max_chars=FINAL_TARGET_SLICE_MAX_CHARS,
+        )
+        assert result.coverage_complete is False
+        assert "opaque.py" in result.uncovered_target_files
+        assert result.has_any_coverage is True
+        assert "coverage warning" in result.warning_text.lower()
+        assert "Uncovered" in result.warning_text
+
+    def test_zero_coverage_prevents_first_patch_generator_call(self, tmp_path):
+        strategy = _make_strategy(target_files=["missing.py"], target_symbols=["missing.py:Missing.thing"])
+        context = _make_context(repo_path=tmp_path)  # nothing resolves; file doesn't even exist on disk
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert result.has_any_coverage is False
+        assert result.rendered == ""
+
+    def test_partial_coverage_continues_with_explicit_warning_not_silence(self, tmp_path):
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        context = _make_context(
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=["policy.py", "opaque_missing.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert result.warning_text  # non-empty, explicit
+        assert result.rendered  # slice still renders what WAS found
+
+
+class TestSliceFailureSafety:
+    def test_construction_failure_degrades_safely(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+
+        def _boom(*a, **kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(rp, "_build_final_target_slice_inner", _boom)
+        strategy = _make_strategy(target_files=["a.py"], target_symbols=["a.py:A.x"])
+        result = rp.build_final_target_slice(strategy, str(tmp_path), None)
+        assert result.coverage_complete is False
+        assert result.has_any_coverage is False
+        assert "failed" in result.rendered.lower()
+        assert result.warning_text
+
+
+class TestMinimistNestedFunctionRegression:
+    """End-to-end (no pipeline, no LLM) reproduction of the real
+    minimist/CVE-2021-44906 regression: a Final Strategy naming a
+    verified target file (index.js) and a target symbol (setKey) that
+    only resolves via the deterministic fallback -- all the way through
+    to the Edit Readiness Gate, without ever hitting Slice 2/3
+    (deterministic/guided acquisition)."""
+
+    def _context(self, tmp_path):
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        return _make_context(
+            functions={"index.js:hasKey": {"name": "hasKey", "startLine": 21, "endLine": 27}},
+            repo_path=tmp_path,
+        )
+
+    def test_final_strategy_keeps_setkey_instead_of_dropping_it(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _verify_strategy_targets
+        context = self._context(tmp_path)
+
+        kept_files, kept_symbols, warnings, rejected_symbols = _verify_strategy_targets(
+            ["index.js"], ["setKey"], tmp_path, context,
+        )
+        assert kept_files == ["index.js"]
+        assert kept_symbols == ["setKey"]
+        assert warnings == []  # no "unverified target_symbol removed: setKey"
+        assert rejected_symbols == []
+
+    def test_final_target_slice_covers_setkey_with_bounded_window_not_full_file(self, tmp_path):
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        strategy = _make_strategy(target_files=["index.js"], target_symbols=["setKey"])
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert result.covered_target_symbols == ["setKey"]
+        assert result.uncovered_target_symbols == []
+        assert result.coverage_complete is True
+        assert result.rendered.count("__proto__") == 2  # both existing guards present
+        # Bounded -- not a whole-file fallback: hasKey's own body must not
+        # be pulled in just because it shares setKey's file.
+        assert "function hasKey" not in result.rendered
+
+    def test_edit_readiness_reached_without_guided_acquisition(self, tmp_path):
+        # This is exactly the gate pipeline.py checks (edit_source_ready)
+        # before ever calling run_deterministic_acquisition / Slice 3's
+        # run_guided_acquisition -- True here means neither runs, so no
+        # (duplicate or otherwise) guided_context_request LLM call is made.
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+        )
+
+        strategy = _make_strategy(target_files=["index.js"], target_symbols=["setKey"])
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        intended_edits = build_intended_edits(strategy, slice_result)
+        readiness = check_edit_readiness(intended_edits, slice_result)
+
+        assert readiness.edit_source_ready is True
+        assert readiness.unready_edits == []
+        assert [e.symbol for e in readiness.ready_edits] == ["setKey"]
+
+    def test_no_patch_regression_removed(self, tmp_path):
+        # The regression's own end state: with the fallback, the Final
+        # Strategy's setKey survives verification, the slice covers it,
+        # and readiness is reached -- so Patch Generation is reachable
+        # instead of the pipeline stopping at "NO PATCH PRODUCED".
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import (
+            _verify_strategy_targets, build_final_target_slice,
+            build_intended_edits, check_edit_readiness,
+        )
+
+        kept_files, kept_symbols, warnings, rejected_symbols = _verify_strategy_targets(
+            ["index.js"], ["setKey"], tmp_path, context,
+        )
+        strategy = _make_strategy(target_files=kept_files, target_symbols=kept_symbols)
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        readiness = check_edit_readiness(build_intended_edits(strategy, slice_result), slice_result)
+
+        assert readiness.edit_source_ready is True  # Patch Generation is now reachable
+
+
+class TestExistingSectionsUnaffected:
+    def test_planner_evidence_unchanged_shape(self, tmp_path):
+        # build_planner_evidence's own contract (heading, disclaimer,
+        # structural+source shape) is untouched by this feature -- smoke
+        # check that it still behaves exactly as its own dedicated tests
+        # already prove.
+        (tmp_path / "retry.py").write_text("class Retry:\n    pass\n", encoding="utf-8")
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=[])
+        result = build_planner_evidence(plan, str(tmp_path), "vuln", None)
+        assert result.startswith("## Planner-Proposed Candidate Evidence")
+
+    def test_final_strategy_rendering_unchanged_shape(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_STRATEGY_WELL_FORMED)
+        result = generate_remediation_strategy(
+            "vuln", llm, None, None, planner_evidence_ctx="EVIDENCE",
+        )
+        assert result.rendered.startswith("## Final Evidence-Backed Remediation Strategy")
+
+
+class TestPipelineContextOrderingWithSlice:
+    def test_slice_and_coverage_warning_ordered_after_strategy(self, tmp_path):
+        target = tmp_path / "policy.py"
+        target.write_text("class Policy:\n    ALLOWED_VALUES = frozenset(['a'])\n", encoding="utf-8")
+
+        def side_effect(system_prompt, user_message, stage="unknown"):
+            if stage == "remediation_planning":
+                return json.dumps({
+                    "remediation_mechanism": "extend policy", "target_files": ["policy.py"],
+                    "target_symbols": [], "security_invariant": "stub", "required_edits": [],
+                    "approaches_to_avoid": [], "explicit_unknowns": [],
+                    "additional_evidence_required": False,
+                    "evidence_requests": [],
+                })
+            if stage == "remediation_strategy":
+                return json.dumps({
+                    "extended_mechanism": "Policy.ALLOWED_VALUES",
+                    "target_files": ["policy.py", "missing_target.py"],
+                    "target_symbols": ["policy.py:Policy.ALLOWED_VALUES"],
+                    "required_edits": ["stub edit"], "rejected_targets": [],
+                    "security_invariant": "stub", "insufficient_evidence": [],
+                })
+            return "{}"
+
+        mock_llm = mock.MagicMock()
+        mock_llm.complete.side_effect = side_effect
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value={"applicable": True, "skipped": False, "stderr": "",
+                                     "exit_code": 0, "skipped_reason": None, "error": None}),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("some vulnerability", api_key="", repo_root=str(tmp_path))
+
+        code_context = mock_gen.call_args.kwargs.get("code_context", "")
+        assert "Final Evidence-Backed Remediation Strategy" in code_context
+        assert "Final-Target Remediation Slice" in code_context
+        strategy_idx = code_context.index("Final Evidence-Backed Remediation Strategy")
+        slice_idx = code_context.index("Final-Target Remediation Slice")
+        assert strategy_idx < slice_idx
+        if "coverage warning" in code_context.lower():
+            warning_idx = code_context.lower().index("coverage warning")
+            assert slice_idx < warning_idx
+
+    def test_zero_coverage_skips_patch_generator_call_in_full_pipeline(self, tmp_path):
+        # Exercises pipeline.py's OWN wiring decision (react correctly to
+        # has_any_coverage=False) directly, rather than fighting the full
+        # real Grounding/Planner/Final-Strategy verification chain just to
+        # engineer a zero-coverage outcome deep inside it -- that
+        # algorithm-level behavior is already covered by
+        # TestCoverageReporting above.
+        target = tmp_path / "policy.py"
+        target.write_text("class Policy:\n    ALLOWED_VALUES = frozenset(['a'])\n", encoding="utf-8")
+
+        def side_effect(system_prompt, user_message, stage="unknown"):
+            if stage == "remediation_planning":
+                return json.dumps({
+                    "remediation_mechanism": "extend policy", "target_files": ["policy.py"],
+                    "target_symbols": [], "security_invariant": "stub", "required_edits": [],
+                    "approaches_to_avoid": [], "explicit_unknowns": [],
+                    "additional_evidence_required": False,
+                    "evidence_requests": [],
+                })
+            if stage == "remediation_strategy":
+                return json.dumps({
+                    "extended_mechanism": "Policy.ALLOWED_VALUES", "target_files": ["policy.py"],
+                    "target_symbols": ["policy.py:Policy.ALLOWED_VALUES"],
+                    "required_edits": ["stub edit"], "rejected_targets": [],
+                    "security_invariant": "stub", "insufficient_evidence": [],
+                })
+            return "{}"
+
+        mock_llm = mock.MagicMock()
+        mock_llm.complete.side_effect = side_effect
+
+        zero_coverage_result = mock.MagicMock(
+            rendered="", warning_text="## Final-target source coverage warning\n\n*none found*\n",
+            coverage_complete=False, has_any_coverage=False,
+            covered_target_files=[], covered_target_symbols=[],
+            uncovered_target_files=["policy.py"], uncovered_target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+        )
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
+            mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice",
+                       return_value=zero_coverage_result),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value={"applicable": None, "skipped": True, "stderr": "",
+                                     "exit_code": None, "skipped_reason": "empty diff", "error": None}),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("some vulnerability", api_key="", repo_root=str(tmp_path))
+
+        assert not mock_gen.called
+
+    def test_zero_coverage_no_patch_stderr_shows_no_patch_produced(self, tmp_path, capsys):
+        """Regression for the terminal/report consistency fix: the SAME
+        real, zero-coverage pipeline.run() as the test above -- which
+        deterministically ends with result.patch == "" -- must print
+        NO PATCH PRODUCED to stderr, never a Recommendation Policy
+        decision such as Manual Review Required, as its primary outcome
+        line (the Go CLI streams this stderr verbatim)."""
+        target = tmp_path / "policy.py"
+        target.write_text("class Policy:\n    ALLOWED_VALUES = frozenset(['a'])\n", encoding="utf-8")
+
+        def side_effect(system_prompt, user_message, stage="unknown"):
+            if stage == "remediation_planning":
+                return json.dumps({
+                    "remediation_mechanism": "extend policy", "target_files": ["policy.py"],
+                    "target_symbols": [], "security_invariant": "stub", "required_edits": [],
+                    "approaches_to_avoid": [], "explicit_unknowns": [],
+                    "additional_evidence_required": False,
+                    "evidence_requests": [],
+                })
+            if stage == "remediation_strategy":
+                return json.dumps({
+                    "extended_mechanism": "Policy.ALLOWED_VALUES", "target_files": ["policy.py"],
+                    "target_symbols": ["policy.py:Policy.ALLOWED_VALUES"],
+                    "required_edits": ["stub edit"], "rejected_targets": [],
+                    "security_invariant": "stub", "insufficient_evidence": [],
+                })
+            return "{}"
+
+        mock_llm = mock.MagicMock()
+        mock_llm.complete.side_effect = side_effect
+
+        zero_coverage_result = mock.MagicMock(
+            rendered="", warning_text="## Final-target source coverage warning\n\n*none found*\n",
+            coverage_complete=False, has_any_coverage=False,
+            covered_target_files=[], covered_target_symbols=[],
+            uncovered_target_files=["policy.py"], uncovered_target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+        )
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
+            mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice",
+                       return_value=zero_coverage_result),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value={"applicable": None, "skipped": True, "stderr": "",
+                                     "exit_code": None, "skipped_reason": "empty diff", "error": None}),
+        ):
+            from utilities.autopatcher.pipeline import run
+            report = run("some vulnerability", api_key="", repo_root=str(tmp_path))
+
+        assert not mock_gen.called
+        captured = capsys.readouterr()
+        # Legacy "[pipeline] Recommendation:" prefix is intentionally gone
+        # from the default banner (presentation cleanup, round 2) -- only
+        # the decision-precedence semantics are checked here.
+        assert "⚫ NO PATCH PRODUCED" in captured.err
+        assert "Manual Review Required" not in captured.err
+        assert "NO PATCH PRODUCED" in report
+
+
+class TestGenericExtendVsParallelFixture:
+    """Synthetic, fully generic (non-urllib3) fixture: an existing policy
+    constant, a consumer that already enforces it, a Final Strategy
+    selecting that policy -- the slice must contain only the exact
+    definition and the focused consumer, never a parallel implementation."""
+
+    def test_slice_contains_only_definition_and_consumer(self, tmp_path):
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        (tmp_path / "consumer.py").write_text(
+            "class Consumer:\n"
+            "    def validate(self, value):\n"
+            "        if value not in Policy.ALLOWED_VALUES:\n"
+            "            raise ValueError(value)\n"
+            "        return True\n"
+            "\n"
+            "    def unrelated_method(self):\n"
+            "        return 42\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={
+                "consumer.py:Consumer.validate": {
+                    "name": "validate", "className": "Consumer", "startLine": 2, "endLine": 5,
+                    "code": (
+                        "    def validate(self, value):\n"
+                        "        if value not in Policy.ALLOWED_VALUES:\n"
+                        "            raise ValueError(value)\n"
+                        "        return True\n"
+                    ),
+                },
+                "consumer.py:Consumer.unrelated_method": {
+                    "name": "unrelated_method", "className": "Consumer", "startLine": 7, "endLine": 8,
+                    "code": "    def unrelated_method(self):\n        return 42\n",
+                },
+            },
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=["policy.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+            extended_mechanism="Policy.ALLOWED_VALUES",
+            required_edits=["Add 'b' to the existing Policy.ALLOWED_VALUES frozenset."],
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=["consumer.py"])
+
+        assert 'ALLOWED_VALUES = frozenset(["a"])' in result.rendered
+        assert "Consumer.validate" in result.rendered
+        assert "unrelated_method" not in result.rendered  # no unrelated/parallel source pulled in
+        assert "Full file (last resort)" not in result.rendered
+
+
+class TestUrllib3StyleDeterministicSelfContained:
+    """Self-contained (no external checkout dependency) urllib3-shaped
+    fixture proving: exact constant definition, exact consumer block,
+    combined size, no full file, no full oversized function, no live LLM."""
+
+    def test_definition_and_consumer_without_full_file_or_full_function(self, tmp_path):
+        retry_dir = tmp_path / "src" / "urllib3" / "util"
+        retry_dir.mkdir(parents=True)
+        # A deliberately large retry.py -- large enough that a full-file
+        # fallback would visibly dominate the budget if it were ever used.
+        filler = "\n".join(f"# filler line {i}" for i in range(400))
+        retry_py = retry_dir / "retry.py"
+        retry_py.write_text(
+            f"{filler}\nclass Retry:\n    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n{filler}\n",
+            encoding="utf-8",
+        )
+        pool_dir = tmp_path / "src" / "urllib3"
+        pool_py = pool_dir / "poolmanager.py"
+        consumer_code = (
+            "    def urlopen(self, method, url, redirect=True, **kw):\n"
+            "        retries = kw.get('retries')\n"
+            "        if retries.remove_headers_on_redirect:\n"
+            "            for header in list(kw.get('headers', {})):\n"
+            "                if header.lower() in retries.remove_headers_on_redirect:\n"
+            "                    pass\n"
+            "        return None\n"
+        )
+        pool_py.write_text(f"class PoolManager:\n{consumer_code}", encoding="utf-8")
+
+        # 400 filler lines (1..400) + line 401 is "class Retry:" -- constant is line 402
+        context = _make_context(
+            functions={
+                "src/urllib3/poolmanager.py:PoolManager.urlopen": {
+                    "name": "urlopen", "className": "PoolManager", "startLine": 2, "endLine": 8,
+                    "code": consumer_code,
+                },
+            },
+            constants={
+                "src/urllib3/util/retry.py": {
+                    "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": {
+                        "qualified_name": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "class_name": "Retry", "name": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "line": 402, "end_line": 402,
+                    },
+                },
+            },
+            repo_path=tmp_path,
+        )
+
+        from utilities.autopatcher.remediation_planner import build_final_target_slice, FINAL_TARGET_SLICE_MAX_CHARS
+        strategy = _make_strategy(
+            target_files=["src/urllib3/util/retry.py"], target_symbols=[],
+            extended_mechanism="DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+            required_edits=["Add 'Cookie' to remove_headers_on_redirect."],
+        )
+
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context,
+            planner_evidence_files=["src/urllib3/poolmanager.py"],
+        )
+
+        assert 'DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])' in result.rendered
+        assert "PoolManager.urlopen" in result.rendered
+        assert "Discovered consumer" in result.rendered
+        assert "Full file (last resort)" not in result.rendered
+        assert str(retry_py.read_text(encoding="utf-8")) not in result.rendered  # no full file text
+        assert len(result.rendered) < FINAL_TARGET_SLICE_MAX_CHARS
+        assert "src/urllib3/util/retry.py" in result.covered_target_files
+        print(f"\n[urllib3-style self-contained proof] rendered chars: {len(result.rendered)}")
+
+    def test_constant_discovered_via_one_hop_when_absent_from_strategy_text(self, tmp_path):
+        # The exact fixed bug: strategy text names only the lowercase
+        # attribute/mechanism, NEVER the constant's own bare name -- so
+        # category 2 (strategy-term lookup) cannot find it. The selected
+        # Retry.__init__ consumer window (found via the "remove_headers_
+        # on_redirect" strategy term) references the bare constant name
+        # directly as a default value, exactly like real urllib3 -- only
+        # the one-hop expansion can surface its exact definition.
+        retry_dir = tmp_path / "src" / "urllib3" / "util"
+        retry_dir.mkdir(parents=True)
+        retry_py = retry_dir / "retry.py"
+        init_code = (
+            "    def __init__(\n"
+            "        self,\n"
+            "        remove_headers_on_redirect=DEFAULT_REMOVE_HEADERS_ON_REDIRECT,\n"
+            "    ):\n"
+            "        self.remove_headers_on_redirect = remove_headers_on_redirect\n"
+        )
+        retry_py.write_text(
+            f"class Retry:\n    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n\n{init_code}",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={
+                "src/urllib3/util/retry.py:Retry.__init__": {
+                    "name": "__init__", "className": "Retry", "startLine": 4, "endLine": 8,
+                    "code": init_code,
+                },
+            },
+            constants={
+                "src/urllib3/util/retry.py": {
+                    "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": {
+                        "qualified_name": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "class_name": "Retry", "name": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "line": 2, "end_line": 2,
+                    },
+                },
+            },
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=["src/urllib3/util/retry.py"], target_symbols=[],
+            extended_mechanism="remove_headers_on_redirect",  # never the constant's own bare name
+            required_edits=["Add Cookie to remove_headers_on_redirect."],
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert 'DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])' in result.rendered
+        assert result.rendered.index("Target definition") < result.rendered.index("Discovered consumer")
+
+
+class TestOneHopDependencyExpansion:
+    def _retry_style_context(self, tmp_path, init_code, const_line=2, const_end=2, gap=""):
+        """`gap` (default "", so every existing caller is unaffected) inserts
+        extra lines between the constant and __init__ -- used by the budget
+        test below to keep the padded definition window (see
+        _DEFINITION_CONTEXT_LINES) from bleeding into the consumer function
+        in this otherwise tiny fixture."""
+        retry_py = tmp_path / "retry.py"
+        retry_py.write_text(
+            f"class Retry:\n    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n\n{gap}{init_code}",
+            encoding="utf-8",
+        )
+        init_start = 4 + gap.count("\n")
+        return _make_context(
+            functions={
+                "retry.py:Retry.__init__": {
+                    "name": "__init__", "className": "Retry", "startLine": init_start,
+                    "endLine": init_start + init_code.count("\n") - 1,
+                    "code": init_code,
+                },
+            },
+            constants={
+                "retry.py": {
+                    "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": {
+                        "qualified_name": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "class_name": "Retry", "name": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                        "line": const_line, "end_line": const_end,
+                    },
+                },
+            },
+            repo_path=tmp_path,
+        )
+
+    def test_consumer_reference_causes_definition_to_be_added(self, tmp_path):
+        init_code = (
+            "    def __init__(self, remove_headers_on_redirect=DEFAULT_REMOVE_HEADERS_ON_REDIRECT):\n"
+            "        self.remove_headers_on_redirect = remove_headers_on_redirect\n"
+        )
+        context = self._retry_style_context(tmp_path, init_code)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=["retry.py"], extended_mechanism="remove_headers_on_redirect",
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert 'DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])' in result.rendered
+
+    def test_definition_renders_before_consumer(self, tmp_path):
+        init_code = (
+            "    def __init__(self, remove_headers_on_redirect=DEFAULT_REMOVE_HEADERS_ON_REDIRECT):\n"
+            "        self.remove_headers_on_redirect = remove_headers_on_redirect\n"
+        )
+        context = self._retry_style_context(tmp_path, init_code)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["retry.py"], extended_mechanism="remove_headers_on_redirect")
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert result.rendered.index("Target definition") < result.rendered.index("Discovered consumer")
+
+    def test_exact_capitalization_and_brackets_preserved(self, tmp_path):
+        init_code = (
+            "    def __init__(self, remove_headers_on_redirect=DEFAULT_REMOVE_HEADERS_ON_REDIRECT):\n"
+            "        pass\n"
+        )
+        context = self._retry_style_context(tmp_path, init_code)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["retry.py"], extended_mechanism="remove_headers_on_redirect")
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        # exact literal syntax, capitalization, and bracket type (square + frozenset call) preserved verbatim
+        assert 'DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])' in result.rendered
+
+    def test_disambiguation_prefers_same_class_and_file(self):
+        from utilities.autopatcher.remediation_planner import _disambiguate_constant_candidates
+        candidates = [
+            ("other.py", "Other.X", {"name": "X", "line": 1, "end_line": 1}),
+            ("retry.py", "Retry.X", {"name": "X", "line": 2, "end_line": 2}),
+        ]
+        chosen, reason = _disambiguate_constant_candidates(
+            candidates, source_file="retry.py", source_class="Retry",
+            symbol_matches={}, strategy_target_files=["retry.py", "other.py"],
+        )
+        assert reason is None
+        assert chosen == ("retry.py", "Retry.X", {"name": "X", "line": 2, "end_line": 2})
+
+    def test_disambiguation_prefers_final_strategy_target_file(self):
+        from utilities.autopatcher.remediation_planner import _disambiguate_constant_candidates
+        candidates = [
+            ("unrelated.py", "Unrelated.X", {"name": "X", "line": 1, "end_line": 1}),
+            ("target.py", "Target.X", {"name": "X", "line": 2, "end_line": 2}),
+        ]
+        # Neither shares the referencing block's own class/file -- tier 3
+        # (same Final Strategy target file) must still disambiguate.
+        chosen, reason = _disambiguate_constant_candidates(
+            candidates, source_file="consumer.py", source_class="Consumer",
+            symbol_matches={}, strategy_target_files=["target.py"],
+        )
+        assert reason is None
+        assert chosen[0] == "target.py"
+
+    def test_unique_bounded_match_is_used(self):
+        from utilities.autopatcher.remediation_planner import _disambiguate_constant_candidates
+        candidates = [("only.py", "Only.X", {"name": "X", "line": 1, "end_line": 1})]
+        chosen, reason = _disambiguate_constant_candidates(
+            candidates, source_file="consumer.py", source_class=None,
+            symbol_matches={}, strategy_target_files=[],
+        )
+        assert reason is None
+        assert chosen[0] == "only.py"
+
+    def test_ambiguous_equal_priority_matches_are_skipped_safely(self):
+        from utilities.autopatcher.remediation_planner import _disambiguate_constant_candidates
+        candidates = [
+            ("a.py", "A.X", {"name": "X", "line": 1, "end_line": 1}),
+            ("b.py", "B.X", {"name": "X", "line": 2, "end_line": 2}),
+        ]
+        # Neither matches the source class/file, neither is a Final
+        # Strategy target file -- every tier is tied at 2 candidates.
+        chosen, reason = _disambiguate_constant_candidates(
+            candidates, source_file="consumer.py", source_class="Consumer",
+            symbol_matches={}, strategy_target_files=["unrelated_target.py"],
+        )
+        assert chosen is None
+        assert reason is not None
+        assert "ambiguous" in reason
+
+    def test_ambiguous_match_does_not_raise_or_fail_the_run(self, tmp_path):
+        (tmp_path / "a.py").write_text("class A:\n    X = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("class B:\n    X = 2\n", encoding="utf-8")
+        (tmp_path / "consumer.py").write_text(
+            "class C:\n    def m(self):\n        return X\n", encoding="utf-8",
+        )
+        context = _make_context(
+            functions={"consumer.py:C.m": {
+                "name": "m", "className": "C", "startLine": 2, "endLine": 3,
+                "code": "    def m(self):\n        return X\n",
+            }},
+            constants={
+                "a.py": {"A.X": {"qualified_name": "A.X", "name": "X", "line": 2, "end_line": 2}},
+                "b.py": {"B.X": {"qualified_name": "B.X", "name": "X", "line": 2, "end_line": 2}},
+            },
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["consumer.py"], extended_mechanism="C.m")
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["a.py", "b.py"],
+        )
+        assert "A.X" not in result.rendered
+        assert "B.X" not in result.rendered  # ambiguous -- neither guessed
+
+    def test_existing_definition_not_duplicated(self, tmp_path):
+        init_code = (
+            "    def __init__(self, remove_headers_on_redirect=DEFAULT_REMOVE_HEADERS_ON_REDIRECT):\n"
+            "        pass\n"
+        )
+        context = self._retry_style_context(tmp_path, init_code)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        # The constant is ALREADY a verified target symbol (category 1)
+        # AND also referenced inside the selected consumer -- must render
+        # exactly once, not twice via one-hop.
+        strategy = _make_strategy(
+            target_files=["retry.py"],
+            target_symbols=["retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"],
+            extended_mechanism="remove_headers_on_redirect",
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert result.rendered.count("Target definition") == 1
+
+    def test_expansion_is_one_hop_only(self, tmp_path):
+        # consumer references REFERENCED_CONST; REFERENCED_CONST's OWN
+        # definition body references SECOND_HOP_CONST. SECOND_HOP_CONST
+        # must NEVER be expanded -- only one hop from the originally
+        # selected source (the consumer), never from a newly-added
+        # dependency definition.
+        (tmp_path / "chain.py").write_text(
+            "class Chain:\n"
+            "    SECOND_HOP_CONST = 1\n"
+            "    REFERENCED_CONST = SECOND_HOP_CONST\n"
+            "    def m(self):\n"
+            "        return REFERENCED_CONST\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={"chain.py:Chain.m": {
+                "name": "m", "className": "Chain", "startLine": 4, "endLine": 5,
+                "code": "    def m(self):\n        return REFERENCED_CONST\n",
+            }},
+            constants={"chain.py": {
+                "Chain.REFERENCED_CONST": {
+                    "qualified_name": "Chain.REFERENCED_CONST", "name": "REFERENCED_CONST", "line": 3, "end_line": 3,
+                },
+                "Chain.SECOND_HOP_CONST": {
+                    "qualified_name": "Chain.SECOND_HOP_CONST", "name": "SECOND_HOP_CONST", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["chain.py"], extended_mechanism="REFERENCED_CONST")
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert "Chain.REFERENCED_CONST" in result.rendered  # one hop: consumer -> REFERENCED_CONST
+        assert "Chain.SECOND_HOP_CONST" not in result.rendered  # NOT a second hop: REFERENCED_CONST's body -> SECOND_HOP_CONST
+
+    def test_comment_does_not_trigger_unrelated_constant(self, tmp_path):
+        (tmp_path / "policy.py").write_text("class Policy:\n    UNRELATED = 1\n", encoding="utf-8")
+        (tmp_path / "consumer.py").write_text(
+            "class C:\n"
+            "    def m(self):\n"
+            "        # see UNRELATED for details\n"
+            "        return 1\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={"consumer.py:C.m": {
+                "name": "m", "className": "C", "startLine": 2, "endLine": 4,
+                "code": "    def m(self):\n        # see UNRELATED for details\n        return 1\n",
+            }},
+            constants={"policy.py": {
+                "Policy.UNRELATED": {"qualified_name": "Policy.UNRELATED", "name": "UNRELATED", "line": 2, "end_line": 2},
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["consumer.py"], extended_mechanism="UNRELATED")
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["policy.py"],
+        )
+        # The comment text itself is legitimately preserved verbatim as
+        # part of the consumer's own selected source (never stripped) --
+        # what must NOT happen is a SEPARATE one-hop definition block for
+        # policy.py:Policy.UNRELATED being added on the strength of a
+        # reference that only ever appeared inside a comment.
+        assert "Target definition: `policy.py:Policy.UNRELATED`" not in result.rendered
+
+    def test_budget_priority_definition_ahead_of_consumer(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        init_code = (
+            "    def __init__(self, remove_headers_on_redirect=DEFAULT_REMOVE_HEADERS_ON_REDIRECT):\n"
+            "        pass\n"
+        )
+        # `gap` keeps __init__ far enough from the constant that the padded
+        # definition window (_DEFINITION_CONTEXT_LINES on each side) doesn't
+        # bleed into the consumer's own lines -- otherwise, in this small a
+        # fixture, "the definition" and "the consumer" would overlap and this
+        # test would no longer isolate what it's testing (budget priority
+        # between two genuinely separate blocks).
+        gap = "".join(f"    # gap line {i}\n" for i in range(1, 7))
+        context = self._retry_style_context(tmp_path, init_code, gap=gap)
+        strategy = _make_strategy(target_files=["retry.py"], extended_mechanism="remove_headers_on_redirect")
+        # A budget just large enough for the (now patch-ready, padded) exact
+        # definition but too small to ALSO fit the consumer window -- the
+        # definition must still win the budget over the consumer that
+        # referenced it. Measured against this fixture: the padded
+        # definition block is 221 characters; definition + consumer combined
+        # is 434. 300 sits cleanly between the two.
+        _set_slice_budget(monkeypatch, 300)
+        result = rp.build_final_target_slice(strategy, str(tmp_path), context, max_chars=300)
+        assert 'DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])' in result.rendered
+        assert "Discovered consumer" not in result.rendered
+
+    def test_extract_source_constant_refs_is_conservative(self):
+        from utilities.autopatcher.remediation_planner import _extract_source_constant_refs
+        code = (
+            "    # see MAX_RETRIES for details\n"
+            "    def m(self, value=DEFAULT_VALUE):\n"
+            "        x = \"a string with WORDS in it\"\n"
+            "        return value\n"
+        )
+        found = _extract_source_constant_refs(code)
+        assert "DEFAULT_VALUE" in found
+        assert "MAX_RETRIES" not in found  # full-line comment skipped
+
+    def test_generic_extend_vs_parallel_fixture_still_passes(self, tmp_path):
+        # Smoke re-check: the earlier, unrelated generic proof (policy
+        # constant + consumer, no reference chain at all) must still
+        # behave identically with the one-hop step added.
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        context = _make_context(
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(target_files=["policy.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"])
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert result.coverage_complete is True
+        assert result.rendered.count("Target definition") == 1
+
+
+# ---------------------------------------------------------------------------
+# Resolved target-symbol files widen preferred_files
+#
+# The structural gap this closes: preferred_files (which bounds every usage/
+# consumer scan below) was seeded ONLY from strategy.target_files --
+# a field the Final Strategy LLM authors completely independently of
+# target_symbols (see generate_remediation_strategy's two separate
+# plan.get(...) reads). Category 1's own symbol resolution
+# (_resolve_symbol_details) never consulted preferred_files at all -- it
+# searches the whole repository index/constants table directly -- so a
+# symbol could resolve successfully while the file it lives in stayed
+# completely outside the usage scan's search boundary, hiding any function
+# in that same file that directly references it. This is NOT proven to be
+# the exact mechanism behind any specific historical run (no run logs were
+# inspected) -- it is a structural gap demonstrated directly against the
+# current implementation below.
+# ---------------------------------------------------------------------------
+
+class TestResolvedSymbolFileWidensPreferredFiles:
+    """Generic fixture (no urllib3/CVE-specific naming) reproducing the
+    structural gap end-to-end and proving the fix closes it, without adding
+    any constructor-specific rule: a plain function in the same file that
+    references the resolved symbol is found by the SAME existing, unmodified
+    _lookup_identifier_usages/_extract_strategy_identifiers mechanism --
+    only the file-scope boundary fed into it changed."""
+
+    def _context(self, tmp_path, usage_code, usage_label, start_line, end_line, gap=""):
+        """`gap` (default "", so every existing caller is unaffected) inserts
+        extra filler lines between the constant and the usage function --
+        same convention as TestOneHopDependencyExpansion._retry_style_context,
+        needed to keep the constant's own _DEFINITION_CONTEXT_LINES-padded
+        render window from bleeding into a deliberately UNRELATED function in
+        this otherwise tiny fixture (see the negative-control test below)."""
+        pkg_dir = tmp_path / "pkg"
+        pkg_dir.mkdir(exist_ok=True)
+        widget_py = pkg_dir / "widget.py"
+        widget_py.write_text(
+            f"class Widget:\n    CLASS_DEFAULT = \"MixedCase\"\n\n{gap}{usage_code}",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={
+                f"pkg/widget.py:{usage_label}": {
+                    "name": usage_label.rsplit(".", 1)[-1],
+                    "className": usage_label.rsplit(".", 1)[0] if "." in usage_label else None,
+                    "startLine": start_line, "endLine": end_line, "code": usage_code,
+                },
+            },
+            constants={
+                "pkg/widget.py": {
+                    "Widget.CLASS_DEFAULT": {
+                        "qualified_name": "Widget.CLASS_DEFAULT", "class_name": "Widget",
+                        "name": "CLASS_DEFAULT", "line": 2, "end_line": 2,
+                    },
+                },
+            },
+            repo_path=tmp_path,
+        )
+        return context
+
+    # -- 1. Critical test: reproduce the structural gap directly, at the
+    # bounded primitive itself, independent of build_final_target_slice.
+    # This characterizes exactly what the pre-fix build_final_target_slice
+    # code path would have hit: a usage scan bounded to a file list that
+    # does not contain the resolved symbol's own file finds nothing, no
+    # matter how the identifier is spelled.
+    def test_bounded_usage_scan_misses_the_file_when_absent_from_scope(self, tmp_path):
+        init_code = (
+            "    def __init__(self, value=CLASS_DEFAULT):\n"
+            "        self.runtime_value = normalize(value)\n"
+        )
+        context = self._context(tmp_path, init_code, "Widget.__init__", 4, 5)
+        from utilities.autopatcher.remediation_planner import _lookup_identifier_usages
+        # pkg/widget.py is deliberately NOT in the search scope here.
+        found = _lookup_identifier_usages("CLASS_DEFAULT", [], context)
+        assert found == []
+
+    # -- 2. End-to-end proof the fix closes it: verified target symbol
+    # resolves to pkg/widget.py; strategy.target_files and
+    # planner_evidence_files both omit it; strategy prose never repeats the
+    # symbol name either (so discovery cannot be attributed to prose
+    # extraction). The constructor's normalization is still surfaced.
+    def test_resolved_symbol_file_becomes_searchable_and_constructor_usage_is_surfaced(self, tmp_path):
+        init_code = (
+            "    def __init__(self, value=CLASS_DEFAULT):\n"
+            "        self.runtime_value = normalize(value)\n"
+        )
+        context = self._context(tmp_path, init_code, "Widget.__init__", 4, 5)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=[],  # deliberately does NOT name pkg/widget.py
+            target_symbols=["Widget.CLASS_DEFAULT"],
+            extended_mechanism="An unrelated narrative that never repeats the symbol name.",
+        )
+
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=[],
+        )
+
+        assert "Widget.CLASS_DEFAULT" in result.covered_target_symbols
+        assert "Widget.__init__" in result.rendered
+        assert "self.runtime_value = normalize(value)" in result.rendered
+        assert "Discovered consumer" in result.rendered
+
+    # -- 3. Generalization: a non-constructor function (a plain helper, not
+    # a class initializer) that directly references the resolved symbol is
+    # surfaced by the exact same mechanism. This proves the fix is
+    # "target-symbol file -> direct usages", not "class constant ->
+    # constructor".
+    def test_non_constructor_direct_usage_is_also_surfaced(self, tmp_path):
+        helper_code = (
+            "def normalize_widget(value=Widget.CLASS_DEFAULT):\n"
+            "    return normalize(value)\n"
+        )
+        context = self._context(tmp_path, helper_code, "normalize_widget", 4, 5)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=[], target_symbols=["Widget.CLASS_DEFAULT"],
+            extended_mechanism="An unrelated narrative that never repeats the symbol name.",
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=[])
+
+        assert "normalize_widget" in result.rendered
+        assert "return normalize(value)" in result.rendered
+
+    # -- 4. Negative control: resolving a class-scoped constant must NOT
+    # pull in an unrelated constructor in the same file that never
+    # references it. This is the explicit proof that no constructor-
+    # specific inclusion rule was added -- only the file-scope widening. A
+    # `gap` separates the constant from the unrelated __init__ so the
+    # constant's own _DEFINITION_CONTEXT_LINES padding (a pre-existing,
+    # unrelated mechanism) cannot incidentally sweep the unrelated function
+    # into the SAME "Target definition" block and produce a false pass.
+    def test_unrelated_constructor_in_same_file_is_not_pulled_in(self, tmp_path):
+        unrelated_init = (
+            "    def __init__(self, other_option=True):\n"
+            "        self.other_option = other_option\n"
+        )
+        gap = "\n".join(f"    # filler line {i}" for i in range(10)) + "\n"
+        context = self._context(
+            tmp_path, unrelated_init, "Widget.__init__",
+            start_line=4 + gap.count("\n"), end_line=5 + gap.count("\n"), gap=gap,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=[], target_symbols=["Widget.CLASS_DEFAULT"],
+            extended_mechanism="An unrelated narrative that never repeats the symbol name.",
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=[])
+
+        assert "Widget.CLASS_DEFAULT" in result.covered_target_symbols
+        assert "self.other_option = other_option" not in result.rendered
+        assert "Discovered consumer" not in result.rendered
+
+    # -- 5. Budget/ordering: widening preferred_files must not bypass the
+    # existing Final-Target Slice budget or category-commit ordering
+    # (extensive dedicated coverage already exists in
+    # TestBudgetBoundedness/TestCategoryPriorityAndOrdering -- this is only
+    # a lightweight check that this specific new file-scope path is subject
+    # to the same rules, not a duplicate of that coverage).
+    def test_widened_scope_still_respects_budget_and_ordering(self, tmp_path):
+        init_code = (
+            "    def __init__(self, value=CLASS_DEFAULT):\n"
+            "        self.runtime_value = normalize(value)\n"
+        )
+        context = self._context(tmp_path, init_code, "Widget.__init__", 4, 5)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice, FINAL_TARGET_SLICE_MAX_CHARS
+        strategy = _make_strategy(
+            target_files=[], target_symbols=["Widget.CLASS_DEFAULT"],
+            extended_mechanism="An unrelated narrative that never repeats the symbol name.",
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=[])
+
+        assert len(result.rendered) < FINAL_TARGET_SLICE_MAX_CHARS
+        assert "Full file (last resort)" not in result.rendered
+        # Category 1 (exact definition) still committed ahead of the
+        # discovered-consumer window, exactly as for every other source.
+        assert result.rendered.index("Target definition") < result.rendered.index("Discovered consumer")
+
+
+# ---------------------------------------------------------------------------
+# Slice 1 -- Edit Readiness Gate
+# ---------------------------------------------------------------------------
+
+class TestBuildIntendedEdits:
+    """Test 1 (intended edit derivation) + Test 2 (file-level fallback
+    only when no target symbol exists)."""
+
+    def test_one_intended_edit_per_verified_target_symbol(self):
+        from utilities.autopatcher.remediation_planner import IntendedEdit, build_intended_edits
+        strategy = _make_strategy(
+            target_files=["src/mod.py"],
+            target_symbols=["src/mod.py:Class.CONST_A", "src/mod.py:Class.method_b"],
+        )
+        edits = build_intended_edits(strategy)
+        assert IntendedEdit(file="src/mod.py", symbol="src/mod.py:Class.CONST_A") in edits
+        assert IntendedEdit(file="src/mod.py", symbol="src/mod.py:Class.method_b") in edits
+        # both target_symbols already carry a file hint naming this file --
+        # no separate file-level edit is added on top of them.
+        assert len(edits) == 2
+
+    def test_bare_symbol_with_no_file_hint_still_produces_its_own_edit(self):
+        from utilities.autopatcher.remediation_planner import IntendedEdit, build_intended_edits
+        strategy = _make_strategy(target_files=["src/mod.py"], target_symbols=["bare_name"])
+        edits = build_intended_edits(strategy)
+        assert IntendedEdit(file=None, symbol="bare_name") in edits
+
+    def test_bare_symbol_with_resolved_file_produces_exactly_one_edit(self):
+        """Regression: a bare (file-hint-less) target_symbol that resolves
+        to a file ALSO named in target_files must not produce a second,
+        spurious file-level IntendedEdit for the same logical target --
+        the prior review's confirmed bare-symbol duplication bug."""
+        from utilities.autopatcher.remediation_planner import (
+            FinalTargetSliceResult, IntendedEdit, build_intended_edits,
+        )
+        strategy = _make_strategy(target_files=["a.py"], target_symbols=["Class.method"])
+        slice_result = FinalTargetSliceResult(
+            rendered="", covered_target_files=[], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=[],
+            coverage_complete=True, has_any_coverage=False, warning_text="",
+            resolved_target_symbols=[], full_file_fallback_covered=[],
+            edit_target_budget_exhausted=False,
+            resolved_symbol_files={"Class.method": "a.py"}, identifier_definition_covered=[],
+        )
+        edits = build_intended_edits(strategy, slice_result)
+        assert edits == [IntendedEdit(file="a.py", symbol="Class.method")]
+
+    def test_duplicate_target_symbols_are_deduplicated(self):
+        from utilities.autopatcher.remediation_planner import build_intended_edits
+        strategy = _make_strategy(target_symbols=["a.py:X", "a.py:X"])
+        edits = build_intended_edits(strategy)
+        assert len(edits) == 1
+
+    def test_no_file_level_edit_when_a_symbol_already_covers_the_file(self):
+        """Test 2: 'Add a file-level intended edit only when a verified
+        target file has no corresponding verified target symbol.'"""
+        from utilities.autopatcher.remediation_planner import IntendedEdit, build_intended_edits
+        strategy = _make_strategy(target_files=["a.py"], target_symbols=["a.py:X"])
+        edits = build_intended_edits(strategy)
+        assert edits == [IntendedEdit(file="a.py", symbol="a.py:X")]
+
+    def test_file_level_edit_added_only_for_the_file_with_no_symbol(self):
+        from utilities.autopatcher.remediation_planner import IntendedEdit, build_intended_edits
+        strategy = _make_strategy(target_files=["a.py", "b.py"], target_symbols=["a.py:X"])
+        edits = build_intended_edits(strategy)
+        assert IntendedEdit(file="a.py", symbol="a.py:X") in edits
+        assert IntendedEdit(file="b.py", symbol=None) in edits
+        assert len(edits) == 2
+
+    def test_empty_strategy_produces_no_intended_edits(self):
+        from utilities.autopatcher.remediation_planner import build_intended_edits
+        assert build_intended_edits(_make_strategy()) == []
+
+
+class TestCheckEditReadinessDirect:
+    """Test 4 (unrelated block from the correct file does not satisfy
+    readiness) + Test 5 (a block containing the exact resolved identifier
+    does satisfy readiness), exercised directly against hand-built
+    FinalTargetSliceResult values -- no repository, no LLM."""
+
+    @staticmethod
+    def _slice_result(**overrides):
+        from utilities.autopatcher.remediation_planner import FinalTargetSliceResult
+        base = dict(
+            rendered="## Final-Target Remediation Slice\n", covered_target_files=[],
+            covered_target_symbols=[], uncovered_target_files=[], uncovered_target_symbols=[],
+            coverage_complete=True, has_any_coverage=True, warning_text="",
+            resolved_target_symbols=[], full_file_fallback_covered=[],
+            edit_target_budget_exhausted=False,
+            resolved_symbol_files={}, identifier_definition_covered=[],
+        )
+        base.update(overrides)
+        return FinalTargetSliceResult(**base)
+
+    def test_symbol_edit_ready_when_covered_target_symbols_contains_it(self):
+        from utilities.autopatcher.remediation_planner import IntendedEdit, check_edit_readiness
+        edit = IntendedEdit(file="a.py", symbol="a.py:X")
+        result = check_edit_readiness([edit], self._slice_result(covered_target_symbols=["a.py:X"]))
+        assert result.edit_source_ready is True
+        assert result.ready_edits[0].role == "edit_target"
+        assert result.unready_edits == []
+
+    def test_symbol_edit_not_ready_when_resolved_but_not_covered_is_missing_target_source(self):
+        from utilities.autopatcher.remediation_planner import IntendedEdit, check_edit_readiness
+        edit = IntendedEdit(file="a.py", symbol="a.py:X")
+        # resolved (present in resolved_target_symbols) but never made it
+        # into the rendered slice (not in covered_target_symbols) --
+        # e.g. a read failure, or an oversized function.
+        result = check_edit_readiness(
+            [edit], self._slice_result(resolved_target_symbols=["a.py:X"])
+        )
+        assert result.edit_source_ready is False
+        assert result.unready_edits[0].reason == "missing_target_source"
+
+    def test_symbol_edit_not_ready_when_never_resolved_is_unresolved_symbol(self):
+        from utilities.autopatcher.remediation_planner import IntendedEdit, check_edit_readiness
+        edit = IntendedEdit(file="a.py", symbol="a.py:X")
+        result = check_edit_readiness([edit], self._slice_result())
+        assert result.edit_source_ready is False
+        assert result.unready_edits[0].reason == "unresolved_symbol"
+
+    def test_file_only_edit_ready_only_via_full_file_fallback_covered(self):
+        """Test 5: the block containing the exact resolved identifier
+        (here: the full-file fallback that passed identifier-containment)
+        satisfies readiness."""
+        from utilities.autopatcher.remediation_planner import IntendedEdit, check_edit_readiness
+        edit = IntendedEdit(file="a.py", symbol=None)
+        result = check_edit_readiness(
+            [edit],
+            self._slice_result(covered_target_files=["a.py"], full_file_fallback_covered=["a.py"]),
+        )
+        assert result.edit_source_ready is True
+        assert result.ready_edits[0].role == "edit_target"
+
+    def test_file_only_edit_not_ready_when_file_covered_by_unrelated_block(self):
+        """Test 4: 'An unrelated block from the correct file does not
+        satisfy readiness.' The file IS in covered_target_files (SOME
+        block -- e.g. a one-hop constant or a usage window -- was
+        rendered from it) but NOT via full_file_fallback_covered, so
+        nothing ties that block to the actual intended edit."""
+        from utilities.autopatcher.remediation_planner import IntendedEdit, check_edit_readiness
+        edit = IntendedEdit(file="a.py", symbol=None)
+        result = check_edit_readiness(
+            [edit],
+            self._slice_result(covered_target_files=["a.py"], full_file_fallback_covered=[]),
+        )
+        assert result.edit_source_ready is False
+        assert result.unready_edits[0].reason == "missing_identifier"
+
+    def test_file_only_edit_not_ready_when_file_has_no_source_at_all(self):
+        from utilities.autopatcher.remediation_planner import IntendedEdit, check_edit_readiness
+        edit = IntendedEdit(file="a.py", symbol=None)
+        result = check_edit_readiness([edit], self._slice_result())
+        assert result.edit_source_ready is False
+        assert result.unready_edits[0].reason == "missing_target_source"
+
+    def test_strategy_ready_false_when_no_intended_edits(self):
+        from utilities.autopatcher.remediation_planner import check_edit_readiness
+        result = check_edit_readiness([], self._slice_result())
+        assert result.strategy_ready is False
+        assert result.edit_source_ready is False
+
+    def test_failure_reasons_deduplicated_in_first_seen_order(self):
+        from utilities.autopatcher.remediation_planner import IntendedEdit, check_edit_readiness
+        edits = [
+            IntendedEdit(file="a.py", symbol="a.py:X"),
+            IntendedEdit(file="b.py", symbol="b.py:Y"),
+        ]
+        result = check_edit_readiness(edits, self._slice_result())
+        assert result.failure_reasons == ["unresolved_symbol"]
+
+
+class TestEditTargetBudgetExhaustion:
+    """Test 8: budget exhaustion across edit targets fails closed instead
+    of silently selecting an arbitrary subset."""
+
+    def test_edit_target_budget_exhausted_flag_set_when_targets_alone_exceed_budget(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        lines = [f"line{i}\n" for i in range(1, 20)]
+        lines[1] = "CONST_A = 1\n"
+        lines[10] = "CONST_B = 2\n"
+        (tmp_path / "mod.py").write_text("".join(lines), encoding="utf-8")
+        context = _make_context(
+            constants={"mod.py": {
+                "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 2, "end_line": 2},
+                "CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 11, "end_line": 11},
+            }},
+            repo_path=tmp_path,
+        )
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A", "mod.py:CONST_B"])
+        # Both constants resolve; a budget too small to fit even ONE
+        # padded definition block forces edit_target_budget_exhausted.
+        _set_slice_budget(monkeypatch, 10)
+        result = rp.build_final_target_slice(strategy, str(tmp_path), context, max_chars=10)
+        assert result.edit_target_budget_exhausted is True
+        # Not silently narrowed to "coverage complete" -- both remain uncovered.
+        assert set(result.uncovered_target_symbols) == {"mod.py:CONST_A", "mod.py:CONST_B"}
+
+    def test_readiness_reports_target_budget_exhausted_not_a_silent_subset(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        lines = [f"line{i}\n" for i in range(1, 20)]
+        lines[1] = "CONST_A = 1\n"
+        lines[10] = "CONST_B = 2\n"
+        (tmp_path / "mod.py").write_text("".join(lines), encoding="utf-8")
+        context = _make_context(
+            constants={"mod.py": {
+                "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 2, "end_line": 2},
+                "CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 11, "end_line": 11},
+            }},
+            repo_path=tmp_path,
+        )
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A", "mod.py:CONST_B"])
+        _set_slice_budget(monkeypatch, 10)
+        slice_result = rp.build_final_target_slice(strategy, str(tmp_path), context, max_chars=10)
+        intended_edits = rp.build_intended_edits(strategy)
+        readiness = rp.check_edit_readiness(intended_edits, slice_result)
+        assert readiness.edit_source_ready is False
+        assert all(u.reason == "target_budget_exhausted" for u in readiness.unready_edits)
+        # Never claims readiness for a symbol the budget couldn't fit,
+        # even if the OTHER one happened to squeeze in.
+        assert len(readiness.unready_edits) == len(intended_edits) - len(readiness.ready_edits)
+
+
+class TestEditTargetOrderedBeforeSupportingContext:
+    """Test 3: edit target source is ordered (committed to the shared
+    budget) before supporting context -- a function edit target with no
+    strategy-term anchor (Category 4, edit-target role) must not be
+    displaced by a one-hop-discovered constant (supporting-context role)
+    competing for the same tight budget."""
+
+    def test_function_edit_target_wins_budget_over_one_hop_constant(self, tmp_path, monkeypatch):
+        from utilities.autopatcher import remediation_planner as rp
+        file_text = (
+            "class Mod:\n"
+            "    CONST_X = 1\n"
+            "\n"
+            "    def target_func(self):\n"
+            "        return CONST_X\n"
+        )
+        (tmp_path / "mod.py").write_text(file_text, encoding="utf-8")
+        func_code = "    def target_func(self):\n        return CONST_X\n"
+        context = _make_context(
+            functions={"mod.py:Mod.target_func": {
+                "name": "target_func", "className": "Mod", "startLine": 4, "endLine": 5,
+                "code": func_code,
+            }},
+            constants={"mod.py": {"Mod.CONST_X": {
+                "qualified_name": "Mod.CONST_X", "class_name": "Mod", "name": "CONST_X",
+                "line": 2, "end_line": 2,
+            }}},
+            repo_path=tmp_path,
+        )
+        # No strategy term anchors inside target_func's own body (nothing
+        # extracted from extended_mechanism/required_edits matches text
+        # inside it), so it can only be covered via Category 4 (compact
+        # full function) -- competing directly with the one-hop constant
+        # CONST_X (discovered by scanning target_func's own rendered body)
+        # for a budget too small to fit both.
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:Mod.target_func"])
+
+        # Measure: function-only vs function+one-hop-constant.
+        _set_slice_budget(monkeypatch, 1_000_000)
+        full_result = rp.build_final_target_slice(strategy, str(tmp_path), context)
+        function_only_size = len(full_result.rendered)
+        assert "target_func" in full_result.rendered
+        assert "CONST_X = 1" in full_result.rendered  # one-hop constant present when budget is generous
+
+        # Now set a budget that fits the function alone but not the
+        # one-hop constant too.
+        just_function_size = function_only_size - len("CONST_X = 1")  # rough lower slack
+        _set_slice_budget(monkeypatch, max(1, just_function_size - 50))
+        tight_result = rp.build_final_target_slice(strategy, str(tmp_path), context)
+
+        # The edit target (the function itself) must still be included --
+        # this is the actual thing that must never be displaced.
+        assert "target_func" in tight_result.rendered
+        assert "mod.py:Mod.target_func" in tight_result.covered_target_symbols
+        # The one-hop supporting constant may or may not fit depending on
+        # exact slack -- not the point of this test either way. What
+        # matters is asserted above: the edit target itself always wins.
+
+
+class TestEditReadinessGatesPatchGeneration:
+    """Test 6 (partial readiness skips Patch Generation), Test 7 (complete
+    readiness preserves current Patch Generation behavior), and Test 9
+    (no new LLM calls introduced) -- exercised through the real
+    pipeline.py wiring (build_intended_edits/check_edit_readiness run for
+    real), with only build_final_target_slice's OWN return value mocked,
+    same pattern as TestPipelineContextOrderingWithSlice above."""
+
+    @staticmethod
+    def _side_effect(stage_calls):
+        def side_effect(system_prompt, user_message, stage="unknown"):
+            stage_calls.append(stage)
+            if stage == "remediation_planning":
+                return json.dumps({
+                    "remediation_mechanism": "extend policy", "target_files": ["policy.py"],
+                    "target_symbols": [], "security_invariant": "stub", "required_edits": [],
+                    "approaches_to_avoid": [], "explicit_unknowns": [],
+                    "additional_evidence_required": False,
+                    "evidence_requests": [],
+                })
+            if stage == "remediation_strategy":
+                return json.dumps({
+                    "extended_mechanism": "Policy.ALLOWED_VALUES", "target_files": ["policy.py"],
+                    "target_symbols": ["policy.py:Policy.ALLOWED_VALUES"],
+                    "required_edits": ["stub edit"], "rejected_targets": [],
+                    "security_invariant": "stub", "insufficient_evidence": [],
+                })
+            return "{}"
+        return side_effect
+
+    def _run(self, tmp_path, slice_result, stage_calls):
+        target = tmp_path / "policy.py"
+        target.write_text("class Policy:\n    ALLOWED_VALUES = frozenset(['a'])\n", encoding="utf-8")
+
+        mock_llm = mock.MagicMock()
+        mock_llm.complete.side_effect = self._side_effect(stage_calls)
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
+            mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice",
+                       return_value=slice_result),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value={"applicable": True, "skipped": False, "stderr": "",
+                                     "exit_code": 0, "skipped_reason": None, "error": None}),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("some vulnerability", api_key="", repo_root=str(tmp_path))
+        return mock_gen
+
+    def test_partial_readiness_skips_patch_generation(self, tmp_path):
+        """Test 6. Deliberately a case has_any_coverage=True (the OLD gate
+        would have proceeded) but the actual intended edit's symbol is
+        neither resolved nor covered -- only unrelated coverage exists.
+        The new Gate must still skip Patch Generation."""
+        stage_calls: list = []
+        unready_result = mock.MagicMock(
+            rendered="## Final-Target Remediation Slice\n\nsome unrelated content\n",
+            warning_text="", coverage_complete=False, has_any_coverage=True,
+            covered_target_files=["policy.py"], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+            resolved_target_symbols=[], full_file_fallback_covered=[],
+            edit_target_budget_exhausted=False,
+        )
+        mock_gen = self._run(tmp_path, unready_result, stage_calls)
+        assert not mock_gen.called
+
+    def test_complete_readiness_preserves_current_patch_generation_behavior(self, tmp_path):
+        """Test 7. The intended edit's own symbol IS covered -- Patch
+        Generation must run exactly as it always has."""
+        stage_calls: list = []
+        # NOTE: run() is called with no investigation_output_dir, so
+        # _investigation_context stays None -- _resolve_symbol_details
+        # returns None for everything, and _verify_strategy_targets
+        # therefore ALWAYS drops the mock LLM's own claimed target_symbol
+        # ("policy.py:Policy.ALLOWED_VALUES") as unverified, regardless of
+        # what this mocked Slice result claims about it. The REAL
+        # intended edit build_intended_edits derives is therefore
+        # file-only (IntendedEdit(file="policy.py", symbol=None)) -- ready
+        # only via full_file_fallback_covered, not covered_target_symbols.
+        ready_result = mock.MagicMock(
+            rendered="## Final-Target Remediation Slice\n\nDEFAULT source\n",
+            warning_text="", coverage_complete=True, has_any_coverage=True,
+            covered_target_files=["policy.py"], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=[],
+            resolved_target_symbols=[], full_file_fallback_covered=["policy.py"],
+            edit_target_budget_exhausted=False,
+        )
+        mock_gen = self._run(tmp_path, ready_result, stage_calls)
+        assert mock_gen.called
+
+    def test_no_new_llm_call_stage_introduced(self, tmp_path):
+        """Test 9. The Edit Readiness Gate must add zero new LLM calls --
+        only the pre-existing remediation_planning/remediation_strategy
+        stages (plus whatever Patch Generation itself calls) ever appear."""
+        stage_calls: list = []
+        # NOTE: run() is called with no investigation_output_dir, so
+        # _investigation_context stays None -- _resolve_symbol_details
+        # returns None for everything, and _verify_strategy_targets
+        # therefore ALWAYS drops the mock LLM's own claimed target_symbol
+        # ("policy.py:Policy.ALLOWED_VALUES") as unverified, regardless of
+        # what this mocked Slice result claims about it. The REAL
+        # intended edit build_intended_edits derives is therefore
+        # file-only (IntendedEdit(file="policy.py", symbol=None)) -- ready
+        # only via full_file_fallback_covered, not covered_target_symbols.
+        ready_result = mock.MagicMock(
+            rendered="## Final-Target Remediation Slice\n\nDEFAULT source\n",
+            warning_text="", coverage_complete=True, has_any_coverage=True,
+            covered_target_files=["policy.py"], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=[],
+            resolved_target_symbols=[], full_file_fallback_covered=["policy.py"],
+            edit_target_budget_exhausted=False,
+        )
+        self._run(tmp_path, ready_result, stage_calls)
+        assert set(stage_calls) <= {
+            "remediation_planning", "remediation_strategy", "patch_challenger",
+            "patch_review", "confidence_scorer", "finding_calibration",
+        }
+        assert "edit_readiness" not in stage_calls
+
+    def test_acquisition_runs_and_still_skips_when_it_cannot_help(self, tmp_path):
+        """Test 14 (Slice 2). build_final_target_slice is mocked to
+        always return the SAME unready result regardless of input args,
+        so Slice 2's own per-edit retries genuinely execute (real code,
+        not skipped) but can never improve on it -- readiness must still
+        be incomplete after acquisition exhausts its rounds, and Patch
+        Generation must still be skipped."""
+        stage_calls: list = []
+        unready_result = mock.MagicMock(
+            rendered="## Final-Target Remediation Slice\n\nsome unrelated content\n",
+            warning_text="", coverage_complete=False, has_any_coverage=True,
+            covered_target_files=["policy.py"], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+            resolved_target_symbols=[], full_file_fallback_covered=[],
+            identifier_definition_covered=[], edit_target_budget_exhausted=False,
+            resolved_symbol_files={},
+        )
+        mock_gen = self._run(tmp_path, unready_result, stage_calls)
+        assert not mock_gen.called
+
+    def test_acquisition_introduces_no_unexpected_llm_call_stage(self, tmp_path):
+        """Test 12 (Slice 2, pipeline level). Same as
+        test_no_new_llm_call_stage_introduced, but forcing Slice 2's
+        deterministic acquisition loop to actually run (initial readiness
+        is incomplete here, unlike that test's always-ready fixture).
+        Because this fixture stays unready even after Slice 2, Slice 3's
+        guided acquisition also runs -- its one, explicit, expected new
+        stage ("guided_context_request", Slice 3's own contract) is
+        allowed; nothing else is."""
+        stage_calls: list = []
+        unready_result = mock.MagicMock(
+            rendered="## Final-Target Remediation Slice\n\nsome unrelated content\n",
+            warning_text="", coverage_complete=False, has_any_coverage=True,
+            covered_target_files=["policy.py"], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+            resolved_target_symbols=[], full_file_fallback_covered=[],
+            identifier_definition_covered=[], edit_target_budget_exhausted=False,
+            resolved_symbol_files={},
+        )
+        self._run(tmp_path, unready_result, stage_calls)
+        assert set(stage_calls) <= {
+            "remediation_planning", "remediation_strategy", "guided_context_request",
+            "patch_challenger", "patch_review", "confidence_scorer", "finding_calibration",
+        }
+        assert "edit_readiness" not in stage_calls
+        assert "acquisition" not in stage_calls
+
+
+class TestEditReadinessNoLLMParameter:
+    """Test 9 (unit level, mirrors TestSliceGatingAndNoNewLLM above)."""
+
+    def test_build_intended_edits_has_no_llm_parameter(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import build_intended_edits
+        assert "llm" not in inspect.signature(build_intended_edits).parameters
+
+    def test_check_edit_readiness_has_no_llm_parameter(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import check_edit_readiness
+        assert "llm" not in inspect.signature(check_edit_readiness).parameters
+
+
+# ---------------------------------------------------------------------------
+# Slice 2 -- Deterministic Pre-Patch Retrieval
+# ---------------------------------------------------------------------------
+
+class TestDeterministicAcquisitionNoLLMParameter:
+    def test_run_deterministic_acquisition_has_no_llm_parameter(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import run_deterministic_acquisition
+        assert "llm" not in inspect.signature(run_deterministic_acquisition).parameters
+
+
+class TestAmbiguousConstantCandidateRejected:
+    """Test 5, part 1 (unit level): _disambiguate_constant_candidates
+    (existing, unmodified) correctly refuses an equal-priority tie rather
+    than guessing -- the mechanism Slice 2 relies on for ambiguity
+    rejection during acquisition."""
+
+    def test_ambiguous_tie_returns_none_not_a_guess(self):
+        from utilities.autopatcher.remediation_planner import _disambiguate_constant_candidates
+        candidates = [
+            ("a.py", "X.AMBIG", {"name": "AMBIG", "line": 2, "end_line": 2}),
+            ("a.py", "Y.AMBIG", {"name": "AMBIG", "line": 6, "end_line": 6}),
+        ]
+        chosen, reason = _disambiguate_constant_candidates(
+            candidates, source_file="a.py", source_class=None, symbol_matches={},
+            strategy_target_files=["a.py"],
+        )
+        assert chosen is None
+        assert "ambiguous" in reason
+
+
+class TestDeterministicAcquisition:
+    """Tests 2, 3, 4, 6, 7, 8, 9, 10, 11, 13 for
+    run_deterministic_acquisition -- exercised against a real (not
+    mocked) InvestigationContext/RepositoryIndex, same convention as the
+    rest of this module's slice-builder tests."""
+
+    def test_complete_initial_readiness_performs_no_acquisition_work(self):
+        """Test 13."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        slice_result = _make_slice_result(covered_target_symbols=["a.py:X"])
+        edit = IntendedEdit(file="a.py", symbol="a.py:X")
+        readiness = check_edit_readiness([edit], slice_result)
+        assert readiness.edit_source_ready is True
+
+        result = run_deterministic_acquisition(
+            _make_strategy(target_symbols=["a.py:X"]), None, None, slice_result, readiness,
+        )
+        assert result.rounds_used == 0
+        assert result.attempts == []
+        assert result.slice_result is slice_result
+
+    def test_unresolved_symbol_becomes_ready_after_retrieval(self, tmp_path):
+        """Test 2. Simulates an initial pass that, for whatever reason
+        (e.g. a transient failure while processing OTHER targets in the
+        same build_final_target_slice call -- see that function's own
+        except-branch), never resolved this symbol at all, even though
+        the repository itself genuinely has it. A per-edit retrieval
+        attempt is isolated from whatever caused the original failure,
+        so it succeeds where the (simulated) initial pass didn't."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+        assert initial_readiness.unready_edits[0].reason == "unresolved_symbol"
+
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.rounds_used >= 1
+        assert result.attempts[0].success is True
+        final_readiness = check_edit_readiness([edit], result.slice_result)
+        assert final_readiness.edit_source_ready is True
+
+    def test_file_level_edit_becomes_ready_via_identifier_definition(self, tmp_path):
+        """Test 3."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset(['a'])\n", encoding="utf-8",
+        )
+        context = _make_context(constants={"policy.py": {
+            "Policy.ALLOWED_VALUES": {
+                "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+            },
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["policy.py"], extended_mechanism="Policy.ALLOWED_VALUES")
+        edit = IntendedEdit(file="policy.py", symbol=None)
+
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+        assert initial_readiness.unready_edits[0].reason == "missing_target_source"
+
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+        final_readiness = check_edit_readiness([edit], result.slice_result)
+        assert final_readiness.edit_source_ready is True
+        assert "policy.py" in result.slice_result.identifier_definition_covered
+
+    def test_unrelated_same_file_match_never_satisfies_readiness(self, tmp_path):
+        """Test 4. A strategy-derived term that is only USED (not
+        defined) inside the target file must never satisfy a file-level
+        edit -- a usage window is supporting-context, never an edit
+        target or an identifier definition. Since transactional
+        acquisition (_try_commit_acquisition) now rolls back any
+        candidate that never makes its own targeted edit ready, this
+        usage window is never committed into the running slice at all
+        -- so the file stays entirely uncovered ("missing_target_source"),
+        never partially covered by content that could never have
+        satisfied it anyway ("missing_identifier", the OLD, non-
+        transactional outcome asserted here before this fix)."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        (tmp_path / "consumer.py").write_text(
+            "class C:\n    def m(self):\n        SOME_TERM\n        return 1\n", encoding="utf-8",
+        )
+        context = _make_context(functions={
+            "consumer.py:C.m": {
+                "name": "m", "className": "C", "startLine": 2, "endLine": 4,
+                "code": "    def m(self):\n        SOME_TERM\n        return 1\n",
+            },
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["consumer.py"], extended_mechanism="SOME_TERM")
+        edit = IntendedEdit(file="consumer.py", symbol=None)
+
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+        final_readiness = check_edit_readiness([edit], result.slice_result)
+        assert final_readiness.edit_source_ready is False
+        assert final_readiness.unready_edits[0].reason == "missing_target_source"
+        assert result.slice_result is initial_slice  # rolled back -- nothing committed
+
+    def test_never_promotes_ambiguous_one_hop_candidate(self, tmp_path):
+        """Test 5, part 2 (behavioral, through acquisition): the edit
+        target itself becomes ready, but an ambiguous SCREAMING_SNAKE_CASE
+        reference inside it is never promoted via one-hop, exactly as
+        the existing (unmodified) one-hop step already guarantees."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        (tmp_path / "consumer.py").write_text(
+            "class X:\n    AMBIG = 1\n\n\nclass Y:\n    AMBIG = 2\n\n\ndef m():\n    return AMBIG\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={"consumer.py:m": {
+                "name": "m", "className": None, "startLine": 9, "endLine": 10,
+                "code": "def m():\n    return AMBIG\n",
+            }},
+            constants={"consumer.py": {
+                "X.AMBIG": {"qualified_name": "X.AMBIG", "class_name": "X", "name": "AMBIG", "line": 2, "end_line": 2},
+                "Y.AMBIG": {"qualified_name": "Y.AMBIG", "class_name": "Y", "name": "AMBIG", "line": 6, "end_line": 6},
+            }},
+            repo_path=tmp_path,
+        )
+        strategy = _make_strategy(target_files=["consumer.py"], target_symbols=["consumer.py:m"])
+        edit = IntendedEdit(file="consumer.py", symbol="consumer.py:m")
+
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+        final_readiness = check_edit_readiness([edit], result.slice_result)
+        assert final_readiness.edit_source_ready is True  # the edit target itself resolves fine
+        assert "AMBIG = 1" not in result.slice_result.rendered
+        assert "AMBIG = 2" not in result.slice_result.rendered
+
+    def test_retrieval_respects_the_verified_target_file(self, tmp_path):
+        """Test 6. Two files share a same-named constant; the edit names
+        one specific file, and retrieval must resolve to exactly that
+        file's own definition, never the other's."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        (tmp_path / "a.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("CONST_A = 2\n", encoding="utf-8")
+        context = _make_context(constants={
+            "a.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+            "b.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["a.py"], target_symbols=["a.py:CONST_A"])
+        edit = IntendedEdit(file="a.py", symbol="a.py:CONST_A")
+
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].resolved_file == "a.py"
+        assert "CONST_A = 2" not in result.slice_result.rendered
+
+    def test_edit_target_source_ordered_ahead_of_supporting_context(self, tmp_path, monkeypatch):
+        """Test 7 -- mirrors TestEditTargetOrderedBeforeSupportingContext,
+        through run_deterministic_acquisition's own per-round budget: a
+        round budget too small for both the function edit target and its
+        one-hop constant must still include the edit target."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        file_text = (
+            "class Mod:\n    CONST_X = 1\n\n    def target_func(self):\n        return CONST_X\n"
+        )
+        (tmp_path / "mod.py").write_text(file_text, encoding="utf-8")
+        context = _make_context(
+            functions={"mod.py:Mod.target_func": {
+                "name": "target_func", "className": "Mod", "startLine": 4, "endLine": 5,
+                "code": "    def target_func(self):\n        return CONST_X\n",
+            }},
+            constants={"mod.py": {"Mod.CONST_X": {
+                "qualified_name": "Mod.CONST_X", "class_name": "Mod", "name": "CONST_X",
+                "line": 2, "end_line": 2,
+            }}},
+            repo_path=tmp_path,
+        )
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:Mod.target_func"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:Mod.target_func")
+
+        # A round budget that fits the function alone but not the
+        # one-hop constant too (measured the same way the existing
+        # ordering test measures it).
+        _set_slice_budget(monkeypatch, 1_000_000)
+        full_result = rp.build_final_target_slice(strategy, str(tmp_path), context)
+        assert "CONST_X = 1" in full_result.rendered
+        tight_budget = max(1, len(full_result.rendered) - len("CONST_X = 1") - 50)
+        monkeypatch.setattr(rp, "MAX_NEW_SOURCE_CHARS_PER_ROUND", tight_budget)
+
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+
+        assert "target_func" in result.slice_result.rendered
+        final_readiness = check_edit_readiness([edit], result.slice_result)
+        assert final_readiness.edit_source_ready is True
+
+    def test_stops_immediately_once_readiness_is_complete(self, tmp_path):
+        """Test 8. Two edits, both resolvable in round 1 -- rounds_used
+        must be 1, never running the second (unnecessary) round."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        (tmp_path / "a.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("CONST_B = 2\n", encoding="utf-8")
+        context = _make_context(constants={
+            "a.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+            "b.py": {"CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 1, "end_line": 1}},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["a.py", "b.py"], target_symbols=["a.py:CONST_A", "b.py:CONST_B"])
+        edits = [IntendedEdit(file="a.py", symbol="a.py:CONST_A"), IntendedEdit(file="b.py", symbol="b.py:CONST_B")]
+
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness(edits, initial_slice)
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+
+        assert result.rounds_used == 1
+        final_readiness = check_edit_readiness(edits, result.slice_result)
+        assert final_readiness.edit_source_ready is True
+
+    def test_stops_after_max_rounds_when_never_ready(self, tmp_path):
+        """Test 9. A symbol that never resolves stays unready every
+        round -- the loop must still terminate at MAX_ACQUISITION_ROUNDS,
+        never looping indefinitely."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:NoSuchSymbol"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:NoSuchSymbol")
+
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+
+        assert result.rounds_used == rp.MAX_ACQUISITION_ROUNDS
+        final_readiness = check_edit_readiness([edit], result.slice_result)
+        assert final_readiness.edit_source_ready is False
+
+    def test_per_round_character_limit_is_enforced(self, tmp_path, monkeypatch):
+        """Test 10. A round budget too small for an otherwise-resolvable
+        target's own block must be DIAGNOSED as "target_budget_exhausted"
+        for this attempt -- never silently spend the full remaining
+        TOTAL budget instead of the smaller per-round cap. Since
+        transactional acquisition (_try_commit_acquisition) rolls back
+        any candidate that doesn't make its own edit ready, that
+        diagnosis lives on the ATTEMPT itself (`attempts[0].
+        failure_reason`); the PERSISTED slice/readiness is untouched by
+        the rolled-back candidate, so re-deriving readiness from
+        `result.slice_result` now correctly shows whatever the edit's
+        readiness was BEFORE this attempt ("unresolved_symbol" here,
+        never "target_budget_exhausted" -- that would incorrectly imply
+        the budget-exhausted attempt left some trace behind)."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+
+        monkeypatch.setattr(rp, "MAX_NEW_SOURCE_CHARS_PER_ROUND", 1)  # far smaller than any real block
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+
+        assert result.attempts[0].failure_reason == "target_budget_exhausted"
+        assert result.slice_result is initial_slice  # rolled back -- nothing committed
+        final_readiness = check_edit_readiness([edit], result.slice_result)
+        assert final_readiness.edit_source_ready is False
+        assert final_readiness.unready_edits[0].reason == initial_readiness.unready_edits[0].reason
+
+    def test_total_budget_exhaustion_fails_closed(self, tmp_path):
+        """Test 11. When the slice already consumed the entire real
+        technical-capacity ceiling (Fix B: no longer
+        FINAL_TARGET_SLICE_MAX_CHARS -- see _effective_final_target_max),
+        acquisition must refuse to add anything more (available <= 0) and
+        fail closed -- never exceed that ceiling."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, _effective_final_target_max, check_edit_readiness, run_deterministic_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+
+        # Simulate a slice that already consumed the entire real ceiling.
+        ceiling = _effective_final_target_max(None)
+        initial_slice = _make_slice_result(rendered="x" * ceiling)
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+
+        assert result.attempts[0].success is False
+        assert result.attempts[0].failure_reason == "target_budget_exhausted"
+        assert len(result.slice_result.rendered) == ceiling  # nothing more added
+
+
+class TestTransactionalAcquisition:
+    """Regression coverage for the urllib3-run fix: acquisition candidates
+    (Slice 2's run_deterministic_acquisition and Slice 3's
+    run_guided_acquisition) must be committed transactionally --
+    _try_commit_acquisition merges one candidate into a TEMPORARY working
+    slice, recomputes Edit Readiness, and only actually advances the
+    running slice (and only then lets the caller deduct from its own
+    round/total character budget) when that merge made the checked
+    edit(s) ready. Before this fix, a candidate that never improved
+    readiness was still merged permanently and still consumed budget --
+    exactly what made a LATER, more accurate attempt fail with
+    "target_budget_exhausted"/"context_request_limit_reached" purely
+    because an earlier, unhelpful one had already spent shared budget."""
+
+    def test_unsuccessful_acquisition_is_rolled_back(self, tmp_path):
+        """Test 1. A candidate that resolves and renders fine, but never
+        makes its OWN targeted edit ready, must be rolled back --
+        _try_commit_acquisition returns the ORIGINAL slice unchanged,
+        never the merged one, and reports committed=False."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, _try_commit_acquisition, build_final_target_slice,
+        )
+        (tmp_path / "consumer.py").write_text(
+            "class C:\n    def m(self):\n        SOME_TERM\n        return 1\n", encoding="utf-8",
+        )
+        context = _make_context(functions={
+            "consumer.py:C.m": {
+                "name": "m", "className": "C", "startLine": 2, "endLine": 4,
+                "code": "    def m(self):\n        SOME_TERM\n        return 1\n",
+            },
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["consumer.py"], extended_mechanism="SOME_TERM")
+        edit = IntendedEdit(file="consumer.py", symbol=None)
+
+        current_slice = _make_slice_result()
+        addition = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=())
+        assert addition.rendered  # a genuine, non-empty usage-window candidate
+
+        slice_to_use, readiness, committed = _try_commit_acquisition(current_slice, addition, strategy, [edit])
+        assert committed is False
+        assert slice_to_use is current_slice
+        assert slice_to_use.rendered == ""
+
+    def test_rolled_back_acquisition_does_not_consume_budget(self, tmp_path, monkeypatch):
+        """Test 2. Two unready edits in the SAME round: the first's own
+        candidate never improves its readiness (rolled back), the second
+        needs the round's FULL character budget to succeed. A round
+        budget sized to fit ONLY the second edit's block -- never both --
+        must still let the second edit succeed, because the first's
+        rolled-back candidate must not have deducted anything from
+        round_budget_remaining."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        (tmp_path / "consumer.py").write_text(
+            "class C:\n    def m(self):\n        SOME_TERM\n        return 1\n", encoding="utf-8",
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(
+            functions={"consumer.py:C.m": {
+                "name": "m", "className": "C", "startLine": 2, "endLine": 4,
+                "code": "    def m(self):\n        SOME_TERM\n        return 1\n",
+            }},
+            constants={"mod.py": {
+                "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+            }},
+            repo_path=tmp_path,
+        )
+        strategy = _make_strategy(
+            target_files=["consumer.py", "mod.py"], target_symbols=["mod.py:CONST_A"],
+            extended_mechanism="SOME_TERM",
+        )
+        edit_fail = IntendedEdit(file="consumer.py", symbol=None)
+        edit_success = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        edits = [edit_fail, edit_success]  # consumer.py's (rolled-back) attempt runs first
+
+        # Room for the CONST_A block alone (~437 chars), never for both
+        # it and consumer.py's usage-window candidate (~512 chars) --
+        # the OLD, non-transactional code would exhaust this on
+        # consumer.py's own never-helps-readiness candidate and leave
+        # mod.py unready too.
+        monkeypatch.setattr(rp, "MAX_NEW_SOURCE_CHARS_PER_ROUND", 600)
+
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness(edits, initial_slice)
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+
+        success_attempt = next(a for a in result.attempts if a.intended_edit == edit_success)
+        assert success_attempt.success is True
+        assert success_attempt.failure_reason is None
+
+    def test_later_acquisition_can_still_succeed(self, tmp_path, monkeypatch):
+        """Test 3. Same setup as Test 2, viewed from the overall outcome:
+        the LATER edit's own readiness must actually become ready by the
+        end of acquisition, not merely report success on one attempt."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        (tmp_path / "consumer.py").write_text(
+            "class C:\n    def m(self):\n        SOME_TERM\n        return 1\n", encoding="utf-8",
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(
+            functions={"consumer.py:C.m": {
+                "name": "m", "className": "C", "startLine": 2, "endLine": 4,
+                "code": "    def m(self):\n        SOME_TERM\n        return 1\n",
+            }},
+            constants={"mod.py": {
+                "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+            }},
+            repo_path=tmp_path,
+        )
+        strategy = _make_strategy(
+            target_files=["consumer.py", "mod.py"], target_symbols=["mod.py:CONST_A"],
+            extended_mechanism="SOME_TERM",
+        )
+        edit_fail = IntendedEdit(file="consumer.py", symbol=None)
+        edit_success = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        edits = [edit_fail, edit_success]
+
+        monkeypatch.setattr(rp, "MAX_NEW_SOURCE_CHARS_PER_ROUND", 600)
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness(edits, initial_slice)
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+
+        final_readiness = check_edit_readiness(edits, result.slice_result)
+        success_readiness = check_edit_readiness([edit_success], result.slice_result)
+        assert success_readiness.edit_source_ready is True
+        assert edit_fail in [u.edit for u in final_readiness.unready_edits]  # never resolvable; unaffected
+
+    def test_committed_acquisition_remains_unchanged(self, tmp_path, monkeypatch):
+        """Test 4. Once an edit's candidate IS committed, a LATER,
+        different edit's rolled-back attempt (including on a subsequent
+        round) must leave the already-committed content completely
+        untouched -- same rendered text, same covered symbol."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition,
+        )
+        (tmp_path / "consumer.py").write_text(
+            "class C:\n    def m(self):\n        SOME_TERM\n        return 1\n", encoding="utf-8",
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(
+            functions={"consumer.py:C.m": {
+                "name": "m", "className": "C", "startLine": 2, "endLine": 4,
+                "code": "    def m(self):\n        SOME_TERM\n        return 1\n",
+            }},
+            constants={"mod.py": {
+                "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+            }},
+            repo_path=tmp_path,
+        )
+        strategy = _make_strategy(
+            target_files=["consumer.py", "mod.py"], target_symbols=["mod.py:CONST_A"],
+            extended_mechanism="SOME_TERM",
+        )
+        edit_fail = IntendedEdit(file="consumer.py", symbol=None)
+        edit_success = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        edits = [edit_fail, edit_success]
+
+        monkeypatch.setattr(rp, "MAX_NEW_SOURCE_CHARS_PER_ROUND", 600)
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness(edits, initial_slice)
+        result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+
+        # mod.py:CONST_A committed in round 1; consumer.py keeps being
+        # (rolled-back) retried in round 2 since it never resolves --
+        # the committed CONST_A content must survive that untouched.
+        assert result.rounds_used >= 2
+        assert "CONST_A = 1" in result.slice_result.rendered
+        assert "mod.py:CONST_A" in result.slice_result.covered_target_symbols
+        rendered_after = result.slice_result.rendered
+        assert rendered_after.count("CONST_A = 1") == 1  # never re-committed/duplicated
+
+    def test_readiness_identical_before_and_after_rollback(self, tmp_path):
+        """Test 5. Rolling back a candidate must leave Edit Readiness
+        (for the SAME edits, computed against the slice actually carried
+        forward) byte-for-byte identical to what it was before that
+        candidate was ever attempted."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, _try_commit_acquisition, build_final_target_slice,
+        )
+        (tmp_path / "consumer.py").write_text(
+            "class C:\n    def m(self):\n        SOME_TERM\n        return 1\n", encoding="utf-8",
+        )
+        context = _make_context(functions={
+            "consumer.py:C.m": {
+                "name": "m", "className": "C", "startLine": 2, "endLine": 4,
+                "code": "    def m(self):\n        SOME_TERM\n        return 1\n",
+            },
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["consumer.py"], extended_mechanism="SOME_TERM")
+        edit = IntendedEdit(file="consumer.py", symbol=None)
+
+        current_slice = _make_slice_result()
+        readiness_before = check_edit_readiness([edit], current_slice)
+
+        addition = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=())
+        slice_to_use, _attempt_readiness, committed = _try_commit_acquisition(
+            current_slice, addition, strategy, [edit],
+        )
+        assert committed is False
+
+        readiness_after = check_edit_readiness([edit], slice_to_use)
+        assert readiness_after == readiness_before
+
+    def test_slice3_can_succeed_after_failed_slice2_attempt(self, tmp_path):
+        """Test 6. Slice 2's own deterministic attempt for a file-only
+        edit rolls back (the strategy's own extended_mechanism only
+        names a term that's USED, not defined, in the file). Slice 3's
+        subsequent guided request -- naming the identifier that's
+        ACTUALLY needed -- must still succeed cleanly afterward, proving
+        Slice 2's rolled-back attempt left no trace for Slice 3 to
+        inherit (neither in the slice nor in its own budget)."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_deterministic_acquisition, run_guided_acquisition,
+        )
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset(['a'])\n\n\n"
+            "def uses_other():\n    OTHER_TERM\n    return 1\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={"policy.py:uses_other": {
+                "name": "uses_other", "className": None, "startLine": 5, "endLine": 7,
+                "code": "def uses_other():\n    OTHER_TERM\n    return 1\n",
+            }},
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        strategy = _make_strategy(target_files=["policy.py"], extended_mechanism="OTHER_TERM")
+        edit = IntendedEdit(file="policy.py", symbol=None)
+
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        slice2_result = run_deterministic_acquisition(strategy, str(tmp_path), context, initial_slice, initial_readiness)
+        assert all(a.success is False for a in slice2_result.attempts)
+        assert slice2_result.slice_result is initial_slice  # rolled back every time
+
+        readiness_after_slice2 = check_edit_readiness([edit], slice2_result.slice_result)
+        assert readiness_after_slice2.edit_source_ready is False
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "identifier_definition", "file_hint": "policy.py",
+            "symbol": None, "identifier": "ALLOWED_VALUES", "reason": "need the constant definition",
+        }]})
+        slice3_result = run_guided_acquisition(
+            strategy, "vuln text", llm, str(tmp_path), context,
+            slice2_result.slice_result, readiness_after_slice2,
+            deterministic_attempts=slice2_result.attempts,
+        )
+        assert slice3_result.readiness.edit_source_ready is True
+        assert "policy.py" in slice3_result.slice_result.identifier_definition_covered
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 -- Bounded LLM-guided pre-patch context retrieval
+# ---------------------------------------------------------------------------
+
+def _guided_llm(response_obj):
+    llm = mock.MagicMock()
+    llm.complete.return_value = json.dumps(response_obj)
+    return llm
+
+
+class TestGuidedAcquisitionNoLLMParameterOnHelpers:
+    def test_resolve_guided_symbol_has_no_llm_parameter(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import _resolve_guided_symbol
+        assert "llm" not in inspect.signature(_resolve_guided_symbol).parameters
+
+    def test_resolve_guided_identifier_has_no_llm_parameter(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import _resolve_guided_identifier
+        assert "llm" not in inspect.signature(_resolve_guided_identifier).parameters
+
+
+class TestGuidedAcquisitionSkipping:
+    """Tests 1-3."""
+
+    def test_skipped_when_initial_readiness_complete(self):
+        """Test 1. No LLM call at all when readiness is already complete."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        slice_result = _make_slice_result(covered_target_symbols=["a.py:X"])
+        edit = IntendedEdit(file="a.py", symbol="a.py:X")
+        readiness = check_edit_readiness([edit], slice_result)
+        assert readiness.edit_source_ready is True
+
+        llm = mock.MagicMock()
+        result = run_guided_acquisition(
+            _make_strategy(target_symbols=["a.py:X"]), "vuln", llm, "/tmp/repo", None,
+            slice_result, readiness,
+        )
+        assert result.rounds_used == 0
+        assert result.attempts == []
+        assert not llm.complete.called
+
+    def test_skipped_when_slice_2_makes_readiness_complete(self, tmp_path):
+        """Test 2, pipeline level: the same fixture used for Slice 1/2's
+        own "complete readiness" pipeline test must still never reach
+        Slice 3 -- "guided_context_request" must not appear in
+        stage_calls."""
+        stage_calls: list = []
+        ready_result = mock.MagicMock(
+            rendered="## Final-Target Remediation Slice\n\nDEFAULT source\n",
+            warning_text="", coverage_complete=True, has_any_coverage=True,
+            covered_target_files=["policy.py"], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=[],
+            resolved_target_symbols=[], full_file_fallback_covered=["policy.py"],
+            identifier_definition_covered=[], edit_target_budget_exhausted=False,
+            resolved_symbol_files={},
+        )
+        harness = TestEditReadinessGatesPatchGeneration()
+        mock_gen = harness._run(tmp_path, ready_result, stage_calls)
+        assert mock_gen.called
+        assert "guided_context_request" not in stage_calls
+
+    def test_runs_only_after_slice_2_remains_incomplete(self, tmp_path):
+        """Test 3, pipeline level: when Slice 2 cannot help,
+        "guided_context_request" DOES appear in stage_calls."""
+        stage_calls: list = []
+        unready_result = mock.MagicMock(
+            rendered="## Final-Target Remediation Slice\n\nsome unrelated content\n",
+            warning_text="", coverage_complete=False, has_any_coverage=True,
+            covered_target_files=["policy.py"], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+            resolved_target_symbols=[], full_file_fallback_covered=[],
+            identifier_definition_covered=[], edit_target_budget_exhausted=False,
+            resolved_symbol_files={},
+        )
+        harness = TestEditReadinessGatesPatchGeneration()
+        harness._run(tmp_path, unready_result, stage_calls)
+        assert "guided_context_request" in stage_calls
+
+
+class TestGuidedAcquisitionResolution:
+    """Tests 4, 5, 15: valid requests resolve deterministically and
+    improve readiness."""
+
+    def test_valid_symbol_definition_request_resolves_and_improves_readiness(self, tmp_path):
+        """Test 4 + Test 15."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": "mod.py", "symbol": "mod.py:CONST_A",
+            "identifier": None, "reason": "need exact source for the intended edit",
+        }]})
+
+        result = run_guided_acquisition(strategy, "vuln text", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.readiness.edit_source_ready is True
+        assert result.attempts[0].verified is True
+        assert result.attempts[0].readiness_improved is True
+        assert result.attempts[0].resolved_file == "mod.py"
+
+    def test_valid_identifier_definition_request_resolves_and_improves_readiness(self, tmp_path):
+        """Test 5 + Test 15 (file-level edit)."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset(['a'])\n", encoding="utf-8",
+        )
+        context = _make_context(constants={"policy.py": {
+            "Policy.ALLOWED_VALUES": {
+                "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+            },
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["policy.py"])
+        edit = IntendedEdit(file="policy.py", symbol=None)
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "identifier_definition", "file_hint": "policy.py",
+            "symbol": None, "identifier": "ALLOWED_VALUES", "reason": "need the constant's definition",
+        }]})
+
+        result = run_guided_acquisition(strategy, "vuln text", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.readiness.edit_source_ready is True
+        assert "policy.py" in result.slice_result.identifier_definition_covered
+
+
+class TestGuidedAcquisitionRejection:
+    """Tests 6-14: every way an untrusted request must be rejected or
+    ignored, never silently trusted."""
+
+    def test_llm_provided_code_and_line_numbers_are_ignored(self, tmp_path):
+        """Tests 6 + 7. Injected fake source/line numbers never reach the
+        retrieved slice or the trace -- retrieval always re-reads real
+        repository text independently."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": "mod.py", "symbol": "mod.py:CONST_A",
+            "identifier": None, "reason": "x",
+            "code": "CONST_A = 'INJECTED_MALICIOUS_VALUE'",
+            "line": 999, "start_line": 999, "end_line": 1000, "diff": "--- fake ---",
+        }]})
+
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert "INJECTED_MALICIOUS_VALUE" not in result.slice_result.rendered
+        assert "--- fake ---" not in result.slice_result.rendered
+        assert result.attempts[0].start_line == 1  # real line, never the injected 999
+        assert result.readiness.edit_source_ready is True
+
+    def test_unsupported_request_type_is_rejected(self):
+        """Test 8."""
+        from utilities.autopatcher.remediation_planner import (
+            GuidedContextRequest, _validate_guided_request_schema,
+        )
+        request = GuidedContextRequest(
+            intended_edit=None, request_type="shell_exec", file_hint=None,
+            symbol="x", identifier=None, reason="y",
+        )
+        assert _validate_guided_request_schema(request) == "unsupported_request_type"
+
+    def test_unsafe_file_path_is_rejected(self, tmp_path):
+        """Test 9."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": "../outside.py",
+            "symbol": "mod.py:CONST_A", "identifier": None, "reason": "y",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].failure_reason == "unsafe_file_path"
+        assert result.readiness.edit_source_ready is False
+
+    def test_unverified_nonexistent_file_hint_is_rejected(self, tmp_path):
+        """Test 10. A syntactically-safe but nonexistent file_hint must
+        still be rejected -- "unsafe_file_path" is the practical outcome
+        _verify_file itself reports for both an unsafe path and a merely
+        nonexistent one (it does not distinguish the two)."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": "does_not_exist.py",
+            "symbol": "mod.py:CONST_A", "identifier": None, "reason": "y",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].failure_reason == "unsafe_file_path"
+
+    def test_ambiguous_symbol_resolution_is_rejected(self, tmp_path):
+        """Test 11."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "a.py").write_text("def m():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("def m():\n    return 2\n", encoding="utf-8")
+        context = _make_context(functions={
+            "a.py:m": {"name": "m", "className": None, "startLine": 1, "endLine": 2, "code": "def m():\n    return 1\n"},
+            "b.py:m": {"name": "m", "className": None, "startLine": 1, "endLine": 2, "code": "def m():\n    return 2\n"},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["a.py"], target_symbols=["a.py:m"])
+        edit = IntendedEdit(file="a.py", symbol="a.py:m")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": None, "symbol": "m",
+            "identifier": None, "reason": "y",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].failure_reason == "ambiguous_symbol"
+        assert result.readiness.edit_source_ready is False
+
+    def test_cross_file_mismatch_is_rejected(self, tmp_path):
+        """Test 12. The requested symbol's own embedded file
+        ("a.py:m") contradicts a separately-given file_hint ("other.py")
+        -- rejected before any resolution is even attempted."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "a.py").write_text("def m():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "other.py").write_text("x = 1\n", encoding="utf-8")
+        context = _make_context(functions={
+            "a.py:m": {"name": "m", "className": None, "startLine": 1, "endLine": 2, "code": "def m():\n    return 1\n"},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["a.py"], target_symbols=["a.py:m"])
+        edit = IntendedEdit(file="a.py", symbol="a.py:m")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": "other.py",
+            "symbol": "a.py:m",  # exact-string attribution match -- ignores file_hint for attribution
+            "identifier": None, "reason": "y",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].failure_reason == "cross_file_mismatch"
+        assert result.readiness.edit_source_ready is False
+
+    def test_request_unrelated_to_unready_edit_is_rejected(self, tmp_path):
+        """Test 13. A request naming a file/symbol that matches NO
+        current unready edit must be rejected, never guessed onto one."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\nCONST_B = 2\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+            "CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 2, "end_line": 2},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        # Names a real, resolvable symbol -- but NOT the current unready
+        # edit's own symbol, and no unready edit shares its file either.
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": "mod.py", "symbol": "CONST_B",
+            "identifier": None, "reason": "y",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].failure_reason == "unrelated_to_unready_edit"
+        assert result.readiness.edit_source_ready is False
+
+    def test_consumer_source_does_not_satisfy_a_separate_edit_target(self, tmp_path):
+        """Test 14. An identifier_usage request retrieves a genuine
+        consumer/usage window (source IS added, for Patch Generation's
+        benefit) but must never mark readiness_improved for the
+        attributed (file-level) edit -- only an exact definition/full-
+        file-with-identifier can."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "consumer.py").write_text(
+            "class C:\n    def m(self):\n        SOME_TERM\n        return 1\n", encoding="utf-8",
+        )
+        context = _make_context(functions={
+            "consumer.py:C.m": {
+                "name": "m", "className": "C", "startLine": 2, "endLine": 4,
+                "code": "    def m(self):\n        SOME_TERM\n        return 1\n",
+            },
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["consumer.py"])
+        edit = IntendedEdit(file="consumer.py", symbol=None)
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "identifier_usage", "file_hint": "consumer.py",
+            "symbol": None, "identifier": "SOME_TERM", "reason": "how is it used",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].readiness_improved is False
+        assert result.readiness.edit_source_ready is False
+
+
+class TestGuidedAcquisitionFileOnlyEditSymbolAttribution:
+    """Regression coverage for the urllib3-run fix: a symbol_definition/
+    enclosing_symbol request naming no existing target_symbol must still
+    be attributable to a file-ONLY unready edit (edit.symbol is None) --
+    but only when file_hint is an exact match for that edit's own file
+    AND the requested symbol was already named by evidence gathered
+    before the request ran (_guided_symbol_is_evidence_supported). Before
+    this fix, EVERY such request was rejected outright as
+    "unrelated_to_unready_edit", regardless of file_hint or evidence, so
+    Slice 3 could never help a file-only edit whose Final Strategy named
+    no target_symbol -- exactly the urllib3 run's observed failure."""
+
+    def _make_retry_context(self, tmp_path):
+        (tmp_path / "retry.py").write_text(
+            "def Retry():\n    return 1\n\n\ndef Other():\n    return 2\n", encoding="utf-8",
+        )
+        return _make_context(functions={
+            "retry.py:Retry": {
+                "name": "Retry", "className": None, "startLine": 1, "endLine": 2,
+                "code": "def Retry():\n    return 1\n",
+            },
+            "retry.py:Other": {
+                "name": "Other", "className": None, "startLine": 4, "endLine": 5,
+                "code": "def Other():\n    return 2\n",
+            },
+        }, repo_path=tmp_path)
+
+    def test_file_only_edit_with_evidence_supported_symbol_is_accepted(self, tmp_path):
+        """Test 1. file-only intended edit + related, evidence-supported,
+        verified symbol -> accepted (attributed, resolved, and -- via the
+        SAME unmodified deterministic retrieval Slice 2/3 already use --
+        readiness for the file-only edit actually improves)."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        context = self._make_retry_context(tmp_path)
+        strategy = _make_strategy(
+            target_files=["retry.py"], required_edits=["Fix the Retry function to cap backoff delay"],
+        )
+        edit = IntendedEdit(file="retry.py", symbol=None)
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+        assert initial_readiness.edit_source_ready is False
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": "retry.py", "symbol": "Retry",
+            "identifier": None, "reason": "need the Retry class definition",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].failure_reason is None
+        assert result.attempts[0].verified is True
+        assert result.attempts[0].resolved_file == "retry.py"
+        assert result.attempts[0].readiness_improved is True
+        assert result.readiness.edit_source_ready is True
+
+    def test_file_only_edit_with_unrelated_symbol_is_rejected(self, tmp_path):
+        """Test 2. The requested symbol resolves fine INSIDE the right
+        file, but was never named anywhere in the evidence gathered so
+        far -- must still be rejected, never attributed just because it
+        happens to live in the same file."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        context = self._make_retry_context(tmp_path)
+        strategy = _make_strategy(
+            target_files=["retry.py"], required_edits=["Fix the Retry function to cap backoff delay"],
+        )
+        edit = IntendedEdit(file="retry.py", symbol=None)
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": "retry.py", "symbol": "Other",
+            "identifier": None, "reason": "need Other's definition too",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].failure_reason == "unrelated_to_unready_edit"
+        assert result.readiness.edit_source_ready is False
+
+    def test_cross_file_symbol_is_rejected(self, tmp_path):
+        """Test 3. file_hint matches the file-only edit's own file, and
+        the bare symbol name IS evidence-supported -- so attribution
+        succeeds -- but the request's own `symbol` string names a
+        DIFFERENT file, contradicting the verified file_hint. Rejected
+        by the existing, unmodified _resolve_guided_symbol cross-file
+        check, never masked as a plain "attributed" success."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        context = self._make_retry_context(tmp_path)
+        (tmp_path / "other.py").write_text("x = 1\n", encoding="utf-8")
+        strategy = _make_strategy(
+            target_files=["retry.py"], required_edits=["Fix the Retry function to cap backoff delay"],
+        )
+        edit = IntendedEdit(file="retry.py", symbol=None)
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": "retry.py", "symbol": "other.py:Retry",
+            "identifier": None, "reason": "need Retry",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].failure_reason == "cross_file_mismatch"
+        assert result.readiness.edit_source_ready is False
+
+    def test_ambiguous_symbol_without_file_hint_is_rejected(self, tmp_path):
+        """Test 4. Two DIFFERENT file-only unready edits both plausibly
+        match the same evidence-supported bare symbol name, but the
+        request names no file_hint at all -- condition 1 (file_hint must
+        resolve EXACTLY to one edit's own file) is never satisfied by
+        construction, so the request is rejected rather than guessed
+        onto either file."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "a.py").write_text("def Retry():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("def Retry():\n    return 2\n", encoding="utf-8")
+        context = _make_context(functions={
+            "a.py:Retry": {"name": "Retry", "className": None, "startLine": 1, "endLine": 2, "code": "def Retry():\n    return 1\n"},
+            "b.py:Retry": {"name": "Retry", "className": None, "startLine": 1, "endLine": 2, "code": "def Retry():\n    return 2\n"},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["a.py", "b.py"], required_edits=["Fix Retry in both a.py and b.py"],
+        )
+        edit_a = IntendedEdit(file="a.py", symbol=None)
+        edit_b = IntendedEdit(file="b.py", symbol=None)
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit_a, edit_b], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": None, "symbol": "Retry",
+            "identifier": None, "reason": "need Retry, unclear which file",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].failure_reason == "unrelated_to_unready_edit"
+        assert result.readiness.edit_source_ready is False
+
+    def test_existing_symbol_level_edit_attribution_is_unaffected(self, tmp_path):
+        """Test 5. A symbol-having unready edit (edit.symbol is not
+        None) must continue attributing/resolving/improving readiness
+        exactly as before this fix, even in the presence of an
+        UNRELATED file-only edit in the same unready set -- the new
+        file-only branch must never interfere with the pre-existing
+        symbol-having path."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        (tmp_path / "other_file.py").write_text("x = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py", "other_file.py"], target_symbols=["mod.py:CONST_A"])
+        symbol_edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        file_only_edit = IntendedEdit(file="other_file.py", symbol=None)
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([symbol_edit, file_only_edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": "mod.py", "symbol": "mod.py:CONST_A",
+            "identifier": None, "reason": "need exact source for the intended edit",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln text", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].verified is True
+        assert result.attempts[0].readiness_improved is True
+        assert result.attempts[0].resolved_file == "mod.py"
+        assert "mod.py:CONST_A" in result.slice_result.covered_target_symbols
+
+
+class TestGuidedAcquisitionBoundsAndStopping:
+    """Tests 16-21."""
+
+    def test_stops_immediately_once_readiness_is_complete(self, tmp_path):
+        """Test 16. Two edits, both resolvable via one round's requests --
+        must not run a second (unnecessary) round."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "a.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("CONST_B = 2\n", encoding="utf-8")
+        context = _make_context(constants={
+            "a.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+            "b.py": {"CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 1, "end_line": 1}},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["a.py", "b.py"], target_symbols=["a.py:CONST_A", "b.py:CONST_B"])
+        edits = [IntendedEdit(file="a.py", symbol="a.py:CONST_A"), IntendedEdit(file="b.py", symbol="b.py:CONST_B")]
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness(edits, initial_slice)
+
+        llm = _guided_llm({"context_requests": [
+            {"request_type": "symbol_definition", "file_hint": "a.py", "symbol": "a.py:CONST_A", "identifier": None, "reason": "y"},
+            {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:CONST_B", "identifier": None, "reason": "y"},
+        ]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+
+        assert result.rounds_used == 1
+        assert result.readiness.edit_source_ready is True
+        assert llm.complete.call_count == 1
+
+    def test_zero_progress_round_stops_before_next_llm_call(self, tmp_path):
+        """Test 17 (updated for the loop/duplicate-request guard). A
+        request that never resolves stays unready every round -- but a
+        round that achieves ZERO readiness improvement across all of its
+        own attempts must stop the loop BEFORE the next round's LLM call,
+        rather than spending the full MAX_GUIDED_ACQUISITION_ROUNDS
+        budget on rounds that provably cannot help (this is the real
+        urllib3 CVE-2023-43804 regression shape: two guided rounds asking
+        for an equivalent unresolvable symbol before giving up)."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:NoSuchSymbol"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:NoSuchSymbol")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": "mod.py", "symbol": "mod.py:NoSuchSymbol",
+            "identifier": None, "reason": "y",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+
+        assert result.rounds_used == 1
+        assert llm.complete.call_count == 1
+        assert result.readiness.edit_source_ready is False
+
+    def test_max_rounds_still_enforced_when_progress_continues(self, tmp_path):
+        """The early-stop-on-zero-progress guard must never shortcut a
+        genuinely productive sequence of rounds: when round 1 resolves ONE
+        of two unready edits (real, non-duplicate progress) but readiness
+        is still incomplete, round 2 still fires -- and the loop still
+        terminates at MAX_GUIDED_ACQUISITION_ROUNDS (never a third round),
+        preserving the pre-existing hard bound."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "a.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("x = 1\n", encoding="utf-8")
+        context = _make_context(constants={
+            "a.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["a.py", "b.py"], target_symbols=["a.py:CONST_A", "b.py:NoSuchSymbol"],
+        )
+        edits = [IntendedEdit(file="a.py", symbol="a.py:CONST_A"), IntendedEdit(file="b.py", symbol="b.py:NoSuchSymbol")]
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness(edits, initial_slice)
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            json.dumps({"context_requests": [
+                {"request_type": "symbol_definition", "file_hint": "a.py", "symbol": "a.py:CONST_A", "identifier": None, "reason": "round1"},
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:NoSuchSymbol", "identifier": None, "reason": "round1"},
+            ]}),
+            # Round 2 asks about b.py again with a DIFFERENT symbol name --
+            # not a duplicate of round 1's own request -- so this proves
+            # the round cap itself, independent of the duplicate guard.
+            json.dumps({"context_requests": [
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:AlsoNoSuchSymbol", "identifier": None, "reason": "round2"},
+            ]}),
+        ]
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+
+        assert llm.complete.call_count == 2
+        assert result.rounds_used == rp.MAX_GUIDED_ACQUISITION_ROUNDS
+        assert result.readiness.edit_source_ready is False  # b.py's edit never resolves
+
+    def test_duplicate_request_is_not_reissued(self, tmp_path):
+        """Test: an exact-duplicate request (same request_type, same
+        symbol, same attributed edit) across rounds is recorded as
+        "duplicate_request" and never re-resolved -- proven by forcing a
+        third, unrelated edit to keep the loop alive for round 2 without
+        relying on the zero-progress early stop."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "a.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("x = 1\n", encoding="utf-8")
+        context = _make_context(constants={
+            "a.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["a.py", "b.py"], target_symbols=["a.py:CONST_A", "b.py:NoSuchSymbol"],
+        )
+        edits = [IntendedEdit(file="a.py", symbol="a.py:CONST_A"), IntendedEdit(file="b.py", symbol="b.py:NoSuchSymbol")]
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness(edits, initial_slice)
+
+        # Round 1 resolves a.py (keeps the loop alive) and asks the exact
+        # same unresolvable b.py request round 2 will repeat verbatim.
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            json.dumps({"context_requests": [
+                {"request_type": "symbol_definition", "file_hint": "a.py", "symbol": "a.py:CONST_A", "identifier": None, "reason": "round1"},
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:NoSuchSymbol", "identifier": None, "reason": "round1"},
+            ]}),
+            json.dumps({"context_requests": [
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:NoSuchSymbol", "identifier": None, "reason": "round2-verbatim-repeat"},
+            ]}),
+        ]
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+
+        round_2_attempts = [a for a in result.attempts if a.round == 2]
+        assert len(round_2_attempts) == 1
+        assert round_2_attempts[0].failure_reason == "duplicate_request"
+        assert round_2_attempts[0].verified is False
+
+    def test_request_count_limits_are_enforced(self, tmp_path):
+        """Test 18: MAX_CONTEXT_REQUESTS_PER_ROUND and
+        MAX_CONTEXT_REQUESTS_PER_EDIT are both enforced.
+
+        Restructured for the loop/duplicate-request guard: a second edit
+        (a.py:CONST_A) resolves in round 1 so round 2 legitimately fires
+        (not shortcut by the zero-progress early stop), and every
+        b.py:NoSuchSymbol request across both rounds uses a DISTINCT
+        symbol name so the duplicate-request guard never masks the
+        per-edit/per-round caps this test is actually about."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "a.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("x = 1\n", encoding="utf-8")
+        context = _make_context(constants={
+            "a.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["a.py", "b.py"], target_symbols=["a.py:CONST_A", "b.py:NoSuchSymbol"],
+        )
+        edits = [IntendedEdit(file="a.py", symbol="a.py:CONST_A"), IntendedEdit(file="b.py", symbol="b.py:NoSuchSymbol")]
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness(edits, initial_slice)
+
+        # Every b.py request below must share the bare name "NoSuchSymbol"
+        # (so _attribute_guided_request's bare-name match attributes each
+        # one to the same b.py edit) while differing in literal `symbol`
+        # text (so the duplicate-request guard -- keyed on that literal
+        # text -- never masks the per-edit/per-round caps this test is
+        # actually about).
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            # Round 1: 2 requests, both attempted -- a.py resolves (keeps
+            # the loop alive), b.py's bare-name guess fails.
+            json.dumps({"context_requests": [
+                {"request_type": "symbol_definition", "file_hint": "a.py", "symbol": "a.py:CONST_A", "identifier": None, "reason": "1"},
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "NoSuchSymbol", "identifier": None, "reason": "2"},
+            ]}),
+            # Round 2: 3 requests offered for b.py -- only
+            # MAX_CONTEXT_REQUESTS_PER_ROUND (2) are even attempted (W
+            # truncated, never recorded); of those, only 1 more fits under
+            # MAX_CONTEXT_REQUESTS_PER_EDIT (b.py already used 1 slot in
+            # round 1), so the second (Z) is rejected with
+            # "context_request_limit_reached".
+            json.dumps({"context_requests": [
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:NoSuchSymbol", "identifier": None, "reason": "3"},
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:NoSuchSymbol", "identifier": None, "reason": "4"},
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:NoSuchSymbol", "identifier": None, "reason": "5"},
+            ]}),
+        ]
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+
+        round_2_attempts = [a for a in result.attempts if a.round == 2]
+        assert len(round_2_attempts) == rp.MAX_CONTEXT_REQUESTS_PER_ROUND  # W truncated, never recorded
+
+        # Across all rounds, at most MAX_CONTEXT_REQUESTS_PER_EDIT attempts
+        # for b.py's edit are ever actually PROCESSED (not immediately
+        # rejected for already being at the per-edit cap).
+        processed_for_b = [
+            a for a in result.attempts
+            if a.request.intended_edit is not None and a.request.intended_edit.file == "b.py"
+            and a.failure_reason != "context_request_limit_reached"
+        ]
+        assert len(processed_for_b) == rp.MAX_CONTEXT_REQUESTS_PER_EDIT
+        assert any(a.failure_reason == "context_request_limit_reached" for a in result.attempts)
+
+    def test_source_character_limits_are_enforced(self, tmp_path, monkeypatch):
+        """Test 19. A per-round budget too small for an otherwise-
+        resolvable target's own block must leave it unready with
+        "target_budget_exhausted" -- never silently spend the full
+        remaining TOTAL budget instead of the smaller per-round cap."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        monkeypatch.setattr(rp, "MAX_GUIDED_SOURCE_CHARS_PER_ROUND", 1)  # far smaller than any real block
+        llm = _guided_llm({"context_requests": [{
+            "request_type": "symbol_definition", "file_hint": "mod.py", "symbol": "mod.py:CONST_A",
+            "identifier": None, "reason": "y",
+        }]})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts[0].failure_reason == "target_budget_exhausted"
+        assert result.readiness.edit_source_ready is False
+
+    def test_malformed_json_fails_closed(self, tmp_path):
+        """Test 20."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = "not json at all {{{"
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts == []
+        assert result.readiness.edit_source_ready is False
+
+    def test_empty_request_list_fails_closed(self, tmp_path):
+        """Test 21."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = _guided_llm({"context_requests": []})
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+        assert result.attempts == []
+        assert result.readiness.edit_source_ready is False
+
+
+class TestGuidedAcquisitionCallDiscipline:
+    """Tests 22, 23, 25: exactly one narrow LLM call per round, never the
+    Patch Generator/Planner/Final Strategy, and final incomplete readiness
+    still skips Patch Generation."""
+
+    def test_no_patch_generator_call_during_guided_acquisition(self, tmp_path):
+        """Test 22 + Test 25, pipeline level."""
+        stage_calls: list = []
+        unready_result = mock.MagicMock(
+            rendered="## Final-Target Remediation Slice\n\nsome unrelated content\n",
+            warning_text="", coverage_complete=False, has_any_coverage=True,
+            covered_target_files=["policy.py"], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+            resolved_target_symbols=[], full_file_fallback_covered=[],
+            identifier_definition_covered=[], edit_target_budget_exhausted=False,
+            resolved_symbol_files={},
+        )
+        harness = TestEditReadinessGatesPatchGeneration()
+        mock_gen = harness._run(tmp_path, unready_result, stage_calls)
+        assert not mock_gen.called
+        assert "guided_context_request" in stage_calls
+
+    def test_planner_and_final_strategy_not_rerun(self, tmp_path):
+        """Test 23. Exactly one remediation_planning and one
+        remediation_strategy call, no matter how many guided rounds ran.
+
+        This harness's mocked guided-context response is always an empty
+        request list ("{}" -- see _side_effect's default branch), so
+        round 1 records zero attempts and therefore achieves zero
+        readiness improvement -- the loop/duplicate-request guard's
+        zero-progress early stop means round 2 is correctly never
+        attempted here (1 guided_context_request call, not
+        MAX_GUIDED_ACQUISITION_ROUNDS); the bound is still an upper bound,
+        never exceeded, which is this test's actual invariant."""
+        stage_calls: list = []
+        unready_result = mock.MagicMock(
+            rendered="## Final-Target Remediation Slice\n\nsome unrelated content\n",
+            warning_text="", coverage_complete=False, has_any_coverage=True,
+            covered_target_files=["policy.py"], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+            resolved_target_symbols=[], full_file_fallback_covered=[],
+            identifier_definition_covered=[], edit_target_budget_exhausted=False,
+            resolved_symbol_files={},
+        )
+        harness = TestEditReadinessGatesPatchGeneration()
+        harness._run(tmp_path, unready_result, stage_calls)
+        assert stage_calls.count("remediation_planning") == 1
+        assert stage_calls.count("remediation_strategy") == 1
+        from utilities.autopatcher import remediation_planner as rp
+        assert 1 <= stage_calls.count("guided_context_request") <= rp.MAX_GUIDED_ACQUISITION_ROUNDS
+
+
+class TestGuidedAcquisitionRecommendationPolicyUnaffected:
+    """Test 24."""
+
+    def test_build_recommendation_v1_does_not_read_guided_acquisition(self):
+        import inspect
+        from utilities.autopatcher.pipeline import _build_recommendation_v1
+        source = inspect.getsource(_build_recommendation_v1)
+        assert "guided_acquisition" not in source
+        assert "edit_readiness" not in source
+
+
+class TestGuidedAcquisitionTraceArtifact:
+    """Test 26."""
+
+    def test_trace_artifact_contains_deterministic_and_guided_states(self, tmp_path, monkeypatch):
+        import json as _json
+
+        stage_calls: list = []
+        unready_result = mock.MagicMock(
+            rendered="## Final-Target Remediation Slice\n\nsome unrelated content\n",
+            warning_text="", coverage_complete=False, has_any_coverage=True,
+            covered_target_files=["policy.py"], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+            resolved_target_symbols=[], full_file_fallback_covered=[],
+            identifier_definition_covered=[], edit_target_budget_exhausted=False,
+            resolved_symbol_files={},
+        )
+        monkeypatch.setenv("AUTOPATCHER_DEBUG", "1")
+        monkeypatch.chdir(tmp_path)
+        harness = TestEditReadinessGatesPatchGeneration()
+        # _run() itself writes into tmp_path/policy.py -- give it a fresh subdir.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        harness._run(run_dir, unready_result, stage_calls)
+
+        debug_dir = tmp_path / "reports" / "debug"
+        files = list(debug_dir.glob("edit_readiness_*.json"))
+        assert len(files) == 1
+        doc = _json.loads(files[0].read_text(encoding="utf-8"))
+        for key in (
+            "initial_edit_readiness", "deterministic_acquisition",
+            "readiness_after_deterministic_acquisition", "guided_acquisition",
+            "final_edit_readiness", "patch_generation_skipped",
+        ):
+            assert key in doc
+        assert doc["guided_acquisition"]["rounds"] >= 1
+        assert "requests" in doc["guided_acquisition"]
+        assert "verification_results" in doc["guided_acquisition"]
+        assert doc["patch_generation_skipped"] is True
+
+
+# ---------------------------------------------------------------------------
+# Bounded target-file fallback (Root Cause A fix): a Final Strategy target
+# whose specific symbol never resolves (deterministically, or through
+# guided acquisition) must not, by itself, force "no patch" when that
+# file's own whole-file source was already deterministically rendered
+# (build_final_target_slice's category 5). Generic fixtures throughout --
+# a class __init__ parameter / instance attribute name that never resolves
+# as a function/class/constant definition, exactly the general shape of
+# the real urllib3 CVE-2023-43804 regression (Retry.remove_headers_on_
+# redirect), without hard-coding urllib3 itself.
+# ---------------------------------------------------------------------------
+
+def _unresolvable_symbol_repo(tmp_path):
+    """A tiny repo where the Final Strategy's own target_symbol names a
+    real file but an identifier that can never resolve via
+    _resolve_symbol_details/RepositoryIndex (it's a constructor parameter
+    / instance-attribute name, not a symbol or constant definition) -- the
+    file itself is real, verified, and small enough to be fully rendered
+    by category 5's full-file fallback."""
+    (tmp_path / "config.py").write_text(
+        "class Settings:\n"
+        "    def __init__(self, allowed_headers=None):\n"
+        "        self.allowed_headers = allowed_headers or DEFAULT_ALLOWED_HEADERS\n"
+        "\n"
+        "DEFAULT_ALLOWED_HEADERS = frozenset(['Authorization'])\n",
+        encoding="utf-8",
+    )
+    return _make_context(repo_path=tmp_path), _make_strategy(
+        target_files=["config.py"], target_symbols=["config.py:Settings.allowed_headers"],
+    )
+
+
+class TestCheckEditReadinessFullFileFallbackForSymbols:
+    """check_edit_readiness's allow_full_file_fallback_for_symbols param,
+    unit-level."""
+
+    def test_default_false_preserves_existing_unresolved_symbol_behavior(self, tmp_path):
+        """Test 1 (source acquisition): default behavior (every existing
+        caller) is completely unchanged -- an unresolved symbol stays
+        unready even when the file has a full-file fallback."""
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+        )
+        context, strategy = _unresolvable_symbol_repo(tmp_path)
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        edits = build_intended_edits(strategy, slice_result)
+
+        readiness = check_edit_readiness(edits, slice_result)
+        assert readiness.edit_source_ready is False
+        assert readiness.unready_edits[0].reason == "unresolved_symbol"
+
+    def test_verified_target_file_plus_resolvable_exact_symbol_unaffected(self, tmp_path):
+        """Test 1 (source acquisition), positive case: a symbol that DOES
+        resolve is unaffected by this parameter either way -- current
+        successful behavior is unchanged."""
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={
+            "mod.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        edits = build_intended_edits(strategy, slice_result)
+
+        for flag in (False, True):
+            readiness = check_edit_readiness(edits, slice_result, allow_full_file_fallback_for_symbols=flag)
+            assert readiness.edit_source_ready is True
+            assert readiness.ready_edits[0].symbol == "mod.py:CONST_A"
+
+    def test_allow_full_file_fallback_marks_unresolved_symbol_ready(self, tmp_path):
+        """Test 2 + Test 10 (source acquisition): the exact urllib3
+        failure shape, generically -- file target known, a
+        Retry.remove_headers_on_redirect-style symbol never resolves, but
+        the verified target file's own already-rendered full-file source
+        is enough for the flag to mark the edit ready."""
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+        )
+        context, strategy = _unresolvable_symbol_repo(tmp_path)
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        edits = build_intended_edits(strategy, slice_result)
+
+        readiness = check_edit_readiness(edits, slice_result, allow_full_file_fallback_for_symbols=True)
+        assert readiness.edit_source_ready is True
+        assert readiness.ready_edits[0].file == "config.py"
+
+    def test_fallback_never_marks_ready_a_file_with_no_full_file_coverage(self, tmp_path):
+        """Test 6 + Test 7 (source acquisition): the flag can never
+        fabricate readiness for a file that was never actually rendered
+        (e.g. category 5 itself failed/was skipped) -- it only ever
+        re-reads full_file_fallback_covered/identifier_definition_covered,
+        which are fixed entirely by the Final Strategy's own verified
+        target_files, never by anything an LLM merely proposed."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, _EMPTY_SLICE_RESULT,
+        )
+        edit = IntendedEdit(file="config.py", symbol="config.py:Settings.allowed_headers")
+        # A slice result where nothing was ever covered for this file --
+        # simulates the fallback itself failing (e.g. file too large, or
+        # read failure).
+        readiness = check_edit_readiness([edit], _EMPTY_SLICE_RESULT, allow_full_file_fallback_for_symbols=True)
+        assert readiness.edit_source_ready is False
+        assert readiness.unready_edits[0].reason == "unresolved_symbol"
+
+    def test_fallback_ignores_llm_proposed_file_not_in_target_files(self, tmp_path):
+        """Test 7 (source acquisition): full_file_fallback_covered is
+        populated ONLY from the Final Strategy's own verified
+        target_files (see build_final_target_slice's category 5) -- an
+        edit naming a file that was never one of those targets can never
+        be marked ready by this flag, no matter what."""
+        from utilities.autopatcher.remediation_planner import IntendedEdit, check_edit_readiness
+        from utilities.autopatcher.remediation_planner import FinalTargetSliceResult
+        slice_result = FinalTargetSliceResult(
+            rendered="", covered_target_files=[], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=[],
+            coverage_complete=True, has_any_coverage=False, warning_text="",
+            resolved_target_symbols=[], full_file_fallback_covered=["config.py"],
+            edit_target_budget_exhausted=False, resolved_symbol_files={},
+            identifier_definition_covered=[],
+        )
+        edit = IntendedEdit(file="an_llm_invented_file.py", symbol="an_llm_invented_file.py:Whatever")
+        readiness = check_edit_readiness([edit], slice_result, allow_full_file_fallback_for_symbols=True)
+        assert readiness.edit_source_ready is False
+
+
+class TestPipelineBoundedTargetFileFallback:
+    """Pipeline-level (Test 4, 5, 6, 10 -- source acquisition): the
+    generic urllib3-shape regression, exercised through real
+    pipeline.run() wiring. Mirrors TestEditReadinessGatesPatchGeneration's
+    own pattern (mock build_final_target_slice's return value; run()
+    exercises everything else for real), additionally mocking
+    build_intended_edits so a genuinely symbol-having, unresolved
+    IntendedEdit reaches check_edit_readiness -- _verify_strategy_targets'
+    real behavior always drops an unresolved target_symbol when no
+    investigation_output_dir is given (see that class's own docstrings),
+    which would otherwise only ever exercise the FILE-ONLY fallback path
+    that already existed before this fix, never the new one."""
+
+    # Conforms to _unresolvable_symbol_repo's real file content (verified
+    # with a real `git apply --check`) so this exercises the FULL pipeline
+    # -- including Slice 4's Patch Target Conformance -- end to end,
+    # rather than stopping short at a synthetic non-conforming diff.
+    _PATCH_DIFF = (
+        "```diff\n--- a/config.py\n+++ b/config.py\n@@ -3,3 +3,3 @@\n"
+        "         self.allowed_headers = allowed_headers or DEFAULT_ALLOWED_HEADERS\n"
+        " \n"
+        "-DEFAULT_ALLOWED_HEADERS = frozenset(['Authorization'])\n"
+        "+DEFAULT_ALLOWED_HEADERS = frozenset(['Authorization', 'Cookie'])\n"
+        "```"
+    )
+
+    @staticmethod
+    def _slice_result(full_file_fallback_covered):
+        return mock.MagicMock(
+            rendered="## Final-Target Remediation Slice\n\nDEFAULT_ALLOWED_HEADERS = frozenset(['Authorization'])\n",
+            warning_text="", coverage_complete=False, has_any_coverage=True,
+            covered_target_files=["config.py"], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=["config.py:Settings.allowed_headers"],
+            resolved_target_symbols=[], full_file_fallback_covered=full_file_fallback_covered,
+            identifier_definition_covered=[], edit_target_budget_exhausted=False,
+            resolved_symbol_files={},
+        )
+
+    @staticmethod
+    def _edits():
+        from utilities.autopatcher.remediation_planner import IntendedEdit
+        return [IntendedEdit(file="config.py", symbol="config.py:Settings.allowed_headers")]
+
+    @staticmethod
+    def _side_effect(stage_calls, patch_diff):
+        def side_effect(system_prompt, user_message, stage="unknown"):
+            stage_calls.append(stage)
+            if stage == "remediation_planning":
+                return json.dumps({
+                    "remediation_mechanism": "restrict allowed headers", "target_files": ["config.py"],
+                    "target_symbols": [], "security_invariant": "stub", "required_edits": [],
+                    "approaches_to_avoid": [], "explicit_unknowns": [],
+                    "additional_evidence_required": False,
+                    "evidence_requests": [],
+                })
+            if stage == "remediation_strategy":
+                return json.dumps({
+                    "extended_mechanism": "Settings.allowed_headers", "target_files": ["config.py"],
+                    "target_symbols": ["config.py:Settings.allowed_headers"],
+                    "required_edits": ["stub edit"], "rejected_targets": [],
+                    "security_invariant": "stub", "insufficient_evidence": [],
+                })
+            if stage == "guided_context_request":
+                # No requests -- the symbol genuinely does not exist as a
+                # definition, so guided acquisition (real code, real
+                # attribution/resolution) can never help either.
+                return "{}"
+            return patch_diff
+        return side_effect
+
+    def _run(self, tmp_path, stage_calls, slice_result, patch_diff=None):
+        patch_diff = patch_diff or self._PATCH_DIFF
+        mock_llm = mock.MagicMock()
+        mock_llm.complete.side_effect = self._side_effect(stage_calls, patch_diff)
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
+            mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice",
+                       return_value=slice_result),
+            mock.patch("utilities.autopatcher.remediation_planner.build_intended_edits",
+                       return_value=self._edits()),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       side_effect=lambda *a, **kw: patch_diff) as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value={"applicable": True, "skipped": False, "stderr": "",
+                                     "exit_code": 0, "skipped_reason": None, "error": None}),
+        ):
+            from utilities.autopatcher.pipeline import run
+            report = run("some vulnerability", api_key="", repo_root=str(tmp_path))
+        return mock_gen, report
+
+    def test_fallback_succeeds_patch_generation_receives_verified_source(self, tmp_path):
+        """Test 5 + Test 10 (source acquisition): the symbol never
+        resolves (deterministically, or through guided acquisition), but
+        the file's own full-file-fallback source was already rendered --
+        the bounded fallback marks the edit ready and Patch Generation is
+        reached with that verified source in its code_context."""
+        # Whether the specific mocked patch this test's Patch Generator
+        # stub returns then survives Slice 4's own, unrelated Patch
+        # Target Conformance gate is out of this task's scope (that gate
+        # concerns a DIFFERENT question -- does the generated patch edit
+        # what Edit Readiness actually approved -- and has its own
+        # existing test coverage elsewhere); this test's own claim is
+        # narrower and already fully proven below: Patch Generation is
+        # reached at all, and with the fallback's verified source.
+        _unresolvable_symbol_repo(tmp_path)
+        stage_calls: list = []
+        mock_gen, report = self._run(tmp_path, stage_calls, self._slice_result(["config.py"]))
+        assert mock_gen.called
+        _args, kwargs = mock_gen.call_args
+        code_context = kwargs.get("code_context") or (_args[2] if len(_args) > 2 else "")
+        assert "DEFAULT_ALLOWED_HEADERS" in code_context
+
+    def test_fallback_fails_pipeline_ends_no_patch_cleanly(self, tmp_path):
+        """Test 6 (source acquisition): when the file was never actually
+        covered by the full-file fallback either (full_file_fallback_
+        covered stays empty -- e.g. the file was too large, or a read
+        failure), the bounded fallback correctly finds nothing to use and
+        the pipeline ends NO PATCH cleanly -- no exception, no malformed
+        report, Patch Generation never called."""
+        _unresolvable_symbol_repo(tmp_path)
+        stage_calls: list = []
+        mock_gen, report = self._run(tmp_path, stage_calls, self._slice_result([]))
+        assert not mock_gen.called
+        assert "NO PATCH PRODUCED" in report
+
+    def test_no_repeated_llm_loop_before_fallback(self, tmp_path):
+        """Test 4 + Test 8 (source acquisition): guided acquisition stops
+        early once it has made zero progress (see the loop/duplicate-
+        request guard) rather than exhausting every round before the
+        bounded fallback takes over -- at most
+        MAX_GUIDED_ACQUISITION_ROUNDS guided_context_request calls,
+        never more."""
+        from utilities.autopatcher import remediation_planner as rp
+        _unresolvable_symbol_repo(tmp_path)
+        stage_calls: list = []
+        self._run(tmp_path, stage_calls, self._slice_result(["config.py"]))
+        assert stage_calls.count("guided_context_request") <= rp.MAX_GUIDED_ACQUISITION_ROUNDS
+        assert stage_calls.count("guided_context_request") >= 1
+        assert stage_calls.count("remediation_planning") == 1
+        assert stage_calls.count("remediation_strategy") == 1
+
+
+# ---------------------------------------------------------------------------
+# Post-Patch Recovery context de-duplication (urllib3-trace cleanup, item 2)
+#
+# Regression shape: Post-Patch Recovery re-verifies a target whose earlier
+# (pre-recovery) "## Final-Target Remediation Slice" is ALREADY baked into
+# `code_context` (built during guided_context_acquisition, before Patch
+# Generation's first call). Appending the freshly recovered slice on top of
+# that stale copy -- rather than replacing it -- carried an old, superseded
+# slice's full text into the regeneration prompt for no benefit. This
+# exercises remove_final_target_slice_section, the exact primitive
+# pipeline.py's Slice-4 recovery path now uses to drop the stale copy
+# before appending the corrected one.
+# ---------------------------------------------------------------------------
+
+class TestRemoveFinalTargetSliceSection:
+    def test_noop_when_heading_absent(self):
+        from utilities.autopatcher.remediation_planner import remove_final_target_slice_section
+        text = "## Some Other Section\n\nnothing to remove here\n"
+        assert remove_final_target_slice_section(text) == text
+
+    def test_removes_to_end_of_text_when_nothing_follows(self):
+        from utilities.autopatcher.remediation_planner import remove_final_target_slice_section
+        text = (
+            "## Earlier Section\n\nkeep me\n\n"
+            "## Final-Target Remediation Slice\n\n"
+            "*disclaimer*\n\n"
+            "#### Target definition: `a.py:X` (lines 1–2)\n\n"
+            "```python\nold\n```\n"
+        )
+        result = remove_final_target_slice_section(text)
+        assert "## Final-Target Remediation Slice" not in result
+        assert "old" not in result
+        assert "## Earlier Section" in result
+        assert "keep me" in result
+
+    def test_stops_at_the_next_top_level_heading_never_removes_past_it(self):
+        from utilities.autopatcher.remediation_planner import remove_final_target_slice_section
+        text = (
+            "## Final-Target Remediation Slice\n\n"
+            "*disclaimer*\n\n"
+            "#### Target definition: `a.py:X` (lines 1–2)\n\n"
+            "```python\nold\n```\n\n"
+            "## Final-target source coverage warning\n\n"
+            "keep this warning\n"
+        )
+        result = remove_final_target_slice_section(text)
+        assert "## Final-Target Remediation Slice" not in result
+        assert "old" not in result
+        assert "## Final-target source coverage warning" in result
+        assert "keep this warning" in result
+
+    def test_leaves_sub_headings_of_other_sections_untouched(self):
+        """A "#### Target definition:" sub-heading belonging to a
+        DIFFERENT, unrelated top-level section (never the removed one)
+        must survive -- only the exact-line-matched heading's own
+        section is scoped for removal."""
+        from utilities.autopatcher.remediation_planner import remove_final_target_slice_section
+        text = (
+            "## Some Other Section\n\n"
+            "#### Target definition: `unrelated.py:Y` (lines 1–2)\n\n"
+            "```python\nunrelated\n```\n\n"
+            "## Final-Target Remediation Slice\n\n"
+            "*disclaimer*\n\n"
+            "#### Target definition: `a.py:X` (lines 1–2)\n\n"
+            "```python\nold\n```\n"
+        )
+        result = remove_final_target_slice_section(text)
+        assert "unrelated.py:Y" in result
+        assert "old" not in result
+
+
+class TestPostPatchRecoveryContextDeduplication:
+    def test_recovery_context_contains_slice_heading_exactly_once(self):
+        """The exact regression this item fixes: code_context already
+        carries one (now-stale) "## Final-Target Remediation Slice" from
+        before Patch Target Conformance triggered recovery. Composing the
+        recovery context the way pipeline.py's Slice-4 path now does --
+        strip the stale section, then append the freshly recovered one --
+        must leave exactly one occurrence of the heading, never two, and
+        must not lose unrelated context that came before the slice."""
+        from utilities.autopatcher.remediation_planner import remove_final_target_slice_section
+
+        code_context = (
+            "## Repository Understanding\n\n"
+            "some earlier, unrelated context\n\n"
+            "## Final-Target Remediation Slice\n\n"
+            "*disclaimer*\n\n"
+            "#### Target definition: `retry.py:RequestHistory.redirect_location` (lines 33–39)\n\n"
+            "```python\nurl: str | None\n```\n"
+        )
+        recovered_rendered = (
+            "## Final-Target Remediation Slice\n\n"
+            "*disclaimer*\n\n"
+            "#### Target definition: `retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT` (lines 177–203)\n\n"
+            "```python\nDEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n```\n"
+        )
+
+        stripped = remove_final_target_slice_section(code_context)
+        recovery_context = (stripped + "\n\n" if stripped else "") + recovered_rendered
+
+        assert recovery_context.count("## Final-Target Remediation Slice") == 1
+        assert "RequestHistory.redirect_location" not in recovery_context  # stale target gone
+        assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in recovery_context  # corrected target present
+        assert "some earlier, unrelated context" in recovery_context  # unrelated context preserved
+
+    def test_recovery_context_falls_back_to_recovered_slice_alone_when_code_context_had_none(self):
+        """code_context with no pre-existing slice at all (e.g. the initial
+        Final-Target Slice was empty/unavailable) must still produce a
+        clean, single-heading recovery context -- remove_final_target_
+        slice_section is a no-op here, exactly as it is for any other
+        text without the heading."""
+        from utilities.autopatcher.remediation_planner import remove_final_target_slice_section
+
+        code_context = "## Repository Understanding\n\nsome earlier context\n"
+        recovered_rendered = (
+            "## Final-Target Remediation Slice\n\n"
+            "*disclaimer*\n\n"
+            "#### Target definition: `a.py:X` (lines 1–2)\n\n"
+            "```python\nnew\n```\n"
+        )
+        stripped = remove_final_target_slice_section(code_context)
+        recovery_context = (stripped + "\n\n" if stripped else "") + recovered_rendered
+
+        assert recovery_context.count("## Final-Target Remediation Slice") == 1
+        assert "some earlier context" in recovery_context
+        assert "new" in recovery_context
+
+
+# ---------------------------------------------------------------------------
+# build_post_patch_recovery_hint fencing (urllib3-trace cleanup, item 3)
+#
+# Regression shape: `failed_patch` reaching build_post_patch_recovery_hint
+# is always patch_generator.classify_patch_response's "valid" result, which
+# is already wrapped in its own "```diff\n...\n```" fence. Wrapping it in a
+# SECOND fence produced a literal nested "```diff\n```diff\n...\n```" in the
+# regeneration prompt.
+# ---------------------------------------------------------------------------
+
+class TestPostPatchRecoveryHintFencing:
+    def _conformance_and_recovery(self):
+        from utilities.autopatcher.remediation_planner import PatchConformanceReport, PostPatchRecoveryResult
+        conformance = PatchConformanceReport(
+            results=[], all_conformant=False, edited_files=["mod.py"],
+            unexpected_files=[], uncovered_files=["mod.py"], no_match_files=[],
+        )
+        recovery = PostPatchRecoveryResult(
+            triggered=True, trigger_reasons=["uncovered_target"], recovery_targets=["mod.py"],
+            slice_result=None, attempts=[], ready_for_regeneration=True, failure_reason=None,
+        )
+        return conformance, recovery
+
+    def test_already_fenced_patch_produces_exactly_one_fence(self):
+        """The real-world shape: `failed_patch` is patch_generator's own
+        pre-fenced "valid" result."""
+        from utilities.autopatcher.remediation_planner import build_post_patch_recovery_hint
+        conformance, recovery = self._conformance_and_recovery()
+        already_fenced = "```diff\n--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-X = 1\n+X = 2\n```"
+
+        hint = build_post_patch_recovery_hint(conformance, recovery, already_fenced)
+
+        assert hint.count("```diff") == 1
+        assert "```diff\n```diff" not in hint
+        assert hint.count("```") == 2  # one opener, one closer -- never a nested pair
+        assert "-X = 1" in hint and "+X = 2" in hint
+
+    def test_unfenced_patch_still_produces_exactly_one_fence(self):
+        """Defensive: a caller that ever passes an unfenced diff (not the
+        current production shape, but not assumed away either) must still
+        get exactly one fence, never zero."""
+        from utilities.autopatcher.remediation_planner import build_post_patch_recovery_hint
+        conformance, recovery = self._conformance_and_recovery()
+        unfenced = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-X = 1\n+X = 2\n"
+
+        hint = build_post_patch_recovery_hint(conformance, recovery, unfenced)
+
+        assert hint.count("```diff") == 1
+        assert hint.count("```") == 2
+        assert "-X = 1" in hint and "+X = 2" in hint
+
+    def test_no_failed_patch_omits_the_section_entirely(self):
+        from utilities.autopatcher.remediation_planner import build_post_patch_recovery_hint
+        conformance, recovery = self._conformance_and_recovery()
+        hint = build_post_patch_recovery_hint(conformance, recovery, "")
+        assert "```" not in hint
+
+
+# ---------------------------------------------------------------------------
+# Category 2 heading differentiation (urllib3-trace cleanup, item 4)
+#
+# Category 2 (SUPPORTING-context, strategy-prose-identifier lookup) must
+# never render under the same "#### Target definition:" heading a genuine,
+# verified Final Strategy target (Category 1/3b/4/one-hop) uses -- the
+# exact real-world confusion the urllib3 trace surfaced: a same-headed but
+# unrelated/unapproved block reading as if it were an approved edit target.
+# ---------------------------------------------------------------------------
+
+class TestCategory2HeadingDifferentiation:
+    def test_category2_only_supporting_block_uses_context_only_heading(self, tmp_path):
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        context = _make_context(
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        # No verified target_symbols -- ALLOWED_VALUES is only discoverable
+        # via Category 2's strategy-prose lookup, never a verified target.
+        strategy = _make_strategy(
+            target_files=["policy.py"], target_symbols=[],
+            extended_mechanism="Policy.ALLOWED_VALUES",
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert (
+            "Related definition (context only, not an approved edit target): "
+            "`policy.py:Policy.ALLOWED_VALUES`" in result.rendered
+        )
+        assert "Target definition: `policy.py:Policy.ALLOWED_VALUES`" not in result.rendered
+
+    def test_verified_target_keeps_target_definition_heading_alongside_category2_block(self, tmp_path):
+        """Both a genuine, verified Final Strategy target (Category 1,
+        `Policy.ALLOWED_VALUES`) AND a merely-referenced, unverified
+        strategy-prose identifier (Category 2, `Other.UNRELATED_NOTE`) in
+        the same rendered slice -- the two must be visually
+        distinguishable: the verified one keeps "Target definition:", the
+        supporting one does not."""
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        (tmp_path / "other.py").write_text(
+            "class Other:\n    UNRELATED_NOTE = 1\n", encoding="utf-8",
+        )
+        context = _make_context(
+            constants={
+                "policy.py": {
+                    "Policy.ALLOWED_VALUES": {
+                        "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                        "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                    },
+                },
+                "other.py": {
+                    "Other.UNRELATED_NOTE": {
+                        "qualified_name": "Other.UNRELATED_NOTE", "class_name": "Other",
+                        "name": "UNRELATED_NOTE", "line": 2, "end_line": 2,
+                    },
+                },
+            },
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=["policy.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+            extended_mechanism="Other.UNRELATED_NOTE",
+        )
+
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["other.py"],
+        )
+
+        assert "Target definition: `policy.py:Policy.ALLOWED_VALUES`" in result.rendered
+        assert (
+            "Related definition (context only, not an approved edit target): "
+            "`other.py:Other.UNRELATED_NOTE`" in result.rendered
+        )
+        assert "Target definition: `other.py:Other.UNRELATED_NOTE`" not in result.rendered
+        assert "policy.py:Policy.ALLOWED_VALUES" in result.covered_target_symbols
+
+
+# ---------------------------------------------------------------------------
+# Method-call one-hop expansion: a dot-qualified method call co-located, on
+# the same source line, with an already strategy-connected identifier
+# inside an ALREADY-ADMITTED evidence block (or an already-computed Planner
+# excerpt block) may receive one bounded lookup opportunity through the
+# existing `_lookup_identifier_definition` resolution machinery. Mirrors
+# the existing ALL-CAPS constant one-hop
+# (_extract_source_constant_refs/_disambiguate_constant_candidates) in
+# spirit, but for a method-call shape instead of a constant-shape -- closes
+# a real observed gap: the literal text `conn.is_same_host(redirect_
+# location)` sits inside an already-admitted consumer window in every run,
+# but was only ever searched for as a term when Strategy's own free text
+# happened to reproduce it verbatim -- pure LLM-wording variance.
+#
+# Every test below exercises the real, unmocked production path
+# (`build_final_target_slice` / `_lookup_identifier_definition`) -- no
+# test-side reimplementation of the extraction rule.
+# ---------------------------------------------------------------------------
+
+
+class TestIsSameHostStyleOneHopMethodCallExpansion:
+    """Method-call one-hop expansion, per the forensic investigation's
+    PART 1-4/6. Generic fixture, no urllib3/CVE names."""
+
+    def _coordinator_context(self, tmp_path):
+        source = (
+            "    def process(self):\n"
+            "        if self.enabled_flag and not helper.is_ready(self.context):\n"
+            "            return\n"
+            "        helper.log_event()\n"
+        )
+        (tmp_path / "coordinator.py").write_text("class Coordinator:\n" + source, encoding="utf-8")
+        (tmp_path / "helper_module.py").write_text(
+            "class Helper:\n"
+            "    def is_ready(self, context):\n"
+            "        return context is not None\n"
+            "\n"
+            "    def log_event(self):\n"
+            "        pass\n",
+            encoding="utf-8",
+        )
+        functions = {
+            "coordinator.py:Coordinator.process": {
+                "name": "process", "className": "Coordinator", "startLine": 2, "endLine": 5,
+                "code": source,
+            },
+            "helper_module.py:Helper.is_ready": {
+                "name": "is_ready", "className": "Helper", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return context is not None\n",
+            },
+            "helper_module.py:Helper.log_event": {
+                "name": "log_event", "className": "Helper", "startLine": 5, "endLine": 6,
+                "code": "    def log_event(self):\n        pass\n",
+            },
+        }
+        return _make_context(functions=functions, constants={}, repo_path=tmp_path), source
+
+    # --- PART 1: same-line connected call gains one-hop supporting
+    # evidence (real build_final_target_slice, unmocked) ---
+    def test_part1_same_line_connected_call_becomes_supporting_evidence(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context, _source = self._coordinator_context(tmp_path)
+        strategy = _make_strategy(
+            target_files=["coordinator.py"], target_symbols=["Coordinator"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper_module.py"],
+        )
+        # Precondition: the consumer window IS admitted, via the existing,
+        # unrelated "enabled_flag" term-discovery path -- proving this is a
+        # genuine evidence-continuity fix, not a fixture that fails to
+        # reach the admitted-evidence stage at all.
+        assert "`coordinator.py:Coordinator.process`" in result.rendered
+        # Helper.is_ready's own definition is represented in the bounded
+        # supporting evidence, since its call is co-located, on the same
+        # source line, with the already strategy-connected `enabled_flag`.
+        assert "`helper_module.py:Helper.is_ready`" in result.rendered
+        # Supporting evidence only -- never promoted to an edit target.
+        assert (
+            "Related definition (context only, not an approved edit target): "
+            "`helper_module.py:Helper.is_ready`" in result.rendered
+        )
+        assert "Target definition: `helper_module.py:Helper.is_ready`" not in result.rendered
+
+    # --- PART 2: different-line negative control (real production path) ---
+    def test_part2_different_line_call_not_admitted_by_rule(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context, _source = self._coordinator_context(tmp_path)
+        strategy = _make_strategy(
+            target_files=["coordinator.py"], target_symbols=["Coordinator"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper_module.py"],
+        )
+        assert "`helper_module.py:Helper.is_ready`" in result.rendered      # same line -- discovered
+        assert "`helper_module.py:Helper.log_event`" not in result.rendered  # different line -- must NOT be
+        # Confirms this is not "expand every callee in the function":
+        # log_event is a real, resolvable callee of the SAME admitted
+        # function and still correctly gains no opportunity.
+
+    # --- PART 3: same-line stress control (fan-out measurement, real
+    # production path) ---
+    def test_part3_same_line_stress_measures_bounded_fanout(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = (
+            "    def process(self):\n"
+            "        if self.enabled_flag and a.ready(x) and b.allowed(y) and c.check(z):\n"
+            "            return\n"
+        )
+        (tmp_path / "gate.py").write_text("class Gate:\n" + source, encoding="utf-8")
+        (tmp_path / "helpers3.py").write_text(
+            "class A:\n    def ready(self, x):\n        return True\n\n"
+            "class B:\n    def allowed(self, y):\n        return True\n\n"
+            "class C:\n    def check(self, z):\n        return True\n",
+            encoding="utf-8",
+        )
+        functions = {
+            "gate.py:Gate.process": {
+                "name": "process", "className": "Gate", "startLine": 2, "endLine": 4, "code": source,
+            },
+            "helpers3.py:A.ready": {"name": "ready", "className": "A", "startLine": 2, "endLine": 3, "code": "    def ready(self, x):\n        return True\n"},
+            "helpers3.py:B.allowed": {"name": "allowed", "className": "B", "startLine": 5, "endLine": 6, "code": "    def allowed(self, y):\n        return True\n"},
+            "helpers3.py:C.check": {"name": "check", "className": "C", "startLine": 8, "endLine": 9, "code": "    def check(self, z):\n        return True\n"},
+        }
+        context = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["gate.py"], target_symbols=["Gate"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helpers3.py"],
+        )
+
+        # Measured, not assumed: a single densely-packed line DOES surface
+        # every co-located call -- this is the real, honest fan-out shape.
+        # No new arbitrary numeric cap is needed: every discovered
+        # candidate still must pass through the EXISTING shared
+        # Final-Target-Slice budget (whole-block-or-omit, a pure
+        # running-total size check with no count-based limit anywhere in
+        # its implementation) before any of its source is actually
+        # rendered -- exactly as already proven for the constant one-hop's
+        # own multi-candidate case (see TestBudgetBoundedness).
+        for label in ("A.ready", "B.allowed", "C.check"):
+            marker = f"`helpers3.py:{label}`"
+            assert marker in result.rendered
+            assert result.rendered.count(marker) == 1  # deduplicated, never rendered twice
+
+    # --- PART 4: large-source control (no candidate explosion, real
+    # production path) ---
+    def test_part4_large_source_only_co_located_line_surfaces(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        lines = ["    def process(self):"]
+        for i in range(60):
+            lines.append(f"        other.unrelated_call_{i}(step_{i})")
+        lines.insert(30, "        if self.enabled_flag and not helper.is_ready(self.context):")
+        # A call that IS equally resolvable (same preferred_files scope)
+        # yet sits on an unrelated line -- proves the boundary holds even
+        # when a large admitted source makes an unrelated resolution
+        # technically available.
+        lines.append("        other.definitely_resolvable_call(9)")
+        lines.append("        return")
+        source = "\n".join(lines) + "\n"
+
+        (tmp_path / "big.py").write_text("class Big:\n" + source, encoding="utf-8")
+        (tmp_path / "helper_module4.py").write_text(
+            "class Helper:\n    def is_ready(self, context):\n        return True\n", encoding="utf-8",
+        )
+        (tmp_path / "other_calls4.py").write_text(
+            "class Other:\n    def definitely_resolvable_call(self, x):\n        return x\n", encoding="utf-8",
+        )
+        functions = {
+            "big.py:Big.process": {
+                "name": "process", "className": "Big", "startLine": 2, "endLine": 2 + len(lines), "code": source,
+            },
+            "helper_module4.py:Helper.is_ready": {
+                "name": "is_ready", "className": "Helper", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return True\n",
+            },
+            "other_calls4.py:Other.definitely_resolvable_call": {
+                "name": "definitely_resolvable_call", "className": "Other", "startLine": 2, "endLine": 3,
+                "code": "    def definitely_resolvable_call(self, x):\n        return x\n",
+            },
+        }
+        context = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["big.py"], target_symbols=["Big"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context,
+            planner_evidence_files=["helper_module4.py", "other_calls4.py"],
+        )
+
+        # (A) scans the whole source but emits only the structurally
+        # co-located candidate -- not (B) unrelated-line leakage, not (C)
+        # candidate explosion across 60 unrelated calls.
+        assert "`helper_module4.py:Helper.is_ready`" in result.rendered
+        assert "`other_calls4.py:Other.definitely_resolvable_call`" not in result.rendered
+
+    # --- PART 6: existing resolution machinery -- ambiguity/scope proof ---
+    def test_part6_resolution_stays_within_preferred_files_and_matches_existing_ambiguity_behavior(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _lookup_identifier_definition
+
+        (tmp_path / "helper_module6.py").write_text(
+            "class Helper:\n    def is_ready(self, context):\n        return True\n", encoding="utf-8")
+        (tmp_path / "other_module6.py").write_text(
+            "class Other:\n    def is_ready(self, context):\n        return False\n", encoding="utf-8")
+        (tmp_path / "unrelated6.py").write_text(
+            "class Unrelated:\n    def is_ready(self, context):\n        return None\n", encoding="utf-8")
+
+        # A definition that exists in the repository but was never passed
+        # in `preferred_files` must never be reachable -- proving no
+        # repo-wide fallback exists in the resolver this rule reuses.
+        functions = {
+            "helper_module6.py:Helper.is_ready": {
+                "name": "is_ready", "className": "Helper", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return True\n",
+            },
+            "unrelated6.py:Unrelated.is_ready": {
+                "name": "is_ready", "className": "Unrelated", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return None\n",
+            },
+        }
+        context = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        match = _lookup_identifier_definition("is_ready", ["helper_module6.py"], context)
+        assert match is not None
+        assert match.file == "helper_module6.py"  # never unrelated6.py, which was never preferred
+
+        # Ambiguous case (two same-named methods, BOTH in preferred_files):
+        # `_lookup_identifier_definition` is documented to accept the same
+        # residual ambiguity `search_definitions()` itself already has for
+        # a bare, class-unqualified term (see its own docstring) -- this
+        # proposed rule inherits that EXISTING, already-accepted
+        # deterministic behavior unchanged; it introduces no new, worse
+        # ambiguity risk of its own.
+        functions_ambiguous = {
+            "helper_module6.py:Helper.is_ready": {
+                "name": "is_ready", "className": "Helper", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return True\n",
+            },
+            "other_module6.py:Other.is_ready": {
+                "name": "is_ready", "className": "Other", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return False\n",
+            },
+        }
+        context2 = _make_context(functions=functions_ambiguous, constants={}, repo_path=tmp_path)
+        match2 = _lookup_identifier_definition("is_ready", ["helper_module6.py", "other_module6.py"], context2)
+        assert match2 is not None
+        assert match2.file in ("helper_module6.py", "other_module6.py")  # bounded; never a third file
+
+
+# ---------------------------------------------------------------------------
+# One-hop, repository-wide unique-match fallback (scopefix-v1 forensic
+# finding, Shape A): a directly-called predicate/helper's own definition
+# should not depend on whether an earlier, low-evidence Planner stage
+# happened to already guess its file into preferred_files. Generic fixture,
+# no urllib3/CVE names. Behavior-level proof (real build_final_target_slice)
+# plus direct unit tests of the new fallback function's own uniqueness gate.
+# ---------------------------------------------------------------------------
+
+class TestOneHopRepoWideUniqueFallback:
+    def _predicate_context(self, tmp_path, *, second_definition=False, ambiguous_name=None):
+        """A consumer file (in preferred_files) whose already-admitted
+        source directly calls `conn.is_ready(...)` -- a predicate defined
+        in a SEPARATE file that is never passed as planner_evidence_files
+        or a target file, mirroring is_same_host living in connectionpool.py
+        while PoolManager.urlopen (the consumer) lives in poolmanager.py."""
+        source = (
+            "    def process(self):\n"
+            "        if self.enabled_flag and not conn.is_ready(self.context):\n"
+            "            return\n"
+        )
+        (tmp_path / "consumer.py").write_text("class Consumer:\n" + source, encoding="utf-8")
+        (tmp_path / "predicate_module.py").write_text(
+            "class Conn:\n    def is_ready(self, context):\n        return context is not None\n",
+            encoding="utf-8",
+        )
+        functions = {
+            "consumer.py:Consumer.process": {
+                "name": "process", "className": "Consumer", "startLine": 2, "endLine": 4, "code": source,
+            },
+            "predicate_module.py:Conn.is_ready": {
+                "name": "is_ready", "className": "Conn", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return context is not None\n",
+            },
+        }
+        if second_definition:
+            (tmp_path / "other_predicate_module.py").write_text(
+                "class OtherConn:\n    def is_ready(self, context):\n        return False\n",
+                encoding="utf-8",
+            )
+            functions["other_predicate_module.py:OtherConn.is_ready"] = {
+                "name": "is_ready", "className": "OtherConn", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return False\n",
+            }
+        return _make_context(functions=functions, constants={}, repo_path=tmp_path)
+
+    def _strategy(self):
+        return _make_strategy(
+            target_files=["consumer.py"], target_symbols=["Consumer"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+
+    # --- 1. Existing preferred-file resolution unchanged ---
+    def test_1_helper_already_in_preferred_files_resolves_exactly_as_before(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context = self._predicate_context(tmp_path)
+        result = build_final_target_slice(
+            self._strategy(), str(tmp_path), context,
+            planner_evidence_files=["predicate_module.py"],  # already preferred -- no fallback needed
+        )
+        assert "`predicate_module.py:Conn.is_ready`" in result.rendered
+
+    # --- 2. Unique definition outside preferred_files ---
+    def test_2_unique_definition_outside_preferred_files_is_included(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context = self._predicate_context(tmp_path)
+        result = build_final_target_slice(
+            self._strategy(), str(tmp_path), context,
+            planner_evidence_files=[],  # predicate_module.py is NOT preferred at all
+        )
+        assert "`predicate_module.py:Conn.is_ready`" in result.rendered
+        # No unrelated source added.
+        assert "other_predicate_module" not in result.rendered
+
+    def test_2b_helper_file_never_promoted_into_preferred_files(self, tmp_path):
+        """The resolved helper's file must confer no broader search
+        opportunity to any OTHER lookup in the same run -- proven by a
+        second, unrelated identifier that exists ONLY in the helper's file
+        and is never itself referenced by any already-selected source."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        self._predicate_context(tmp_path)  # writes the base fixture files
+        # Add a second, unrelated symbol to predicate_module.py that is
+        # never called from consumer.py at all -- if the helper's file were
+        # promoted into preferred_files, later strategy-term/usage lookups
+        # could start finding it; it must not appear at all.
+        (tmp_path / "predicate_module.py").write_text(
+            "class Conn:\n"
+            "    def is_ready(self, context):\n"
+            "        return context is not None\n"
+            "\n"
+            "    def unrelated_sibling(self):\n"
+            "        pass\n",
+            encoding="utf-8",
+        )
+        functions = {
+            "consumer.py:Consumer.process": {
+                "name": "process", "className": "Consumer", "startLine": 2, "endLine": 4,
+                "code": (
+                    "    def process(self):\n"
+                    "        if self.enabled_flag and not conn.is_ready(self.context):\n"
+                    "            return\n"
+                ),
+            },
+            "predicate_module.py:Conn.is_ready": {
+                "name": "is_ready", "className": "Conn", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return context is not None\n",
+            },
+            "predicate_module.py:Conn.unrelated_sibling": {
+                "name": "unrelated_sibling", "className": "Conn", "startLine": 5, "endLine": 6,
+                "code": "    def unrelated_sibling(self):\n        pass\n",
+            },
+        }
+        context2 = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        result = build_final_target_slice(
+            self._strategy(), str(tmp_path), context2, planner_evidence_files=[],
+        )
+        assert "`predicate_module.py:Conn.is_ready`" in result.rendered
+        assert "unrelated_sibling" not in result.rendered
+
+    # --- 3. Zero matches ---
+    def test_3_zero_matches_adds_no_evidence_and_does_not_raise(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = (
+            "    def process(self):\n"
+            "        if self.enabled_flag and not conn.nonexistent_predicate(self.context):\n"
+            "            return\n"
+        )
+        (tmp_path / "consumer3.py").write_text("class Consumer:\n" + source, encoding="utf-8")
+        functions = {
+            "consumer3.py:Consumer.process": {
+                "name": "process", "className": "Consumer", "startLine": 2, "endLine": 4, "code": source,
+            },
+        }
+        context = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["consumer3.py"], target_symbols=["Consumer"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=[])
+        # No SEPARATE definition block was added for the unresolvable call
+        # target -- the raw substring legitimately appears only inside
+        # Consumer's own already-included source (the class-level target
+        # definition, and/or its own discovered-usage window), never as
+        # its own "Related definition" one-hop block.
+        assert "Related definition" not in result.rendered
+        assert "`consumer3.py:Consumer`" in result.rendered  # existing evidence unaffected
+
+    # --- 4. Multiple repository-wide matches -- fail closed ---
+    def test_4_ambiguous_repo_wide_matches_selects_nothing(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context = self._predicate_context(tmp_path, second_definition=True)
+        result = build_final_target_slice(
+            self._strategy(), str(tmp_path), context, planner_evidence_files=[],
+        )
+        assert "predicate_module.py:Conn.is_ready" not in result.rendered
+        assert "other_predicate_module.py:OtherConn.is_ready" not in result.rendered
+
+    def test_4b_unit_ambiguous_returns_none_directly(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import (
+            _lookup_identifier_definition_or_unique_repo_match,
+        )
+
+        context = self._predicate_context(tmp_path, second_definition=True)
+        match = _lookup_identifier_definition_or_unique_repo_match("is_ready", [], context)
+        assert match is None
+
+    def test_unit_zero_matches_returns_none(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import (
+            _lookup_identifier_definition_or_unique_repo_match,
+        )
+
+        context = self._predicate_context(tmp_path)
+        match = _lookup_identifier_definition_or_unique_repo_match("totally_unknown_name", [], context)
+        assert match is None
+
+    def test_unit_unique_match_outside_preferred_files_resolves(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import (
+            _lookup_identifier_definition_or_unique_repo_match,
+        )
+
+        context = self._predicate_context(tmp_path)
+        match = _lookup_identifier_definition_or_unique_repo_match("is_ready", [], context)
+        assert match is not None
+        assert match.file == "predicate_module.py"
+        assert match.label == "is_ready"
+
+    def test_unit_prefers_preferred_files_result_without_needing_repo_scan(self, tmp_path):
+        """When the normal, unchanged lookup already resolves, the result
+        must be identical to calling it directly -- the fallback path is
+        never consulted."""
+        from utilities.autopatcher.remediation_planner import (
+            _lookup_identifier_definition, _lookup_identifier_definition_or_unique_repo_match,
+        )
+
+        context = self._predicate_context(tmp_path)
+        direct = _lookup_identifier_definition("is_ready", ["predicate_module.py"], context)
+        widened = _lookup_identifier_definition_or_unique_repo_match(
+            "is_ready", ["predicate_module.py"], context,
+        )
+        assert widened == direct
+
+    # --- 5. No recursive expansion ---
+    def test_5_newly_acquired_helper_own_call_is_not_automatically_acquired(self, tmp_path):
+        """The resolved helper (`is_ready`) itself calls a second,
+        uniquely-defined helper (`inner.confirm()`) on its own source line
+        -- that second helper must NOT be automatically acquired: this
+        one-hop fallback is not itself re-scanned for further one-hop
+        opportunities."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = (
+            "    def process(self):\n"
+            "        if self.enabled_flag and not conn.is_ready(self.context):\n"
+            "            return\n"
+        )
+        (tmp_path / "consumer5.py").write_text("class Consumer:\n" + source, encoding="utf-8")
+        (tmp_path / "predicate_module5.py").write_text(
+            "class Conn:\n"
+            "    def is_ready(self, context):\n"
+            "        return inner.confirm(context)\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "inner_module5.py").write_text(
+            "class Inner:\n    def confirm(self, context):\n        return True\n", encoding="utf-8",
+        )
+        functions = {
+            "consumer5.py:Consumer.process": {
+                "name": "process", "className": "Consumer", "startLine": 2, "endLine": 4, "code": source,
+            },
+            "predicate_module5.py:Conn.is_ready": {
+                "name": "is_ready", "className": "Conn", "startLine": 2, "endLine": 3,
+                "code": "    def is_ready(self, context):\n        return inner.confirm(context)\n",
+            },
+            "inner_module5.py:Inner.confirm": {
+                "name": "confirm", "className": "Inner", "startLine": 2, "endLine": 3,
+                "code": "    def confirm(self, context):\n        return True\n",
+            },
+        }
+        context = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["consumer5.py"], target_symbols=["Consumer"],
+            extended_mechanism="The fix adjusts enabled_flag.",
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=[])
+        assert "`predicate_module5.py:Conn.is_ready`" in result.rendered
+        # "confirm" legitimately appears once, inside is_ready's OWN
+        # rendered body (`return inner.confirm(context)`) -- but
+        # Inner.confirm must never gain its OWN, separate definition block.
+        assert "inner_module5.py:Inner.confirm" not in result.rendered
+        assert result.rendered.count("confirm") == 1
+
+    # --- 6. Call-site isolation ---
+    def test_6_strategy_term_lookup_call_site_remains_preferred_files_only(self, tmp_path):
+        """The Strategy-term usage/definition lookup (a DIFFERENT call site
+        of `_lookup_identifier_definition`, used for strategy-derived
+        terms named only in Strategy's own mechanism prose, never for
+        one-hop dot-calls) must still find nothing for a symbol outside
+        preferred_files -- the new widened fallback is never consulted
+        there. Uses a DIFFERENT bare name than the one-hop fixtures above,
+        deliberately never referenced on any already-admitted source line,
+        so this isolates the strategy-term path from the one-hop path --
+        a term that is BOTH a strategy term AND a same-line dot-call target
+        would exercise one-hop too, which is not what this test is for."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = (
+            "    def process(self):\n"
+            "        if self.enabled_flag:\n"
+            "            return\n"
+        )
+        (tmp_path / "consumer6.py").write_text("class Consumer:\n" + source, encoding="utf-8")
+        (tmp_path / "predicate_module6.py").write_text(
+            "class Conn:\n    def other_gate(self, context):\n        return True\n",
+            encoding="utf-8",
+        )
+        functions = {
+            "consumer6.py:Consumer.process": {
+                "name": "process", "className": "Consumer", "startLine": 2, "endLine": 4, "code": source,
+            },
+            "predicate_module6.py:Conn.other_gate": {
+                "name": "other_gate", "className": "Conn", "startLine": 2, "endLine": 3,
+                "code": "    def other_gate(self, context):\n        return True\n",
+            },
+        }
+        context = _make_context(functions=functions, constants={}, repo_path=tmp_path)
+        # Names "other_gate" in mechanism prose ONLY -- never on any
+        # already-admitted source line -- so only the strategy-term lookup
+        # path (never the one-hop dot-call path) could ever look it up.
+        strategy = _make_strategy(
+            target_files=["consumer6.py"], target_symbols=["Consumer"],
+            extended_mechanism="The fix relies on other_gate to gate the change.",
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=[],
+        )
+        assert "predicate_module6.py:Conn.other_gate" not in result.rendered
+
+    # --- 7. Budget behavior ---
+    def test_7_helper_omitted_whole_block_when_budget_exhausted(self, tmp_path):
+        """A unique, resolvable helper outside preferred_files that cannot
+        fit the remaining slice budget must be omitted entirely -- never
+        truncated -- and must not cause the run to exceed budget."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        context = self._predicate_context(tmp_path)
+        tiny_budget = 10  # far smaller than even the target definition alone
+        result = build_final_target_slice(
+            self._strategy(), str(tmp_path), context,
+            planner_evidence_files=[], max_chars=tiny_budget,
+        )
+        assert "predicate_module.py:Conn.is_ready" not in result.rendered
+        assert len(result.rendered) <= tiny_budget or result.rendered == ""
+
+
+# ---------------------------------------------------------------------------
+# Class-level same-file assignment evidence: a verified target's own
+# deterministically established owning class can have a DIFFERENT member
+# reassigned at module scope, far from the class body, in the SAME file --
+# e.g. a ClassVar declaration (no value) whose real runtime construction
+# lives hundreds of lines later (`Retry.DEFAULT = Retry(3)`, discovered even
+# though the verified target is the unrelated `Retry.DEFAULT_REMOVE_
+# HEADERS_ON_REDIRECT` constant). Generic fixture, no urllib3/CVE names.
+# ---------------------------------------------------------------------------
+
+class TestClassLevelSameFileAssignmentEvidence:
+    def _widget_source(self, extra_class_body="", tail_statement="Widget.DEFAULT = Widget(3)"):
+        lines = [
+            "class Widget:",
+            '    POLICY = "value"',
+            '    DEFAULT: "Widget"',
+            "",
+            "    def __init__(self, n):",
+            "        self.n = n",
+            "",
+        ]
+        if extra_class_body:
+            lines.append(extra_class_body)
+        # Unrelated padding, far exceeding _DEFINITION_CONTEXT_LINES (3), so
+        # POLICY's own padded window cannot reach the tail statement below.
+        for i in range(40):
+            lines.append(f"def unrelated_helper_{i}():")
+            lines.append(f"    return {i}")
+            lines.append("")
+        lines.append(tail_statement)
+        return "\n".join(lines) + "\n"
+
+    def _context_and_strategy(self, tmp_path, source, constants=None, functions=None):
+        (tmp_path / "widget.py").write_text(source, encoding="utf-8")
+        constants = constants or {
+            "widget.py": {
+                "Widget.POLICY": {
+                    "qualified_name": "Widget.POLICY", "class_name": "Widget",
+                    "name": "POLICY", "line": 2, "end_line": 2,
+                },
+            },
+        }
+        context = _make_context(functions=functions or {}, constants=constants, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["widget.py"], target_symbols=["Widget.POLICY"],
+            extended_mechanism="Adjust Widget's policy configuration.",
+        )
+        return context, strategy
+
+    # --- PRIMARY RED ---
+    def test_distant_module_level_assignment_to_different_member_is_admitted(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = self._widget_source()
+        context, strategy = self._context_and_strategy(tmp_path, source)
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        # Precondition: the verified target's own evidence is present --
+        # proving the fixture reaches the admitted-evidence stage at all.
+        assert "`widget.py:Widget.POLICY`" in result.rendered
+        # The actual invariant under test: a DIFFERENT member of the SAME
+        # verified owning class, reassigned far away at module scope, must
+        # also be admitted as supporting evidence -- genuinely absent today
+        # (no existing mechanism reaches an ast.Attribute-targeted,
+        # module-scope assignment: not the padded per-symbol window, which
+        # cannot reach 120+ lines away; not the constants table, which
+        # excludes attribute targets entirely; not the consumer scan, which
+        # only scans function bodies, never module-level statements; not
+        # the full-file fallback, since Category 1 already covers this file).
+        assert "Widget.DEFAULT = Widget(3)" in result.rendered
+
+    # --- Control 1: a different class's same-named member must not match ---
+    def test_other_class_same_member_name_not_admitted(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = self._widget_source()
+        source += (
+            "\nclass Other:\n"
+            '    DEFAULT: "Other"\n'
+            "\n"
+            "Other.DEFAULT = Other(3)\n"
+        )
+        context, strategy = self._context_and_strategy(tmp_path, source)
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "Widget.DEFAULT = Widget(3)" in result.rendered
+        assert "Other.DEFAULT = Other(3)" not in result.rendered
+
+    # --- Control 2: function-local assignment must not be admitted ---
+    def test_function_local_assignment_not_admitted(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = self._widget_source(
+            tail_statement="def configure():\n    Widget.DEFAULT = Widget(3)\n    return Widget.DEFAULT",
+        )
+        context, strategy = self._context_and_strategy(tmp_path, source)
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "`widget.py:Widget.POLICY`" in result.rendered
+        assert "Widget.DEFAULT = Widget(3)" not in result.rendered
+
+    # --- Control 3: same assignment in a different file must not be
+    # discovered -- the scan is scoped to the verified target's OWN
+    # resolved file only, never any other file. ---
+    def test_assignment_in_different_file_not_discovered(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = self._widget_source(tail_statement="# no assignment in this file")
+        (tmp_path / "other_file.py").write_text(
+            "from widget import Widget\nWidget.DEFAULT = Widget(3)\n", encoding="utf-8",
+        )
+        context, strategy = self._context_and_strategy(tmp_path, source)
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "`widget.py:Widget.POLICY`" in result.rendered
+        assert "Widget.DEFAULT = Widget(3)" not in result.rendered
+
+    # --- Control 4: supporting context only -- never edit-target authority ---
+    def test_admitted_assignment_never_becomes_edit_target(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        source = self._widget_source()
+        context, strategy = self._context_and_strategy(tmp_path, source)
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "Widget.DEFAULT = Widget(3)" in result.rendered
+        assert "Widget.DEFAULT" not in result.covered_target_symbols
+        assert (
+            "Related definition (context only, not an approved edit target): "
+            "`widget.py:Widget.DEFAULT`" in result.rendered
+        )
+        assert "Target definition: `widget.py:Widget.DEFAULT`" not in result.rendered
+
+    # --- Control 5: no recursive discovery from the newly admitted RHS ---
+    def test_no_recursive_discovery_from_admitted_assignment(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        # "Widget" is itself a strategy term (dot-split from "Widget.POLICY"),
+        # and this line contains a dot-call co-located with it -- exactly
+        # the shape the EXISTING method-call one-hop rule looks for. The
+        # claim under test is that the class-level assignment mechanism
+        # never feeds its own admitted text back into that (or any other)
+        # discovery pass.
+        source = self._widget_source(tail_statement="Widget.DEFAULT = Widget(helper.compute())")
+        (tmp_path / "helper_mod.py").write_text(
+            "class Helper:\n    def compute(self):\n        return 3\n", encoding="utf-8",
+        )
+        functions = {
+            "helper_mod.py:Helper.compute": {
+                "name": "compute", "className": "Helper", "startLine": 2, "endLine": 3,
+                "code": "    def compute(self):\n        return 3\n",
+            },
+        }
+        context, strategy = self._context_and_strategy(tmp_path, source, functions=functions)
+
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["helper_mod.py"],
+        )
+
+        assert "Widget.DEFAULT = Widget(helper.compute())" in result.rendered
+        assert "helper_mod.py:Helper.compute" not in result.rendered

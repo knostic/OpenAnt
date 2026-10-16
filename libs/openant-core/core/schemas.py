@@ -113,9 +113,39 @@ class UsageInfo:
     # flows into step reports and scan.report.json via tracking.get_usage.
     cost_incomplete: bool = False
     unpriced_models: list = field(default_factory=list)
+    # #626: the cache line items. Cached and uncached input stay
+    # separated; cache-unpriceable models keep the run incomplete.
+    #
+    # These do NOT follow the #624 always-present asdict decision: they are
+    # PRESENT-ONLY in the serialized envelope (see to_dict below). The
+    # FIELDS always exist, so typed consumers keep attribute access and the
+    # 0/[] defaults; only the dict envelope omits what a run did not
+    # measure. A run that used no cache therefore serializes byte-identically
+    # to the pre-#626 shape, which is the discipline get_totals /
+    # get_summary / the call record / the step snapshot already follow, and
+    # which tests/patch/test_run_traced_wrapper.py:304 asserts by exact
+    # dict equality on this very envelope.
+    total_cache_read_tokens: int = 0
+    total_cache_write_tokens: int = 0
+    unpriced_cache_models: list = field(default_factory=list)
+
+    #: the #626 cache keys, dropped from to_dict() when the run measured
+    #: none of them (present-only). Per field, never all-or-nothing — a
+    #: read-only cache run must not assert a cache_write of zero.
+    _CACHE_ENVELOPE_KEYS = (
+        "total_cache_read_tokens",
+        "total_cache_write_tokens",
+        "unpriced_cache_models",
+    )
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # present-only: a falsy cache line item was not measured, so the
+        # envelope stays silent about it rather than claiming a zero.
+        for k in self._CACHE_ENVELOPE_KEYS:
+            if not d.get(k):
+                d.pop(k, None)
+        return d
 
 
 @dataclass

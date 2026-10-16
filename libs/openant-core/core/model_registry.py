@@ -163,7 +163,17 @@ def pricing_map(provider: str) -> dict[str, dict[str, float]]:
     out: dict[str, dict[str, float]] = {}
     for rec in recs:  # pass 1: exact keys win
         price = rec["price"]
-        out[rec["id"]] = {"input": float(price["input"]), "output": float(price["output"])}
+        entry = {"input": float(price["input"]), "output": float(price["output"])}
+        # #626: cache multipliers (read / write, as multipliers of the base
+        # input rate) ride the entry when the record carries them; a record
+        # without them prices cached usage as INCOMPLETE (the tracker's
+        # unpriced-cache path), never $0.
+        cache = rec.get("cache")
+        if isinstance(cache, dict) and cache.get("read") is not None:
+            entry["cache_read"] = float(cache["read"])
+            if cache.get("write") is not None:
+                entry["cache_write"] = float(cache["write"])
+        out[rec["id"]] = entry
     for rec in recs:  # pass 2: aliases fill absent keys only
         entry = out[rec["id"]]
         for alias in _alias_spellings(rec["id"]):
@@ -196,6 +206,43 @@ def max_output_tokens(provider: str, model: str) -> int | None:
     if rec is None:
         return None
     cap = rec.get("max_output_tokens")
+    return int(cap) if cap else None
+
+
+def context_window_tokens(provider: str, model: str) -> int | None:
+    """The model's documented TOTAL context-window capacity (input + output
+    combined), in tokens, or ``None`` when unknown.
+
+    Fix B (Auto Patcher release hardening): feeds ``utilities.autopatcher.
+    technical_capacity``'s per-call source-evidence ceiling -- the real
+    replacement for the arbitrary stage-local character constants
+    (``planner_evidence``/``final_target_slice``/``post_patch_recovery``)
+    that previously gated whether already-resolved repository evidence
+    ever reached an LLM call. ``None`` (no ``context_window_tokens``
+    record for this model -- true for every model today; this field ships
+    unpopulated, see ``config/models.json``'s own schema) routes the
+    caller to ONE documented conservative fallback
+    (``technical_capacity.CONSERVATIVE_FALLBACK_CONTEXT_WINDOW_TOKENS``)
+    -- never a per-model or per-stage guess.
+
+    Alias-tolerant, exactly like ``pricing_map``/``max_output_tokens``:
+    bare, vendor-prefixed, dotted and dashed spellings resolve to the same
+    record. Missing config raises via ``require_models`` (fail-loud, same
+    contract as pricing/``max_output_tokens``) -- an entirely missing
+    ``config/models.json`` is an installation problem, not a capacity
+    question.
+    """
+    recs = [rec for rec in require_models() if rec.get("provider") == provider]
+    by_id = {rec["id"]: rec for rec in recs}
+    rec = by_id.get(model)
+    if rec is None:
+        for rec_ in recs:  # alias pass
+            if model in _alias_spellings(rec_["id"]):
+                rec = rec_
+                break
+    if rec is None:
+        return None
+    cap = rec.get("context_window_tokens")
     return int(cap) if cap else None
 
 
