@@ -28,7 +28,7 @@ sleep 60 &
 exec >&-
 exit 1
 `)
-	res, err := Invoke(s, []string{"analyze", "."}, "", true, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "", nil)
 	if el := time.Since(start); el > 45*time.Second {
 		t.Fatalf("the deadline must fire (~30s); took %v — the test would be vacuous", el)
 	}
@@ -63,7 +63,7 @@ exit 2
 	r, w, _ := os.Pipe()
 	old := os.Stderr
 	os.Stderr = w
-	_, _ = Invoke(s, []string{"analyze", "."}, "", false, "")
+	_, _ = Invoke(s, []string{"analyze", "."}, "", false, "", nil)
 	os.Stderr = old
 	w.Close()
 	b, _ := io.ReadAll(r)
@@ -102,7 +102,7 @@ func TestInvoke_InterruptWinsOverDeadlineDiagnosis(t *testing.T) {
 		_ = p.Signal(syscall.SIGINT)
 	}()
 
-	res, err := Invoke(s, []string{"analyze", "."}, "", true, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "", nil)
 	if err != nil {
 		t.Fatalf("the interrupt must win over the deadline diagnosis: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestInvoke_Exit0WithHeldPipeIsNotADeadlineKill(t *testing.T) {
 exec >&-
 exit 0
 `)
-	res, err := Invoke(s, []string{"analyze", "."}, "", true, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "", nil)
 	if el := time.Since(start); el > 45*time.Second {
 		t.Fatalf("the deadline must fire (~30s); took %v — the test would be vacuous", el)
 	}
@@ -186,7 +186,7 @@ func TestInvoke_EnvelopeThenGenuineKill_Exit2WithSuccess(t *testing.T) {
 	s := writeScript(t, `printf '{"status":"success","errors":[]}'
 sleep 60
 `)
-	res, err := Invoke(s, []string{"analyze", "."}, "", true, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "", nil)
 	if el := time.Since(start); el > 45*time.Second {
 		t.Fatalf("the deadline must fire (~30s); took %v — the test would be vacuous", el)
 	}
@@ -207,7 +207,7 @@ func TestInvoke_NullStdoutIsNotAnEnvelope(t *testing.T) {
 	t.Setenv("OPENANT_INVOKE_TIMEOUT", "60s")
 	s := writeScript(t, `printf 'null'
 `)
-	res, err := Invoke(s, []string{"analyze", "."}, "", true, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "", nil)
 	if err != nil {
 		t.Fatalf("valid-but-not-an-envelope stdout surfaces as an error envelope, not an error: %v", err)
 	}

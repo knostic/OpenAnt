@@ -37,57 +37,151 @@
 # sha512 against the registry's dist.integrity and the inner file's
 # sha256 against the committed bytes — never trust the diff's own numbers.
 #
-# marked-18.0.13.min.js (the #583 patch bump from 18.0.12; the #332 recipe)
-#   source: https://cdn.jsdelivr.net/npm/marked@18.0.13/lib/marked.umd.js
-#   npm anchor: registry.npmjs.org/marked/-/marked-18.0.13.tgz
-#   dist.integrity (of the .tgz, not of the inner file): sha512-xTxVzZsBFwunP6HDmtBkabUQEYArnP7/rMDGmPj9SlrKlQ4i8MdYVow+nJL0eOqwpUqhzBoTBRADGN6uYwPyOw==
-#   sha256: b147274a9ce27d17276587167e49483d719f6893eeca3a3667a59797661d3556
-#   verified: 2026-09-13 — the tarball sha512 was re-derived and MATCHED the
-#         registry dist.integrity at write time; the committed bytes are the
-#         tarball's lib/marked.umd.js, verbatim (the 18.x tarball ships no
-#         root .min.js since v16 — the -<semver>.min.js NAME is kept for
-#         the version-suffix + notifier conventions; the file IS
-#         upstream-minified (jsdelivr's synthesized .umd.min.js was
-#         deliberately NOT vendored: it strips the version banner and is
-#         not a registry artifact).
-#         Upstream delta 18.0.12 -> 18.0.13: SEVEN bug fixes (re-derived
-#         from the upstream release notes, not the renovate body — the
-#         #583 review round's correction): #4087 (tabs in the thematic
-#         break that ends a list item), #4090 (O(n^2) reflinkSearch —
-#         perf/DoS-relevant for attacker-authored markdown), #4077 (case
-#         fold reference link labels), #4075 (drop leading whitespace
-#         after a hard line break), #4072 (html block start conditions
-#         when ending a list item), #4066 (respect raw tokens when
-#         closing link labels), #4080 (strip a tab following spaces in
-#         an indented code block). The two-oracle render differential
-#         (raw + post-DOMPurify) ran as out-of-band verification at this
-#         version with corpus items exercising EACH of the seven fixed
-#         shapes. OBSERVED (24 items, two oracles): 22/24 identical
-#         post-sanitize; 2 NAMED deltas, both the fixes' OWN intended
-#         behavior changes — #4075 (the leading whitespace after a hard
-#         break is dropped: "backslash<br>\n   next" -> "backslash<br>next")
-#         and #4080 (a tab following spaces in an indented code block is
-#         stripped: "\tcontinue" -> "continue"). The other five fixes
-#         (#4087, #4090, #4077, #4072, #4066) showed 0 deltas on their
-#         exercised shapes. Both deltas are benign rendering changes on
-#         the untrusted-markdown path; DOMPurify's boundary and the
-#         nonce CSP are unaffected.
+# marked-18.1.1.min.js (the #678 minor bump from 18.0.13; the #332 recipe)
+#   source: https://cdn.jsdelivr.net/npm/marked@18.1.1/lib/marked.umd.js
+#   npm anchor: registry.npmjs.org/marked/-/marked-18.1.1.tgz
+#   dist.integrity (of the .tgz, not of the inner file): sha512-zEGgrtUG8crk+TrMacJSVABU4DYDDkS8uqgU3ohrn/2fW9C2AEfUrO3m6IhpIpQpl7YcVpiXXC9cSMWDANT3dg==
+#   sha256: b82b9334406d8bdd16b6236c08de1cb65b2a859873ca9503d9cc0b292ca3c12a
+#   verified: 2026-10-13 — the tarball sha512 was re-derived and MATCHED the
+#         registry dist.integrity at write time (its sha1 also matched
+#         dist.shasum); the committed bytes are the tarball's
+#         lib/marked.umd.js, verbatim, 47,956 bytes, banner "marked v18.1.1"
+#         (the 18.x tarball ships no root .min.js since v16 — the
+#         -<semver>.min.js NAME is kept for the version-suffix + notifier
+#         conventions; the file IS upstream-minified; jsdelivr's synthesized
+#         .umd.min.js was deliberately NOT vendored: it strips the version
+#         banner and is not a registry artifact).
+#         Upstream delta 18.0.13 -> 18.1.1: NINETEEN changes across THREE
+#         releases (re-derived from the upstream release notes, not the
+#         renovate body — the #583 review round's standing correction; the
+#         branch body excerpts ONE of them).
+#         18.0.14: #4095 (indented lines in setext heading text), #4076
+#         (decode numeric character references in text), #4101 (keep text
+#         after an empty nested blockquote), #4086 (preserve internal tabs
+#         in list item content), #4091 (strip whitespace when normalizing
+#         link reference labels), #4067 (GFM protocol autolinks).
+#         18.1.0: #4106 (avoid CUBIC BACKTRACKING on unicode whitespace in a
+#         link destination — complexity/DoS-relevant on attacker-authored
+#         markdown, the headline of this bump), #4107 (reject unbalanced
+#         parentheses in link destinations), #4100 (CLI config load — not on
+#         this app's path), + feature #4070 (linkParenPossible lexer state,
+#         fail-fast for link token generation — the companion to #4106/#4107).
+#         18.1.1: #4121 (make walkTokens LINEAR by appending values in place
+#         — complexity-relevant), #4114 (match pre/script/style/textarea as
+#         WHOLE tag names in html blocks), #4124 (let indented and type 3-5
+#         html blocks interrupt a paragraph), #4115 (end a blockquote before
+#         a lazy line after a heading, hr or html block), #4111 (keep a
+#         decoded character reference from forming a new one), #4117 (keep a
+#         backslash in a code span from hiding emphasis), #4123 (preserve
+#         enclosing link state after parsing images), #4119 (respect tab
+#         stops in list continuation indentation), #4113 (CLI empty-string
+#         input — not on this app's path), + perf #4082 (avoid repeated raw
+#         string copies in nested lists — complexity-relevant).
+#         RENDER DIFFERENTIAL (raw marked.parse, 18.0.13's committed blob vs
+#         these bytes, out-of-band at write time). The browser-smoke canary
+#         (testdata/browser-smoke/golden_input.md, every MD_SANITIZE class):
+#         BYTE-IDENTICAL, 1,905 bytes both sides — golden_expected.html does
+#         not move on this bump. A 21-shape corpus, ONE SHAPE PER FIX:
+#         16 identical, 5 NAMED deltas, each the corresponding fix's own
+#         intended behavior change — #4076 ("a &#35; b" -> "a # b": numeric
+#         character references in TEXT are now decoded, then escaped again on
+#         output), #4086 (internal tabs in a list item are preserved rather
+#         than expanded), #4107 (an unbalanced paren in a link destination no
+#         longer forms a link — strictly tighter), #4115 (a blockquote now
+#         ends before a lazy line following a heading/hr/html block), #4124
+#         (an indented or type-3-5 html block now interrupts a paragraph).
+#         SANITIZER-BOUNDARY probes on the one decoding change (#4076), 7
+#         shapes: a decoded "&#60;script&#62;" is RE-ESCAPED on output
+#         ("&lt;script&gt;") and forms no tag; the href and title entity
+#         shapes render identically at both versions. No new raw-markup or
+#         event-handler class; DOMPurify (unmoved by this commit) remains the
+#         content boundary and the route-scoped nonce CSP is unaffected.
+#         STATED LIMIT, honestly: this is the ONE-SHAPE-PER-FIX differential,
+#         not the #583 round's two-oracle (raw + post-DOMPurify) sweep over a
+#         real scan-summary corpus. That wider sweep is OWED to this PR's
+#         review round — the 2 deltas #583 found were invisible to its own
+#         first, narrower corpus, which is why this limit is written down
+#         instead of implied.
 #
-# dompurify-3.4.15.min.js
-#   source: https://cdn.jsdelivr.net/npm/dompurify@3.4.15/dist/purify.min.js
-#   npm anchor: registry.npmjs.org/dompurify/-/dompurify-3.4.15.tgz
-#   dist.integrity (of the .tgz, not of the inner file): sha512-EUBjM+B+lkDE41iE82DDSCfkoPGfXx8IxFxPMjNzm/Uk4xDet77rTN9wqlxlVg71kK7XGuUMv6wUxJUwwv+Xyw==
-#   sha256: f263b05369e050fa175d4ecb9c9358eb4253602d510297adfb31df48b2f1c4d5
-#   verified: 2026-09-12 — the tarball sha512 was re-derived and MATCHED the
-#         registry dist.integrity at write time; the committed bytes are the
-#         tarball's dist/purify.min.js, verbatim. Currency bump from 3.4.13
-#         (the pre-#577 blob was itself genuine — byte-identical to the
-#         3.4.13 dist, and 3.4.13 is the version that fixed the
-#         GHSA-55q2-fjhq-7xh7 advisory). 3.4.14 and 3.4.15 carry no advisory
-#         ids; upstream's notes name bypass preconditions (risky tags
-#         allow-listed; XML-content clobbering) that this app's inert
-#         MD_SANITIZE allowlist does not meet — this is a hygiene/currency
-#         bump of the sole sanitizer, not a claim that a known exploit is
-#         closed. The trailing sourceMappingURL comment references a map the
-#         /assets route never serves (allowlisted) — cosmetic, kept verbatim
-#         for byte fidelity.
+# dompurify-3.4.17.min.js (the #717 patch bump from 3.4.15; the #332 recipe)
+#   source: https://cdn.jsdelivr.net/npm/dompurify@3.4.17/dist/purify.min.js
+#   npm anchor: registry.npmjs.org/dompurify/-/dompurify-3.4.17.tgz
+#   dist.integrity (of the .tgz, not of the inner file): sha512-B/pSlYVHQ58kqISD/yDjuJ1yfzI34m1gF4lAod2bwSRhiN4K5Cl3H8Af7hqB2PmTL911tdEudnnXn5FnhRoz0w==
+#   sha256: cd37898f9782adf54820c413191b5691803f0f137c799d6edcfd38523b4c2c31
+#   verified: 2026-10-16 — the tarball sha512 was re-derived and MATCHED the
+#         registry dist.integrity at write time (its sha1 also matched
+#         dist.shasum, 074bbb24eaa419535ac19ffe7f663104b0e1543d); the
+#         committed bytes are the tarball's dist/purify.min.js, verbatim,
+#         29,828 bytes, banner "DOMPurify 3.4.17". The out-of-band
+#         cross-check the LIMITATION note above demands was ALSO run: the
+#         jsDelivr copy of dompurify@3.4.17/dist/purify.min.js is
+#         BYTE-IDENTICAL to the registry tarball's inner file (same sha256),
+#         and the SUPERSEDED 3.4.15 blob's own sha256 was re-derived from the
+#         3.4.15 registry tarball and matched the record it is replacing
+#         (f263b053…, 29,369 B) — i.e. the previous entry was genuine and the
+#         extraction convention is unchanged. Two cosmetic byte-shape
+#         differences from 3.4.15, kept verbatim for fidelity: the file no
+#         longer ends in a newline, and a `;` precedes the trailing
+#         sourceMappingURL comment (3.4.16 migrated the build from rollup to
+#         rolldown — a MINIFIER change, not a source change). The
+#         sourceMappingURL still references a map the /assets route never
+#         serves (not allowlisted in handleAsset) — cosmetic.
+#         Upstream delta 3.4.15 -> 3.4.17: TWELVE changes across TWO releases
+#         (re-derived from the upstream GitHub release notes, not the
+#         renovate body — the #583 review round's standing correction).
+#         3.4.16 (2026-09-23): IN_PLACE node removal with hooks; IN_PLACE
+#         sanitization with raw-text roots; ESM default exports landing in
+#         CommonJS declarations; the rollup -> rolldown build migration
+#         (performance); dependency bumps.
+#         3.4.17 (2026-10-12): IN_PLACE + SAFE_FOR_TEMPLATES + shadow roots;
+#         IN_PLACE handling of nodes that hooks or custom elements touch
+#         during sanitization; the SMIL `attributeName` guard in XHTML mode;
+#         hardening of smaller edge cases (namespaces, literal-text
+#         elements, `isValidAttribute()`); a purify-edge compatibility test
+#         runner; an IN_PLACE README risk note; dependency bumps.
+#         NO ADVISORY IDS in either release — this is a currency/hygiene bump
+#         of the sole sanitizer, not a claim that a known exploit is closed.
+#         REACH, stated honestly: this app calls `DOMPurify.sanitize(string,
+#         MD_SANITIZE)` and assigns the returned STRING to innerHTML. It sets
+#         no IN_PLACE, no SAFE_FOR_TEMPLATES, no RETURN_DOM*, no hooks, no
+#         setConfig, and touches no shadow root (grep-verified across all
+#         four embedded pages), and the pages are HTML, never XHTML — so the
+#         IN_PLACE family (most of both releases) and the XHTML-mode SMIL
+#         guard are OFF THIS APP'S PATH. The on-path items are the 3.4.17
+#         namespace / literal-text-element / isValidAttribute hardening.
+#         SANITIZE DIFFERENTIAL (the two-oracle sweep #583's review round
+#         declared OWED and #678's narrower one-shape corpus did not pay —
+#         run here, out-of-band, jsdom in a vm realm per version, the
+#         MD_SANITIZE golden copied verbatim from ui/vendor_test.go):
+#         ORACLE 1, 50 raw shapes (one per ALLOWED_TAGS/ALLOWED_ATTR class,
+#         one per FORBID floor entry, the javascript:/data:/vbscript:/
+#         protocol-relative/entity-encoded URL families, on*-handler shapes,
+#         the mXSS families named by the release notes — noscript, svg
+#         foreignObject, mglyph+style, table+form, annotation-xml — the
+#         literal-text elements — textarea, title, xmp, plaintext, iframe
+#         srcdoc — the SMIL attributeName/animate/xlink namespace shapes,
+#         custom elements, template, slot, and the SAFE_FOR_TEMPLATES
+#         mustache/ERB expression shapes): 50 of 50 BYTE-IDENTICAL, 0 deltas.
+#         The execution-class assertion held on BOTH versions for all 50: no
+#         script/iframe/svg/math/style/form/img/object/embed/link/base/meta
+#         element, no on* attribute, and no javascript:/vbscript: URL
+#         survives the policy at either version.
+#         ORACLE 2, the pages' REAL pipeline (marked.parse -> sanitize ->
+#         the innerHTML string): the browser-smoke canary
+#         testdata/browser-smoke/golden_input.md renders BYTE-IDENTICAL,
+#         1,565 bytes both sides — golden_expected.html does not move on this
+#         bump — plus a 10-shape markdown corpus (raw-html script/img, GFM
+#         autolink, javascript: link, table, code fence, an html block whose
+#         attribute value contains '>', numeric character references, nested
+#         blockquote+list, heading attr): 10 of 10 identical, 0 deltas.
+#         PROTOTYPE-POLLUTION re-verification (the defense-in-depth claim
+#         ui/vendor_test.go records): polluting Object.prototype with
+#         ADD_TAGS / ALLOWED_TAGS / ALLOW_UNKNOWN_PROTOCOLS inside the
+#         sanitizer's own realm leaves the output byte-identical at BOTH
+#         3.4.15 and 3.4.17 — the config reader still ignores inherited keys.
+#         STATED LIMIT, honestly: the corpora above are hand-built shape
+#         corpora, not a sweep over a real scan-summary archive; a behaviour
+#         change reachable only from markup no shape above spells would be
+#         invisible to it. What the differential DOES establish is that every
+#         policy class this app pins, every family the two releases' own
+#         notes name, and the live golden render are unmoved.

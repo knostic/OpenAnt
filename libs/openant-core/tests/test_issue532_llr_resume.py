@@ -76,11 +76,17 @@ class FakeTracker:
     def get_unit_usage(self):
         return dict(self._current)
 
+    # **kw, not a fixed keyword list: llm_reachability wraps its
+    # add_prior_usage call in `except Exception: pass` (accounting must never
+    # kill the pass), so a stub that rejects a NEW keyword makes this stage
+    # look like it injected nothing at all instead of failing loudly. #626
+    # added unpriced_cache_models and this stub swallowed the whole
+    # injection until it was widened. Keep it permissive.
     def add_prior_usage(self, input_tokens, output_tokens, cost_usd,
-                        unpriced_models=None):
+                        unpriced_models=None, **kw):
         self.prior_calls.append(
             {"input_tokens": input_tokens, "output_tokens": output_tokens,
-             "cost_usd": cost_usd})
+             "cost_usd": cost_usd, **kw})
 
 
 def _binding(adapter):
