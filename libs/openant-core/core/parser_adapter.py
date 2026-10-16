@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -34,6 +35,52 @@ from utilities.prune_telemetry import compute_prune_telemetry
 
 # Root of openant-core (where parsers/ lives)
 _CORE_ROOT = Path(__file__).parent.parent
+
+# AUTOPATCHER_PARSER_QUIET (additive, opt-in env var -- see
+# parsers/python/parse_repository.py's own module docstring on it) is set
+# only by Auto Patcher (utilities.autopatcher, via core/patch.py), and only
+# outside its own --verbose mode. `openant parse`/`analyze` and standalone
+# CLI use never set it, so their console output is completely unaffected by
+# the checks below -- this module's wrapper-level "[Parser] Running..."/
+# "Auto-detected language:"/"...complete: N units" lines only go quiet for
+# Auto Patcher's own default/quiet runs.
+def _verbose_parser_output() -> bool:
+    return not bool(os.environ.get("AUTOPATCHER_PARSER_QUIET"))
+
+
+# Presentation-only, additive: while active, a parse_repository() call
+# skips its own human-facing "repository analyzed" summary line entirely
+# (currently: the Python path's compact summary -- see
+# parsers/python/parse_repository.py) instead of repeating it. Used by
+# Auto Patcher's Post-Patch Investigation (utilities.autopatcher.
+# pipeline.py), which re-parses an isolated, patched copy of the repository
+# as an internal implementation detail of its own stage -- not a second
+# "repository analyzed" event the terminal should announce. Never affects
+# parsing itself, verbose output (AUTOPATCHER_PARSER_QUIET unset already
+# shows the complete report for every call, suppressed or not), or any
+# return value. A depth counter (not a bool) so nested/re-entrant calls
+# degrade safely rather than one inner call's exit clearing an outer one's
+# suppression.
+_suppress_summary_depth = 0
+
+
+@contextlib.contextmanager
+def suppress_summary_announcement():
+    """See module-level comment above. Usage::
+
+        with suppress_summary_announcement():
+            parse_repository(repo_path, output_dir)
+    """
+    global _suppress_summary_depth
+    _suppress_summary_depth += 1
+    try:
+        yield
+    finally:
+        _suppress_summary_depth -= 1
+
+
+def _summary_announcement_suppressed() -> bool:
+    return _suppress_summary_depth > 0
 
 # JS parser directory (holds its own package.json / node_modules)
 _JS_PARSER_DIR = _CORE_ROOT / "parsers" / "javascript"
@@ -158,7 +205,8 @@ def parse_repository(
     # Detect language if auto
     if language == "auto":
         language = detect_language(repo_path)
-        print(f"  Auto-detected language: {language}", file=sys.stderr)
+        if _verbose_parser_output():
+            print(f"  Auto-detected language: {language}", file=sys.stderr)
 
     # Dispatch to the right parser via the registry.
     try:
@@ -723,7 +771,8 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
     The Python parser has a clean `parse_repository()` function that we can
     call directly (it's the best-structured of the three).
     """
-    print("[Parser] Running Python parser...", file=sys.stderr)
+    if _verbose_parser_output():
+        print("[Parser] Running Python parser...", file=sys.stderr)
 
     # Import and call directly — the Python parser is well-structured
     parser_dir = str(_CORE_ROOT / "parsers" / "python")
@@ -739,6 +788,10 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
         "dataset_name": name or Path(repo_path).name,
         "output_dir": output_dir,  # For intermediate files
         "skip_tests": skip_tests,
+        # Presentation-only passthrough -- see suppress_summary_announcement()
+        # above. Never read for anything other than parse_repository.py's
+        # own compact "Repository analyzed" summary line.
+        "suppress_summary": _summary_announcement_suppressed(),
     }
 
     dataset, analyzer_output = _py_parse(repo_path, options)
@@ -752,7 +805,8 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
     write_json(dataset_path, dataset)
     write_json(analyzer_output_path, analyzer_output)
     units_count = len(dataset.get("units", []))
-    print(f"  Python parser complete: {units_count} units", file=sys.stderr)
+    if _verbose_parser_output():
+        print(f"  Python parser complete: {units_count} units", file=sys.stderr)
 
     return ParseResult(
         dataset_path=dataset_path,
@@ -767,15 +821,92 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
 # JavaScript/TypeScript parser
 # ---------------------------------------------------------------------------
 
+def _lock_dependency_pins(lock_path: Path) -> dict[str, tuple[str | None, str | None]]:
+    """Map ``node_modules/...`` path -> ``(version, integrity)`` from a lockfile.
+
+    Reads both npm lockfile flavours with the same code: the committed
+    ``package-lock.json`` and the ``node_modules/.package-lock.json`` npm
+    leaves behind in an installed tree.
+
+    Three kinds of entry are EXCLUDED, because the two files legitimately
+    disagree about them and comparing them would report a correct tree as
+    stale -- which would re-run ``npm install`` on every single parse:
+
+    * the root ``""`` entry -- it describes this project rather than a
+      dependency, and only the committed file carries it;
+    * ``optional`` entries -- the lockfile enumerates every platform's
+      prebuilt native binary, and a machine installs only the one matching
+      it (here: one of the ``@typescript/typescript-*`` set);
+    * ``dev`` entries -- a production install omits devDependencies.
+
+    Integrity is compared alongside the version: a republished tarball keeps
+    the version string and changes the hash.
+
+    Raises:
+        ValueError: the file is not a lockfile shape (including torn JSON).
+        OSError: the file could not be read.
+    """
+    data = read_json(lock_path)
+    if not isinstance(data, dict):
+        raise ValueError(f"{lock_path}: lockfile is not a JSON object")
+    packages = data.get("packages")
+    if not isinstance(packages, dict):
+        raise ValueError(f"{lock_path}: lockfile has no 'packages' object")
+
+    pins: dict[str, tuple[str | None, str | None]] = {}
+    for name, meta in packages.items():
+        if not name:
+            continue  # the root entry
+        if not isinstance(meta, dict):
+            raise ValueError(f"{lock_path}: lockfile entry {name!r} is not an object")
+        if meta.get("optional") or meta.get("dev"):
+            continue
+        pins[name] = (meta.get("version"), meta.get("integrity"))
+    return pins
+
+
 def _js_deps_installed() -> bool:
-    """Return True only if a *complete* npm install has previously succeeded.
+    """Return True only if a *complete and current* npm install is in place.
 
     Checking that ``node_modules/`` exists is not enough: a prior install that
     was killed (Ctrl+C, OOM, disk full) leaves a partial directory. npm writes
     ``node_modules/.package-lock.json`` at the *end* of a successful install,
     so we use that as the completion sentinel.
+
+    The sentinel's EXISTENCE is not enough either: it records that an install
+    finished, not that it installed what ``package-lock.json`` now pins. On
+    its own it made a lockfile bump -- a transitive security upgrade, say --
+    a no-op for every checkout that had already bootstrapped once: the
+    sentinel was still there, so the bootstrap skipped and the outdated tree
+    was reused indefinitely. So the sentinel is also COMPARED against the
+    committed lockfile, and a mismatch re-runs the install.
     """
-    return (_JS_PARSER_DIR / "node_modules" / ".package-lock.json").is_file()
+    marker = _JS_PARSER_DIR / "node_modules" / ".package-lock.json"
+    if not marker.is_file():
+        return False
+
+    committed_lock = _JS_PARSER_DIR / "package-lock.json"
+    if not committed_lock.is_file():
+        # Nothing to be stale relative to: keep the completion sentinel as
+        # the sole signal, exactly as before.
+        return True
+
+    try:
+        installed = _lock_dependency_pins(marker)
+        required = _lock_dependency_pins(committed_lock)
+    except (OSError, ValueError):
+        # A torn or unreadable lockfile is NOT an error to raise from here.
+        # npm rewrites the marker in place, so a concurrent bootstrap can be
+        # observed mid-write, and both call sites below run this check --
+        # including the fast path outside the lock. Report "not installed"
+        # and let the caller re-bootstrap under the lock.
+        return False
+
+    # SYMMETRIC equality, not "is everything the lock requires present?". An
+    # EXTRA installed package is a dependency the lockfile no longer pins (a
+    # removed or downgraded transitive) and it stays importable on disk until
+    # the install is redone, so it has to read as stale too.
+    return installed == required
 
 
 # #325: the npm-install bootstrap bound — the parse-step convention (PR
@@ -998,7 +1129,8 @@ def _parse_via_subprocess(
     if spec.bootstrap == "npm":
         _ensure_js_parser_dependencies()
 
-    print(f"[Parser] Running {language} parser...", file=sys.stderr)
+    if _verbose_parser_output():
+        print(f"[Parser] Running {language} parser...", file=sys.stderr)
 
     parser_script = parser_script_path(language)
     if parser_script is None:
@@ -1029,17 +1161,38 @@ def _parse_via_subprocess(
     if library_mode:
         cmd.append("--library-mode")
 
-    result = subprocess.run(
-        cmd,
-        stdout=sys.stderr,
-        stderr=sys.stderr,
-        cwd=str(_CORE_ROOT),
-        timeout=1800,  # 30 min — large repos, tree-sitter/Node/Go toolchains
-        # #303: the child resolves THIS checkout by construction — the shared
-        # venv's editable .pth (re-pointable mid-scan by a concurrent session)
-        # cannot win over an explicit PYTHONPATH entry.
-        env=child_interpreter_env(),
-    )
+    # Under AUTOPATCHER_PARSER_QUIET (Auto Patcher's default/quiet modes
+    # only), the child's stdout -- its full "PARSER PIPELINE TEST" progress
+    # report -- goes to a temporary file instead of the terminal and is
+    # replayed only if the parser fails. A file, not a pipe: a grandchild
+    # that inherits the descriptor can never block us on a pipe. The
+    # child's stderr is untouched. Unset (every other command), output is
+    # exactly as before.
+    with (contextlib.nullcontext(None) if _verbose_parser_output()
+          else tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")) as quiet_stdout:
+
+        def _replay_quiet_stdout() -> None:
+            if quiet_stdout is not None:
+                quiet_stdout.seek(0)
+                sys.stderr.write(quiet_stdout.read())
+
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=quiet_stdout if quiet_stdout is not None else sys.stderr,
+                stderr=sys.stderr,
+                cwd=str(_CORE_ROOT),
+                timeout=1800,  # 30 min — large repos, tree-sitter/Node/Go toolchains
+                # #303: the child resolves THIS checkout by construction — the shared
+                # venv's editable .pth (re-pointable mid-scan by a concurrent session)
+                # cannot win over an explicit PYTHONPATH entry.
+                env=child_interpreter_env(),
+            )
+        except Exception:  # timeout, OSError, ...: replay, then propagate unchanged
+            _replay_quiet_stdout()
+            raise
+        if result.returncode != 0:
+            _replay_quiet_stdout()
 
     if result.returncode != 0:
         raise RuntimeError(f"{language} parser failed with exit code {result.returncode}")
@@ -1053,7 +1206,8 @@ def _parse_via_subprocess(
         data = read_json(dataset_path)
         units_count = len(data.get("units", []))
 
-    print(f"  {language} parser complete: {units_count} units", file=sys.stderr)
+    if _verbose_parser_output():
+        print(f"  {language} parser complete: {units_count} units", file=sys.stderr)
 
     return ParseResult(
         dataset_path=dataset_path,

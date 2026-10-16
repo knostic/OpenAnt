@@ -11,7 +11,12 @@
         "output": 25.0
       },
       "source": "verified against live Anthropic pricing (Claude Opus 4.8 = $5/$25 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-09-01) and the live OpenRouter catalogue (anthropic/claude-opus-4.8 = $5.00/$25.00 per 1M, openrouter.ai/api/v1/models, 2026-09-01) — both live sources agree; the prior 15.00/75.00 was the retired Opus 4.1-era shipped-table rate, never re-verified (#344)",
-      "retrieved": "2026-09-01"
+      "retrieved": "2026-09-01",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
     },
     {
       "id": "claude-sonnet-4-6",
@@ -22,7 +27,12 @@
         "output": 15.0
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Anthropic pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
     },
     {
       "id": "claude-haiku-4-5-20251001",
@@ -33,7 +43,12 @@
         "output": 5.0
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Anthropic pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
     },
     {
       "id": "claude-sonnet-5",
@@ -44,7 +59,12 @@
         "output": 10.0
       },
       "source": "verified against live Anthropic pricing (Claude Sonnet 5 = $2/$10 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-09-18 — the page's note: the $2/$10 launch pricing is now the STANDARD price, the previously scheduled 2026-09-01 increase to $3/$15 will not occur) and the live OpenRouter catalogue (anthropic/claude-sonnet-5 = $2.00/$10.00 per 1M, openrouter.ai/api/v1/models, 2026-09-18) — both live sources agree",
-      "retrieved": "2026-09-18"
+      "retrieved": "2026-09-18",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
     },
     {
       "id": "claude-opus-5",
@@ -55,7 +75,12 @@
         "output": 25.0
       },
       "source": "verified against live Anthropic pricing (Claude Opus 5 = $5/$25 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-09-18) and the live OpenRouter catalogue (anthropic/claude-opus-5 = $5.00/$25.00 per 1M, openrouter.ai/api/v1/models, 2026-09-18) — both live sources agree; the OpenRouter anthropic/fast endpoint at $10/$50 is the fast-mode SKU, not the catalogue rate",
-      "retrieved": "2026-09-18"
+      "retrieved": "2026-09-18",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
     },
     {
       "id": "claude-fable-5",
@@ -66,7 +91,12 @@
         "output": 50.0
       },
       "source": "verified against live Anthropic pricing (Claude Fable 5 = $10/$50 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-09-18) and the live OpenRouter catalogue (anthropic/claude-fable-5 = $10.00/$50.00 per 1M, openrouter.ai/api/v1/models, 2026-09-18) — both live sources agree",
-      "retrieved": "2026-09-18"
+      "retrieved": "2026-09-18",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
     },
     {
       "id": "claude-fable-5-1",
@@ -77,7 +107,12 @@
         "output": 50.0
       },
       "source": "verified against live Anthropic pricing (Claude Fable 5.1 = $10/$50 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-09-18); the live OpenRouter catalogue serves it at the same rate (anthropic/claude-fable-5.1 = $10.00/$50.00 per 1M, openrouter.ai/api/v1/models, 2026-09-18) — both live sources agree",
-      "retrieved": "2026-09-18"
+      "retrieved": "2026-09-18",
+      "cache": {
+        "read": 0.025,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): 5-minute cache write 1.25x; cache read 0.025x — the documented Fable 5.1 / Mythos 5.1 exception (2.5% of the base input price)"
+      }
     },
     {
       "id": "claude-mythos-5",
@@ -88,7 +123,12 @@
         "output": 50.0
       },
       "source": "verified against live Anthropic pricing (Claude Mythos 5 = $10/$50 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-09-18 — limited availability, the glasswing program); OpenRouter does not serve this model (404, openrouter.ai, 2026-09-18), so the direct provider's page is the single source",
-      "retrieved": "2026-09-18"
+      "retrieved": "2026-09-18",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
     },
     {
       "id": "claude-mythos-5-1",
@@ -99,7 +139,12 @@
         "output": 50.0
       },
       "source": "verified against live Anthropic pricing (Claude Mythos 5.1 = $10/$50 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-09-18 — limited availability, the glasswing program); OpenRouter does not serve this model (404, openrouter.ai, 2026-09-18), so the direct provider's page is the single source",
-      "retrieved": "2026-09-18"
+      "retrieved": "2026-09-18",
+      "cache": {
+        "read": 0.025,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): 5-minute cache write 1.25x; cache read 0.025x — the documented Fable 5.1 / Mythos 5.1 exception (2.5% of the base input price)"
+      }
     },
     {
       "id": "claude-opus-4-7",
@@ -110,7 +155,12 @@
         "output": 25.0
       },
       "source": "verified against live Anthropic pricing (Claude Opus 4.7 = $5/$25 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-09-18 — fast mode is not available on this model, per the page's fast-mode section); the live OpenRouter catalogue serves it at the same rate (anthropic/claude-opus-4.7 = $5.00/$25.00 per 1M, openrouter.ai/api/v1/models, 2026-09-18) — both live sources agree",
-      "retrieved": "2026-09-18"
+      "retrieved": "2026-09-18",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
     },
     {
       "id": "claude-mythos-preview",

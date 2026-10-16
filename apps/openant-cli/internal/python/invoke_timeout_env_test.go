@@ -84,7 +84,7 @@ func TestInvoke_EnvTimeoutBoundsHang(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = Invoke(hang, []string{"parse", "."}, "", true, "")
+		_, _ = Invoke(hang, []string{"parse", "."}, "", true, "", nil)
 	}()
 
 	select {
