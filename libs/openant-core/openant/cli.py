@@ -75,6 +75,19 @@ def _output_json(data: dict):
     sys.stdout.write("\n")
 
 
+def _positive_int(value: str) -> int:
+    """argparse `type=` validator for --max-context-budget-windows -- a
+    positive integer only, no unbounded sentinel (e.g. 0/-1/"unlimited")
+    accepted."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return parsed
+
+
 from core.verdict_taxonomy import (SEVERITIES as _SEVERITY_ORDER, SEVERITY_FINDING_VERDICTS,
                                    severity_display_verdict)
 
@@ -106,6 +119,36 @@ def _severity_source_for_result(result: dict, displayed_verdict: str = None) -> 
     if sev in _SEVERITY_ORDER and src == "model":
         return "model"
     return src if src in ("corrected", "derived") else "derived"
+
+
+def _deferred_edges(unit: dict) -> list:
+    """#745: the unit's dataset call edges, BOTH directions, as id strings.
+
+    The delegation-dismissed SAFE row's concern went elsewhere — and the
+    corpus's delegations go UP ("the actual open-redirect risk exists at the
+    callers": the row's direct_callers) and DOWN ("the dangerous operation
+    lives in a helper this unit calls": direct_calls). Both edge sets are the
+    followable ones (the same ids the result rows key on), so the row carries
+    the union, deduped, order-stable.
+
+    The #305 convention ("never a crash"): a malformed dataset entry —
+    metadata not a dict, direct_calls/direct_callers not a list — reads as no
+    edge, never a TypeError and never a char-split of a string value (the
+    dataset is parser-produced, but the read is guarded like every other
+    boundary the row build performs).
+    """
+    meta = unit.get("metadata") if isinstance(unit, dict) else None
+    if not isinstance(meta, dict):
+        return []
+    out: list = []
+    for key in ("direct_calls", "direct_callers"):
+        vals = meta.get(key)
+        if isinstance(vals, list):
+            # only STRING ids (what the parsers emit): a malformed element
+            # (None, a bool, a dict) is dropped, never str()-cast into a
+            # phantom id that renders as an edge.
+            out.extend(c for c in vals if isinstance(c, str))
+    return list(dict.fromkeys(out))
 
 
 def _unit_start_line(unit: dict) -> int:
@@ -873,6 +916,108 @@ def cmd_dynamic_test(args):
         return 2
 
 
+def cmd_patch(args):
+    """Generate and evaluate a candidate remediation for a Finding or a known CVE."""
+    from core.patch import run_patch, run_patch_cve
+    from core.schemas import success, error
+    from core.step_report import step_context
+    from utilities.autopatcher import progress
+    from utilities.autopatcher.context_budget import ContextBudgetController
+
+    # Presentation only -- configured once, at the very top, before any
+    # pipeline work: --quiet wins over --verbose (see progress.configure's
+    # own docstring), matching the Go CLI's own --quiet/--verbose
+    # precedence. Read by pipeline.py/llm_client.py/the repository parser
+    # as module-global state for the rest of this process -- see
+    # utilities/autopatcher/progress.py's module docstring for why a
+    # global, not a threaded parameter, is the smallest correct design
+    # here.
+    progress.configure(
+        verbose=bool(getattr(args, "verbose", False)),
+        quiet=bool(getattr(args, "quiet", False)),
+    )
+
+    finding_id = getattr(args, "finding_id", None)
+    cve = getattr(args, "cve", None)
+
+    if bool(finding_id) == bool(cve):
+        _output_json(error("exactly one of --finding-id or --cve is required"))
+        return 2
+
+    if cve and not args.repo_root:
+        _output_json(error("--cve requires --repo-root"))
+        return 2
+
+    if finding_id and not args.pipeline_output:
+        _output_json(error("pipeline_output is required when using --finding-id"))
+        return 2
+
+    output_dir = args.output or tempfile.mkdtemp(prefix="openant_patch_")
+
+    # Fix B: --context-budget-policy/--max-context-budget-windows no longer
+    # gate whether resolved repository evidence reaches an LLM call -- that
+    # is now always bounded by the real per-call technical capacity of the
+    # active model (see utilities.autopatcher.technical_capacity), never by
+    # an arbitrary "budget window" count. Both flags are still ACCEPTED
+    # (so an existing script/CI invocation that already passes them keeps
+    # working) but are otherwise inert here -- see patch_p.add_argument(...)
+    # above for the full deprecation help text. A single, one-time notice
+    # fires on this process's stderr whenever either was explicitly passed,
+    # so a caller relying on the old numeric behavior finds out immediately
+    # rather than silently getting different (correct) behavior.
+    if getattr(args, "context_budget_policy", None) is not None or getattr(
+        args, "max_context_budget_windows", None
+    ) is not None:
+        print(
+            "warning: --context-budget-policy/--max-context-budget-windows no longer "
+            "control whether repository evidence reaches an LLM call -- that is now "
+            "always bounded by the model's real technical context capacity. Both "
+            "flags are accepted for compatibility but have no further effect.",
+            file=sys.stderr,
+        )
+    budget_controller = ContextBudgetController()
+    compare_existing_tests = bool(getattr(args, "compare_existing_tests", False))
+
+    try:
+        if cve:
+            with step_context("patch", output_dir, inputs={"cve": cve}) as ctx:
+                result = run_patch_cve(
+                    cve_id=cve,
+                    repo_root=args.repo_root,
+                    output_dir=output_dir,
+                    budget_controller=budget_controller,
+                    compare_existing_tests=compare_existing_tests,
+                )
+                ctx.outputs = {
+                    "vulnerability_path": result.vulnerability_path,
+                    "trust_report_path": result.trust_report_path,
+                }
+        else:
+            with step_context("patch", output_dir, inputs={
+                "pipeline_output_path": os.path.abspath(args.pipeline_output),
+                "finding_id": finding_id,
+            }) as ctx:
+                result = run_patch(
+                    pipeline_output_path=args.pipeline_output,
+                    finding_id=finding_id,
+                    output_dir=output_dir,
+                    repo_root=args.repo_root,
+                    budget_controller=budget_controller,
+                    compare_existing_tests=compare_existing_tests,
+                )
+                ctx.outputs = {
+                    "vulnerability_path": result.vulnerability_path,
+                    "trust_report_path": result.trust_report_path,
+                }
+
+        _output_json(success(result.to_dict()))
+        return 0
+
+    except Exception as e:
+        _output_json(error(str(e)))
+        return 2
+
+
 def _default_report_output(results_path: str, fmt: str) -> str:
     """Derive a sensible default output path based on format."""
     reports_dir = os.path.join(os.path.dirname(os.path.abspath(results_path)), "final-reports")
@@ -1010,6 +1155,36 @@ def cmd_checkpoint_status(args):
         return 2
 
 
+def _unrecognized_verdict_rows(findings, verdict_order):
+    """#679: the off-enum rows — a verdict matching no canonical group
+    (and NOT the canonical 'error' spelling, which Stage-1 stamps for
+    analysis failures — those are RECOGNIZED). They were dropped entirely
+    (the omission surface of the false-clean); a local ERROR display
+    group makes them visible without touching the enum."""
+    known = set(verdict_order) | {"error"}
+    return [f for f in findings if f.get("verdict") not in known]
+
+
+def _remediation_for_unrecognized(actionable, error_rows):
+    """#679: the honest remediation message — the false-clean text is
+    suppressed when unclassifiable rows exist (either the canonical
+    error verdict or an off-enum spelling)."""
+    if not actionable and not error_rows:
+        return "<p>No vulnerabilities or security concerns found. All code units are either safe or properly protected.</p>"
+    if not actionable and error_rows:
+        n_err = sum(1 for f in error_rows if f.get("verdict") == "error")
+        n_unknown = len(error_rows) - n_err
+        parts = []
+        if n_err:
+            parts.append(f"{n_err} errored")
+        if n_unknown:
+            parts.append(f"{n_unknown} with an unrecognized verdict")
+        return ("<p>No actionable findings, but "
+                f"{', '.join(parts)} unit(s) were not classified. "
+                "Review them manually.</p>")
+    return None  # the actionable path takes the LLM call
+
+
 def cmd_report_data(args):
     """Prepare pre-computed report data as JSON for the Go HTML renderer.
 
@@ -1096,6 +1271,15 @@ def cmd_report_data(args):
 
             # --- Prepare findings ---
             units_by_id = {u["id"]: u for u in dataset.get("units", [])}
+            # #745: the scan's row keys — a delegation-dismissed SAFE row's
+            # named callees are checked against THIS set so the evaporation
+            # case (a pruned or absent sink-owner: no result row anywhere)
+            # is surfaced on the row instead of lost in the reasoning prose.
+            _scan_route_keys = {
+                str(r.get("route_key", ""))
+                for r in experiment.get("results", [])
+                if isinstance(r, dict)
+            }
 
             verdict_order = list(FINDING_VERDICT_ORDER)
             verdict_colors = {
@@ -1168,6 +1352,19 @@ def cmd_report_data(args):
                     dt_status = dt_result.get("status", "")
                     dt_details = dt_result.get("details", "")
 
+                # #745: the delegation-dismissed SAFE row's followable edge.
+                # The analysis scope is function-local by construction
+                # ("ANALYZE THIS FUNCTION ONLY"), so a SAFE row whose
+                # dangerous operation lives elsewhere names its edge units
+                # HERE — the dataset's call edges in BOTH directions (the
+                # corpus's delegations go UP: the risk at the callers; and
+                # DOWN: the danger in a callee), the same ids the result rows
+                # key on — instead of losing the edge in the reasoning prose;
+                # and a named edge unit with no result row (pruned by the
+                # reachability filter or never analyzed) is surfaced as
+                # rowless, so the evaporation case is distinguishable from
+                # an examined-and-safe one.
+                _deferred = _deferred_edges(unit)
                 findings.append({
                     "verdict": verdict,
                     "verdict_color": verdict_colors.get(verdict, "#6c757d"),
@@ -1186,6 +1383,11 @@ def cmd_report_data(args):
                     "dynamic_test_details": dt_details,
                     "start_line": _unit_start_line(unit),
                     "number": 0,  # assigned after sort
+                    **({"scope": "function_local",
+                        "deferred_to": _deferred,
+                        "deferred_rowless": [
+                            c for c in _deferred if c not in _scan_route_keys]}
+                       if verdict == "safe" else {}),
                 })
 
             # Sort by verdict priority, then by dynamic test status within each group
@@ -1205,6 +1407,22 @@ def cmd_report_data(args):
             ]
 
             findings_by_verdict = []
+            # #679: the assembly + the message live in the testable helper
+            # #679 (the T1 round): the visible-not-classified group carries
+            # BOTH the canonical error rows and the off-enum spellings —
+            # the wording distinguishes them (the html_report.py convention).
+            _error_group = ([f for f in findings if f.get("verdict") == "error"]
+                            + _unrecognized_verdict_rows(findings, verdict_order))
+            if _error_group:
+                findings_by_verdict.append({
+                    "verdict": "error",
+                    "verdict_color": "#6c42f5",
+                    "count": len(_error_group),
+                    "open_by_default": True,
+                    "findings": _error_group,
+                    "subgroups": [],
+                    "has_subgroups": False,
+                })
             for v in verdict_order:
                 group = [f for f in findings if f["verdict"] == v]
                 if not group:
@@ -1258,8 +1476,9 @@ def cmd_report_data(args):
             # --- Remediation guidance (LLM call) ---
             actionable = [f for f in findings if f["verdict"] in ("vulnerable", "bypassable", "inconclusive")]
 
-            if not actionable:
-                remediation_html = "<p>No vulnerabilities or security concerns found. All code units are either safe or properly protected.</p>"
+            _msg = _remediation_for_unrecognized(actionable, _error_group)
+            if _msg is not None:
+                remediation_html = _msg
             else:
                 # attack_vector and analysis are untrusted Stage-1/2 LLM output.
                 # Interpolated raw they could inject prompt instructions (or a
@@ -1908,6 +2127,95 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     dt_p.set_defaults(func=cmd_dynamic_test)
+
+    # ---------------------------------------------------------------
+    # patch — generate and evaluate a candidate remediation for a finding
+    # ---------------------------------------------------------------
+    patch_p = subparsers.add_parser(
+        "patch", help="Generate and evaluate a candidate remediation for a finding or a known CVE"
+    )
+    patch_p.add_argument(
+        "pipeline_output", nargs="?", default=None,
+        help="Path to pipeline_output.json (required unless --cve is given)",
+    )
+    patch_p.add_argument(
+        "--finding-id", help="ID of the finding to remediate (mutually exclusive with --cve)"
+    )
+    patch_p.add_argument(
+        "--cve", help="CVE identifier to fetch from NVD and remediate (mutually exclusive with --finding-id)"
+    )
+    patch_p.add_argument(
+        "--repo-root", help="Path to the target repository root (required when using --cve)"
+    )
+    patch_p.add_argument("--output", "-o", help="Output directory (default: temp dir)")
+    patch_p.add_argument(
+        "--context-budget-policy",
+        choices=["ask", "always", "never"],
+        default=None,
+        help=(
+            "DEPRECATED, accepted for compatibility only: no longer controls "
+            "whether repository evidence reaches an LLM call. That is now "
+            "always bounded by the active model's real technical context "
+            "capacity (see the Fix B release notes), never by an arbitrary "
+            "'budget window' count. Passing this has no further effect "
+            "beyond a one-time deprecation notice."
+        ),
+    )
+    patch_p.add_argument(
+        "--max-context-budget-windows",
+        type=_positive_int,
+        default=None,
+        help=(
+            "DEPRECATED, accepted for compatibility only: no longer caps "
+            "anything -- see --context-budget-policy's own help text. "
+            "Passing this has no further effect beyond a one-time "
+            "deprecation notice."
+        ),
+    )
+    patch_p.add_argument(
+        "--compare-existing-tests",
+        action="store_true",
+        help=(
+            "Opt-in, off by default: after the candidate patch settles, "
+            "discover how this repository prepares/runs its existing "
+            "tests and run that same test plan once against an isolated, "
+            "unpatched copy and once against an isolated, patched copy, "
+            "then report which tests newly fail after the patch (a "
+            "factual delta -- OpenAnt does not judge whether that change "
+            "is intended). This builds an isolated Docker test "
+            "environment and may download the repository's own "
+            "dependencies as part of that (Docker required -- never "
+            "falls back to running tests on the host). Supported "
+            "runtimes only (currently Python, Node, Go); anything else "
+            "reports Not Verified. Adds a new, observability-only Trust "
+            "Signal and report section -- does not change the "
+            "Recommendation."
+        ),
+    )
+    patch_p.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Show detailed progress: the repository parser's full "
+            "Phase 1-4 report, per-stage diagnostic telemetry (hunk "
+            "repair, relocation, applicability retries, evidence "
+            "acquisition rounds, etc.), and any fatal error's full "
+            "traceback. Default output is a concise, structured summary; "
+            "this adds the underlying detail without changing anything "
+            "that gets decided."
+        ),
+    )
+    patch_p.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Suppress this run's human-readable progress narration on "
+            "stderr entirely (the JSON envelope on stdout is unaffected). "
+            "Set automatically by the Go CLI when its own --quiet or "
+            "--json flag is used; can also be passed directly here."
+        ),
+    )
+    patch_p.set_defaults(func=cmd_patch)
 
     # ---------------------------------------------------------------
     # report — generate reports from results

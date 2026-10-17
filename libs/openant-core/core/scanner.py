@@ -245,6 +245,45 @@ def same_model_verification_note(analyze_binding, verify_binding) -> str | None:
     return None
 
 
+def _post_verify_metrics(analyze_metrics, verify_result) -> "AnalysisMetrics":
+    """#681: the post-verify envelope, extracted — ONE authority the tests
+    can drive. The folds (previously inline in scan_repository):
+
+    - ``inconclusive`` += disagreed_inconclusive (#509: an explicitly
+      unconfirmable finding threads to inconclusive, never into safe).
+    - ``protected`` += disagreed_protected (#622: protected-by-controls,
+      not inherently-safe) AND #681: += consistency_protected (an agreed
+      row the consistency pass rewrote — the destination previously
+      reached NO envelope column: the analysis metrics counted the
+      Stage-1 verdict and disagreed_* counts only agree=False rows, so
+      the envelope was the outlier surface against its own recount).
+    - ``safe`` += disagreed (#622: only genuine downgrades to safe) AND
+      #681: += consistency_safe (the same sum-to-total property).
+    - #679: an unrecognised verdict never reaches the disagreed arm — it
+      counts as error_count upstream.
+    """
+    return AnalysisMetrics(
+        total=analyze_metrics.total,
+        vulnerable=verify_result.confirmed_vulnerabilities,
+        bypassable=0,
+        inconclusive=analyze_metrics.inconclusive
+        + getattr(verify_result, "disagreed_inconclusive", 0)
+        + getattr(verify_result, "consistency_inconclusive", 0),
+        protected=analyze_metrics.protected
+        + getattr(verify_result, "disagreed_protected", 0)
+        + getattr(verify_result, "consistency_protected", 0),
+        safe=analyze_metrics.safe
+        + getattr(verify_result, "disagreed", 0)
+        + getattr(verify_result, "consistency_safe", 0),
+        errors=analyze_metrics.errors + verify_result.error_count,
+        verified=verify_result.findings_verified,
+        stage2_agreed=verify_result.agreed,
+        stage2_disagreed=verify_result.disagreed,
+        stage2_disagreed_protected=verify_result.disagreed_protected,
+        needs_review=verify_result.needs_review,
+    )
+
+
 def scan_repository(
     repo_path: str,
     output_dir: str,
@@ -1267,33 +1306,8 @@ def scan_repository(
                 # (``needs_review``) or that errored (``error_count``) must NOT inflate
                 # ``safe`` — they are preserved Stage-1 potential vulnerabilities
                 # awaiting manual review. Errors stay in the ``errors`` bucket.
-                result.metrics = AnalysisMetrics(
-                    total=analyze_result.metrics.total,
-                    vulnerable=verify_result.confirmed_vulnerabilities,
-                    bypassable=0,
-                    # #509: a Stage-2 disagreement corrected to
-                    # ``inconclusive`` is an explicitly-unconfirmable finding —
-                    # it threads into inconclusive, NEVER into safe (the
-                    # plain-disagreement fold below covers only genuine
-                    # downgrades to safe).
-                    inconclusive=analyze_result.metrics.inconclusive
-                    + verify_result.disagreed_inconclusive,
-                    # #622: a disagreement corrected to ``protected`` is
-                    # protected-by-controls — the destination category
-                    # reaches the scan metrics (the recount always counted
-                    # it here; the scanner fold was the only divergence).
-                    protected=analyze_result.metrics.protected
-                    + verify_result.disagreed_protected,
-                    # #622: the residual ``disagreed`` (corrected to safe or
-                    # an unrecognised verdict) is ALL that folds into safe.
-                    safe=analyze_result.metrics.safe + verify_result.disagreed,
-                    errors=analyze_result.metrics.errors + verify_result.error_count,
-                    verified=verify_result.findings_verified,
-                    stage2_agreed=verify_result.agreed,
-                    stage2_disagreed=verify_result.disagreed,
-                    stage2_disagreed_protected=verify_result.disagreed_protected,
-                    needs_review=verify_result.needs_review,
-                )
+                result.metrics = _post_verify_metrics(
+                    analyze_result.metrics, verify_result)
             except Exception as e:
                 print(f"  WARNING: Verification failed: {e}", file=sys.stderr)
                 print("  Continuing with unverified Stage 1 results.", file=sys.stderr)
@@ -1462,7 +1476,11 @@ def scan_repository(
             try:
                 # Thread the scan's --llm-config through to the report phase
                 # (else it silently falls back to the file's default_llm).
-                generate_summary_report(pipeline_output_path, summary_path, llm_config_name)
+                # #684: thread the SCAN'S validated registry — the report
+                # uses the config the scan validated at startup (no disk
+                # re-read, no second paid probe mid-scan)
+                generate_summary_report(pipeline_output_path, summary_path,
+                                        llm_config_name, registry=registry)
                 result.summary_path = summary_path
                 outputs["summary_path"] = summary_path
                 print(f"  Summary: {summary_path}", file=sys.stderr)
@@ -1473,7 +1491,8 @@ def scan_repository(
             # Only generate disclosures if there are findings
             if has_findings:
                 try:
-                    generate_disclosure_docs(pipeline_output_path, disclosures_dir, llm_config_name)
+                    generate_disclosure_docs(pipeline_output_path, disclosures_dir,
+                                           llm_config_name, registry=registry)
                     outputs["disclosures_dir"] = disclosures_dir
                     print(f"  Disclosures: {disclosures_dir}", file=sys.stderr)
                 except Exception as e:
@@ -1909,6 +1928,22 @@ def _write_scan_report(
     total_output = sum(
         sr.get("token_usage", {}).get("output_tokens", 0) for sr in step_reports
     )
+    # #626/PR#661 hunt F3: the per-step cache deltas (step_report.py writes
+    # them present-only under these names) and the cache-unpriced model ids.
+    # Both were absent from the rebuild, so the scan-level artifact lost the
+    # cache token volume AND the attribution for a cache-only incompleteness.
+    _cache_read = sum(
+        sr.get("token_usage", {}).get("cache_read", 0) or 0
+        for sr in step_reports
+    )
+    _cache_write = sum(
+        sr.get("token_usage", {}).get("cache_write", 0) or 0
+        for sr in step_reports
+    )
+    _unpriced_cache = {
+        m for sr in step_reports
+        for m in (sr.get("token_usage", {}).get("unpriced_cache_models") or [])
+    }
 
     # #285: carry the derived status/errors onto the ScanResult so the
     # envelope and downstream consumers see the degraded scan.
@@ -2006,14 +2041,36 @@ def _write_scan_report(
             "input_tokens": total_input,
             "output_tokens": total_output,
             "total_tokens": total_input + total_output,
+            # #626/PR#661 hunt F3: the cache line items are real traffic
+            # and the rebuild dropped them, so the operator's aggregate read
+            # 11 000 tokens for a step that moved 101 000. Summed across the
+            # step reports under the step reports' own key names, present-only
+            # (a no-cache scan's token_usage keeps exactly the three keys
+            # above). Deliberately NOT folded into input_tokens/total_tokens:
+            # the uncached/cached split is the billing-reconciliation shape
+            # the tracker, the call record and UsageInfo all keep (#626).
+            **({"cache_read": _cache_read} if _cache_read else {}),
+            **({"cache_write": _cache_write} if _cache_write else {}),
             # #216: the aggregate rebuilds token_usage from the step
             # reports — OR-aggregate the incomplete-cost marker across them
             # (a rebuild must not drop the advisory).
+            #
+            # PR#661 hunt F3: ``unpriced_cache_models`` is OR-aggregated the
+            # same way. It was dropped here, one hop downstream of the
+            # F661-2 fix that added it to the step report, so a
+            # cache-only-incomplete scan shipped
+            # {"cost_incomplete": true, "unpriced_models": []} — incomplete
+            # with NO model named, the exact shape F661-2 deleted upstream.
+            # The e2e harness reads this artifact and printed
+            # "cost INCOMPLETE — unpriced: [unknown]" for it. Present-only,
+            # so a #216-only incomplete scan is byte-identical to before.
             **({
                 "cost_incomplete": True,
                 "unpriced_models": sorted({m for sr in step_reports
                                            for m in (sr.get("token_usage", {})
                                                      .get("unpriced_models") or [])}),
+                **({"unpriced_cache_models": sorted(_unpriced_cache)}
+                   if _unpriced_cache else {}),
             } if any(sr.get("token_usage", {}).get("cost_incomplete")
                      for sr in step_reports) else {}),
             # #605: the accounting-drop marker OR-aggregates across the step

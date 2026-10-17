@@ -1,0 +1,239 @@
+name: CI Workflow
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (Python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint Python (undefined names, syntax errors)
+        working-directory: libs/openant-core
+        run: ruff check .
+
+  python-tests:
+    name: Python tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.repository == 'knostic/OpenAnt' && fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: |
+            libs/openant-core/requirements.txt
+            libs/openant-core/pyproject.toml
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: libs/openant-core/parsers/javascript/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: libs/openant-core/parsers/go/go_parser/go.mod
+          cache-dependency-path: libs/openant-core/parsers/go/go_parser/go.mod
+
+      - name: Install Python dependencies
+        working-directory: libs/openant-core
+        run: pip install -r requirements.txt && pip install ".[dev]"
+
+      - name: Cache JS parser node_modules
+        id: cache-node-modules
+        uses: actions/cache@v6
+        with:
+          path: libs/openant-core/parsers/javascript/node_modules
+          key: ${{ runner.os }}-jsparser-nodemodules-${{ hashFiles('libs/openant-core/parsers/javascript/package-lock.json') }}
+
+      - name: Install JS parser dependencies
+        if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        working-directory: libs/openant-core/parsers/javascript
+        run: npm ci
+
+      - name: Build go_parser binary (Linux/macOS)
+        if: runner.os != 'Windows'
+        working-directory: libs/openant-core/parsers/go/go_parser
+        run: go build -o go_parser .
+
+      - name: Build go_parser binary (Windows)
+        if: runner.os == 'Windows'
+        working-directory: libs/openant-core/parsers/go/go_parser
+        run: go build -o go_parser.exe .
+
+      - name: Run Python and parser tests
+        working-directory: libs/openant-core
+        run: python -m pytest tests/ -v
+
+  go-tests:
+    name: Go build + integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      OPENANT_PYTHON: python
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.repository == 'knostic/OpenAnt' && fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: apps/openant-cli/go.mod
+          cache-dependency-path: apps/openant-cli/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: |
+            libs/openant-core/requirements.txt
+            libs/openant-core/pyproject.toml
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: libs/openant-core/parsers/javascript/package-lock.json
+
+      - name: Vet
+        working-directory: apps/openant-cli
+        run: go vet ./...
+
+      - name: Run Go unit tests
+        working-directory: apps/openant-cli
+        run: go test ./... -v
+
+      - name: Build (Linux/macOS)
+        if: runner.os != 'Windows'
+        working-directory: apps/openant-cli
+        run: go build -o openant .
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        working-directory: apps/openant-cli
+        run: go build -o openant.exe .
+
+      - name: Verify binary exists
+        working-directory: apps/openant-cli
+        shell: bash
+        run: |
+          if [ -f openant ] || [ -f openant.exe ]; then
+            echo "Binary built successfully"
+          else
+            echo "ERROR: Binary not found" && exit 1
+          fi
+
+      - name: Install Python dependencies
+        working-directory: libs/openant-core
+        run: pip install -r requirements.txt && pip install ".[dev]"
+
+      - name: Cache JS parser node_modules
+        id: cache-node-modules
+        uses: actions/cache@v6
+        with:
+          path: libs/openant-core/parsers/javascript/node_modules
+          key: ${{ runner.os }}-jsparser-nodemodules-${{ hashFiles('libs/openant-core/parsers/javascript/package-lock.json') }}
+
+      - name: Install JS parser dependencies
+        if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        working-directory: libs/openant-core/parsers/javascript
+        run: npm ci
+
+      - name: Run Go CLI integration tests
+        working-directory: libs/openant-core
+        run: python -m pytest tests/test_go_cli.py -v --tb=short
+
+  report-css:
+    name: Report CSS reproducibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: apps/openant-cli/internal/report/tailwind/package-lock.json
+
+      - name: Regenerate report.css from the pinned recipe
+        working-directory: apps/openant-cli/internal/report/tailwind
+        # NB: -o regen.css, NOT ../vendor/report.css — writing to the
+        # committed path would make the cmp compare the file against ITSELF
+        # (vacuously green on divergence). The distinct output is load-bearing.
+        run: |
+          npm ci --ignore-scripts
+          ./node_modules/.bin/tailwindcss -c tailwind.config.js -i input.css -o regen.css --minify
+
+      - name: Compare with the committed bytes
+        run: cmp apps/openant-cli/internal/report/tailwind/regen.css apps/openant-cli/internal/report/vendor/report.css
+
+      - name: Clean the regen artifact
+        working-directory: apps/openant-cli/internal/report/tailwind
+        run: rm -f regen.css
+
+  browser-smoke:
+    name: Browser CSP smoke + golden render
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: apps/openant-cli/internal/server/testdata/browser-smoke/package-lock.json
+
+      - name: Install Playwright + Chromium
+        working-directory: apps/openant-cli/internal/server/testdata/browser-smoke
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: apps/openant-cli/go.mod
+
+      - name: Run the browser smoke (real-browser CSP enforcement + the golden render oracle)
+        working-directory: apps/openant-cli
+        env:
+          OPENANT_BROWSER_TESTS: "1"
+        run: go test ./internal/server/ -run TestBrowserSmoke -v -count=1
