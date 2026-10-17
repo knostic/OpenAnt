@@ -1,7 +1,7 @@
 """Tests for the JavaScript parser pipeline.
 
 Requires Node.js and npm dependencies installed:
-  cd parsers/javascript && npm install
+  cd parsers/javascript && npm ci
 """
 import json
 import subprocess

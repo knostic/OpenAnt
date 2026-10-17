@@ -4,7 +4,9 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -28,6 +30,12 @@ type CallGraphBuilder struct {
 	// (handlers[k]()) records edges to every referenced function —
 	// over-seed, the safe direction for reachability.
 	containersByFile map[string]map[string][]string
+
+	// #747: module path declared by each go.mod in the scanned tree -> that go.mod's
+	// repo-relative directory ("." for the scan root). An import path is
+	// module-qualified while a funcID directory is repo-relative, so this map is what
+	// makes the two comparable EXACTLY instead of by trailing-component guesswork.
+	moduleDirs map[string]string
 
 	// Built-in functions to skip
 	builtins map[string]bool
@@ -77,12 +85,18 @@ func NewCallGraphBuilder(repoPath string) *CallGraphBuilder {
 		methodsByType:    make(map[string][]string),
 		importsByFile:    make(map[string]map[string]string),
 		containersByFile: make(map[string]map[string][]string),
+		moduleDirs:       make(map[string]string),
 		builtins:         builtins,
 	}
 }
 
 // BuildCallGraph builds the call graph from extracted functions
 func (c *CallGraphBuilder) BuildCallGraph(analyzer *AnalyzerOutput) (*CallGraph, error) {
+	// #747: read the module path of every go.mod in the tree BEFORE resolution, so that a
+	// package-qualified call resolves its import path to the one directory the module
+	// layout says it means, instead of guessing from the path's trailing components.
+	c.loadModulePaths(analyzer)
+
 	// Build indexes
 	c.buildIndexes(analyzer)
 
@@ -161,6 +175,119 @@ func (c *CallGraphBuilder) buildIndexes(analyzer *AnalyzerOutput) {
 		// #299: collect file-scope dispatch containers from the same parse
 		c.collectFileContainers(fullPath, funcInfo.FilePath)
 	}
+}
+
+// loadModulePaths records the module path declared by every go.mod that covers a scanned
+// file: for each extracted file, that file's own directory and every ancestor UP TO the
+// scan root -- never above it, because the parser does not read outside the tree it was
+// pointed at (the same boundary the scanner enforces by refusing symlinks). Every module
+// root that could hold a resolvable callee is reached this way: a callee's directory
+// contains an extracted function, and that directory's module root is one of its ancestors.
+//
+// Each directory is visited at most once -- reaching a visited directory means its
+// ancestors are done too, since the walk always continues to the root. A module path
+// declared twice in one tree (a copied module) keeps the lexicographically smallest
+// directory, so the map never depends on Go map iteration order.
+func (c *CallGraphBuilder) loadModulePaths(analyzer *AnalyzerOutput) {
+	seen := make(map[string]bool)
+	upward := ".." + string(filepath.Separator)
+	for _, funcInfo := range analyzer.Functions {
+		dir := filepath.Dir(funcInfo.FilePath)
+		for !seen[dir] {
+			seen[dir] = true
+			// Defensive: filepath.Rel in the extractor cannot produce a ".."
+			// component for a file a walk rooted at repoPath found, and a go.mod
+			// outside the scanned tree is out of scope either way.
+			if dir == ".." || strings.HasPrefix(dir, upward) {
+				break
+			}
+			if modPath := readModulePath(filepath.Join(c.repoPath, dir, "go.mod")); modPath != "" {
+				relDir := filepath.ToSlash(dir)
+				if prev, ok := c.moduleDirs[modPath]; !ok || relDir < prev {
+					c.moduleDirs[modPath] = relDir
+				}
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+}
+
+// readModulePath returns the module path declared by the go.mod at path, or "" when there
+// is no readable go.mod there or it declares no module. go.mod is parsed here instead of
+// with golang.org/x/mod/modfile because this module has no dependencies and must build
+// offline, and only the `module` directive is needed. The go.mod grammar permits the path
+// to be quoted and permits the directive in factored form (`module ( example.com/m )`), so
+// both are handled; a line merely STARTING with "module" inside another directive's
+// parenthesised block is not a module directive and is skipped.
+func readModulePath(path string) string {
+	// R2-1 (fable T1 r2): a go.mod may arrive as a SYMLINK (git mode 120000
+	// survives clone), and os.ReadFile FOLLOWS it — a hostile `go.mod ->
+	// /dev/zero` (or a FIFO) then hangs/OOMs the parser on a one-line repo
+	// (measured: 40 GB RSS before timeout). The scanner refuses symlinks for
+	// .go files (scanner.go:95, the boundary this walk cites); go.mod walked
+	// here received no such vetting — Lstat is the same gate, never Stat.
+	if fi, err := os.Lstat(path); err != nil || fi.Mode()&os.ModeType != 0 {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	inBlock, wantPath := false, false
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+		if line == "" {
+			continue
+		}
+		switch {
+		case wantPath:
+			if strings.HasPrefix(line, ")") {
+				return ""
+			}
+			return goModToken(line)
+		case inBlock:
+			if strings.HasPrefix(line, ")") {
+				inBlock = false
+			}
+		case line == "module", strings.HasPrefix(line, "module "),
+			strings.HasPrefix(line, "module\t"), strings.HasPrefix(line, "module("):
+			rest := strings.TrimSpace(strings.TrimPrefix(line, "module"))
+			rest = strings.TrimSpace(strings.TrimPrefix(rest, "("))
+			rest = strings.TrimSpace(strings.TrimSuffix(rest, ")"))
+			if rest == "" {
+				wantPath = true
+				continue
+			}
+			return goModToken(rest)
+		case strings.HasSuffix(line, "("):
+			inBlock = true
+		}
+	}
+	return ""
+}
+
+// goModToken reads the first whitespace-separated token of a go.mod line, unquoting it
+// when the grammar's quoted form was used. An unparseable quoted token yields "", which
+// readModulePath reports as "no module declared" rather than as a path.
+func goModToken(line string) string {
+	tok := line
+	if i := strings.IndexAny(tok, " \t"); i >= 0 {
+		tok = tok[:i]
+	}
+	if strings.HasPrefix(tok, `"`) || strings.HasPrefix(tok, "`") {
+		if unquoted, err := strconv.Unquote(tok); err == nil {
+			return unquoted
+		}
+		return ""
+	}
+	return tok
 }
 
 // collectFileContainers parses a file (full mode, once, cached) and records
@@ -866,23 +993,160 @@ func (c *CallGraphBuilder) resolvePackageCall(funcName, pkgAlias, currentFile st
 		return ""
 	}
 
-	// Match by the package's directory (the last component of the resolved import path), NOT the
-	// user-chosen alias. funcID is "<relPath>:<Name>", so a function's package is the directory its
-	// file lives in. The old code tested strings.Contains(funcID, pkgAlias): it used the alias (so
-	// aliased imports failed to resolve) and matched any funcID merely CONTAINING the alias as a
-	// substring (so it emitted edges to unrelated packages).
-	pkgDir := filepath.Base(pkgPath)
-	for _, funcID := range c.functionsByName[funcName] {
-		filePart := funcID
-		if ci := strings.LastIndex(funcID, ":"); ci >= 0 {
-			filePart = funcID[:ci]
-		}
-		if filepath.Base(filepath.Dir(filePart)) == pkgDir {
-			return funcID
-		}
+	// Match the candidate's package DIRECTORY against the resolved IMPORT PATH, NOT the
+	// user-chosen alias and NOT merely the path's last component. funcID is
+	// "<relPath>:<Name>", so a function's package is the directory its file lives in. The
+	// original code tested strings.Contains(funcID, pkgAlias): it used the alias (so aliased
+	// imports failed to resolve) and matched any funcID merely CONTAINING the alias as a
+	// substring (so it emitted edges to unrelated packages). Matching on the import path's
+	// last component fixed both of those and introduced a third: every sibling directory
+	// named "config" is a candidate for an import of "command/agent/config", and the loop
+	// returned the FIRST such candidate out of c.functionsByName -- a slice appended under
+	// map iteration in buildIndexes -- so the winner was the wrong package, and a DIFFERENT
+	// wrong package per process. Same defect and same remedy as resolveMethodCall above:
+	// score EVERY candidate and pick deterministically instead of returning the first match.
+	//
+	// WHICH candidate is the imported package is decided in two steps, and only the first
+	// one is exact:
+	//
+	//  1. If a go.mod in the scanned tree declares a module path that covers pkgPath, the
+	//     import path names exactly one directory -- <that go.mod's directory>/<the rest of
+	//     the import path> -- and only a candidate in THAT directory is the imported
+	//     package. This is what the go command itself does. It is also the only step that
+	//     can tell `example.com/x/app/config` (the module is `example.com/x/app` at the
+	//     root, so the package is `config/`) from the sibling directory `app/config/`, and
+	//     the only one that can follow a nested module whose path does not mirror its
+	//     directory -- including the ordinary major-version form, `sdk/go.mod` declaring
+	//     `.../sdk/v2`, where no directory is ever named "v2".
+	//  2. Otherwise -- an import of a module that is not in this tree, or a tree scanned
+	//     from BELOW its go.mod -- fall back to the heuristic: how many WHOLE path
+	//     components of the candidate's directory match the tail of the import path
+	//     (pathSuffixDepth), deepest wins. Whole components are what reject a
+	//     same-basename sibling ("a/config" is not a component suffix of "fx/z/config"),
+	//     and the module prefix is allowed to be absent because a funcID directory is
+	//     repo-relative. This step GUESSES which candidate the import meant, so it is
+	//     never consulted when step 1 applies.
+	//
+	// In both steps a non-method beats a method of the same name in that package (a
+	// package-qualified call reaches a function), and an otherwise genuine tie -- two
+	// build-tagged files in ONE directory -- breaks on the lexicographically smallest
+	// funcID, as resolveMethodCall does. See bestCandidate.
+	if wantDir, ok := c.moduleRelDir(pkgPath); ok {
+		return c.bestCandidate(funcName, func(dir string) int {
+			if dir == wantDir {
+				return 1
+			}
+			return 0
+		})
 	}
 
-	return ""
+	// DECLARED LIMITATION, deliberate: when no go.mod in the tree covers the import path AND
+	// no candidate directory is a component suffix of it, there is no candidate and no edge
+	// -- where the basename test produced one by guessing (deterministically with a single
+	// same-basename candidate, differently per process with several). A guessed edge is a
+	// FABRICATION, not a reachability-safe over-approximation -- over-seeding real API is
+	// safe, a wrong edge misleads reachability -- so it is not kept. The shapes that reach
+	// here are an import of a module outside the scanned tree (where no in-tree edge is
+	// correct anyway) and a scan rooted BELOW the enclosing go.mod, which the parser cannot
+	// read because it never reads above its scan root. Orphan-rate telemetry is the
+	// downstream signal if a tree is affected.
+	return c.bestCandidate(funcName, func(dir string) int { return pathSuffixDepth(pkgPath, dir) })
+}
+
+// moduleRelDir translates a resolved import path into the repo-relative directory that
+// must hold that package, using the module paths declared by the scanned tree's go.mod
+// files, and reports whether any of them covers the path at all. The LONGEST (most
+// specific) module path wins, exactly as in the go command: with `github.com/o/bao` at the
+// root and `github.com/o/bao/sdk/v2` at `sdk/`, an import of
+// `github.com/o/bao/sdk/v2/helper/jsonutil` is `sdk/helper/jsonutil`, never
+// `sdk/v2/helper/jsonutil`. Two DIFFERENT module paths of equal length cannot both prefix
+// one import path, so the winner is unique and independent of map iteration order. A
+// major-version suffix needs no special case: it is part of the declared module path, so
+// the prefix match consumes it instead of comparing it to a directory name.
+func (c *CallGraphBuilder) moduleRelDir(importPath string) (string, bool) {
+	bestMod, bestDir := "", ""
+	for modPath, modDir := range c.moduleDirs {
+		if importPath != modPath && !strings.HasPrefix(importPath, modPath+"/") {
+			continue
+		}
+		if len(modPath) > len(bestMod) {
+			bestMod, bestDir = modPath, modDir
+		}
+	}
+	if bestMod == "" {
+		return "", false
+	}
+	rest := strings.TrimPrefix(strings.TrimPrefix(importPath, bestMod), "/")
+	if bestDir == "." || bestDir == "" {
+		if rest == "" {
+			return ".", true
+		}
+		return rest, true
+	}
+	if rest == "" {
+		return bestDir, true
+	}
+	return bestDir + "/" + rest, true
+}
+
+// bestCandidate returns the single best-scoring funcID named funcName, or "" when none
+// scores above zero. score receives a candidate's slash-separated package directory and
+// returns 0 for "not the imported package". The preference order -- higher score, then a
+// function over a method of the same name, then the lexicographically smallest funcID --
+// is a strict total order over distinct funcIDs, so the result does not depend on the order
+// of c.functionsByName, which buildIndexes appends under Go map iteration (:138-140).
+func (c *CallGraphBuilder) bestCandidate(funcName string, score func(dir string) int) string {
+	best, bestScore, bestIsFunc := "", 0, false
+	for _, funcID := range c.functionsByName[funcName] {
+		filePart, namePart := funcID, ""
+		if ci := strings.LastIndex(funcID, ":"); ci >= 0 {
+			filePart, namePart = funcID[:ci], funcID[ci+1:]
+		}
+		// A method's funcID name part is "<Type>.<Name>" (extractor.makeFunctionID). A
+		// method is not EXCLUDED, only de-preferred: analyzeCallExpr classifies a selector
+		// as a package call on import-alias membership alone (:762-770), so a local
+		// variable shadowing an import alias arrives here and its real method edge must
+		// stay reachable.
+		isFunc := !strings.Contains(namePart, ".")
+		// funcID file parts come from filepath.Rel, so on Windows they are
+		// backslash-separated while an import path never is; filepath.Dir and
+		// filepath.ToSlash are both separator-aware there and no-ops on Unix.
+		s := score(filepath.ToSlash(filepath.Dir(filePart)))
+		if s <= 0 {
+			continue
+		}
+		if s > bestScore ||
+			(s == bestScore && isFunc && !bestIsFunc) ||
+			(s == bestScore && isFunc == bestIsFunc && funcID < best) {
+			best, bestScore, bestIsFunc = funcID, s, isFunc
+		}
+	}
+	return best
+}
+
+// pathSuffixDepth reports how many whole path components of dir match the tail of
+// importPath, or 0 when dir is not a component-wise suffix of it. Both are compared
+// slash-separated; dir must already be normalised (filepath.ToSlash). It is the FALLBACK
+// scorer for resolvePackageCall, used only when no go.mod in the tree covers the import
+// path: the module prefix is allowed to be absent because funcID directories are
+// repo-relative, but partial components never match -- "a/config" is not a suffix of
+// "fx/z/config", which is what makes a same-basename sibling package a non-candidate.
+func pathSuffixDepth(importPath, dir string) int {
+	if dir == "" || dir == "." || importPath == "" {
+		return 0
+	}
+	ic := strings.Split(importPath, "/")
+	dc := strings.Split(dir, "/")
+	if len(dc) > len(ic) {
+		return 0
+	}
+	off := len(ic) - len(dc)
+	for i, part := range dc {
+		if ic[off+i] != part {
+			return 0
+		}
+	}
+	return len(dc)
 }
 
 // userFuncInScope reports whether the repo defines its own function of the given

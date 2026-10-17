@@ -926,7 +926,7 @@ class CallGraphBuilder:
             calls = self._extract_calls_from_code(code, func_id)
 
             # Filter to valid function IDs (must exist, not self-calls)
-            valid_calls = [c for c in calls if c in self.functions and c != func_id]
+            valid_calls = sorted(c for c in calls if c in self.functions and c != func_id)
             self.call_graph[func_id] = valid_calls
 
             # Build reverse graph
