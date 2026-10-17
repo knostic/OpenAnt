@@ -70,9 +70,9 @@ func TestHandleAssetServesVersionedVendor(t *testing.T) {
 
 	// The retired pre-#577 versionless names, and every SUPERSEDED
 	// versioned name (marked-12.0.2 by the 18.x re-vendor; marked-18.0.12
-	// by the 18.0.13 patch bump; marked-18.0.13 by the 18.1.1 minor bump):
-	// 404, never aliased.
-	for _, name := range []string{"marked.min.js", "purify.min.js", "marked-12.0.2.min.js", "marked-18.0.12.min.js", "marked-18.0.13.min.js"} {
+	// by the 18.0.13 patch bump; marked-18.0.13 by the 18.1.1 minor bump;
+	// dompurify-3.4.15 by the 3.4.17 patch bump): 404, never aliased.
+	for _, name := range []string{"marked.min.js", "purify.min.js", "marked-12.0.2.min.js", "marked-18.0.12.min.js", "marked-18.0.13.min.js", "dompurify-3.4.15.min.js"} {
 		req := httptest.NewRequest(http.MethodGet, "/assets/"+name, nil)
 		req.Host = "localhost:8080"
 		rec := httptest.NewRecorder()

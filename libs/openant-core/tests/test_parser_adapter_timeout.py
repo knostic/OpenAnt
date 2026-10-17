@@ -57,7 +57,7 @@ def test_go_parse_subprocess_has_timeout(monkeypatch):
 
 def test_all_subprocess_parsers_are_uniformly_timed():
     """Every language whose *parse step* runs as a subprocess must carry a timeout — not just
-    4 of them. (Python parses in-process, so it is intentionally excluded; the npm-install
+    4 of them. (Python parses in-process, so it is intentionally excluded; the npm ci
     dependency bootstrap in _ensure_js_parser_dependencies is a separate concern, not a parse.)
 
     The six per-language bodies this originally scanned have been collapsed into the single

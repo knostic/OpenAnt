@@ -300,6 +300,21 @@
                                     <span class="text-gray-400 text-xs font-medium">Analysis</span>
                                     <p class="text-gray-300 text-sm mt-1 whitespace-pre-wrap leading-relaxed">{{$f.Analysis}}</p>
                                 </div>
+                                {{if $f.DeferredTo}}
+                                {{/* #745: the SAFE row's followable edges — the block renders only when EDGES exist and states what the data IS (the analysis scope + the followable call edges), never a delegation CAUSE (deferred_to is the raw edge set, not a delegation signal: every surviving non-entry unit has callers, so a causal claim would be false for a row safe on its own merits); a deferred unit with no result row (pruned or never analyzed) is surfaced as rowless. */}}
+                                <div class="mt-3 pt-3 border-t border-gray-700/30">
+                                    <span class="text-gray-400 text-xs font-medium">Call edges</span>
+                                    <p class="text-gray-300 text-sm mt-0.5">
+                                        Analysis scope <code class="text-xs bg-navy-900 px-2 py-1 rounded">{{$f.Scope}}</code> — this row covers this function only; follow the edges to see where the concern could live.
+                                    </p>
+                                    {{if $f.DeferredTo}}
+                                    <p class="text-gray-300 text-xs mt-1 font-mono">deferred to: {{range $i, $d := $f.DeferredTo}}{{if $i}}, {{end}}<code class="bg-navy-900 px-2 rounded">{{$d}}</code>{{end}}</p>
+                                    {{end}}
+                                    {{if $f.DeferredRowless}}
+                                    <p class="text-orange-500 text-xs mt-1 font-mono">no result row (pruned or never analyzed): {{range $i, $d := $f.DeferredRowless}}{{if $i}}, {{end}}<code class="bg-navy-900 px-2 rounded">{{$d}}</code>{{end}}</p>
+                                    {{end}}
+                                </div>
+                                {{end}}
                                 {{if $f.HasDynamicTest}}
                                 <div class="mt-3 pt-3 border-t border-gray-700/30">
                                     <span class="text-gray-400 text-xs font-medium">Dynamic Test</span>
