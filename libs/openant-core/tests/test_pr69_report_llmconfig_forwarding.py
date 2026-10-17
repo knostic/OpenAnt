@@ -104,12 +104,12 @@ def test_report_step_forwards_scan_llm_config(monkeypatch, tmp_path):
 
     captured = {}
 
-    def _fake_summary(results_path, output_path, llm_config_name=None):
+    def _fake_summary(results_path, output_path, llm_config_name=None, **kwargs):
         captured["summary"] = llm_config_name
         Path(output_path).write_text("# summary")
         return None
 
-    def _fake_disclosure(results_path, output_dir, llm_config_name=None):
+    def _fake_disclosure(results_path, output_dir, llm_config_name=None, **kwargs):
         captured["disclosure"] = llm_config_name
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         return None

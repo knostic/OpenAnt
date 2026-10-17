@@ -26,7 +26,10 @@ from core.checkpoint import StepCheckpoint, analyze_result_is_error
 from core.progress import ProgressReporter
 
 # Import existing analysis machinery
-from utilities.llm_client import get_global_tracker
+from utilities.llm_client import (get_global_tracker,
+                                  incomplete_markers,
+                                  turn_has_spend,
+                                  unpriced_kinds_from)
 from utilities.llm import (
     PhaseBinding,
     PhaseRegistry,
@@ -481,6 +484,11 @@ def _seed_summary(existing: dict, unit_ids: frozenset | set | None = None,
     output_tokens = 0
     cost_usd = 0.0
     unpriced: set = set()
+    # #626/PR#661 hunt F4: the cache kind's own set. The per-unit checkpoint
+    # has always carried ``unpriced_cache_models`` (get_unit_usage writes
+    # it); this seed read ``unpriced_models`` only, so the kind died here and
+    # the resumed phase reported a complete cost after cache-unpriced spend.
+    unpriced_cache: set = set()
     _unit_by_id = {u.get("id"): u for u in (units or [])}
     for _id, _cp in existing.items():
         if unit_ids is not None and _id not in unit_ids:
@@ -500,14 +508,18 @@ def _seed_summary(existing: dict, unit_ids: frozenset | set | None = None,
         input_tokens += _usage.get("input_tokens", 0)
         output_tokens += _usage.get("output_tokens", 0)
         cost_usd += _usage.get("cost_usd", 0.0)
-        # #216: restore the incomplete-cost marker from per-unit records.
-        unpriced.update(_usage.get("unpriced_models") or [])
+        # #216 + #626: restore BOTH incomplete-cost kinds from the per-unit
+        # records, through the one reader that knows which keys carry them.
+        _u, _c = unpriced_kinds_from(_usage)
+        unpriced.update(_u)
+        unpriced_cache.update(_c)
     return {
         "completed": completed,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost_usd": cost_usd,
         "unpriced_models": unpriced,
+        "unpriced_cache_models": unpriced_cache,
     }
 
 
@@ -827,6 +839,7 @@ def run_analysis(
     _summary_output_tokens = _seed["output_tokens"]
     _summary_cost_usd = _seed["cost_usd"]
     _summary_unpriced: set[str] = _seed["unpriced_models"]
+    _summary_unpriced_cache: set[str] = _seed["unpriced_cache_models"]
 
     def _usage_dict():
         usage = {"input_tokens": _summary_input_tokens,
@@ -834,18 +847,34 @@ def run_analysis(
                  "cost_usd": round(_summary_cost_usd, 6)}
         # #216: persist the unpriced set into _summary.json so a resume of
         # a resume keeps the marker (run-cumulative semantics).
-        _all_unpriced = set(_summary_unpriced) | set(
-            get_global_tracker().get_totals().get("unpriced_models") or [])
-        if _all_unpriced:
-            usage["cost_incomplete"] = True
-            usage["unpriced_models"] = sorted(_all_unpriced)
+        #
+        # #626/PR#661 hunt F4: the cache kind is unioned from the tracker the
+        # same way, which fixes TWO cases at once — the resumed phase (the
+        # seed above) and a FRESH phase, because this dict never consulted the
+        # tracker's own ``cost_incomplete`` and so wrote a complete-looking
+        # analyze/_summary.json even on a first run whose only incompleteness
+        # was cache-unpriced. ``incomplete_markers`` stamps both kinds under
+        # their own keys, present-only.
+        _totals = get_global_tracker().get_totals()
+        usage.update(incomplete_markers(
+            set(_summary_unpriced) | set(_totals.get("unpriced_models") or []),
+            set(_summary_unpriced_cache)
+            | set(_totals.get("unpriced_cache_models") or [])))
         return usage
 
     # Inject prior usage into tracker so step_report captures the total
-    if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
+    # F661-3: the ONE spend predicate (see utilities.llm_client) — cost
+    # included, or a resumed analyze whose restored spend was cache-only
+    # injects nothing and every later step report under-counts.
+    if turn_has_spend(input_tokens=_summary_input_tokens,
+                      output_tokens=_summary_output_tokens,
+                      cost_usd=_summary_cost_usd,
+                      unpriced=_summary_unpriced,
+                      unpriced_cache=_summary_unpriced_cache):
         get_global_tracker().add_prior_usage(
             _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
-            unpriced_models=sorted(_summary_unpriced) or None)
+            unpriced_models=sorted(_summary_unpriced) or None,
+            unpriced_cache_models=sorted(_summary_unpriced_cache) or None)
         # #281: re-snapshot the phase baseline AFTER the injection — the
         # pre-injection baseline made the "Stage 1" delta include the prior
         # session's tokens/cost (calls exclude restored units while
