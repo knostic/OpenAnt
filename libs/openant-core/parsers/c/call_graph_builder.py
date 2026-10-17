@@ -116,6 +116,13 @@ class CallGraphBuilder:
         # predates base-class extraction, so resolution degrades to the [51]
         # same-type behavior rather than erroring.
         self.class_bases: Dict[str, List[str]] = extractor_output.get('class_bases', {})
+        # #805: the extractor's content-selected grammar for ambiguous .h
+        # files (the C parse errored, the C++ retry parsed clean) travels
+        # with the output — those files' function BODIES must re-parse
+        # under the C++ grammar here too, never re-derived from the
+        # extension (the extractor selected it for a reason).
+        self.cpp_grammar_files: Set[str] = set(
+            extractor_output.get('cpp_grammar_files', []))
         self.repo_path = extractor_output.get('repository', '')
 
         self.max_depth = options.get('max_depth', 3)
@@ -187,6 +194,11 @@ class CallGraphBuilder:
         return name in STDLIB_FUNCTIONS
 
     def _get_parser_for_file(self, file_path: str) -> Parser:
+        # #805: the content-selected grammar wins over the extension —
+        # a .h file extracted under the C++ grammar parses its bodies
+        # under the C++ grammar here as well.
+        if file_path in self.cpp_grammar_files:
+            return self.cpp_parser
         ext = Path(file_path).suffix.lower()
         if ext in CPP_EXTENSIONS:
             return self.cpp_parser
@@ -846,8 +858,12 @@ class CallGraphBuilder:
 
             calls = self._extract_calls_from_code(code, func_id)
 
-            # Filter to valid function IDs (must exist, not self-calls)
-            valid_calls = [c for c in calls if c in self.functions and c != func_id]
+            # Filter to valid function IDs (must exist, not self-calls).
+            # `calls` is a set, whose iteration order depends on PYTHONHASHSEED; sort the
+            # filtered list so call_graph (and, below, reverse_call_graph) emit a stable,
+            # reproducible ordering on identical input. Matches the repair already carried
+            # at the Python parser's own consumer (parsers/python/call_graph_builder.py).
+            valid_calls = sorted(c for c in calls if c in self.functions and c != func_id)
             self.call_graph[func_id] = valid_calls
 
             # Build reverse graph

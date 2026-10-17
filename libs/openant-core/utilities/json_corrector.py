@@ -38,23 +38,25 @@ from .llm import PhaseBinding, simple_text
 # verify stage's finish shape is ``_VERIFY_SCHEMA`` below. The legacy
 # INSUFFICIENT_CONTEXT value stays ACCEPTED downstream (the finding->verdict
 # mapping below is recover-only); it is only no longer ASKED for.
+# #683: the shape aligned with the Stage-1 prompt's schema
+# (prompts/vulnerability_analysis.py:248-256) — the same one-home argument
+# #623 completed for the ENUM, this completes for the SHAPE. The legacy form
+# (verdict/confidence/severity/vulnerabilities[]/reasoning) was a DIFFERENT
+# schema than the producer's (finding/function_analyzed/attack_vector/
+# cwe_id/cwe_name flat) — a rescued reply could only carry fields the
+# extraction schema asked for, and _normalize_result stamped cwe_id=0 on
+# the gap (CWE-0 disclosure, empty impact, dedup exempt, the weakened join
+# guard #314).
 _VULN_SCHEMA = """{
-    "verdict": """ + " | ".join(
-    f'"{v.upper()}"' for v in STAGE1_PROMPT_FINDINGS) + """,
+    "function_analyzed": "exact function signature that was analyzed",
+    "finding": """ + " | ".join(
+    f'"{v}"' for v in STAGE1_PROMPT_FINDINGS) + """,
+    "reasoning": "the analysis of the target function's code",
+    "severity": "if vulnerable: critical | high | medium | low; otherwise null",
+    "attack_vector": "if vulnerable: a single plain-text string describing the specific attack; if safe: null",
     "confidence": 0.0-1.0,
-    "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
-    "vulnerabilities": [
-        {
-            "type": "SQL Injection | XSS | Command Injection | Path Traversal | Open Redirect | XXE | Insecure Deserialization | Broken Access Control | Other",
-            "severity": "CRITICAL | HIGH | MEDIUM | LOW",
-            "source": "description of where tainted data enters",
-            "sink": "description of dangerous operation",
-            "flow": "data flow description",
-            "evidence": "code snippet",
-            "why_vulnerable": "explanation"
-        }
-    ],
-    "reasoning": "analysis summary"
+    "cwe_id": "if vulnerable: the CWE number (integer, 0 if no match); if safe: 0",
+    "cwe_name": "if vulnerable: the short CWE name; if safe: null"
 }"""
 
 

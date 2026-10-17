@@ -121,7 +121,7 @@ def test_run_single_hardening_flags(monkeypatch):
         return ("", "", 0, False)
 
     monkeypatch.setattr(de, "_run_command", fake_run)
-    de._run_single("/tmp/nowhere", "img:tag", "net", 10, 10)
+    de._run_single("/tmp/nowhere", "img:tag", "net", 10, 10, "openant-ct-x")
     run_cmd = [c for c in calls if c[:2] == ["docker", "run"]][0]
     s = " ".join(run_cmd)
     assert "--cap-drop ALL" in s

@@ -50,6 +50,12 @@ CPP_LANGUAGE = Language(tscpp.language())
 
 C_EXTENSIONS = {'.c', '.h'}
 CPP_EXTENSIONS = {'.cpp', '.hpp', '.cc', '.cxx', '.hxx', '.hh'}
+# #805: the extensions BOTH families legitimately claim. `.h` is a C
+# header by default, but C++ projects (the Google style guide among
+# others) write C++ headers with it too — the grammar is selected by
+# CONTENT for these, never by the extension alone (see
+# _parse_selecting_grammar).
+AMBIGUOUS_EXTENSIONS = {'.h'}
 
 
 class FunctionExtractor:
@@ -76,6 +82,14 @@ class FunctionExtractor:
 
         self.file_cache: Dict[str, bytes] = {}
 
+        # #805: repo-relative paths whose grammar was selected BY CONTENT —
+        # an ambiguous .h whose C parse carried errors and whose C++ retry
+        # parsed clean. The selection travels with the extraction output
+        # (export()) so the call-graph builder re-parses those files'
+        # function BODIES under the same grammar, never re-derived from
+        # the extension.
+        self.cpp_grammar_files: set = set()
+
         self.stats = {
             'total_functions': 0,
             'total_prototypes': 0,
@@ -83,6 +97,16 @@ class FunctionExtractor:
             'static_functions': 0,
             'files_processed': 0,
             'files_with_errors': 0,
+            # #805 (r1-F2): the parse-error DIAGNOSTICS channel — a tree
+            # with ERROR nodes is an event here REGARDLESS of extension
+            # (the old shape surfaced the both-grammars-errored .h in
+            # files_with_errors, making the stat extension-dependent and
+            # breaking its partition with files_processed: identical
+            # content counted as .h but not as .c). files_with_errors
+            # keeps the lost-file semantics (unreadable/exception) and
+            # stays partitioned; a processed-with-parse-errors file
+            # rides ONLY this key.
+            'files_with_parse_errors': 0,
             'by_type': {},
         }
 
@@ -93,9 +117,98 @@ class FunctionExtractor:
             return self.cpp_parser
         return self.c_parser
 
-    def _is_cpp_file(self, file_path: str) -> bool:
-        ext = os.path.splitext(file_path)[1].lower()
-        return ext in CPP_EXTENSIONS
+    @staticmethod
+    def _c_namespace_misparse(tree) -> bool:
+        """#805 (r1-F1/r2-F1): the CLEAN-parse C++ tell. tree-sitter-c
+        reads ``namespace util { ... }`` as a function_definition whose
+        TYPE is a type_identifier spelled ``namespace`` (a C++
+        namespace-only header of free inline functions therefore parses
+        ERROR-FREE under the C grammar, so the has_error trigger never
+        fires and the bogus whole-namespace span units persist). In real
+        C the type ``namespace`` is an undeclared identifier a compiler
+        would reject; a top-level definition typed exactly ``namespace``
+        is a C++ mis-parse, never a legitimate C definition.
+
+        r2-F1: the scan descends through the preprocessor-condition
+        nodes (preproc_ifdef / preproc_if / preproc_elif / preproc_else /
+        preproc_elifdef)
+        — the DOMINANT real-world header form wraps the namespace in an
+        include guard or an ``#ifdef __cplusplus`` block, and the
+        mis-parsed definition then nests under the condition node, not
+        the root. A C function body can never contain a
+        function_definition (the GNU nested-function extension aside,
+        which the extractor handles at its own layer), so a bounded
+        preproc-descent scan stays tight.
+        """
+        def _scan(children) -> bool:
+            for child in children:
+                if child.type == 'function_definition':
+                    type_node = child.child_by_field_name('type')
+                    if (type_node is not None
+                            and type_node.type == 'type_identifier'
+                            and type_node.text == b'namespace'):
+                        return True
+                elif child.type in ('preproc_ifdef', 'preproc_if',
+                                    'preproc_elif', 'preproc_else',
+                                    'preproc_elifdef'):
+                    if _scan(child.children):
+                        return True
+            return False
+        return _scan(tree.root_node.children)
+
+    def _parse_selecting_grammar(self, file_path: Path, source: bytes):
+        """#805: parse a file, selecting the grammar by CONTENT for the
+        AMBIGUOUS .h extension. Returns ``(tree, is_cpp, parse_errors)``:
+
+        * the selected tree;
+        * the EFFECTIVE is_cpp — it travels WITH the selected grammar,
+          never re-derived from the extension (the classification at
+          _classify_function gates on ``is_cpp and class_name``; a C++
+          tree parsed out of a .h must classify as C++ or the selection
+          only replaces the tree and loses the structure anyway);
+        * ``parse_errors`` — the SELECTED tree carries ERROR nodes (the
+          extension-independent diagnostics flag; the caller counts it
+          in files_with_parse_errors for EVERY file, not just .h).
+
+        The rules: a non-.h extension keeps its own grammar unchanged
+        (the extension is unambiguous there). A .h parses under the C
+        grammar first (the extension default); a CLEAN C parse with NO
+        namespace tell stands. A C parse with errors — or the namespace
+        tell (a C++ namespace-only header parses ERROR-FREE under the C
+        grammar as bogus whole-namespace spans) — retries under the C++
+        grammar; a CLEAN C++ parse wins and selects the C++ extraction.
+        When BOTH parses carry errors, the extension default stands (the
+        C tree — deterministic, no error-count comparison heuristics),
+        the tree still feeds extraction (the over-seed direction:
+        tree-sitter's error recovery yields parseable function_definitions
+        alongside the ERROR nodes, exactly what the base did), and the
+        errors surface through files_with_parse_errors.
+        """
+        ext = os.path.splitext(str(file_path))[1].lower()
+        if ext not in AMBIGUOUS_EXTENSIONS:
+            parser = self._get_parser(str(file_path))
+            tree = parser.parse(source)
+            return tree, ext in CPP_EXTENSIONS, tree.root_node.has_error
+
+        c_tree = self.c_parser.parse(source)
+        if (not c_tree.root_node.has_error
+                and not self._c_namespace_misparse(c_tree)):
+            return c_tree, False, False
+        cpp_tree = self.cpp_parser.parse(source)
+        if not cpp_tree.root_node.has_error:
+            # a clean C++ parse wins: the C++ extraction/classification
+            # travels with the tree. The caller records the repo-relative
+            # path in cpp_grammar_files (the export carries the selection).
+            return cpp_tree, True, False
+        # both grammars errored (or the tell fired and the C++ retry
+        # could not parse it either — a legit C file whose TYPE happens
+        # to be spelled ``namespace`` via a typedef/macro): the
+        # extension default stands, extraction proceeds on the recovered
+        # C tree (over-seed), and the diagnostics flag is the SELECTED
+        # tree's own state — never hard-coded True (r2-F3: a clean C
+        # tree that fired the tell falsely must not count as a parse
+        # error, and must count identically to its .c twin).
+        return c_tree, False, c_tree.root_node.has_error
 
     def read_file(self, file_path: Path) -> bytes:
         """Read and cache file contents as bytes (tree-sitter needs bytes)."""
@@ -726,15 +839,31 @@ class FunctionExtractor:
             return
 
         relative_path = file_path.relative_to(self.repo_path).as_posix()
-        is_cpp = self._is_cpp_file(str(file_path))
-        parser = self._get_parser(str(file_path))
-
+        # #805: the grammar (and the is_cpp classification flag that gates
+        # every C++ extraction branch) is selected WITH the parse; a
+        # tree with ERROR nodes still feeds extraction (over-seed — the
+        # recovered spans are exactly what the base extracted) and the
+        # errors surface through files_with_parse_errors for EVERY file
+        # (extension-independent; the r1-F2 catch: counting them in
+        # files_with_errors made the stat extension-dependent and broke
+        # its partition with files_processed).
         try:
-            tree = parser.parse(source)
+            tree, is_cpp, parse_errors = self._parse_selecting_grammar(
+                file_path, source)
         except Exception as e:
             print(f"Parse error in {file_path}: {e}", file=sys.stderr)
             self.stats['files_with_errors'] += 1
             return
+        if parse_errors:
+            self.stats['files_with_parse_errors'] += 1
+        if (is_cpp
+                and os.path.splitext(str(file_path))[1].lower()
+                in AMBIGUOUS_EXTENSIONS):
+            # the content-selected C++ grammar for an ambiguous .h: the
+            # extension default would have said C, so the selection is
+            # recorded (a .cpp/.hpp needs no record — its extension route
+            # already selects C++ everywhere).
+            self.cpp_grammar_files.add(relative_path)
 
         # Extract includes
         self.includes[relative_path] = self._extract_includes(tree, source)
@@ -804,6 +933,11 @@ class FunctionExtractor:
             'macro_aliases': self.macro_aliases,
             'prototypes': self.prototypes,
             'class_bases': self.class_bases,
+            # #805: the ambiguous-.h files whose grammar was selected BY
+            # CONTENT (the C parse errored, the C++ retry parsed clean) —
+            # the call-graph builder consults this so their function BODIES
+            # re-parse under the same grammar.
+            'cpp_grammar_files': sorted(self.cpp_grammar_files),
             'statistics': self.stats,
         }
 
