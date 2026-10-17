@@ -182,32 +182,94 @@ class TypeScriptAnalyzer {
    * Analyze a list of files and extract functions + call graph
    */
   analyzeFiles(filePaths) {
+    // F1 (fable T1 r1): Step-1 add failures belong in files_with_errors --
+    // the Python sibling counts read failures in the same bucket; a file
+    // that cannot be added is an error, not an absence.
+    const addFailed = new Set();
+    // F4 (fable T1 r2): the denominator is the DISTINCT input set -- the
+    // scanner's list may repeat or alias a path (relative + absolute), and
+    // ts-morph dedupes by resolved path, so a raw .length would over-count
+    // files_processed for duplicate lists.
+    const distinctInputs = new Set();
     // Step 1: Add all files to project
     for (const filePath of filePaths) {
-      const fullPath = path.isAbsolute(filePath)
-        ? filePath
-        : path.join(this.repoPath, filePath);
+      // F5 (fable T1 r3): resolve EVERY input (not just the relative branch)
+      // so `..` / `//` / `./` aliases of the same file collapse into one
+      // distinct input, matching how ts-morph keys the project.
+      const fullPath = path.resolve(this.repoPath, filePath);
 
       // ts-morph treats backslashes as escape characters when matching
       // paths it has already added. Normalise to forward slashes so
       // Windows-native paths (with `\`) resolve consistently.
       const normalised = toPosixPath(fullPath);
+      distinctInputs.add(normalised);
 
       try {
         this.project.addSourceFileAtPath(normalised);
       } catch (error) {
         console.error(`Failed to add file ${normalised}: ${error.message}`);
+        addFailed.add(normalised);
       }
     }
 
+    // Per-file isolation for Steps 2 and 3 (#713), porting the
+    // `_process_file_guarded` contract PR #136 added to the Python extractor
+    // and #170 to the C / Ruby / PHP ones. Step 1 above already guards the
+    // file-adding loop; Steps 2 and 3 were bare, and the only catch above them
+    // is the CLI's outer handler, which prints and exits 1 — so one
+    // pathological file (a deeply nested source that overflows the stack
+    // inside the ts-morph walk, or any throw in the extractor) lost EVERY unit
+    // collected so far, a total false negative for the language on that repo.
+    // Log the file plus the error, count the file ONCE, continue.
+    const filesWithErrors = new Set();
+    // The path is resolved defensively: a catch block that itself throws would
+    // re-open exactly the bug being fixed.
+    const filePathOf = (sourceFile) => {
+      try {
+        return sourceFile.getFilePath();
+      } catch {
+        return "<unknown file>";
+      }
+    };
+    const recordFileError = (sourceFile, stage, error) => {
+      const filePath = filePathOf(sourceFile);
+      filesWithErrors.add(filePath);
+      console.error(
+        `Warning: failed to process ${filePath} (${stage}): ` +
+          (error instanceof Error
+            ? `${error.name}: ${error.message}`
+            : String(error)),
+      );
+    };
+
     // Step 2: Extract functions from each file
     for (const sourceFile of this.project.getSourceFiles()) {
-      this.extractFunctionsFromFile(sourceFile);
+      try {
+        this.extractFunctionsFromFile(sourceFile);
+      } catch (error) {
+        recordFileError(sourceFile, "extraction", error);
+      }
     }
 
-    // Step 3: Build call graph
+    // Step 3: Build call graph.
+    //
+    // A file whose EXTRACTION threw is skipped here: its inventory is partial,
+    // so building its edges keys `callGraph` on ids `functions` never
+    // received. Measured, not assumed — on a two-file repo where one file
+    // throws during extraction, running Step 3 over it anyway yields
+    // functions=2 / callGraph=4 with `boom.js:one`, `boom.js:two` present in
+    // the graph and absent from the inventory: phantom units, and the
+    // `len(callGraph) === len(functions)` lockstep the Step-4 backstop
+    // maintains breaks (the backstop can only ADD missing companions, never
+    // drop surplus ones). Those keys also propagate into the resolved
+    // `call_graph` / `reverse_call_graph` built in Step 5.
     for (const sourceFile of this.project.getSourceFiles()) {
-      this.buildCallGraphForFile(sourceFile);
+      if (filesWithErrors.has(filePathOf(sourceFile))) continue;
+      try {
+        this.buildCallGraphForFile(sourceFile);
+      } catch (error) {
+        recordFileError(sourceFile, "call graph", error);
+      }
     }
 
     // Step 4: Backstop the Pattern-A companion invariant — every function in
@@ -240,6 +302,20 @@ class TypeScriptAnalyzer {
     // reverse_call_graph of resolved ids, repository, per-fn parameters).
     this._buildResolvedGraphs();
 
+    // #713: the per-file degradation reaches the analyzer's output, not only
+    // stderr, mirroring the sibling parsers' `statistics.files_with_errors`
+    // contract. Derived from the final source-file count so
+    // `files_processed + files_with_errors` always equals the files iterated —
+    // the Python guard's bucket invariant: a file that crashed is counted once
+    // as an error and never as processed.
+    // F1: a Step-1 failure means the file never entered the project, so
+    // getSourceFiles() does not count it -- totalSourceFiles under-counts.
+    // The honest denominator is the input list length (the files we were
+    // asked to parse); the error bucket merges both Step-1 and Step-2/3
+    // failures (the Python sibling's contract).
+    const totalInputFiles = distinctInputs.size;
+    const totalErrors = filesWithErrors.size + addFailed.size;
+
     return {
       repository: this.repoPath,
       functions: this.functions,
@@ -248,6 +324,10 @@ class TypeScriptAnalyzer {
       call_graph: this.resolvedCallGraph,
       reverse_call_graph: this.reverseCallGraph,
       indirect_calls: this.indirectCalls,
+      statistics: {
+        files_processed: totalInputFiles - totalErrors,
+        files_with_errors: totalErrors,
+      },
     };
   }
 
@@ -2623,6 +2703,21 @@ if (require.main === module) {
 
       const analyzer = new TypeScriptAnalyzer(repoPath);
       const result = analyzer.analyzeFiles(filePaths);
+
+      // #713: ONE loud summary line, not only the N scattered per-file warnings.
+      // Mirrors the sibling extractors' CLI, which prints exactly this
+      // (`parsers/python/function_extractor.py:1143-1144`): a degraded parse now
+      // exits 0, so without a summary a repo whose every file is pathological is
+      // indistinguishable from a repo with no JS files at all -- `core/parser_adapter.py`
+      // records 0 units as a successful parse and emits no advisory for it.
+      if (result.statistics.files_with_errors > 0) {
+        const seen =
+          result.statistics.files_processed + result.statistics.files_with_errors;
+        console.error(
+          `Files with errors: ${result.statistics.files_with_errors} of ${seen} ` +
+            "(skipped; their units and/or call-graph edges are absent from this output)",
+        );
+      }
 
       // Output JSON
       const jsonOutput = JSON.stringify(result, null, 2);

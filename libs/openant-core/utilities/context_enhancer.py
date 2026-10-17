@@ -134,11 +134,18 @@ def _build_error_info(exc: Exception) -> dict:
     # but the original SDK exception is chained on ``__cause__`` (adapters
     # re-raise ``... from exc``) and the major SDKs expose those there.
     # Surface them when present without reaching into adapter internals.
+    # #770: the status read falls back to the validated ``.code`` shape —
+    # the google-genai SDK's ServerError/APIError carries the HTTP code
+    # there; without the fallback the ``api_status`` dict a Google 5xx
+    # builds carries no status and ``is_retryable_error(dict)`` defaults
+    # it to 0 -> never retried, where the string arm of the same error
+    # retried (the #716 preference flip's silent regression).
+    from .llm._redact import _http_status_from
     for source in (exc, getattr(exc, "__cause__", None)):
         if source is None:
             continue
         if "status_code" not in info:
-            status_code = getattr(source, "status_code", None)
+            status_code = _http_status_from(source)
             if status_code is not None:
                 info["status_code"] = status_code
         if "request_id" not in info:
