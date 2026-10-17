@@ -116,6 +116,13 @@ class CallGraphBuilder:
         # predates base-class extraction, so resolution degrades to the [51]
         # same-type behavior rather than erroring.
         self.class_bases: Dict[str, List[str]] = extractor_output.get('class_bases', {})
+        # #805: the extractor's content-selected grammar for ambiguous .h
+        # files (the C parse errored, the C++ retry parsed clean) travels
+        # with the output — those files' function BODIES must re-parse
+        # under the C++ grammar here too, never re-derived from the
+        # extension (the extractor selected it for a reason).
+        self.cpp_grammar_files: Set[str] = set(
+            extractor_output.get('cpp_grammar_files', []))
         self.repo_path = extractor_output.get('repository', '')
 
         self.max_depth = options.get('max_depth', 3)
@@ -187,6 +194,11 @@ class CallGraphBuilder:
         return name in STDLIB_FUNCTIONS
 
     def _get_parser_for_file(self, file_path: str) -> Parser:
+        # #805: the content-selected grammar wins over the extension —
+        # a .h file extracted under the C++ grammar parses its bodies
+        # under the C++ grammar here as well.
+        if file_path in self.cpp_grammar_files:
+            return self.cpp_parser
         ext = Path(file_path).suffix.lower()
         if ext in CPP_EXTENSIONS:
             return self.cpp_parser
