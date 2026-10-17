@@ -119,7 +119,11 @@ def enhance_dataset(
     print(f"[Enhance] Units to enhance: {len(units)}", file=sys.stderr)
 
     # Set up progress reporter
-    progress = ProgressReporter("Enhance", len(units), tracker=tracker)
+    # #685: the Done/summary cost lines report THIS step's spend, read
+    # against the same mutable holder the "Enhance" log_usage line uses —
+    # so the #281 refresh at the checkpoint-injection site covers them too.
+    progress = ProgressReporter("Enhance", len(units), tracker=tracker,
+                                cost_baseline=_phase_baseline)
 
     def _on_unit_done(unit_id: str, classification: str, unit_elapsed: float):
         progress.report(
