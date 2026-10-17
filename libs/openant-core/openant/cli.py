@@ -121,6 +121,36 @@ def _severity_source_for_result(result: dict, displayed_verdict: str = None) -> 
     return src if src in ("corrected", "derived") else "derived"
 
 
+def _deferred_edges(unit: dict) -> list:
+    """#745: the unit's dataset call edges, BOTH directions, as id strings.
+
+    The delegation-dismissed SAFE row's concern went elsewhere — and the
+    corpus's delegations go UP ("the actual open-redirect risk exists at the
+    callers": the row's direct_callers) and DOWN ("the dangerous operation
+    lives in a helper this unit calls": direct_calls). Both edge sets are the
+    followable ones (the same ids the result rows key on), so the row carries
+    the union, deduped, order-stable.
+
+    The #305 convention ("never a crash"): a malformed dataset entry —
+    metadata not a dict, direct_calls/direct_callers not a list — reads as no
+    edge, never a TypeError and never a char-split of a string value (the
+    dataset is parser-produced, but the read is guarded like every other
+    boundary the row build performs).
+    """
+    meta = unit.get("metadata") if isinstance(unit, dict) else None
+    if not isinstance(meta, dict):
+        return []
+    out: list = []
+    for key in ("direct_calls", "direct_callers"):
+        vals = meta.get(key)
+        if isinstance(vals, list):
+            # only STRING ids (what the parsers emit): a malformed element
+            # (None, a bool, a dict) is dropped, never str()-cast into a
+            # phantom id that renders as an edge.
+            out.extend(c for c in vals if isinstance(c, str))
+    return list(dict.fromkeys(out))
+
+
 def _unit_start_line(unit: dict) -> int:
     """#305 (the adjacent finding in the issue comment): the parsers emit
     ``start_line`` inside ``code.primary_origin`` and it survives
@@ -1241,6 +1271,15 @@ def cmd_report_data(args):
 
             # --- Prepare findings ---
             units_by_id = {u["id"]: u for u in dataset.get("units", [])}
+            # #745: the scan's row keys — a delegation-dismissed SAFE row's
+            # named callees are checked against THIS set so the evaporation
+            # case (a pruned or absent sink-owner: no result row anywhere)
+            # is surfaced on the row instead of lost in the reasoning prose.
+            _scan_route_keys = {
+                str(r.get("route_key", ""))
+                for r in experiment.get("results", [])
+                if isinstance(r, dict)
+            }
 
             verdict_order = list(FINDING_VERDICT_ORDER)
             verdict_colors = {
@@ -1313,6 +1352,19 @@ def cmd_report_data(args):
                     dt_status = dt_result.get("status", "")
                     dt_details = dt_result.get("details", "")
 
+                # #745: the delegation-dismissed SAFE row's followable edge.
+                # The analysis scope is function-local by construction
+                # ("ANALYZE THIS FUNCTION ONLY"), so a SAFE row whose
+                # dangerous operation lives elsewhere names its edge units
+                # HERE — the dataset's call edges in BOTH directions (the
+                # corpus's delegations go UP: the risk at the callers; and
+                # DOWN: the danger in a callee), the same ids the result rows
+                # key on — instead of losing the edge in the reasoning prose;
+                # and a named edge unit with no result row (pruned by the
+                # reachability filter or never analyzed) is surfaced as
+                # rowless, so the evaporation case is distinguishable from
+                # an examined-and-safe one.
+                _deferred = _deferred_edges(unit)
                 findings.append({
                     "verdict": verdict,
                     "verdict_color": verdict_colors.get(verdict, "#6c757d"),
@@ -1331,6 +1383,11 @@ def cmd_report_data(args):
                     "dynamic_test_details": dt_details,
                     "start_line": _unit_start_line(unit),
                     "number": 0,  # assigned after sort
+                    **({"scope": "function_local",
+                        "deferred_to": _deferred,
+                        "deferred_rowless": [
+                            c for c in _deferred if c not in _scan_route_keys]}
+                       if verdict == "safe" else {}),
                 })
 
             # Sort by verdict priority, then by dynamic test status within each group

@@ -149,6 +149,10 @@ def main():
             dependency_depth=args.dependency_depth,
         )
         dataset, analyzer_output = generator.generate(name=args.name)
+        # #768: the filter's record reaches the DATASET (the reader surface).
+        _rf = call_graph_output.get("_reachability_filter")
+        if _rf is not None:
+            dataset.setdefault("metadata", {})["reachability_filter"] = _rf
         generator.save_results(str(output_dir), dataset, analyzer_output)
         print(
             f"  Generated {dataset['statistics']['total_units']} units",
@@ -207,7 +211,7 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
     --processing-level reachable.
     """
     try:
-        from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector, blackout_warning, library_seed_ids
+        from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector, blackout_warning, library_seed_ids, reachability_filter_record
         from utilities.agentic_enhancer.reachability_analyzer import ReachabilityAnalyzer
     except ImportError:
         print(
@@ -242,7 +246,9 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
     # points => the reachable set is empty => every function pruned, silently
     # blacking out the dataset (dominant failure for library / no-entry targets).
     # Degrade to keep-all + warn instead of a silent 0-unit result.
+    _keep_all_why = None
     if not entry_points and functions:
+        _keep_all_why = "No entry points detected"
         print("  [Warning] No entry points detected — keeping all units unfiltered "
               "to avoid a silent blackout.", file=sys.stderr)
         reachable = set(functions.keys())
@@ -267,10 +273,34 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
         if k in reachable
     }
 
-    _blackout = blackout_warning(detector.entry_point_details, len(functions),
-                                 len(filtered_functions), library_mode=library_mode)
-    if _blackout:
-        print(f"  [Advisory] {_blackout}", file=sys.stderr)
+    # #768: the ONE record shape (the core path's contract) — zig, like
+    # rust, had NO metadata.reachability_filter record at all (stderr was
+    # the only witness); the record rides the call-graph output and the
+    # pipeline's main stamps it into the dataset.
+    # r1-F1: the record counts DATASET UNITS, not call-graph functions —
+    # the generator drops the synthetic harnesses (instrumentation, not
+    # analysis targets), so a functions-based count would exceed the
+    # dataset's total_units (the reporter's --limit subset check reads the
+    # excess as a FALSE subset). The unit-aligned counts: the non-synthetic
+    # population (zig synthesizes no harnesses today — the parity holds the
+    # shape honest if it ever does).
+    _n_units = sum(1 for _f in functions.values()
+                   if not _f.get("synthetic_harness"))
+    _n_reachable_units = sum(1 for _f in filtered_functions.values()
+                             if not _f.get("synthetic_harness"))
+    result["_reachability_filter"] = reachability_filter_record(
+        detector, _n_units, len(entry_points),
+        _n_reachable_units, keep_all_why=_keep_all_why)
+    if not _keep_all_why:
+        # r1-F3 (core parity): the FILTERED arm stamps the advisory when it
+        # fires — the keep-all arm NEVER does (core's keep-all branch returns
+        # early; the keep-all warning IS the whole story there).
+        _blackout = blackout_warning(detector.entry_point_details,
+                                     _n_units, _n_reachable_units,
+                                     library_mode=library_mode)
+        if _blackout:
+            result["_reachability_filter"]["blackout_advisory"] = _blackout
+            print(f"  [Advisory] {_blackout}", file=sys.stderr)
 
     return result
 

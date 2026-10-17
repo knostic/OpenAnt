@@ -443,6 +443,19 @@ def analyze_reachability(
     if not units:
         return []
 
+    # #798: the signal-validation universe is the DATASET's id index, never
+    # the current batch slice. A signal for a unit that exists in the
+    # dataset and merely sits outside the current batch is a REAL
+    # reachability signal — the batch-scope validation dropped it as
+    # "unknown unit_id" (the campaign's own artifacts: 61 of 95 skip events
+    # on the SGLang completion run were in-dataset units, 10 of them
+    # entry_point/high promotions that never landed). The universe is the
+    # FULL dataset (not the max_units-truncated review slice), so the skip
+    # keeps its honest meaning: "absent from the dataset" — the genuine
+    # model inventions.
+    dataset_ids = {u.get("id") for u in dataset.get("units") or []
+                   if u.get("id")}
+
     if binding is None:
         # Self-contained fallback for callers that don't have a
         # registry yet (standalone scripts, tests that didn't bother
@@ -490,6 +503,20 @@ def analyze_reachability(
     # derived at report time from promote_set, never here).
     signals_skipped_unknown_unit = 0
     signals_skipped_by_class: Dict[str, int] = {}
+    # #798: the cache-adopted signal count — the resume-comparability
+    # companion to signals_skipped_unknown_unit (see the adoption site).
+    signals_cache_adopted = 0
+    # #798: signals parsed in one batch whose TARGET sits in another
+    # batch (or beyond the review slice). The target's own record write
+    # happens later — the stash is merged there, so a resume's adopted
+    # state equals the applied state (#532's boundary: the cross-batch
+    # signal is now carried, so it must also PERSIST).
+    cross_batch_signals: Dict[str, List[dict]] = {}
+    # #798 (r1-F1): the records written THIS run, by uid — the per-batch
+    # flush merges the still-stashed cross-batch signals into targets whose
+    # records were written by an EARLIER batch (or adopted from the cache
+    # and never rewritten), so the backward direction persists too.
+    saved_records: Dict[str, dict] = {}
     # #599: the artifact-failure counter — summary-write failures are
     # diagnostics, NOT coverage gaps (the pass succeeded; the persisted
     # artifact is degraded). Like its sibling counters, it is bypassed by
@@ -658,9 +685,18 @@ def analyze_reachability(
                     continue
                 adopted[uid] = rec
                 signals.extend(rec_sigs)
+                signals_cache_adopted += len(rec_sigs)
             units_to_run = [u for u in units if u.get("id") not in adopted]
             if stats is not None:
                 stats["units_adopted"] = len(adopted)
+                # #798: the resume-comparability counter — signals_skipped_
+                # unknown_unit counts PARSE-time skips only, so a resume
+                # whose signals were adopted from the checkpoint cache
+                # reads 0 by construction (the adopted signals were
+                # validated by the run that parsed them). This key names
+                # how many signals came from the cache, so the resume's
+                # own record explains its zero.
+                stats["signals_cache_adopted"] = signals_cache_adopted
             # Restored cost lands as PRIOR usage — never zero, never this run's
             # new spend (the #26/#26b kill-vs-complete asymmetry lessons).
             if adopted and tracker is not None:
@@ -796,7 +832,8 @@ def analyze_reachability(
             units_not_reviewed += len(sub_batch)
             return [], "failed", {"dropped": 0, "units": 0, "truncated": 0}
 
-        batch_ids = {u.get("id") for u in sub_batch if u.get("id")}
+        # #798: valid_unit_ids is the DATASET index (built once above), not
+        # this batch's slice — first/last still label the batch itself.
         first = sub_batch[0].get("id", "?") if sub_batch else "?"
         last = sub_batch[-1].get("id", "?") if sub_batch else "?"
         dropped = []
@@ -824,7 +861,7 @@ def analyze_reachability(
             _attempt_skips.append(kw)
 
         parsed = parse_response(
-            text, valid_unit_ids=batch_ids, on_error=on_error,
+            text, valid_unit_ids=dataset_ids, on_error=on_error,
             batch_label=f"{label}, units {first}..{last}",
             on_batch_drop=_count_drop,
             stop_reason=result.stop_reason,
@@ -981,21 +1018,106 @@ def analyze_reachability(
                 return share
 
             sig_by_unit: Dict[str, List[dict]] = {}
+            own_uids = {u.get("id") for u in record_units if u.get("id")}
             for sig in parsed:
-                sig_by_unit.setdefault(sig.unit_id, []).append({
-                    "unit_id": sig.unit_id, "kind": sig.kind,
-                    "confidence": sig.confidence, "reason": sig.reason,
-                })
+                entry = {"unit_id": sig.unit_id, "kind": sig.kind,
+                         "confidence": sig.confidence, "reason": sig.reason}
+                if sig.unit_id in own_uids:
+                    sig_by_unit.setdefault(sig.unit_id, []).append(entry)
+                else:
+                    # #798: the target sits in ANOTHER batch (or beyond
+                    # the review slice) — its own record write happens
+                    # later; stash for the merge so the resume's
+                    # adopted state equals the applied state.
+                    cross_batch_signals.setdefault(
+                        sig.unit_id, []).append(entry)
+            # #798 (r1-F1/r2-F1): the PER-BATCH flush. A signal parsed in a
+            # batch for a unit whose record was written by an EARLIER batch
+            # (or whose target was ADOPTED and never rewritten) is applied in
+            # this run's returned signals — without a flush its record never
+            # carries it, and a resume at phase=done silently adopted fewer
+            # signals than the run applied (the r1 lane: promoted 2 -> 1).
+            # The flush runs after EVERY batch (the same cadence as the
+            # publication below) and BEFORE this batch's own-record writes,
+            # so a kill anywhere in this batch leaves its own units
+            # unrecorded — the resume re-runs them and the signal regenerates
+            # (the BACKWARD self-healing window holds exactly: the flush
+            # runs first, so the earlier-batch merges are already
+            # persisted). Targets
+            # whose records do not exist YET (this batch's own units, a
+            # later batch's units) stay stashed — the own write pops its
+            # entry. ONE DIRECTION DOES NOT SELF-HEAL (disclosed): a
+            # kill between a FORWARD stash and the target's own write
+            # loses the forward signal — the signaler's record exists,
+            # so the resume adopts it and never re-parses it; a
+            # disclosed residual, not self-healing. Targets with NO record at all
+            # (a dropped batch's units, a max_units-truncated unit) stay the
+            # disclosed residual; `persisted` is NOT re-incremented (a
+            # resurrected record — one whose own save failed but whose stash
+            # merge succeeds — is not re-counted; the next resume's adoption
+            # corrects the summary phase).
+            if checkpoint is not None and cross_batch_signals:
+                for uid, extra in list(cross_batch_signals.items()):
+                    rec = saved_records.get(uid)
+                    if rec is None:
+                        prior = adopted.get(uid)
+                        rec = dict(prior) if isinstance(prior, dict) else None
+                    if rec is None:
+                        continue  # no record yet / the disclosed residual
+                    _merged = list(rec.get("signals") or []) + extra
+                    _seen: set = set()
+                    _deduped: List[dict] = []
+                    for e in _merged:
+                        _k = (e.get("unit_id"), e.get("kind"),
+                              e.get("confidence"))
+                        if _k not in _seen:
+                            _seen.add(_k)
+                            _deduped.append(e)
+                    try:
+                        checkpoint.save(uid, {**rec, "signals": _deduped})
+                        # #798 (r3-F1): refresh the in-memory base — a target
+                        # cross-signaled by TWO later batches (distinct
+                        # kind/confidence) must accumulate on the MERGED
+                        # record, not on a stale pre-flush snapshot (the
+                        # stale-base overwrite kept only the last signal).
+                        saved_records[uid] = {**rec, "signals": _deduped}
+                        cross_batch_signals.pop(uid, None)
+                    except OSError as exc:
+                        if on_error:
+                            on_error(f"llm_reach checkpoint save failed for {uid}: {exc}")
+                        else:
+                            print(f"[LLMReach] checkpoint save failed for {uid}: {exc}",
+                                  file=sys.stderr)
+
             for u in record_units:
                 uid = u.get("id")
                 if not uid:
                     continue
+                # #798: merge the stashed cross-batch signals for THIS
+                # unit (parsed in an earlier batch) with its own batch's
+                # parse — deduped on (unit_id, kind, confidence), keeping
+                # the FIRST reason: two completions re-signaling the same
+                # unit with different wording both carry the same
+                # reachability fact (r1-F4: a reason-inclusive tuple only
+                # collapses byte-identical re-emissions).
+                merged = sig_by_unit.get(uid, []) + \
+                    cross_batch_signals.pop(uid, [])
+                seen_keys: set = set()
+                deduped: List[dict] = []
+                for e in merged:
+                    k = (e.get("unit_id"), e.get("kind"),
+                         e.get("confidence"))
+                    if k not in seen_keys:
+                        seen_keys.add(k)
+                        deduped.append(e)
+                record = {
+                    "signals": deduped,
+                    "projection_sha": current_sha[uid],
+                    "usage": _share(n_units),
+                }
+                saved_records[uid] = record
                 try:
-                    checkpoint.save(uid, {
-                        "signals": sig_by_unit.get(uid, []),
-                        "projection_sha": current_sha[uid],
-                        "usage": _share(n_units),
-                    })
+                    checkpoint.save(uid, record)
                     persisted += 1
                 except OSError as exc:
                     if on_error:
@@ -1091,6 +1213,21 @@ def analyze_reachability(
         stats["checkpoint_summary_write_failures"] = \
             checkpoint_summary_write_failures
 
+    # #798 (r2-F5): the returned list is deduped on the same key the
+    # records dedupe on — (unit_id, kind, confidence), keeping the first
+    # reason. Without this, a unit re-signaled across two batches applies
+    # twice in this run's summary while its record persists once, so the
+    # step report's counts diverged across a resume chain by one per
+    # re-signal (the adopted-vs-applied parity held only for promotions).
+    _seen_sigs: set = set()
+    _deduped_signals: List[ReachabilitySignal] = []
+    for _s in signals:
+        _k = (_s.unit_id, _s.kind, _s.confidence)
+        if _k not in _seen_sigs:
+            _seen_sigs.add(_k)
+            _deduped_signals.append(_s)
+    signals = _deduped_signals
+
     return signals
 
 
@@ -1182,6 +1319,8 @@ def apply_signals(
             "signals_applied": <n>,
             "entry_points_promoted": <n>,
             "units_touched": <n>,
+            "signals_dropped_unknown_unit": <n>,  # #798: the apply-time drop
+            "promote_set": [...],
         }
     """
     units = dataset.get("units") or []
@@ -1191,10 +1330,17 @@ def apply_signals(
     promoted = 0
     touched: set = set()
     applied = 0
+    dropped_unknown = 0
 
     for sig in signals:
         unit = by_id.get(sig.unit_id)
         if unit is None:
+            # #798: the apply-time drop is COUNTED — the stale-id class
+            # (a checkpoint-adopted signal replayed against a changed
+            # dataset; a caller-supplied signal list) previously vanished
+            # with no counter anywhere, and the returned summary could
+            # not distinguish "every signal landed" from "some did not".
+            dropped_unknown += 1
             continue
 
         existing = unit.setdefault("llm_reachability_signals", [])
@@ -1215,6 +1361,9 @@ def apply_signals(
         "signals_applied": applied,
         "entry_points_promoted": promoted,
         "units_touched": len(touched),
+        # #798: the apply-time counterpart of the parse-time skip counter —
+        # how many signals referenced a unit absent from THIS dataset.
+        "signals_dropped_unknown_unit": dropped_unknown,
         # #345 (wave r1 opus): the resolved set is part of the run's
         # provenance — two scans under different sets produce different
         # promotions with byte-identical step reports otherwise.
