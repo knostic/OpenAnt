@@ -789,8 +789,13 @@ class FindingVerifier:
         _restored_ok = 0
         _restored_incomplete = 0
         _errored_retried = 0
+        # #802: the current population's keys — the verify census keys the
+        # delta on these (the checkpoint rows NOT in this batch are the
+        # prior run's rows whose findings left scope).
+        _current_keys: set = set()
         for r in results:
             key = r.get("unit_id") or r.get("route_key", "unknown")
+            _current_keys.add(key)
             cp_data = checkpointed.get(key)
             if cp_data and not _cp_is_error(cp_data):
                 # Restore verification data from checkpoint
@@ -852,6 +857,23 @@ class FindingVerifier:
             _summary_unpriced.update(_u)
             _summary_unpriced_cache.update(_c)
 
+        # #802: the kept-set delta — the verify leg's foreign rows
+        # (checkpoint keys NOT in this batch) were never visited: a prior
+        # run's ERRORED verify row whose finding left scope is unfinished
+        # work silently absorbed (the same 88-casualty class the analyze
+        # and enhance legs report). Classify each dropped row by THIS
+        # phase's own errored-row predicate and thread the block into
+        # every summary write, present-only.
+        _resume_delta = None
+        if checkpoint is not None:
+            from core.checkpoint import build_resume_delta
+            _dropped_rows = [
+                (_key, _cp_is_error(_cp))
+                for _key, _cp in checkpointed.items()
+                if _key not in _current_keys
+            ]
+            _resume_delta = build_resume_delta(_dropped_rows)
+
         def _usage_dict():
             usage = {"input_tokens": _summary_input_tokens,
                      "output_tokens": _summary_output_tokens,
@@ -884,7 +906,8 @@ class FindingVerifier:
         if checkpoint is not None:
             checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                      _summary_error_breakdown, phase="in_progress",
-                                     usage=_usage_dict(), incomplete=_summary_incomplete)
+                                     usage=_usage_dict(), incomplete=_summary_incomplete,
+                                     resume_delta=_resume_delta)
 
         def _summary_callback(detail, usage=None):
             """Update summary counters after each unit. Called from main thread."""
@@ -924,7 +947,8 @@ class FindingVerifier:
             if checkpoint is not None:
                 checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                          _summary_error_breakdown, phase="in_progress",
-                                         usage=_usage_dict(), incomplete=_summary_incomplete)
+                                         usage=_usage_dict(), incomplete=_summary_incomplete,
+                                         resume_delta=_resume_delta)
 
         remaining = len(results_to_verify)
         # #542 (the #435 family, PR #472's verify sibling): "already done"
@@ -951,7 +975,8 @@ class FindingVerifier:
         if checkpoint is not None:
             checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                      _summary_error_breakdown, phase="done",
-                                     usage=_usage_dict(), incomplete=_summary_incomplete)
+                                     usage=_usage_dict(), incomplete=_summary_incomplete,
+                                     resume_delta=_resume_delta)
 
         # Step 2: Consistency cross-check (barrier — needs all results)
         results = self._check_consistency(results, code_by_route)
