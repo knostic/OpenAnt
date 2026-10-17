@@ -100,8 +100,13 @@ class RepositoryScanner {
         }
 
         // File name patterns: .test.*, .spec.*, _test.*, test_*
-        if (/\.(test|spec)\.[jt]sx?$/.test(base)) return true;
-        if (/_(test)\.[jt]sx?$/.test(base)) return true;
+        // #801: the extension set must cover the c-/m-prefixed forms —
+        // .test.cjs evaded the old [jt]sx? pattern (a one-character
+        // class gap) and a CI test file reached a paid kept set. The
+        // pattern now matches js|jsx|ts|tsx|cjs|mjs (the scanner's own
+        // sourceExtensions list, mirrored).
+        if (/\.(test|spec)\.(?:[jt]sx?|[cm]js)$/.test(base)) return true;
+        if (/_test\.(?:[jt]sx?|[cm]js)$/.test(base)) return true;
         if (/^test_/.test(base)) return true;
 
         return false;
@@ -111,6 +116,16 @@ class RepositoryScanner {
      * Check if a directory should be excluded
      */
     shouldExcludeDirectory(dirName) {
+        // #801: the hidden-directory RULE, not one more literal name —
+        // the language-independent policy (tooling and VCS metadata live
+        // in dot-directories: .github, .agents, .claude, .devcontainer,
+        // .cargo...). Python's scanner has had the rule all along
+        // (repository_scanner.py: if dir_name.startswith('.'): return
+        // True); the JS scanner drifted to a literal list, so .github —
+        // absent from the list — leaked five CI units into a paid kept
+        // set. A rule cannot drift per-name; the list stays for the
+        // named non-hidden dirs (node_modules, dist, build...).
+        if (dirName.startsWith('.')) return true;
         return this.excludePatterns.some(pattern => {
             // Exact match
             if (dirName === pattern) return true;
