@@ -255,9 +255,13 @@ class BedrockAdapter:
             # Bedrock throttling (ThrottlingException) rides the SDK's
             # 429 mapping; report it to the global limiter exactly like
             # the reference adapter so multi-worker scans coordinate.
+            # #785: a quota-named 429 (a hard limit) never arms the pause.
+            kind = _rate_limit_kind(exc)
             retry_after = _retry_after_from(exc)
-            report_rate_limit(retry_after)
-            raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
+            if kind != "quota":
+                report_rate_limit(retry_after)
+            raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after,
+                                    kind=kind) from redacted_cause_from(exc)
         except anthropic.NotFoundError as exc:
             raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except anthropic.APIConnectionError as exc:
@@ -305,8 +309,12 @@ class BedrockAdapter:
                 redact_secrets(str(exc)) + _MODEL_ACCESS_HINT
             ) from redacted_cause_from(exc)
         except anthropic.RateLimitError as exc:
+            # #785: kind passes through here too — validate deliberately
+            # never reports (a one-shot preflight outside the worker
+            # loop), but the caller reads the kind.
             retry_after = _retry_after_from(exc)
-            raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
+            raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after,
+                                    kind=_rate_limit_kind(exc)) from redacted_cause_from(exc)
         except anthropic.NotFoundError as exc:
             raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except anthropic.APIConnectionError as exc:
@@ -330,6 +338,57 @@ class BedrockAdapter:
 # ----------------------------------------------------------------------
 
 
+_AWS_QUOTA_ERROR_TYPE = "ServiceQuotaExceededException"
+
+
+def _rate_limit_kind(exc: BaseException) -> str:
+    """#785: classify a Bedrock rate-limit-shaped error by the AWS error type.
+
+    The AWS service model (botocore bedrock-runtime/2023-09-30) names its
+    quota error ``ServiceQuotaExceededException`` — an HTTP **400**, never a
+    429 — so it arrives here through the residual ``APIStatusError`` path,
+    not the typed ``RateLimitError`` catch. The type name travels on the
+    ``x-amzn-ErrorType`` response header and on the AWS rest-json body's
+    ``__type`` key (botocore's fallback carrier); both are normalized the
+    botocore way (the wire values carry ``:URI``/``ns#Code`` suffixes). The
+    message prose is NOT a carrier — a throttle whose prose mentions the
+    quota type must not flip to quota (a false non-retryable). Everything else —
+    ``ThrottlingException``, ``ModelNotReadyException``, an unknown 429 —
+    stays ``"throttle"``: transient, bounded-backoff-friendly.
+
+    ``"quota"`` (#663): a hard limit — the account quota is exhausted;
+    backoff does not restore access, so it must neither arm the global
+    all-worker pause (the adapters' ``kind != "quota"`` gate) nor be
+    retried as transient (rate_limiter's kind check).
+    """
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    # T1 round-1 F1: the real AWS wire form carries a suffix —
+    # ``<Code>:<URI>`` or ``<ns>#<Code>`` (botocore normalizes exactly this
+    # way, parsers.py: split(':', 1)[0].rsplit('#', 1)[-1]). The bare
+    # catalogue name is the one shape AWS does NOT send, so normalize
+    # before comparing or the classifier is inert on production.
+    raw_header = str(headers.get("x-amzn-ErrorType", "") or "")
+    header_type = raw_header.split(":", 1)[0].rsplit("#", 1)[-1]
+    # T1 round-2 R2-1: the AWS rest-json body carrier is the ``__type``
+    # key (botocore parsers.py: body.get("__type")), and its wire value
+    # carries the same ``:URI``/``ns#Code`` suffixes the header does —
+    # normalize identically or the fallback is inert exactly where the
+    # header was stripped (the gateway-body path). The anthropic-native
+    # ``type`` key (``"error"``) never names a type — dropped.
+    body = getattr(exc, "body", None)
+    body_type = ""
+    if isinstance(body, dict):
+        raw_body_type = str(body.get("__type", "") or "")
+        body_type = raw_body_type.split(":", 1)[0].rsplit("#", 1)[-1]
+    # T1 round-1 F2: the message prose is NOT a carrier — a transient
+    # throttle whose body mentions the quota type would flip to quota
+    # (a false non-retryable). Only the structured carriers count.
+    if _AWS_QUOTA_ERROR_TYPE in (header_type, body_type):
+        return "quota"
+    return "throttle"
+
+
 def _classify_status_error(exc: anthropic.APIStatusError, *, report_429: bool) -> Exception:
     """Map a residual APIStatusError to the adapter taxonomy.
 
@@ -342,11 +401,24 @@ def _classify_status_error(exc: anthropic.APIStatusError, *, report_429: bool) -
         # 429 is Bedrock's throttling status; 529 is the Anthropic-compat
         # "overloaded" a base_url gateway may send. A typed RateLimitError
         # is normally caught upstream in ``complete()``; this covers a 429
-        # that arrives as a bare APIStatusError. Both are transient.
+        # that arrives as a bare APIStatusError. Both are normally
+        # transient — but #785: if the AWS type names the quota error, it
+        # is a hard limit and must not arm the global pause.
+        kind = _rate_limit_kind(exc)
         retry_after = _retry_after_from(exc)
-        if report_429:
+        if report_429 and kind != "quota":
             report_rate_limit(retry_after)
-        return LLMRateLimitError(message, retry_after=retry_after)
+        return LLMRateLimitError(message, retry_after=retry_after, kind=kind)
+    if status == 400 and _rate_limit_kind(exc) == "quota":
+        # #785: the ServiceQuotaExceededException is a 400 — a service
+        # quota is exceeded (per-request or account-level). Surface it as
+        # the rate limit it is (kind "quota") instead of the structural
+        # residual: the LABEL and the consumer surface change — at base
+        # the residual LLMResponseError was already non-retryable at the
+        # gate, so the behavioral delta here is the classification and the
+        # kind-carrying surface, not the 400's retry outcome. No
+        # report_rate_limit — a quota never arms the global pause.
+        return LLMRateLimitError(message, kind="quota")
     if status == 400 and "model identifier" in message.lower():
         # Bedrock reports a malformed/unknown model ID as a 400
         # ValidationException ("The provided model identifier is
