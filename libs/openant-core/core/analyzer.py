@@ -41,7 +41,7 @@ from utilities.llm import (
 from utilities.file_io import read_json, write_json
 from utilities.json_corrector import JSONCorrector
 from utilities.llm import DEFAULT_MAX_TOKENS
-from utilities.context_enhancer import _build_error_info
+from utilities.context_enhancer import _build_error_info, _summary_error_bucket
 from utilities.rate_limiter import (
     get_rate_limiter,
     is_budget_exhausted_error,
@@ -266,8 +266,10 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
     Supports checkpoint/resume via the checkpoint parameter.
 
     Args:
-        summary_callback: Optional callable(finding, usage=None) called from
-            main thread after each unit completes. Used for _summary.json updates.
+        summary_callback: Optional callable(finding, usage=None,
+            error_msg=None, error_info=None) called from main thread after
+            each unit completes. Used for _summary.json updates (#800:
+            the error args carry the material the breakdown classifies).
 
     Returns (results_list, code_by_route_dict) in original unit order.
     """
@@ -348,7 +350,9 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
                 results[i] = out["result"]
                 code_by_route[out["route_key"]] = out["code_for_route"]
                 if summary_callback:
-                    summary_callback(out["finding"], usage=out.get("usage"))
+                    summary_callback(out["finding"], usage=out.get("usage"),
+                                     error_msg=out["result"].get("error"),
+                                     error_info=out["result"].get("error_info"))
                 progress.report(
                     out["result"].get("unit_id", f"unit_{i}"),
                     detail=out["finding"],
@@ -382,7 +386,9 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
             results[idx] = out["result"]
             code_by_route[out["route_key"]] = out["code_for_route"]
             if summary_callback:
-                summary_callback(out["finding"], usage=out.get("usage"))
+                summary_callback(out["finding"], usage=out.get("usage"),
+                                 error_msg=out["result"].get("error"),
+                                 error_info=out["result"].get("error_info"))
             worker = out.get("worker", "?")
             progress.report(
                 out["result"].get("unit_id", f"unit_{idx}"),
@@ -916,14 +922,22 @@ def run_analysis(
                              usage=_usage_dict(), incomplete=_summary_incomplete,
                              resume_delta=_resume_delta)
 
-    def _summary_callback(finding, usage=None):
+    def _summary_callback(finding, usage=None, error_msg=None,
+                         error_info=None):
         """Update summary counters after each unit. Called from main thread."""
         nonlocal _summary_completed, _summary_incomplete, _summary_errors
         nonlocal _summary_error_breakdown
         nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
         if finding == "error":
             _summary_errors += 1
-            _summary_error_breakdown["api"] = _summary_error_breakdown.get("api", 0) + 1
+            # #800: the taxonomy split — a permanent context-overflow 400
+            # files under its own class, distinct from a transient 429 (the
+            # hardcoded "api" bucket made the two indistinguishable in
+            # _summary.json, and the two demand opposite operator
+            # responses: never retry vs. retry later).
+            _bucket = _summary_error_bucket(error_msg, error_info)
+            _summary_error_breakdown[_bucket] = \
+                _summary_error_breakdown.get(_bucket, 0) + 1
         else:
             # #293 adjudication: "inconclusive"/"insufficient_context" are
             # completed verdicts (taxonomy), not incomplete — no third state.
@@ -1003,6 +1017,25 @@ def run_analysis(
         for i in retryable_indices:
             unit = units[i]
             _cap = budget_retry_cap(i, _budget_set, binding)
+            # #800 (r1-F1): the FIRST-ATTEMPT class must retire with the
+            # first attempt — capture the bucket BEFORE the retry
+            # overwrites the result (the storm-then-overflow pattern: a
+            # 429 first attempt retried into a permanent context-overflow
+            # 400 must file as context_overflow, the residual class the
+            # operator needs — never as the transient first-attempt
+            # class; the enhance phase's own retry already retires its
+            # bucket, the analyzer's loop did not).
+            _prev_bucket = _summary_error_bucket(
+                results[i].get("error"), results[i].get("error_info"))
+            if _prev_bucket in _summary_error_breakdown:
+                _n = _summary_error_breakdown[_prev_bucket] - 1
+                if _n > 0:
+                    _summary_error_breakdown[_prev_bucket] = _n
+                else:
+                    # the enhance phase's own retire precedent: a zeroed
+                    # count drops the key (a "rate_limit: 0" artifact
+                    # invites the question the split was meant to answer)
+                    _summary_error_breakdown.pop(_prev_bucket, None)
             out = _process_unit(binding, unit, i, json_corrector, app_context,
                                 max_tokens=_cap)
             results[i] = out["result"]
@@ -1014,6 +1047,16 @@ def run_analysis(
             if out["finding"] != "error":
                 _summary_errors = max(0, _summary_errors - 1)
                 _summary_completed += 1
+            else:
+                # the retry errored again: re-file under the RETRY's
+                # class (the first-attempt bucket already retired above;
+                # the error COUNT stays — the unit never left the error
+                # side)
+                _new_bucket = _summary_error_bucket(
+                    out["result"].get("error"),
+                    out["result"].get("error_info"))
+                _summary_error_breakdown[_new_bucket] = \
+                    _summary_error_breakdown.get(_new_bucket, 0) + 1
             retry_usage = out.get("usage", {})
             _summary_input_tokens += retry_usage.get("input_tokens", 0)
             _summary_output_tokens += retry_usage.get("output_tokens", 0)

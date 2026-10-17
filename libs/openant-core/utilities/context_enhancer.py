@@ -44,6 +44,7 @@ from .agentic_enhancer import (
 from .rate_limiter import get_rate_limiter, is_retryable_error
 from .file_io import read_json, write_json
 from .json_extract import extract_json_object
+import re as _re
 
 # Avoid circular import — import checkpoint at usage site
 _StepCheckpoint = None
@@ -87,6 +88,148 @@ _ENHANCE_JSON_SCHEMA = """{
     "confidence": 0.0,
     "security_classification": "exploitable | vulnerable_internal | security_control | neutral | unknown"
 }"""
+
+
+def _summary_error_bucket(error_msg, error_info=None) -> str:
+    """#800: classify an analyze/verify summary error into the triage
+    taxonomy. The hardcoded ``"api"`` bucket mixed permanent,
+    deterministic failures with transient ones — the two demand opposite
+    operator responses (never retry vs. retry later) — and a
+    context-overflow 400 was indistinguishable from a 402/429 storm in
+    ``_summary.json``.
+
+    The buckets (checked most-specific first):
+
+    * ``context_overflow`` — the permanent token-ceiling 400s. The
+      campaign's two message shapes: ``prompt is too long`` (Anthropic's
+      wording, which the Bedrock adapter's SDK also emits) and
+      ``maximum context length`` (the unattributed OpenAI-style shape);
+      the ``context_length_exceeded`` literal (OpenAI's error code);
+      Google's ``exceeds the maximum number of input tokens`` / ``input
+      token count`` shape. Retrying can never help: the projection
+      exceeds the provider ceiling.
+    * ``payload_too_large`` — the permanent byte-size 400s (the
+      campaign's ``total text input size exceeds 8 MB`` shape and the
+      request-entity family).
+    * ``quota`` — the #663/#790 entitlement class: an
+      ``LLMRateLimitError`` whose ``kind`` is ``quota`` (a spend cap, a
+      daily cap — the retry gate refuses these; the breakdown must not
+      tell the operator "retry later" for a class the retry pass will
+      not retry).
+    * ``rate_limit`` — the transient 429 class (the adapter's
+      LLMRateLimitError taxonomy via ``error_info["type"]``, or the
+      string shapes — with the HTTP codes WORD-BOUNDED, the #292
+      lesson: an unanchored ``" 429"`` substring matched "afford 42900
+      tokens" on the error_info-less verify path).
+    * ``payment_required`` — the 402 billing class (the campaign's
+      4,894 storm under the old single bucket).
+    * ``api`` — the fallback (the legacy bucket name: an LLM/API
+      failure this taxonomy does not name — backwards-compatible).
+
+    Order matters, twice over:
+
+    * the message signatures are decisive even when the structured
+      ``error_info`` is generic (an api_status dict with status_code 400
+      carries no distinction the classifier could use);
+    * but a NON-generic structured type is decisive over the payload-size
+      SIGNATURE (r5-F4): OpenAI's single-request-over-TPM 429 says
+      ``Request too large for gpt-4o ... on tokens per min`` — the
+      adapter types it ``rate_limit`` and the retry gate retries it, so
+      the breakdown must agree (the r1-F4 consistency), not call a
+      retryable throttle a permanent payload failure. The token-ceiling
+      signatures stay FIRST: a 400 prompt-too-long is never typed
+      rate_limit, and its message is the campaign's own evidence.
+    * a ``parse_error`` type (the producer's unparseable-response class)
+      resolves to the legacy ``api`` (r5-F3): its message is a JSON
+      parser position, which can EMBED a bare 3-digit number
+      (``line 1 column 429 (char 428)``) — a permanent producer fault
+      must never file as a transient HTTP class through the
+      word-bounded code scan.
+    """
+    # #800 (r4-F1): the analyze producer emits a DICT error for the
+    # unparseable-response class (analysis_core.py: "error": {"type":
+    # "parse_error", "message": ...} — the repo's own established shape;
+    # rate_limiter.is_retryable_error dispatches on dict-vs-str for
+    # exactly this producer). Accept BOTH shapes: the dict's message is
+    # the string arm's input, and the dict itself serves as the
+    # structured error_info when none was passed (a parse_error files
+    # under the legacy "api" — its own class is #432-family territory).
+    if isinstance(error_msg, dict):
+        if error_info is None:
+            error_info = error_msg
+        error_msg = (error_msg.get("message")
+                     or error_msg.get("type") or "")
+    msg = str(error_msg or "").lower()
+
+    # The permanent token-ceiling class (the campaign's executed shapes +
+    # Google's first-class wording + Anthropic's input+max_tokens band).
+    for sig in ("prompt is too long", "maximum context length",
+                "context_length_exceeded",
+                "exceeds the maximum number of input tokens",
+                "input token count", "exceed context limit"):
+        if sig in msg:
+            return "context_overflow"
+
+    # The structured route BEFORE the payload signature (r5-F4): a
+    # NON-generic type (the adapter's own taxonomy) names the class;
+    # only the generic api_status/unknown dicts fall through to the
+    # message signatures.
+    if isinstance(error_info, dict):
+        # r5-F3: the parse producer's own type — its message is a parser
+        # position that can embed a bare 3-digit number; the structured
+        # dict NAMES the class, so it is decisive (the word-bounded code
+        # scan must never see it).
+        if error_info.get("type") == "parse_error":
+            return "api"
+        if error_info.get("type") == "rate_limit":
+            # #663/#790: the throttle/quota split rides the kind — a
+            # quota is a hard entitlement limit (never retryable); a
+            # throttle is short-window throughput (retry later).
+            if error_info.get("kind") == "quota":
+                return "quota"
+            return "rate_limit"
+        status = error_info.get("status_code")
+        if status == 402:
+            return "payment_required"
+        if status == 429:
+            return "rate_limit"
+
+    # The permanent payload-size class.
+    for sig in ("total text input size exceeds", "request too large",
+                "payload too large", "request entity too large"):
+        if sig in msg:
+            return "payload_too_large"
+
+    # The verify path carries the adapter's exception CLASS NAME as the
+    # string prefix (finding_verifier's f"{type(e).__name__}: {e}") —
+    # consume it when the structured dict is absent.
+    if msg.startswith("llmratelimiterror"):
+        return "rate_limit"
+
+    # WORD-BOUNDED HTTP codes (the #292 lesson: an unanchored " 429"
+    # matched "afford 42900 tokens" — a 402 body, misfiled). The leading
+    # "error code: NNN" (the adapters' own prefix) wins when present, so
+    # a 402 body carrying a bounded 429 elsewhere ("can only afford
+    # 429.") resolves by its OWN code (r2-F4).
+    m = _re.search(r"error code: (\d{3})\b", msg)
+    if m:
+        # the LEADING code resolves by ITSELF (the arm's own principle):
+        # a 400/5xx body carrying a standalone 429 elsewhere must not
+        # fall through to the bounded scan (the r3-F2 catch —
+        # "invalid parameter 'n': 429" and "too many requests queued
+        # upstream" misfiled as rate_limit)
+        code = m.group(1)
+        if code == "429":
+            return "rate_limit"
+        if code == "402":
+            return "payment_required"
+        return "api"
+    if _re.search(r"\b429\b", msg) or "too many requests" in msg:
+        return "rate_limit"
+    if _re.search(r"\b402\b", msg) or "payment required" in msg:
+        return "payment_required"
+
+    return "api"
 
 
 def _build_error_info(exc: Exception) -> dict:
