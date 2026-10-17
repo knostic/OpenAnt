@@ -13,7 +13,7 @@ httpx2==2.13.1  # NOTE: never call httpx2.alias_httpx() here — it rebinds `imp
 # process-wide and would corrupt the httpx<1 exception handling in the
 # openai/google-genai adapters (see providers/{openai,google}.py)
 httpcore2==2.13.1
-truststore==0.10.4
+truststore==0.10.5
 idna==3.20
 jiter==0.17.0
 pydantic==2.13.5
