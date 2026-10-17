@@ -288,6 +288,11 @@ class ContextEnhancer:
         self.tracker = tracker or get_global_tracker()
         self.binding = binding
         self.logger = logger or _null_logger
+        # #802: the kept-set delta holder — set by both resume paths at
+        # their stale-restored intersections (the rows a prior run left in
+        # the monotonic checkpoint dir whose units are not in THIS run's
+        # population); core/enhancer.py reads it onto the EnhanceResult.
+        self._resume_delta = None
         self._use_logger = logger is not None
         self.stats = {
             "units_processed": 0,
@@ -484,6 +489,33 @@ class ContextEnhancer:
             # scope / manual strays) as restored, inflating the #218 baseline
             # rebase and the skip set's counts — intersect with THIS dataset.
             _dataset_ids = {u.get("id") for u in units}
+            # #802: the kept-set delta — the census is the DIR (all rows,
+            # completed AND errored), not the completed set: a FOREIGN
+            # ERRORED row (a prior run's unfinished work whose unit left
+            # scope) is deliberately absent from processed_ids, so the
+            # stale-restored intersection below never sees it — exactly
+            # the 88-casualty class this delta exists to name. This path
+            # writes no _summary.json, so the delta's surfaces are the
+            # phase holder (the EnhanceResult, read by the standalone
+            # enhance CLI's envelope) — the scan-level step report does NOT
+            # aggregate it (a named follow-up, the r1-F3 finding; the
+            # agentic leg's _summary.json is the durable surface inside
+            # scan); the prior-verdict predicate is the error key THIS
+            # path's own error branch stamps (enhancer.py's counter reads
+            # the same key).
+            from core.checkpoint import build_resume_delta
+            _drop_map = self._id_keyed_checkpoint_map(checkpoint_dir)
+            _dropped = []
+            for _sid in set(_drop_map) - _dataset_ids:
+                _row = read_json(_drop_map[_sid])
+                # r1-F2: the row's own context_key (both modes share this
+                # dir; a mode switch between runs must not misclassify a
+                # prior-mode ERRORED row as completed).
+                _ctx_key = (_row or {}).get("context_key", "llm_context")
+                _ctx = (_row or {}).get(_ctx_key, {})
+                _dropped.append(
+                    (_sid, isinstance(_ctx, dict) and bool(_ctx.get("error"))))
+            self._resume_delta = build_resume_delta(_dropped)
             _stale_restored = processed_ids - _dataset_ids
             if _stale_restored:
                 # the sample is capped: a diff-scope resume over a shared
@@ -709,6 +741,33 @@ class ContextEnhancer:
             # already dataset-keyed (they iterate units) — only the COUNTS
             # were raw.
             _dataset_ids = {u.get("id") for u in units}
+            # #802: the campaign's 105-orphan shape — the prior run's rows
+            # whose units are not in THIS population were counted nowhere.
+            # The census is the DIR (all rows, completed AND errored), not
+            # the completed set: _load_completed_units deliberately
+            # excludes errored rows, so a FOREIGN ERRORED row — the exact
+            # unfinished work a resume exists to finish — is invisible to
+            # the stale-restored intersection below (the 88-casualty
+            # class). The delta (classified by each row's prior verdict:
+            # the agent_context.error key this path's own error branch
+            # stamps) reaches the enhance _summary.json and the phase
+            # holder (the EnhanceResult seam).
+            from core.checkpoint import build_resume_delta
+            _drop_map = self._id_keyed_checkpoint_map(checkpoint_dir)
+            _dropped = []
+            for _sid in set(_drop_map) - _dataset_ids:
+                _row = read_json(_drop_map[_sid])
+                # r1-F2: honor the ROW's own context_key (the same
+                # predicate _load_completed_units uses) — both modes share
+                # this dir, so a mode switch between runs (agentic ->
+                # single-shot after a quota storm) must not misclassify a
+                # prior-mode ERRORED row as completed (the 88-casualty
+                # class labeled as its opposite).
+                _ctx_key = (_row or {}).get("context_key", "agent_context")
+                _ctx = (_row or {}).get(_ctx_key, {})
+                _dropped.append(
+                    (_sid, isinstance(_ctx, dict) and bool(_ctx.get("error"))))
+            self._resume_delta = build_resume_delta(_dropped)
             _stale_restored = processed_ids - _dataset_ids
             if _stale_restored:
                 # the sample is capped: a diff-scope resume over a shared
@@ -865,7 +924,8 @@ class ContextEnhancer:
             _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                       _summary_error_breakdown, phase="in_progress",
                                       incomplete=_summary_incomplete,
-                                      usage=_usage_dict())
+                                      usage=_usage_dict(),
+                                      resume_delta=self._resume_delta)
 
             # Inject prior usage into tracker so step_report captures the total
             # F661-3: the ONE spend predicate — the cost disjunct is what
@@ -1053,7 +1113,8 @@ class ContextEnhancer:
             if _summary_cp is not None:
                 _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                           _summary_error_breakdown, phase="in_progress",
-                                          usage=_usage_dict(), incomplete=_summary_incomplete)
+                                          usage=_usage_dict(), incomplete=_summary_incomplete,
+                                          resume_delta=self._resume_delta)
 
         if workers <= 1:
             # Sequential mode
@@ -1213,7 +1274,8 @@ class ContextEnhancer:
                     _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                               _summary_error_breakdown, phase="in_progress",
                                               incomplete=_summary_incomplete,
-                                              usage=_usage_dict())
+                                              usage=_usage_dict(),
+                                              resume_delta=self._resume_delta)
 
                 # Save checkpoint (overwrite error with result)
                 if checkpoint_dir:
@@ -1233,7 +1295,8 @@ class ContextEnhancer:
             _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                       _summary_error_breakdown, phase="done",
                                       incomplete=_summary_incomplete,
-                                      usage=_usage_dict())
+                                      usage=_usage_dict(),
+                                      resume_delta=self._resume_delta)
 
         # Compute stats from all units (including previously checkpointed ones)
         agentic_stats = self._compute_agentic_stats(units)
