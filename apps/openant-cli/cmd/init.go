@@ -64,8 +64,52 @@ func init() {
 	// flag is what forced every project into a single language.
 }
 
+// validateInitLanguage is the #691 CLI boundary: `auto` (the multi-language
+// pin) always passes; any other value must be a member of the supported
+// set — exact case (the '-l Python' typo is the silently-persisted-garbage
+// shape), no path shapes (the traversal escape). A registry failure fails
+// CLOSED for the non-auto form: no pin exists yet, so the honest answer is
+// the refusal, never a silent pass.
+func validateInitLanguage(value string) error {
+	return validateInitLanguageRegistryDown(value, languages.Supported)
+}
+
+// validateInitLanguageRegistryDown is the seam form (the registry failure
+// is injectable for the test).
+func validateInitLanguageRegistryDown(value string, supportedFn func() ([]string, error)) error {
+	if value == "" || value == "auto" {
+		return nil
+	}
+	supported, err := supportedFn()
+	if err != nil {
+		// FAIL CLOSED (the #667 guard lets the off-pin message fire on a
+		// registry failure because a pin already exists; HERE no pin
+		// exists — persisting an unvalidated value is the #691 bug).
+		return fmt.Errorf("--language/-l %q could not be validated against the supported set (%v) — refusing to pin an unvalidated language; restore config/languages.json and retry ('auto' cannot detect languages while the registry is down either)", value, err)
+	}
+	for _, s := range supported {
+		if s == value {
+			return nil
+		}
+	}
+	return fmt.Errorf("--language/-l %q is not a supported language (the supported set: %s) — the value is pinned verbatim into project.json and becomes the artifacts path, so a typo fails every later scan far from the cause (issue #691); use 'auto' to scan all languages", value, strings.Join(supported, ", "))
+}
+
 func runInit(cmd *cobra.Command, args []string) {
 	input := args[0]
+
+	// #691 + the T1's F1: the language gate runs FIRST — before the
+	// remote clone/pull branch (a bad -l previously triggered a full
+	// git clone/pull before the zero-cost flag check refused it) and
+	// before ANY write (the traversal escape and the silently-persisted
+	// typo must refuse at the boundary, cost-free).
+	if initLanguage == "" {
+		initLanguage = "auto"
+	}
+	if err := validateInitLanguage(initLanguage); err != nil {
+		output.PrintError(err.Error())
+		os.Exit(2)
+	}
 
 	// Derive project name
 	name := initName
@@ -153,9 +197,8 @@ func runInit(cmd *cobra.Command, args []string) {
 	// Detection still runs, but only to TELL the user what is there. The set is
 	// resolved per-scan now, so adding a language to the repo later is picked up
 	// without re-running init.
-	if initLanguage == "" {
-		initLanguage = "auto"
-	}
+	// (the gate ran at the top — see the F1 note; the detection below
+	// only TELLS the user what is there)
 	if initLanguage == "auto" {
 		fmt.Fprintf(os.Stderr, "Detecting languages...\n")
 		counts, err := languages.DetectLanguages(repoPath)
