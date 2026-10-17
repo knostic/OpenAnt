@@ -270,8 +270,11 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
             pruned_ids = sorted(set(functions) - set(filtered_functions))
             # #301: third return value = the orphan-rate advisory (its own
             # key, never the reserved warning slot; core parity).
+            # #741: the PARSED total (core parity) — without it the advisory's
+            # per-pruned rate reads 95% on a library-mode run that pruned 80 of 359.
             _extra, _asym_warning, _orphan_advisory = compute_prune_telemetry(
-                reachable, pruned_ids, call_graph, reverse_call_graph, output_dir)
+                reachable, pruned_ids, call_graph, reverse_call_graph, output_dir,
+                total_parsed_units=original_count)
             rf.update(_extra)
             if _asym_warning:
                 rf["warning"] = _asym_warning

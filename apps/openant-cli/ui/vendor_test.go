@@ -42,7 +42,7 @@ var uiVendorScripts = []struct {
 	banner string
 }{
 	{"marked-18.1.1.min.js", "b82b9334406d8bdd16b6236c08de1cb65b2a859873ca9503d9cc0b292ca3c12a", "marked v"},
-	{"dompurify-3.4.15.min.js", "f263b05369e050fa175d4ecb9c9358eb4253602d510297adfb31df48b2f1c4d5", "DOMPurify "},
+	{"dompurify-3.4.17.min.js", "cd37898f9782adf54820c413191b5691803f0f137c799d6edcfd38523b4c2c31", "DOMPurify "},
 }
 
 const uiVendorMinBytes = 10_000
@@ -488,10 +488,14 @@ func TestMDSanitizeConfigPinnedAndUsed(t *testing.T) {
 		if got := strings.Count(codeOnly, "DOMPurify"); got != wantDP {
 			t.Fatalf("%s: DOMPurify appears %d times in code, want exactly %d — a reassignment (DOMPurify.sanitize=s=>s kills the sink while the pinned invocation string survives), an alias, or a config-API call in any spelling (setConfig deadens the per-call argument — the vendored blob: Ae?(ae=Ee,ce=we):rn(e); clearConfig resets the shared state; addHook re-allows) adds a code mention", page, got, wantDP)
 		}
-		// Prototype pollution needs NEITHER identifier. The vendored 3.4.15
+		// Prototype pollution needs NEITHER identifier. The vendored 3.4.17
 		// clones configs onto Object.create(null) and reads own properties
 		// only, so this is DEFENSE-IN-DEPTH (an upstream config-reader
 		// change, typo-class writes), not a currently-live vector.
+		// Re-verified EXECUTABLY on the 3.4.15 -> 3.4.17 bump: polluting
+		// Object.prototype with ADD_TAGS/ALLOWED_TAGS/ALLOW_UNKNOWN_PROTOCOLS
+		// in the sanitizer's own realm leaves the output byte-identical at
+		// BOTH versions (the config reader still ignores inherited keys).
 		for _, bad := range []string{"prototype", "__proto__"} {
 			if strings.Contains(ps, bad) {
 				t.Fatalf("%s: %q present — prototype writes are out of policy for the pages (defense-in-depth: the sanitizer's config plumbing must stay untouched from outside the pinned block)", page, bad)
