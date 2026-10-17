@@ -407,6 +407,12 @@ def run_single_container(
     safe_id = re.sub(r"[^a-z0-9-]", "-", finding_id.lower()).strip("-_.")
     image_tag = f"openant-test-{run_id}-{safe_id}"
     network_name = f"openant-net-{run_id}-{safe_id}"
+    # #732: the single-container path must be able to address the container
+    # it started. run_id exists precisely to make every per-run name unique
+    # (the #315 collision guard, already on the image tag, the network name
+    # and the compose project name); the container gets the same prefix
+    # model so a timed-out run can be killed by name.
+    container_name = f"openant-ct-{run_id}-{safe_id}"
 
     # Use a deterministic, sanitized work_dir name so docker compose project
     # names (derived from the dir name) are always valid Docker references.
@@ -430,7 +436,8 @@ def run_single_container(
         else:
             # Single container: docker build + run
             result = _run_single(work_dir, image_tag, network_name,
-                                 container_timeout, build_timeout)
+                                 container_timeout, build_timeout,
+                                 container_name)
     finally:
         result.elapsed_seconds = time.time() - start_time
         # Clean up work directory
@@ -447,8 +454,16 @@ def _run_single(
     network_name: str,
     container_timeout: int,
     build_timeout: int,
+    container_name: str,
 ) -> DockerExecutionResult:
-    """Build and run a single Docker container."""
+    """Build and run a single Docker container.
+
+    ``container_name`` is REQUIRED and carries the run's own UUID model
+    (``openant-ct-{run_id}-{safe_id}``, built beside the image tag in
+    run_single_container) — a container nobody can name is a container
+    nobody can tear down (#732). No derivation fallback here: the naming
+    model has exactly one home, next to image_tag/network_name.
+    """
     result = DockerExecutionResult()
 
     # Build
@@ -470,33 +485,53 @@ def _run_single(
     # tests still work over loopback. (No `docker network create` needed for this path.)
     # RESIDUAL: build-time RUN egress is still open — see _sanitize_compose. Hardening,
     # not a vuln fix. The multi-service path uses an internal compose network instead.
-    stdout, stderr, code, timed_out = _run_command(
-        [
-            "docker", "run",
-            "--rm",
-            "--network", "none",
-            "--memory", "512m",
-            "--cpus", "1",
-            "--pids-limit", "256",
-            "--cap-drop", "ALL",
-            "--read-only",
-            "--tmpfs", "/tmp:size=256m",
-            "--tmpfs", "/root:size=128m",
-            "--security-opt", "no-new-privileges",
-            # No --user: the container runs as its image default (root) with a writable
-            # HOME via the /root tmpfs above. cap_drop ALL + no-new-privileges + read_only
-            # + --network none contain it; a non-root --user on a read-only rootfs would
-            # instead move $HOME to an unwritable `/` and flip HOME-cache tests to ERROR.
-            image_tag,
-        ],
-        timeout=container_timeout,
-        cwd=work_dir,
-    )
-
-    result.stdout = stdout
-    result.stderr = stderr
-    result.exit_code = code
-    result.timed_out = timed_out
+    #
+    # #732: the container is NAMED. subprocess's timeout (inside _run_command)
+    # kills the `docker run` CLIENT only, and `--rm` is daemon-side (it fires
+    # only when the container exits on its own), so a timed-out test would
+    # otherwise leak a running container the outer cleanup cannot touch
+    # (docker rmi -f cannot remove an image a running container uses — at
+    # best it untags, leaving dangling layers while the container runs;
+    # `network rm` never stops it — measured live: rmi -f on a container's
+    # image exits 0 and leaves it dangling). The finally below tears the
+    # container down by name on every exit path — the discipline _run_compose
+    # already holds (#536: down-in-finally).
+    try:
+        stdout, stderr, code, timed_out = _run_command(
+            [
+                "docker", "run",
+                "--rm",
+                "--name", container_name,
+                "--network", "none",
+                "--memory", "512m",
+                "--cpus", "1",
+                "--pids-limit", "256",
+                "--cap-drop", "ALL",
+                "--read-only",
+                "--tmpfs", "/tmp:size=256m",
+                "--tmpfs", "/root:size=128m",
+                "--security-opt", "no-new-privileges",
+                # No --user: the container runs as its image default (root) with a writable
+                # HOME via the /root tmpfs above. cap_drop ALL + no-new-privileges + read_only
+                # + --network none contain it; a non-root --user on a read-only rootfs would
+                # instead move $HOME to an unwritable `/` and flip HOME-cache tests to ERROR.
+                image_tag,
+            ],
+            timeout=container_timeout,
+            cwd=work_dir,
+        )
+        result.stdout = stdout
+        result.stderr = stderr
+        result.exit_code = code
+        result.timed_out = timed_out
+    finally:
+        # Always tear the container down (best effort, exactly like the
+        # compose path's `down`): after a timeout the container is still
+        # RUNNING — the client-side kill never reached it — and `docker rm -f`
+        # both kills and removes it. On a normal exit `--rm` already removed
+        # it and this is a harmless error whose rc nobody reads (the same
+        # best-effort contract _cleanup_docker holds for rmi/network).
+        _run_command(["docker", "rm", "-f", container_name], timeout=10, cwd=work_dir)
 
     return result
 

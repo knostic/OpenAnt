@@ -177,7 +177,7 @@ def _scan_with_report_failures(monkeypatch, tmp_path, *, summary_fails, disclosu
     _install_minimal_pipeline(monkeypatch)
     import core.reporter as reporter
 
-    def _fake_summary(results_path, output_path, llm_config_name=None):
+    def _fake_summary(results_path, output_path, llm_config_name=None, **kwargs):
         if summary_fails:
             raise RuntimeError(
                 "summary report generation returned empty output; refusing "
@@ -186,7 +186,7 @@ def _scan_with_report_failures(monkeypatch, tmp_path, *, summary_fails, disclosu
         Path(output_path).write_text("# summary")
         return None
 
-    def _fake_disclosure(results_path, output_dir, llm_config_name=None):
+    def _fake_disclosure(results_path, output_dir, llm_config_name=None, **kwargs):
         if disclosures_fail:
             raise RuntimeError("disclosure generation failed (test)")
         Path(output_dir).mkdir(parents=True, exist_ok=True)
