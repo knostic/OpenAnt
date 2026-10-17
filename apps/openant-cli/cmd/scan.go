@@ -3,6 +3,8 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/knostic/open-ant-cli/internal/checkpoint"
 	"github.com/knostic/open-ant-cli/internal/config"
@@ -190,6 +192,66 @@ func registerScanFlags(cmd *cobra.Command) {
 	cmd.Flags().BoolVar(&scanLibraryMode, "library-mode", false, "Seed the exported public API as reachability entry points, for a library whose public API is being dropped by the structural filter. Blunt: keeps most units — prefer letting fuzz/bin/route entry points seed reachability first.")
 }
 
+// rejectOffPinLanguage returns an error when an explicitly-requested scan
+// language would write another language's scan into a CONCRETE-pinned
+// project's directory (#667, the maintainer's REJECT-now ruling). The
+// exemption keys on the EFFECTIVE output path (the delta round's D1/D2:
+// `-o ""` re-defaults to the pin and must NOT exempt; parse passes its own
+// output after defaults — a package-level Changed() flag was the wrong
+// carrier on both counts).
+func rejectOffPinLanguage(ctx *projectContext, explicitLang bool, requested, effectiveOutput string) error {
+	if ctx == nil || ctx.Project == nil || !explicitLang {
+		return nil
+	}
+	pin := ctx.Project.Language
+	if pin == "" || pin == "auto" {
+		return nil // no concrete pin: auto/legacy projects are multi-language
+	}
+	if requested == pin {
+		return nil
+	}
+	// The T1 round's F2: an unsupported/miscased -l previously got the
+	// off-pin message whose remedy (`init -l <it>`) SUCCEEDS (issue #691's
+	// hole) — pinning garbage. Name the real problem instead. The delta
+	// round's D3: a registry failure NEVER misdiagnoses — on error, skip
+	// the pre-check and fall through to the honest #667 message.
+	if requested != "auto" {
+		if supported, err := languages.Supported(); err == nil && !containsLanguage(supported, requested) {
+			return fmt.Errorf("scan -l %s is not a supported language — the pinned project %q stays %s (issue #691 tracks init's missing validation; the supported set: %s)", requested, ctx.Project.Name, pin, strings.Join(supported, ", "))
+		}
+	}
+	// The effective-output exemption (the delta round's D1/D2): the
+	// artifacts land in the pin's dir ONLY when the effective output IS
+	// the pin's dir (unset, `-o ""`, or the literal pin path). An -o
+	// ELSEWHERE means the overwrite claim would be FALSE there.
+	// The round-3 F-A + round-4 F-2 fix: both sides ABSOLUTIZED (Abs
+	// implies Clean) — `-o <pin>/` (the tab-completion form), `<pin>/./`,
+	// and the cwd-relative `python` from inside the scans dir do not
+	// bypass the guard. Symlinks are declared out of scope (the round-4
+	// residual).
+	if effectiveOutput != "" && absPath(effectiveOutput) != absPath(ctx.ScanDir) {
+		return nil
+	}
+	return fmt.Errorf("scan -l %s on the %s-pinned project %q would write %s's scan into the pinned language's directory in place (issue #667) — re-run `openant init` with a SUPPORTED -l to change the pin, or pass -o to write elsewhere, or scan the repo without the project context", requested, pin, ctx.Project.Name, requested)
+}
+
+func absPath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p // unresolvable: compare raw — the reject direction
+	}
+	return abs
+}
+
+func containsLanguage(set []string, want string) bool {
+	for _, s := range set {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
 func runScan(cmd *cobra.Command, args []string) {
 	// Fail-fast on missing Docker when dynamic-test will run, before we
 	// resolve the project, write meta.json, or shell to Python. Otherwise
@@ -207,6 +269,10 @@ func runScan(cmd *cobra.Command, args []string) {
 		os.Exit(2)
 	}
 
+	// #667 (the REJECT-now ruling): capture whether -l was EXPLICITLY
+	// passed before the project defaults adopt the pin — only an explicit
+	// off-pin request is the overwrite shape.
+	explicitLang := cmd.Flags().Changed("language")
 	// Apply project defaults if using project context
 	if ctx != nil {
 		if scanOutput == "" {
@@ -215,6 +281,14 @@ func runScan(cmd *cobra.Command, args []string) {
 		if scanLanguage == "" {
 			scanLanguage = ctx.Language
 		}
+	}
+	// ...and reject it BEFORE any artifact write, meta write, or Python
+	// invocation (the fail-fast order: the user burns nothing). The
+	// EFFECTIVE scanOutput (post-defaults) is the exemption's key: `-o ""`
+	// re-defaults to the pin and does not exempt (the delta round's D1).
+	if err := rejectOffPinLanguage(ctx, explicitLang, scanLanguage, scanOutput); err != nil {
+		output.PrintError(err.Error())
+		os.Exit(2)
 	}
 	if scanLanguage == "" {
 		scanLanguage = "auto"
