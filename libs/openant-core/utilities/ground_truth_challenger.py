@@ -19,6 +19,7 @@ from typing import Optional
 from dataclasses import dataclass
 
 from .llm import PhaseBinding, simple_text
+from .json_extract import extract_json_object
 
 
 # Expected JSON shape of an arbitration response — handed to JSONCorrector so a
@@ -189,14 +190,10 @@ def _parse_json_response(response: str, binding: Optional[PhaseBinding] = None) 
     try:
         return json.loads(response)
     except json.JSONDecodeError:
-        # Try to find JSON in the response
-        start = response.find("{")
-        end = response.rfind("}") + 1
-        if start >= 0 and end > start:
-            try:
-                return json.loads(response[start:end])
-            except json.JSONDecodeError:
-                pass
+        # #673: the shared depth-0 scanner, not a first-{/last-} slice.
+        recovered = extract_json_object(response)
+        if recovered is not None:
+            return recovered
 
     # Fallback: use LLM to correct malformed JSON. Pass the arbitration schema
     # so the corrector recovers arbitration shape (no verdict) instead of

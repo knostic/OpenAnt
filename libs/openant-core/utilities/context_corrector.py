@@ -19,6 +19,7 @@ from typing import Optional
 
 from .llm_client import TokenTracker, get_global_tracker
 from .llm import PhaseBinding, simple_text
+from .json_extract import extract_json_object
 
 
 # Maximum characters per batch (leaving room for prompt overhead)
@@ -363,15 +364,9 @@ def _parse_json_response(response: str) -> Optional[dict]:
     try:
         return json.loads(response)
     except json.JSONDecodeError:
-        # Try to find JSON in the response
-        start = response.find("{")
-        end = response.rfind("}") + 1
-        if start >= 0 and end > start:
-            try:
-                return json.loads(response[start:end])
-            except json.JSONDecodeError:
-                pass
-    return None
+        # #673: the shared depth-0 scanner, not a first-{/last-} slice -- a
+        # brace anywhere in the surrounding prose invalidated that span.
+        return extract_json_object(response)
 
 
 class ContextCorrector:
@@ -579,14 +574,10 @@ class ContextCorrector:
             result = json.loads(response)
             return self._normalize_result(result)
         except json.JSONDecodeError as e:
-            start = response.find("{")
-            end = response.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    result = json.loads(response[start:end])
-                    return self._normalize_result(result)
-                except json.JSONDecodeError:
-                    pass
+            # #673: the shared depth-0 scanner, not a first-{/last-} slice.
+            result = extract_json_object(response)
+            if result is not None:
+                return self._normalize_result(result)
 
             # If all parsing failed, try LLM correction
             if hasattr(self, 'binding') and self.binding:
