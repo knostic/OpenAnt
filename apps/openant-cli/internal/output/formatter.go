@@ -64,29 +64,131 @@ func PrintKeyValue(key, value string) {
 	fmt.Println(value)
 }
 
-// renderCostBlock prints the Cost line (labelled incomplete when any model
-// was unpriced) and the unpriced id list — the one home for all three
-// summary renderers. #598: an incomplete figure must never read as
-// complete, and a $0 incomplete figure must not vanish the cost line
-// entirely (the report renderer's old cost>0 gate did exactly that).
+// stringIDs extracts the string ids from a decoded JSON list, skipping any
+// non-string element (the usage envelope arrives as map[string]any).
+func stringIDs(raw []any) []string {
+	ids := make([]string, 0, len(raw))
+	for _, u := range raw {
+		if id, ok := u.(string); ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// renderCostBlock prints the Cost line and the incompleteness detail lines —
+// the one home for all three summary renderers. #598: an incomplete figure
+// must never read as complete, and a $0 incomplete figure must not vanish
+// the cost line entirely (the report renderer's old cost>0 gate did exactly
+// that).
+//
+// There are TWO kinds of incompleteness and they are NOT interchangeable, so
+// they get two labels and two lines — never one merged list:
+//
+//	unpriced_models        the model has NO pricing record. Its spend is
+//	                       attributed $0, so the figure is a LOWER bound
+//	                       (#216/#598). That direction IS knowable here.
+//	unpriced_cache_models  the model IS priced; only its cache multipliers
+//	                       are absent (#626). Its error DIRECTION depends on
+//	                       the provider's field shape and is OPPOSITE for the
+//	                       two shapes, so it is NOT knowable from this
+//	                       envelope — see below.
+//
+// Merging them (the F661-2 shape) told the operator a priced model such as
+// gpt-4o (input $2.50 / output $10.00) was "unpriced", and made a bounded
+// over-estimate indistinguishable from an altogether missing figure.
+//
+// PR#661 hunt F1 — why the cache kind carries NO direction claim. The
+// round-1 wording said "upper bound". That is true only for the INCLUSIVE
+// provider field shapes (openai cached_tokens, google
+// cached_content_token_count): those cached tokens are already inside the
+// reported input count, so an absent multiplier bills them at the full input
+// rate — an over-estimate. For the EXCLUSIVE shapes (anthropic/bedrock
+// cache_read_input_tokens / cache_creation_input_tokens) the cached tokens
+// are DISJOINT from input_tokens, so an absent multiplier contributes $0 and
+// the figure is a LOWER bound. Executed against the shipped registry:
+//
+//	us.anthropic.claude-sonnet-4-6, 10k in / 1k out / 90k cache-read
+//	formula $0.049500   real bill $0.079200   ratio 0.625
+//
+// All 11 bedrock records ship priced with no cache block and the bedrock
+// adapter does emit the exclusive fields (it reuses anthropic.py's
+// _response_to_unified), so "upper bound" was false for the whole bedrock
+// census — an operator read "the bill is at most $0.0495" against a real
+// $0.0792. The usage envelope carries no inclusion-shape discriminator, so
+// this renderer states the CONDITION and that the figure may be under- or
+// over-stated, and never a direction it cannot derive. (Surfacing the
+// derived direction is a named follow-up: it needs a tri-state that survives
+// the step-report, scan-report and resume hops.)
 func renderCostBlock(usage map[string]any) {
 	cost := floatFromAny(usage["total_cost_usd"])
 	incomplete, _ := usage["cost_incomplete"].(bool)
-	unpriced, _ := usage["unpriced_models"].([]any)
+	rawUnpriced, _ := usage["unpriced_models"].([]any)
+	rawCacheUnpriced, _ := usage["unpriced_cache_models"].([]any)
+	unpriced := stringIDs(rawUnpriced)
+	cacheUnpriced := stringIDs(rawCacheUnpriced)
+
+	// The cost label names the condition(s) that actually hold. The
+	// pricing-absent wording is unchanged from #598 so that case renders
+	// byte-identically to before.
 	costLabel := "Cost"
-	if incomplete {
+	switch {
+	case len(unpriced) > 0 && len(cacheUnpriced) > 0:
+		costLabel = "Cost (incomplete — at least one model unpriced; " +
+			"cache rates not configured)"
+	case len(unpriced) > 0:
+		costLabel = "Cost (incomplete — at least one model unpriced)"
+	case len(cacheUnpriced) > 0:
+		costLabel = "Cost (incomplete — cache rates not configured)"
+	case incomplete:
+		// cost_incomplete without either id list: keep the #598 promise
+		// that an incomplete figure never reads as complete.
 		costLabel = "Cost (incomplete — at least one model unpriced)"
 	}
 	PrintKeyValue(costLabel, fmt.Sprintf("$%.4f", cost))
+
 	if len(unpriced) > 0 {
-		ids := make([]string, 0, len(unpriced))
-		for _, u := range unpriced {
-			if id, ok := u.(string); ok {
-				ids = append(ids, id)
-			}
-		}
-		PrintKeyValue("Unpriced models", strings.Join(ids, ", "))
+		PrintKeyValue("Unpriced models", strings.Join(unpriced, ", "))
 	}
+	if len(cacheUnpriced) > 0 {
+		PrintKeyValue("Cache rates not configured",
+			strings.Join(cacheUnpriced, ", ")+
+				" (these models ARE priced; their cached traffic was not "+
+				"priced at a cache rate, so this figure may be under- or "+
+				"over-stated)")
+	}
+}
+
+// renderTokensLine prints the token line for all three summary renderers —
+// the one home, the renderCostBlock pattern.
+//
+// PR#661 hunt L1: the two summary renderers printed "N input / M output"
+// only. On the EXCLUSIVE provider shapes (anthropic/bedrock) the cached
+// tokens are a SEPARATE line item that is deliberately never folded into
+// total_input_tokens — the uncached/cached split is the
+// billing-reconciliation shape — so an anthropic run displayed "10000
+// input" beside a cost covering 100000 tokens of real traffic, with the
+// 90000 invisible. The typed UsageInfo and every JSON artifact carried the
+// counts; nothing rendered them.
+//
+// Present-only PER FIELD, mirroring the Python envelope (core/schemas.py
+// UsageInfo.to_dict) and the Go struct's omitempty: a run with no cache
+// traffic prints the pre-#626 line byte-for-byte, and a READ-ONLY cache run
+// does not assert a cache-write zero it never measured (the FIX-1 rule).
+func renderTokensLine(usage map[string]any) {
+	segments := []string{
+		fmt.Sprintf("%d input", intFromAny(usage["total_input_tokens"])),
+		fmt.Sprintf("%d output", intFromAny(usage["total_output_tokens"])),
+	}
+	if _, present := usage["total_cache_read_tokens"]; present {
+		segments = append(segments, fmt.Sprintf("%d cache read",
+			intFromAny(usage["total_cache_read_tokens"])))
+	}
+	if _, present := usage["total_cache_write_tokens"]; present {
+		segments = append(segments, fmt.Sprintf("%d cache write",
+			intFromAny(usage["total_cache_write_tokens"])))
+	}
+	PrintKeyValue("Tokens", strings.Join(segments, " / "))
 }
 
 // PrintScanSummary outputs a formatted summary of scan results.
@@ -141,10 +243,8 @@ func PrintScanSummary(data map[string]any) {
 	// Usage info
 	if usage, ok := data["usage"].(map[string]any); ok {
 		PrintHeader("Usage")
-		inputTokens := intFromAny(usage["total_input_tokens"])
-		outputTokens := intFromAny(usage["total_output_tokens"])
 		renderCostBlock(usage)
-		PrintKeyValue("Tokens", fmt.Sprintf("%d input / %d output", inputTokens, outputTokens))
+		renderTokensLine(usage)
 	}
 
 	// Report paths
@@ -517,10 +617,8 @@ func PrintScanSummaryV2(data map[string]any) {
 	// Usage info
 	if usage, ok := data["usage"].(map[string]any); ok {
 		PrintHeader("Usage")
-		inputTokens := intFromAny(usage["total_input_tokens"])
-		outputTokens := intFromAny(usage["total_output_tokens"])
 		renderCostBlock(usage)
-		PrintKeyValue("Tokens", fmt.Sprintf("%d input / %d output", inputTokens, outputTokens))
+		renderTokensLine(usage)
 	}
 
 	// Output paths

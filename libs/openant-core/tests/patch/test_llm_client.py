@@ -1303,3 +1303,91 @@ def test_google_is_not_reachable_via_llm_provider_env(monkeypatch):
 
     with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
         call_llm("prompt")
+
+
+# ---------------------------------------------------------------------------
+# #626 / PR#661 hunt F2 — the Auto Patcher producer is INSIDE the cache
+# accounting, not outside it.
+#
+# call_llm() forwards input/output tokens and the adapter's pricing, but
+# dropped ``result.usage_details`` — the field the shared utilities.llm
+# adapters populate with the provider's cache counters. The consequence was
+# that the SAME implicitly-cached call read ``cost_incomplete=True`` through
+# the scan path (utilities/llm/helpers.py:114 passes it) and
+# ``cost_incomplete=False`` through the patch path, with
+# ``run_traced.py``'s --json ``usage`` block — and the e2e harness's trust
+# gate — keyed on exactly that flag.
+# ---------------------------------------------------------------------------
+
+
+def test_live_completion_forwards_usage_details_to_the_tracker(monkeypatch):
+    """The #211 capture must reach the tracker from the patch path too."""
+    from utilities.llm_client import get_global_tracker
+
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-sonnet-5")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    result = CompletionResult(
+        content=[TextBlock(text="ok")],
+        input_tokens=10_000,
+        output_tokens=1_000,
+        stop_reason="end_turn",
+        usage_details={"cache_read_input_tokens": 8_000},
+    )
+    fake = _install_fake_adapter(monkeypatch, outcomes=[result])
+    fake.pricing = {"claude-sonnet-5": {"input": 3.0, "output": 15.0,
+                                        "cache_read": 0.1, "cache_write": 1.25}}
+
+    call_llm("prompt", stage="patch_generation")
+
+    call_record = get_global_tracker().get_summary()["calls"][-1]
+    assert call_record["usage_details"] == {"cache_read_input_tokens": 8_000}
+    assert call_record["cache_read_tokens"] == 8_000
+    # and the cached traffic is PRICED, not silently free
+    expected = ((10_000 / 1e6) * 3.0 + (1_000 / 1e6) * 15.0
+                + (8_000 / 1e6) * 3.0 * 0.1)
+    assert call_record["cost_usd"] == pytest.approx(round(expected, 6))
+
+
+def test_patch_path_agrees_with_the_scan_path_on_cost_incomplete(monkeypatch):
+    """F2's defect, stated as the divergence it caused: a cache-unpriced
+    model (priced, no cache multipliers — all 11 bedrock records and every
+    openai/google record today, and OpenAI/Gemini cache IMPLICITLY on any
+    long prefix) must mark the run incomplete on the patch path exactly as
+    it does on the scan path."""
+    from utilities.llm_client import TokenTracker, get_global_tracker
+
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-sonnet-5")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    # The adapter's pricing table is authoritative (issue #65): this one is
+    # PRICED with NO cache multipliers — the shipped shape of all 11 bedrock
+    # records and every openai/google record.
+    details = {"cache_read_input_tokens": 8_000}
+    result = CompletionResult(
+        content=[TextBlock(text="ok")],
+        input_tokens=10_000,
+        output_tokens=1_000,
+        stop_reason="end_turn",
+        usage_details=details,
+    )
+    fake = _install_fake_adapter(monkeypatch, outcomes=[result])
+    fake.pricing = {"claude-sonnet-5": {"input": 3.0, "output": 15.0}}
+
+    call_llm("prompt", stage="patch_generation")
+    patch_totals = get_global_tracker().get_totals()
+
+    # the scan path's producer shape (utilities/llm/helpers.py), same usage
+    scan = TokenTracker()
+    scan.record_call(model="claude-sonnet-5", input_tokens=10_000,
+                     output_tokens=1_000,
+                     pricing={"input": 3.0, "output": 15.0},
+                     usage_details=details)
+    scan_totals = scan.get_totals()
+
+    for key in ("cost_incomplete", "unpriced_models", "unpriced_cache_models",
+                "total_cache_read_tokens"):
+        assert patch_totals.get(key) == scan_totals.get(key), (
+            f"patch path and scan path disagree on {key!r}: "
+            f"{patch_totals.get(key)!r} vs {scan_totals.get(key)!r}")
+    assert patch_totals["cost_incomplete"] is True

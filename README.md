@@ -4,7 +4,7 @@
 
 # OpenAnt
 
-[OpenAnt](https://knostic.ai/openant) from [Knostic](https://knostic.ai) is the first open source LLM-based vulnerability discovery product (now called a harness) that helps defenders proactively find verified security flaws while minimizing both false positives and false negatives. Stage 1 detects. Stage 2 attacks. What survives is real.
+[OpenAnt](https://knostic.ai/openant) from [Knostic](https://knostic.ai) is the first open source LLM-based vulnerability discovery and remediation product (now called a harness) that helps defenders proactively find verified security flaws while minimizing both false positives and false negatives. Stage 1 detects. Stage 2 attacks. What survives is real.
 
 Do keep in mind that this started as a research project, and as we develop new capabilities, we often release them as beta. We welcome contributions.
 

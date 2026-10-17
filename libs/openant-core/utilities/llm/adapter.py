@@ -195,9 +195,11 @@ class CompletionResult:
             fields (reasoning tokens; cache read/write tokens), copied
             VERBATIM by the adapter — present-only, absent when the
             provider reported none. Pass-through capture for #211:
-            these fields never feed the cost formula and are never
-            summed into token totals; they exist so the accounting
-            artifacts can be reconciled against a provider bill. (The
+            #626/#661 amended the blanket exclusion for the CACHE fields (they
+            price at their own multipliers now); the REASONING fields remain
+            outside the cost formula verbatim — never summed into token
+            totals — so the accounting artifacts can be reconciled against a
+            provider bill. (The
             cost-math question — whether ``output_tokens`` already
             includes reasoning on a given route — is deliberately
             unresolved; summing here would double-count on routes
@@ -293,13 +295,29 @@ class LLMResponseError(LLMError):
     Zeroes when the failure predates a usage block (a transport error or
     a refusal raised before the response parsed) — those are never billed
     as completions by construction.
+
+    Attributes:
+        usage_details: #626/F-A1 — the rejected reply's provider DETAIL
+            fields (cache read/write, reasoning), captured by the same
+            ``_extract_usage_details*`` the successful return uses on the
+            SAME usage object. Load-bearing because #626 prices the cache
+            portion off these fields and nowhere else: without this channel
+            the error-path recorder could forward input/output only, so a
+            rejected call silently lost its cache line items — on the
+            EXCLUSIVE (anthropic) shape a real under-report of spend, on the
+            INCLUSIVE (openai/openrouter) shape a loss of the
+            ``cost_incomplete`` disclosure while the figure stayed put (the
+            #598 masquerade). ``None`` means the provider reported no detail
+            fields — never a fabricated ``{}`` (#211: absent != zero).
     """
 
     def __init__(self, message: str, *,
-                 input_tokens: int = 0, output_tokens: int = 0):
+                 input_tokens: int = 0, output_tokens: int = 0,
+                 usage_details: Optional[dict] = None):
         super().__init__(message)
         self.input_tokens = int(input_tokens or 0)
         self.output_tokens = int(output_tokens or 0)
+        self.usage_details = usage_details
 
 
 class LLMRefusalError(LLMResponseError):

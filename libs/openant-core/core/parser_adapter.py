@@ -711,8 +711,11 @@ def apply_reachability_filter(
     # already claim the slot. call_graph/reverse_call_graph are the UN-pruned graphs.
     _rf = dataset["metadata"]["reachability_filter"]
     _pruned_ids = [u.get("id", "") for u in units if u.get("id", "") not in reachable_ids]
+    # #741: original_count is the PARSED total — the denominator the orphan-rate
+    # advisory needs to stay readable when the prune set is small (library mode).
     _extra, _asym_warning, _orphan_advisory = compute_prune_telemetry(
-        reachable_ids, sorted(_pruned_ids), call_graph, reverse_call_graph, output_dir)
+        reachable_ids, sorted(_pruned_ids), call_graph, reverse_call_graph, output_dir,
+        total_parsed_units=original_count)
     _rf.update(_extra)
     # #520 (the fable+astra fold): with the advisory on its own key, the
     # reserved ``warning`` slot belongs to the correctness signals — the
@@ -818,18 +821,95 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
 # JavaScript/TypeScript parser
 # ---------------------------------------------------------------------------
 
+def _lock_dependency_pins(lock_path: Path) -> dict[str, tuple[str | None, str | None]]:
+    """Map ``node_modules/...`` path -> ``(version, integrity)`` from a lockfile.
+
+    Reads both npm lockfile flavours with the same code: the committed
+    ``package-lock.json`` and the ``node_modules/.package-lock.json`` npm
+    leaves behind in an installed tree.
+
+    Three kinds of entry are EXCLUDED, because the two files legitimately
+    disagree about them and comparing them would report a correct tree as
+    stale -- which would re-run ``npm ci`` on every single parse:
+
+    * the root ``""`` entry -- it describes this project rather than a
+      dependency, and only the committed file carries it;
+    * ``optional`` entries -- the lockfile enumerates every platform's
+      prebuilt native binary, and a machine installs only the one matching
+      it (here: one of the ``@typescript/typescript-*`` set);
+    * ``dev`` entries -- a production install omits devDependencies.
+
+    Integrity is compared alongside the version: a republished tarball keeps
+    the version string and changes the hash.
+
+    Raises:
+        ValueError: the file is not a lockfile shape (including torn JSON).
+        OSError: the file could not be read.
+    """
+    data = read_json(lock_path)
+    if not isinstance(data, dict):
+        raise ValueError(f"{lock_path}: lockfile is not a JSON object")
+    packages = data.get("packages")
+    if not isinstance(packages, dict):
+        raise ValueError(f"{lock_path}: lockfile has no 'packages' object")
+
+    pins: dict[str, tuple[str | None, str | None]] = {}
+    for name, meta in packages.items():
+        if not name:
+            continue  # the root entry
+        if not isinstance(meta, dict):
+            raise ValueError(f"{lock_path}: lockfile entry {name!r} is not an object")
+        if meta.get("optional") or meta.get("dev"):
+            continue
+        pins[name] = (meta.get("version"), meta.get("integrity"))
+    return pins
+
+
 def _js_deps_installed() -> bool:
-    """Return True only if a *complete* npm install has previously succeeded.
+    """Return True only if a *complete and current* npm ci install is in place.
 
     Checking that ``node_modules/`` exists is not enough: a prior install that
     was killed (Ctrl+C, OOM, disk full) leaves a partial directory. npm writes
     ``node_modules/.package-lock.json`` at the *end* of a successful install,
     so we use that as the completion sentinel.
+
+    The sentinel's EXISTENCE is not enough either: it records that an install
+    finished, not that it installed what ``package-lock.json`` now pins. On
+    its own it made a lockfile bump -- a transitive security upgrade, say --
+    a no-op for every checkout that had already bootstrapped once: the
+    sentinel was still there, so the bootstrap skipped and the outdated tree
+    was reused indefinitely. So the sentinel is also COMPARED against the
+    committed lockfile, and a mismatch re-runs the install.
     """
-    return (_JS_PARSER_DIR / "node_modules" / ".package-lock.json").is_file()
+    marker = _JS_PARSER_DIR / "node_modules" / ".package-lock.json"
+    if not marker.is_file():
+        return False
+
+    committed_lock = _JS_PARSER_DIR / "package-lock.json"
+    if not committed_lock.is_file():
+        # Nothing to be stale relative to: keep the completion sentinel as
+        # the sole signal, exactly as before.
+        return True
+
+    try:
+        installed = _lock_dependency_pins(marker)
+        required = _lock_dependency_pins(committed_lock)
+    except (OSError, ValueError):
+        # A torn or unreadable lockfile is NOT an error to raise from here.
+        # npm rewrites the marker in place, so a concurrent bootstrap can be
+        # observed mid-write, and both call sites below run this check --
+        # including the fast path outside the lock. Report "not installed"
+        # and let the caller re-bootstrap under the lock.
+        return False
+
+    # SYMMETRIC equality, not "is everything the lock requires present?". An
+    # EXTRA installed package is a dependency the lockfile no longer pins (a
+    # removed or downgraded transitive) and it stays importable on disk until
+    # the install is redone, so it has to read as stale too.
+    return installed == required
 
 
-# #325: the npm-install bootstrap bound — the parse-step convention (PR
+# #325: the npm ci bootstrap bound — the parse-step convention (PR
 # #135's timeout=1800). Module-level so a test can inject a small bound and
 # EXECUTE the diagnosis path instead of grepping the source for it.
 _NPM_INSTALL_TIMEOUT_S = 1800
@@ -843,7 +923,7 @@ def _ensure_js_parser_dependencies() -> None:
     when a JS repo is actually being parsed, so Python/Go-only users never need npm.
 
     Concurrency: uses a lockfile so two parallel parses don't both run
-    ``npm install`` in the same directory (which can corrupt node_modules).
+    ``npm ci`` in the same directory (which can corrupt node_modules).
     """
     if _js_deps_installed():
         return
@@ -858,16 +938,16 @@ def _ensure_js_parser_dependencies() -> None:
     if npm is None:
         raise RuntimeError(
             "JavaScript parser dependencies are not installed and `npm` is not on PATH. "
-            f"Install Node.js/npm, then run: npm install (from {_JS_PARSER_DIR})"
+            f"Install Node.js/npm, then run: npm ci (from {_JS_PARSER_DIR})"
         )
 
     # Serialize concurrent bootstraps. The lockfile lives next to package.json so
     # it's always on the same filesystem as the install target.
     lock_path = _JS_PARSER_DIR / ".openant-npm-install.lock"
-    # the wait budget outlasts a legitimate install (the bounded npm install
+    # the wait budget outlasts a legitimate install (the bounded npm ci
     # inside the lock holds it for up to 30 minutes): the install bound + 5
     # minutes of slack.
-    with _file_lock(lock_path, what="the npm-install bootstrap",
+    with _file_lock(lock_path, what="the npm ci bootstrap",
                     wait_seconds=1800 + 300):
         # Re-check under the lock: another process may have finished while we waited.
         if _js_deps_installed():
@@ -892,7 +972,7 @@ def _ensure_js_parser_dependencies() -> None:
         # exists to prevent. start_new_session puts npm in its own group
         # so the kill can reach the grandchildren.
         _npm_proc = subprocess.Popen(
-            [npm, "install"],
+            [npm, "ci"],
             cwd=str(_JS_PARSER_DIR),
             stdout=sys.stderr,
             stderr=sys.stderr,
@@ -909,16 +989,20 @@ def _ensure_js_parser_dependencies() -> None:
             _npm_proc.kill()
             _npm_proc.wait()
             raise RuntimeError(
-                f"`npm install` (from {_JS_PARSER_DIR}) exceeded the "
+                f"`npm ci` (from {_JS_PARSER_DIR}) exceeded the "
                 f"{_NPM_INSTALL_TIMEOUT_S}s install bound and was killed "
                 "with its process group. Re-run the command; if it persists, "
                 "inspect the npm output above for the stalled postinstall step."
             ) from None
         if _rc != 0:
             raise RuntimeError(
-                f"`npm install` failed in {_JS_PARSER_DIR} with exit code "
+                f"`npm ci` failed in {_JS_PARSER_DIR} with exit code "
                 f"{_rc}. See npm output above for details; you can "
-                f"reproduce with: npm install (from {_JS_PARSER_DIR})"
+                f"reproduce with: npm ci (from {_JS_PARSER_DIR}). An "
+                "'in sync' EUSAGE error means the committed lock is out "
+                "of sync with package.json -- a maintainer regenerates "
+                "the lock in a PR; do not run `npm install` here (it "
+                "rewrites the tracked lock, #795)."
             )
 
 

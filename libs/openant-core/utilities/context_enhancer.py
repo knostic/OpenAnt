@@ -24,7 +24,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .model_config import CLAUDE_SONNET_4_20250514
-from .llm_client import TokenTracker, get_global_tracker
+from .llm_client import (TokenTracker, get_global_tracker,
+                         incomplete_markers, turn_has_spend,
+                         unpriced_kinds_from)
 from .llm import (
     LLMAuthError,
     LLMConnectionError,
@@ -132,11 +134,18 @@ def _build_error_info(exc: Exception) -> dict:
     # but the original SDK exception is chained on ``__cause__`` (adapters
     # re-raise ``... from exc``) and the major SDKs expose those there.
     # Surface them when present without reaching into adapter internals.
+    # #770: the status read falls back to the validated ``.code`` shape —
+    # the google-genai SDK's ServerError/APIError carries the HTTP code
+    # there; without the fallback the ``api_status`` dict a Google 5xx
+    # builds carries no status and ``is_retryable_error(dict)`` defaults
+    # it to 0 -> never retried, where the string arm of the same error
+    # retried (the #716 preference flip's silent regression).
+    from .llm._redact import _http_status_from
     for source in (exc, getattr(exc, "__cause__", None)):
         if source is None:
             continue
         if "status_code" not in info:
-            status_code = getattr(source, "status_code", None)
+            status_code = _http_status_from(source)
             if status_code is not None:
                 info["status_code"] = status_code
         if "request_id" not in info:
@@ -470,6 +479,21 @@ class ContextEnhancer:
             )
             os.makedirs(checkpoint_dir, exist_ok=True)
             processed_ids = self._load_completed_units(checkpoint_dir, context_key="llm_context")
+            # #748 (the sibling of the agentic path's fix): the raw dir scan
+            # counts stale ids (units from a prior dataset / outside a diff
+            # scope / manual strays) as restored, inflating the #218 baseline
+            # rebase and the skip set's counts — intersect with THIS dataset.
+            _dataset_ids = {u.get("id") for u in units}
+            _stale_restored = processed_ids - _dataset_ids
+            if _stale_restored:
+                # the sample is capped: a diff-scope resume over a shared
+                # checkpoint dir (core/enhancer.py's {output_dir}/enhance_
+                # checkpoints) can carry ~1800 stale ids — the count rides
+                # the message, the units kwarg carries the first 20.
+                self._log("info",
+                          f"Ignoring {len(_stale_restored)} checkpoint id(s) not in this run's unit set",
+                          units=sorted(str(s) for s in _stale_restored)[:20])
+                processed_ids = processed_ids & _dataset_ids
             _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
             # Restore llm_context for already-completed units.
             for unit in units:
@@ -673,6 +697,28 @@ class ContextEnhancer:
 
             # Load completed unit IDs from per-unit checkpoint files
             processed_ids = self._load_completed_units(checkpoint_dir)
+            # #748: the raw dir scan counts whatever a checkpoint file names
+            # — a stale id (a unit from a prior dataset, an unchanged unit
+            # outside a diff scope, a manual stray) is not a member of THIS
+            # dataset, but it inflated the restored count, _summary_completed
+            # past total_units (the corpus's `Done: 1825/1819`), and the
+            # remaining-unit count. The counters key on DATASET membership:
+            # intersect once, here, and every count downstream (the restore
+            # log, restored_callback, _summary_completed, remaining) is
+            # dataset-scoped. The restore loop and units_to_process were
+            # already dataset-keyed (they iterate units) — only the COUNTS
+            # were raw.
+            _dataset_ids = {u.get("id") for u in units}
+            _stale_restored = processed_ids - _dataset_ids
+            if _stale_restored:
+                # the sample is capped: a diff-scope resume over a shared
+                # checkpoint dir (core/enhancer.py's {output_dir}/enhance_
+                # checkpoints) can carry ~1800 stale ids — the count rides
+                # the message, the units kwarg carries the first 20.
+                self._log("info",
+                          f"Ignoring {len(_stale_restored)} checkpoint id(s) not in this run's unit set",
+                          units=sorted(str(s) for s in _stale_restored)[:20])
+                processed_ids = processed_ids & _dataset_ids
             _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
 
             # Restore agent_context from checkpoint files into units
@@ -705,10 +751,27 @@ class ContextEnhancer:
         _summary_incomplete = _restored_incomplete
         _summary_errors = 0
         _summary_error_breakdown = {}
+        # #748: the dataset units the resume seed counted as errors, with the
+        # error TYPE each carried. The seed keys on units whose checkpoint is
+        # errored; those units are re-attempted by this run's main loop, so
+        # _update_summary must RETIRE the seed when one lands non-error (the
+        # corpus's `errors: 528` with zero errored checkpoints on disk) —
+        # and it retires the BREAKDOWN type too: the retry round decrements
+        # errors only because it cannot know which type it re-covers; the
+        # seed knows. The dict is also what keeps a re-errored seed from
+        # double-counting: one unit, one error.
+        _seeded_error_types: dict[str, str] = {}
         _summary_input_tokens = 0
         _summary_output_tokens = 0
         _summary_cost_usd = 0.0
         _summary_unpriced: set[str] = set()
+        # #626/PR#661 hunt F4: the cache kind's own set. Every fold below
+        # that touches ``_summary_unpriced`` has a cache twin — the enhance
+        # phase has FIVE spend sources (checkpoint, agent_metadata, the
+        # error path's agent_state, the retry's state, the discarded-attempt
+        # prior map) and the kind had to be taught to all five or it died on
+        # whichever path a given run took.
+        _summary_unpriced_cache: set[str] = set()
         # #609: prior-attempt spend per unit, keyed by unit id. Written on
         # the MAIN THREAD ONLY, at exactly two discard points (the retry
         # wipe below, and the errored-checkpoint seed in the resume loop)
@@ -732,9 +795,10 @@ class ContextEnhancer:
             usage = {"input_tokens": _summary_input_tokens,
                      "output_tokens": _summary_output_tokens,
                      "cost_usd": round(_summary_cost_usd, 6)}
-            if _summary_unpriced:
-                usage["cost_incomplete"] = True
-                usage["unpriced_models"] = sorted(_summary_unpriced)
+            # #626/PR#661 hunt F4: both kinds, one rule
+            # (utilities.llm_client.incomplete_markers), present-only.
+            usage.update(incomplete_markers(_summary_unpriced,
+                                            _summary_unpriced_cache))
             from utilities.llm_client import _accounting_error_count
             _errs = _accounting_error_count()
             if _errs:
@@ -767,13 +831,22 @@ class ContextEnhancer:
                     _summary_input_tokens += cp_usage.get("input_tokens", 0)
                     _summary_output_tokens += cp_usage.get("output_tokens", 0)
                     _summary_cost_usd += cp_usage.get("cost_usd", 0.0)
-                    # #216: restore the incomplete-cost marker per unit.
-                    _summary_unpriced.update(cp_usage.get("unpriced_models") or [])
+                    # #216 + #626: restore BOTH incomplete-cost kinds.
+                    _cp_u, _cp_c = unpriced_kinds_from(cp_usage)
+                    _summary_unpriced.update(_cp_u)
+                    _summary_unpriced_cache.update(_cp_c)
                     # Count errors for non-completed units
                     if uid not in processed_ids and cp_data.get("agent_context", {}).get("error"):
                         _summary_errors += 1
                         err = cp_data["agent_context"]["error"]
                         err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
+                        # #748: remember WHICH dataset units the seed counted
+                        # and the error TYPE each carried — the main loop
+                        # re-attempts them and _update_summary retires the
+                        # seed (errors AND the type) on a non-error landing,
+                        # or refuses a second count on a re-error (one unit,
+                        # one error).
+                        _seeded_error_types[uid] = err_type
                         _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
                         # #609: an errored unit is re-attempted by this run
                         # and its checkpoint OVERWRITTEN — seed the run-1
@@ -783,8 +856,8 @@ class ContextEnhancer:
                             "input_tokens": cp_usage.get("input_tokens", 0),
                             "output_tokens": cp_usage.get("output_tokens", 0),
                             "cost_usd": cp_usage.get("cost_usd", 0.0),
-                            "unpriced_models": list(
-                                cp_usage.get("unpriced_models") or []),
+                            "unpriced_models": list(_cp_u),
+                            "unpriced_cache_models": list(_cp_c),
                         }
                 except (json.JSONDecodeError, OSError):
                     pass
@@ -795,10 +868,18 @@ class ContextEnhancer:
                                       usage=_usage_dict())
 
             # Inject prior usage into tracker so step_report captures the total
-            if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
+            # F661-3: the ONE spend predicate — the cost disjunct is what
+            # keeps cache-only restored spend (0 tokens, real dollars) from
+            # being orphaned while _usage_dict() reports it in full.
+            if turn_has_spend(input_tokens=_summary_input_tokens,
+                              output_tokens=_summary_output_tokens,
+                              cost_usd=_summary_cost_usd,
+                              unpriced=_summary_unpriced,
+                              unpriced_cache=_summary_unpriced_cache):
                 self.tracker.add_prior_usage(
                     _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
-                    unpriced_models=sorted(_summary_unpriced) or None)
+                    unpriced_models=sorted(_summary_unpriced) or None,
+                    unpriced_cache_models=sorted(_summary_unpriced_cache) or None)
                 # #281: refresh the caller's phase baseline AFTER the
                 # injection so its "Enhance" delta excludes restored usage.
                 if phase_baseline is not None:
@@ -888,16 +969,44 @@ class ContextEnhancer:
 
             return unit_id or "?", classification, unit_elapsed, worker
 
+        def _retire_seeded_error(uid: str) -> None:
+            """#748: retire a seeded error EXACTLY — errors and the breakdown
+            type the seed recorded for this unit. The retry round cannot
+            know which type it re-covers, so its own decrement (unchanged
+            here) leaves the breakdown stale for a unit it recovers — a
+            pre-existing divergence this closure does not touch; the seed
+            KNOWS, so it retires both, and a zeroed count drops the key."""
+            nonlocal _summary_errors, _summary_error_breakdown
+            _summary_errors = max(0, _summary_errors - 1)
+            _t = _seeded_error_types.pop(uid, None)
+            if _t is None:
+                return
+            _n = max(0, _summary_error_breakdown.get(_t, 0) - 1)
+            if _n:
+                _summary_error_breakdown[_t] = _n
+            else:
+                _summary_error_breakdown.pop(_t, None)
+
         def _update_summary(classification, unit):
             """Update summary counters after a unit completes. Called from main thread."""
             nonlocal _summary_completed, _summary_incomplete, _summary_errors
             nonlocal _summary_error_breakdown
             nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
+            uid = unit.get("id", "unknown")
             if classification == "error":
-                _summary_errors += 1
                 err = unit.get("agent_context", {}).get("error", {})
-                err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
-                _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
+                if uid in _seeded_error_types:
+                    # #748: the resume seed already counted this unit's error
+                    # (the checkpoint it restored WAS the error) — one unit,
+                    # one error, and the breakdown keeps the SEEDED type (the
+                    # unit is still one error; a re-errored landing does not
+                    # re-count or re-type it — the retry round's contract).
+                    # Fold the new attempt's spend only.
+                    _seeded_error_types.pop(uid, None)
+                else:
+                    _summary_errors += 1
+                    err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
+                    _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
                 # #609: fold the failed attempt's spend — the error path's
                 # agent_state (attached by agent.py alongside its record_call)
                 # is the ONLY place it exists: agent_metadata is absent on
@@ -910,19 +1019,32 @@ class ContextEnhancer:
                 _summary_input_tokens += int(state.get("input_tokens", 0) or 0)
                 _summary_output_tokens += int(state.get("output_tokens", 0) or 0)
                 _summary_cost_usd += float(state.get("cost_usd", 0.0) or 0.0)
-                _summary_unpriced.update(state.get("unpriced_models") or [])
+                _st_u, _st_c = unpriced_kinds_from(state)
+                _summary_unpriced.update(_st_u)
+                _summary_unpriced_cache.update(_st_c)
             elif classification == INCOMPLETE_CLASSIFICATION:
                 # #293: the agent's degenerate exit (no completed finish call)
                 # is the third state — not a completion, not an error.
+                if uid in _seeded_error_types:
+                    # #748: retire the seed — the unit landed incomplete, not
+                    # errored (the retry round's flip, mirrored for the main
+                    # loop's landing).
+                    _retire_seeded_error(uid)
                 _summary_incomplete += 1
             else:
+                if uid in _seeded_error_types:
+                    # #748: retire the seed — the re-attempted unit landed a
+                    # verdict; the errored checkpoint it restored is gone.
+                    _retire_seeded_error(uid)
                 _summary_completed += 1
             # Accumulate per-unit usage
             meta = unit.get("agent_context", {}).get("agent_metadata", {})
             _summary_input_tokens += meta.get("input_tokens", 0)
             _summary_output_tokens += meta.get("output_tokens", 0)
             _summary_cost_usd += meta.get("cost_usd", 0.0)
-            _summary_unpriced.update(meta.get("unpriced_models") or [])
+            _mu, _mc = unpriced_kinds_from(meta)
+            _summary_unpriced.update(_mu)
+            _summary_unpriced_cache.update(_mc)
             # #609 hunt r2: folds run unconditionally; only the WRITE is
             # checkpoint-gated — the no-checkpoint-dir path accumulates
             # the same totals as the checkpointed one (nothing reads them
@@ -1011,15 +1133,19 @@ class ContextEnhancer:
                 _wiped_err = unit.get("agent_context", {}).get("error")
                 _wiped_state = ((_wiped_err.get("agent_state") or {})
                                 if isinstance(_wiped_err, dict) else {})
-                if (_wiped_state.get("input_tokens")
-                        or _wiped_state.get("output_tokens")
-                        or _wiped_state.get("unpriced_models")):
+                _wiped_u, _wiped_c = unpriced_kinds_from(_wiped_state)
+                # F661-3: the ONE spend predicate. The kinds are passed
+                # explicitly so the gate and the accumulate below agree on the
+                # same merged sets.
+                if turn_has_spend(_wiped_state, unpriced=_wiped_u,
+                                  unpriced_cache=_wiped_c):
                     # key: the SAME expression the save reads (get("id",
                     # "unknown") - #609 hunt: an id-less unit's moved spend
                     # was silently dropped when the keys diverged).
                     _prev = _prior_spend.setdefault(unit.get("id", "unknown"), {
                         "input_tokens": 0, "output_tokens": 0,
-                        "cost_usd": 0.0, "unpriced_models": []})
+                        "cost_usd": 0.0, "unpriced_models": [],
+                        "unpriced_cache_models": []})
                     _prev["input_tokens"] += int(
                         _wiped_state.get("input_tokens", 0) or 0)
                     _prev["output_tokens"] += int(
@@ -1027,8 +1153,10 @@ class ContextEnhancer:
                     _prev["cost_usd"] += float(
                         _wiped_state.get("cost_usd", 0.0) or 0.0)
                     _prev["unpriced_models"] = sorted(
-                        set(_prev["unpriced_models"])
-                        | set(_wiped_state.get("unpriced_models") or []))
+                        set(_prev["unpriced_models"]) | set(_wiped_u))
+                    _prev["unpriced_cache_models"] = sorted(
+                        set(_prev.get("unpriced_cache_models") or [])
+                        | set(_wiped_c))
                 # Clear previous error
                 unit["agent_context"] = {}
                 uid, classification, elapsed, _ = _enhance_one(unit)
@@ -1063,8 +1191,9 @@ class ContextEnhancer:
                         _re_state.get("output_tokens", 0) or 0)
                     _summary_cost_usd += float(
                         _re_state.get("cost_usd", 0.0) or 0.0)
-                    _summary_unpriced.update(
-                        _re_state.get("unpriced_models") or [])
+                    _re_u, _re_c = unpriced_kinds_from(_re_state)
+                    _summary_unpriced.update(_re_u)
+                    _summary_unpriced_cache.update(_re_c)
                 # Accumulate retry usage
                 meta = unit.get("agent_context", {}).get("agent_metadata", {})
                 _summary_input_tokens += meta.get("input_tokens", 0)
@@ -1072,8 +1201,11 @@ class ContextEnhancer:
                 _summary_cost_usd += meta.get("cost_usd", 0.0)
                 # #609: the retry's unpriced ids reach the tracker via its
                 # record_call; the summary marker must follow (the same
-                # fold _update_summary does for the initial pass).
-                _summary_unpriced.update(meta.get("unpriced_models") or [])
+                # fold _update_summary does for the initial pass) — #626:
+                # both kinds.
+                _rm_u, _rm_c = unpriced_kinds_from(meta)
+                _summary_unpriced.update(_rm_u)
+                _summary_unpriced_cache.update(_rm_c)
                 # Folds run BEFORE the _summary_cp guard (fold-always,
                 # guard-the-write — the no-checkpoint-dir path accumulates
                 # the same totals as the checkpointed one).
@@ -1198,15 +1330,25 @@ class ContextEnhancer:
         usage_cost = (float(meta.get("cost_usd", 0.0) or 0.0)
                       + float(state.get("cost_usd", 0.0) or 0.0)
                       + float(prior.get("cost_usd", 0.0) or 0.0))
-        usage_unpriced = sorted(
-            set(meta.get("unpriced_models") or [])
-            | set(state.get("unpriced_models") or [])
-            | set(prior.get("unpriced_models") or []))
+        _m_u, _m_c = unpriced_kinds_from(meta)
+        _s_u, _s_c = unpriced_kinds_from(state)
+        _p_u, _p_c = unpriced_kinds_from(prior)
+        usage_unpriced = sorted(set(_m_u) | set(_s_u) | set(_p_u))
+        # #626/PR#661 hunt F4: the cache kind merges across the SAME three
+        # sources. Dropping it here made the resume reader — which forwards
+        # the ids into the tracker — see nothing on a real enhance resume,
+        # exactly as #598 described for the #216 kind.
+        usage_unpriced_cache = sorted(set(_m_c) | set(_s_c) | set(_p_c))
         # #598 review: the unpriced term — a zero-token call whose only
         # trace is the unpriced id must still write the usage block, or
         # a resume loses the marker (#609 extends the gate to all three
         # sources).
-        if usage_in or usage_out or usage_unpriced:
+        # F661-3: the ONE spend predicate, over the SAME three merged
+        # sources the block below writes — a cache-only attempt costs real
+        # dollars at zero tokens, and the resume reader sums these blocks.
+        if turn_has_spend(input_tokens=usage_in, output_tokens=usage_out,
+                          cost_usd=usage_cost, unpriced=usage_unpriced,
+                          unpriced_cache=usage_unpriced_cache):
             cp_data["usage"] = {
                 "input_tokens": usage_in,
                 "output_tokens": usage_out,
@@ -1216,6 +1358,10 @@ class ContextEnhancer:
                 # reader (which forwards them into the tracker) read
                 # nothing on a real enhance resume.
                 "unpriced_models": usage_unpriced,
+                # #626: the cache kind, present-only so a no-cache unit's
+                # checkpoint record is byte-identical to the pre-#626 shape.
+                **({"unpriced_cache_models": usage_unpriced_cache}
+                   if usage_unpriced_cache else {}),
             }
         # #317: collision-safe AND under the save lock (this runs in a
         # ThreadPoolExecutor worker — the resolve+write pair must be

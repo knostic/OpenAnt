@@ -4,8 +4,11 @@
   "engines": {
     "node": ">=24"
   },
-  "comment": "#540: the pinned build recipe for the committed report.css. NOT under vendor/ (renovate ignores **/vendor/**). Regenerate: npm ci --ignore-scripts && ./node_modules/.bin/tailwindcss -c tailwind.config.js -i input.css -o ../vendor/report.css --minify; then update the sha in SOURCES.txt AND report_vendor_test.go. ALWAYS ./node_modules/.bin/tailwindcss — never npx (which can fetch a different version on resolution failure). The committed package-lock pins the CLI exactly; engines.node declares the runtime the CI job reproduces on (setup-node pins it; npm only warns without engine-strict).",
+  "comment": "#540: the pinned build recipe for the committed report.css. NOT under vendor/ (renovate ignores **/vendor/**). Regenerate: npm ci --ignore-scripts && ./node_modules/.bin/tailwindcss -c tailwind.config.js -i input.css -o ../vendor/report.css --minify; then update the sha in SOURCES.txt AND report_vendor_test.go. ALWAYS ./node_modules/.bin/tailwindcss — never npx (which can fetch a different version on resolution failure). The committed package-lock pins the CLI exactly; engines.node declares the runtime the CI job reproduces on (setup-node pins it; npm only warns without engine-strict). OVERRIDES (dependabot #18/#19): `overrides` forces postcss-selector-parser to the patched 7.1.6 — 6.1.4 is the LAST 6.x published and tailwind 3.4.19's parents range on ^6, so no in-range fix exists; the regenerated lock also carries source-map-js 1.2.2 (no override needed — postcss ranges on ^1.2.1). Both emit byte-identical CSS (the reproducibility job is the oracle). The lock does NOT record `overrides` (no such key anywhere in it, root entry included), and losing the block splits into two states: lock NOT regenerated -> `npm ci` FAILS loudly (EUSAGE, \"Missing: postcss-selector-parser@6.1.4 from lock file\"); lock regenerated -> the resolution falls back to 6.1.4 at NESTED paths with no hoisted entry and `npm ci` installs it with exit 0 over byte-identical CSS, which is the SILENT one. So ../report_builddeps_test.go asserts the lock's RESOLVED versions at every entry (the silent state), guards this block (the loud one, before a lock regen converts it into the silent one), and carries the override's removal condition.",
   "dependencies": {
     "tailwindcss": "3.4.19"
+  },
+  "overrides": {
+    "postcss-selector-parser": "7.1.6"
   }
 }
