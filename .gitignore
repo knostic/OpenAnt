@@ -15,6 +15,16 @@ reports/
 # Local-only scratch and generated artifacts (not part of the codebase)
 *knowledge-graph.*
 
+# Run output logs (pytest/CLI run scratch) never belong in the tree -- the
+# one instance that landed (runA-388b.log, #388) was removed in #766. A
+# future intentional .log fixture is let back in by a path-narrow `!pattern`
+# negation here (or a plain `git add -f`); either way it needs an allowlist
+# entry, with a reason, in the test file at
+# libs/openant-core/tests/test_issue766_stray_run_log.py -- full
+# repo-relative paths for tracked entries, bare names for root on-disk
+# entries.
+*.log
+
 # Local scripts and tools (e.g. libs/openant-core/scripts/local/) --
 # personal, unversioned developer scratch space. Does NOT cover
 # libs/openant-core/utilities/autopatcher/tools/ (tracked Auto Patcher
