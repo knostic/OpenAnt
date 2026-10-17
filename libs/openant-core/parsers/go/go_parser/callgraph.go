@@ -978,6 +978,27 @@ func (c *CallGraphBuilder) resolveMethodCall(methodName, receiverType, currentFi
 		}
 	}
 
+	// #781: the bare-name cross-package fabrication kill. methodsByType and
+	// varTypes carry BARE type names, and a bare-written type is the caller's
+	// OWN package's type by construction — an imported type is written
+	// qualified (a SelectorExpr), exprTypeName returns "" for it, and it
+	// contributes nothing to the body model. A winner in ANOTHER package is
+	// therefore a bare-name collision in every shape the body model can
+	// produce EXCEPT a dot-import (import . "m/f") or a type alias
+	// (type B = otherpkg.B) — the two shapes where the other package's type
+	// IS written bare; both are the declared residuals (the alias shape
+	// widens the class #746's CompositeValue gate declared), the same trade:
+	// the gate trades those rare real edges for the deterministic
+	// fabrication kill. This covers every IsMethod resolution routed here —
+	// the direct call b.view() and the method-value-then-call
+	// f := b.view; f() — where the caller's own package's same-named type
+	// does not provide the method (a func-typed FIELD or a plain name
+	// collision) and the fall-through would fabricate
+	// a:backend.mk -> z:backend.view.
+	if best != "" && filepath.Dir(best) != callerPkg {
+		return ""
+	}
+
 	return best
 }
 
