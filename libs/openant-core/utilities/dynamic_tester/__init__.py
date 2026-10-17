@@ -481,7 +481,12 @@ def run_dynamic_tests(
                                          usage=_summary_usage())
             continue
 
-        print(f"  Generated (${generation_cost:.4f}). Running in Docker...",
+        # #786 (the #608 contract: get_totals reads are SANCTIONED readers
+        # only — this line reads the unit's OWN usage, which never calls
+        # get_totals and already carries the unpriced ids per #216/#598)
+        from core.tracking import cost_marker
+        print(f"  Generated (${generation_cost:.4f}"
+              f"{cost_marker(unit_usage)}). Running in Docker...",
               file=sys.stderr)
 
         # Resolve the vulnerable source file for pre-staging. location.file is a
@@ -589,7 +594,17 @@ def run_dynamic_tests(
     # cumulative — prior-phase spend on the shared tracker must not appear
     # here (the JSON step-report on the same run already reads the delta).
     total_cost = tracker.total_cost_usd - _baseline_cost_usd
-    report_md = generate_report(results, repo_info["name"], total_cost)
+    # #786 (T1 round-2 F-A): the total marker reads the tracker's run-set
+    # via the #608-sanctioned accessor (never get_totals) and passes it as
+    # the render input — the RESULT ROWS ARE NEVER MUTATED (the JSON stays
+    # the honest per-unit record; a union fold would fabricate ids on rows
+    # whose units were priced, and a run-cumulative set against a
+    # phase-scoped figure is exactly the F1 class). The conservative
+    # direction: the total figure is not provably complete when the
+    # run-set is non-empty.
+    _total_unpriced = tracker.cost_incomplete_models() or None
+    report_md = generate_report(results, repo_info["name"], total_cost,
+                                total_unpriced=_total_unpriced)
 
     report_path = os.path.join(output_dir, "DYNAMIC_TEST_RESULTS.md")
     with open_utf8(report_path, "w") as f:

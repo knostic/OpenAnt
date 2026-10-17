@@ -843,6 +843,12 @@ class TokenTracker:
             getattr(tl, "unit_unpriced_cache", None)))
         return usage
 
+    # #786: the human-line completeness read — a plain-attribute accessor
+    # (never get_totals), so the #608 contract (sanctioned readers only)
+    # holds for every new render site.
+    def cost_incomplete_models(self) -> list:
+        return sorted(self._unpriced_models)
+
     def get_summary(self) -> dict:
         """
         Get summary of all tracked calls.

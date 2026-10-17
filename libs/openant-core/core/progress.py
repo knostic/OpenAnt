@@ -82,6 +82,13 @@ class ProgressReporter:
         totals = self.tracker.get_totals()
         return totals.get("total_cost_usd", 0.0)
 
+    def _cost_marker(self) -> str:
+        """#786: the completeness marker for this reporter's cost lines."""
+        if not self.tracker:
+            return ""
+        from core.tracking import cost_marker
+        return cost_marker(self.tracker.get_totals())
+
     def mark_restored(self, count: int) -> None:
         """Rebase progress to a checkpoint-restored count AFTER construction.
 
@@ -160,7 +167,17 @@ class ProgressReporter:
             if unit_elapsed > 0:
                 parts.append(f"{unit_elapsed:.1f}s")
 
-            meta = f"(elapsed {_fmt_duration(elapsed)}, ETA {eta}, {_fmt_cost(unit_cost)})"
+            # #786 (T1 round-3 F2): the per-unit line's dollars are
+            # UNIT-scoped (total - last_cost) while the tracker set is
+            # RUN-cumulative — the honest form is the run-scoped note,
+            # never asserting this unit's own cost is an under-count.
+            _ids = (self.tracker.cost_incomplete_models()
+                    if self.tracker else [])
+            _unit_marker = ("" if not _ids else
+                            f" (run cost incomplete: {len(_ids)} unpriced "
+                            f"model(s) — this unit's figure may exclude their "
+                            f"spend)")
+            meta = f"(elapsed {_fmt_duration(elapsed)}, ETA {eta}, {_fmt_cost(unit_cost)}{_unit_marker})"
             parts.append(meta)
 
             line = "  ".join(parts)
@@ -186,7 +203,7 @@ class ProgressReporter:
             f"avg {avg:.1f}s/unit | "
             f"elapsed {_fmt_duration(elapsed)} | "
             f"ETA {eta} | "
-            f"cost {_fmt_cost(cost)}"
+            f"cost {_fmt_cost(cost)}{self._cost_marker()}"
             f" ---"
         )
         print(line, file=sys.stderr, flush=True)
@@ -203,6 +220,6 @@ class ProgressReporter:
                 f"[{self.step_name}] Done: "
                 f"{self.completed}/{self.total} units in {_fmt_duration(elapsed)} | "
                 f"avg {avg:.1f}s/unit | "
-                f"cost {_fmt_cost(cost)}"
+                f"cost {_fmt_cost(cost)}{self._cost_marker()}"
             )
             print(line, file=sys.stderr, flush=True)

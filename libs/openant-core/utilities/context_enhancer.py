@@ -623,11 +623,15 @@ class ContextEnhancer:
                       "data_flows_extracted": self.stats['data_flows_extracted'],
                       "errors": self.stats['errors']
                   })
+        # #786: the marker renders on the phase line — an unpriced model's
+        # under-count never reads as a complete figure.
+        from core.tracking import cost_marker
         self._log("info", "Token usage",
                   input_tokens=token_stats['total_input_tokens'],
                   output_tokens=token_stats['total_output_tokens'],
                   total_tokens=token_stats['total_tokens'],
-                  cost=f"${token_stats['total_cost_usd']:.4f}")
+                  cost=f"${token_stats['total_cost_usd']:.4f}"
+                       f"{cost_marker(token_stats)}")
 
         return dataset
 
@@ -1263,11 +1267,15 @@ class ContextEnhancer:
                       "incomplete": agentic_stats['incomplete_found'],
                       "errors": agentic_stats['errors']
                   })
+        # #786: the marker renders on the phase line — an unpriced model's
+        # under-count never reads as a complete figure.
+        from core.tracking import cost_marker
         self._log("info", "Token usage",
                   input_tokens=token_stats['total_input_tokens'],
                   output_tokens=token_stats['total_output_tokens'],
                   total_tokens=token_stats['total_tokens'],
-                  cost=f"${token_stats['total_cost_usd']:.4f}")
+                  cost=f"${token_stats['total_cost_usd']:.4f}"
+                       f"{cost_marker(token_stats)}")
 
         return dataset
 
