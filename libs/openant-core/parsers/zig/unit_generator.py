@@ -195,11 +195,18 @@ class UnitGenerator:
         files_included = [func_info["file_path"]]
 
         if not upstream:
-            return primary_code, files_included
+            # #723 (T1 round-2 N1): the early return skipped neutralization —
+            # a forged boundary-shaped line in a no-dependency function's own
+            # body survived raw and the consumer's split truncated the target.
+            # rust and swift got this wrap first; zig is the same class.
+            return neutralize_boundaries(primary_code), files_included
 
         # Group dependencies by file
         deps_by_file: Dict[str, List[str]] = {}
-        for dep_id in upstream:
+        # #723 (T1 round-2 N3): sorted like swift's — the set's iteration
+        # order would otherwise vary with PYTHONHASHSEED and make the
+        # emitted part order (and dataset.json) non-deterministic.
+        for dep_id in sorted(upstream):
             dep_info = self.functions.get(dep_id)
             if dep_info:
                 file_path = dep_info["file_path"]
@@ -214,24 +221,34 @@ class UnitGenerator:
         # core/file_boundary.neutralize_boundaries.
         code_parts = [neutralize_boundaries(primary_code)]
 
-        for file_path, dep_ids in deps_by_file.items():
+        for file_path, dep_ids in sorted(deps_by_file.items()):
             if file_path == func_info["file_path"]:
-                # Same file - add dependencies without file boundary
+                # Same file - the dependency needs the boundary too (#723, the
+                # rust twin fable's round-1 found EXECUTED): without it the
+                # helper's body lands inside the ">>> ANALYZE THIS FUNCTION
+                # ONLY <<<" target block (part[0]); the cross-file branch below
+                # already boundary-prefixes its parts.
                 for dep_id in dep_ids:
                     dep_info = self.functions.get(dep_id)
                     if dep_info:
-                        code_parts.append(neutralize_boundaries(dep_info.get("code", "")))
+                        dep_code = neutralize_boundaries(dep_info.get("code", ""))
+                        if dep_code.strip():
+                            code_parts.append(
+                                self.FILE_BOUNDARY + dep_code)
             else:
-                # Different file - add file boundary
-                if file_path not in files_included:
-                    files_included.append(file_path)
+                # Different file - the boundary (and the file claim) only
+                # when the part actually emits — an empty group must not
+                # claim a file it never inlined
                 file_code = []
                 for dep_id in dep_ids:
                     dep_info = self.functions.get(dep_id)
                     if dep_info:
                         file_code.append(neutralize_boundaries(dep_info.get("code", "")))
-                if file_code:
-                    code_parts.append(self.FILE_BOUNDARY + "\n".join(file_code))
+                joined = "\n".join(file_code)
+                if joined.strip():
+                    if file_path not in files_included:
+                        files_included.append(file_path)
+                    code_parts.append(self.FILE_BOUNDARY + joined)
 
         return "\n\n".join(code_parts), files_included
 

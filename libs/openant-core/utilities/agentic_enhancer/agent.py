@@ -16,6 +16,7 @@ import sys
 from typing import Optional, Set, List
 
 from core.file_boundary import boundary_for_language
+from core.file_boundary import neutralize_boundaries
 from ..llm_client import (TokenTracker, error_path_turn,
                           get_global_tracker, incomplete_markers,
                           record_accounting_error, unit_unpriced_kinds)
@@ -743,7 +744,13 @@ def enhance_unit_with_agent(
                 func_data = index.get_function(func_id)
 
                 if func_data and func_data.get("code"):
-                    additional_code.append(func_data["code"])
+                    # #723 (T1 round-6, the 8th producer): the joined parts are
+                    # scanned-repo source — a boundary-shaped line in them
+                    # would split the unit at the consumer and relabel the
+                    # payload do-not-analyze. The producers' contract: defang
+                    # every part before it enters the blob.
+                    additional_code.append(
+                        neutralize_boundaries(func_data["code"]))
 
                     # Extract file path from func_id
                     colon_idx = func_id.rfind(":")

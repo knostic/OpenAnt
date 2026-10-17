@@ -200,10 +200,16 @@ class UnitGenerator:
         files_included = [func_info["file_path"]]
 
         if not upstream:
-            return primary_code, files_included
+            # #723: the early return skipped neutralization entirely — a
+            # forged boundary-shaped line in a no-dependency function's own
+            # body survived raw and the consumer's split truncated the target
+            # at it. Every other exit path below already neutralized.
+            return neutralize_boundaries(primary_code), files_included
 
         deps_by_file: Dict[str, List[str]] = {}
-        for dep_id in upstream:
+        # #723 (T1 round-2 N3): sorted like swift's — set iteration order
+        # is PYTHONHASHSEED-dependent; the emitted part order must not be.
+        for dep_id in sorted(upstream):
             dep_info = self.functions.get(dep_id)
             if dep_info:
                 file_path = dep_info["file_path"]
@@ -221,17 +227,26 @@ class UnitGenerator:
                 for dep_id in dep_ids:
                     dep_info = self.functions.get(dep_id)
                     if dep_info:
-                        code_parts.append(neutralize_boundaries(dep_info.get("code", "")))
+                        # #723: same-file dependencies need the boundary too —
+                        # without it the helper's body lands inside the
+                        # ">>> ANALYZE THIS FUNCTION ONLY <<<" target block
+                        # (part[0]); the cross-file branch below already
+                        # boundary-prefixes its parts.
+                        dep_code = neutralize_boundaries(
+                            dep_info.get("code", ""))
+                        if dep_code.strip():
+                            code_parts.append(self.FILE_BOUNDARY + dep_code)
             else:
-                if file_path not in files_included:
-                    files_included.append(file_path)
                 file_code = []
                 for dep_id in dep_ids:
                     dep_info = self.functions.get(dep_id)
                     if dep_info:
                         file_code.append(neutralize_boundaries(dep_info.get("code", "")))
-                if file_code:
-                    code_parts.append(self.FILE_BOUNDARY + "\n".join(file_code))
+                joined = "\n".join(file_code)
+                if joined.strip():
+                    if file_path not in files_included:
+                        files_included.append(file_path)
+                    code_parts.append(self.FILE_BOUNDARY + joined)
 
         return "\n\n".join(code_parts), files_included
 
