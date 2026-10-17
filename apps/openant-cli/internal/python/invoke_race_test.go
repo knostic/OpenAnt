@@ -37,7 +37,7 @@ func TestInvoke_InterruptedFlagHasNoRace(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = Invoke(hang, []string{"parse", "."}, "", true, "")
+		_, _ = Invoke(hang, []string{"parse", "."}, "", true, "", nil)
 	}()
 
 	// Let Invoke start the subprocess and install its signal.Notify handler

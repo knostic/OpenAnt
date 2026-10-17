@@ -356,8 +356,10 @@ def _extract_usage_details(usage: Any) -> Optional[dict]:
     Copies ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
     VERBATIM when the provider reported them; returns ``None`` when neither
     is present (absent ≠ 0 — fabricated zeros would poison reconciliation
-    against a provider bill). These fields NEVER feed the cost formula:
-    ``TokenTracker`` stores them verbatim, unsummed. (Anthropic's
+    against a provider bill). #626 AMENDED the blanket exclusion for the CACHE
+    fields: they now price at their own multipliers (#661) and total as separate
+    line items — never into total_input_tokens. The REASONING fields remain
+    outside the cost formula verbatim: ``TokenTracker`` stores them unsummed. (Anthropic's
     ``output_tokens`` includes thinking tokens; there is no separate
     reasoning field to capture on this path.)
     """
@@ -451,6 +453,12 @@ def _response_to_unified(
             f"stop_reason={raw_stop!r}); {_cause}",
             input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
             output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+            # F-A1: the DETAIL fields travel too, from the same extractor
+            # the successful return below calls on this same usage object.
+            # #626 prices the cache portion off these and nowhere else, and
+            # on this EXCLUSIVE shape the cached read is OUTSIDE
+            # input_tokens — dropping it under-reports real spend.
+            usage_details=_extract_usage_details(usage),
         )
 
     if raw_stop not in _ANTHROPIC_STOP_REASONS:

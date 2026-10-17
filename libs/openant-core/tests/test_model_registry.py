@@ -109,6 +109,45 @@ def test_configured_default_phase_models_resolve_to_non_retired():
             f"phase {phase!r} default {ref.model!r} resolves to a RETIRED model")
 
 
+def test_context_window_tokens_none_for_every_current_model():
+    """Fix B: the ``context_window_tokens`` field ships unpopulated for
+    every model today (schema only, no data population this release --
+    see technical_capacity.py's own docstring) -- every current model
+    must resolve to ``None`` here, routing callers to the one documented
+    conservative fallback rather than a per-model guess."""
+    for rec in mr.load_models():
+        if rec.get("status") != "current":
+            continue
+        assert mr.context_window_tokens(rec["provider"], rec["id"]) is None
+
+
+def test_context_window_tokens_unknown_model_and_provider_return_none():
+    assert mr.context_window_tokens("anthropic", "does-not-exist-model") is None
+    assert mr.context_window_tokens("does-not-exist-provider", "claude-opus-4-8") is None
+
+
+def test_context_window_tokens_reads_populated_field(tmp_path, monkeypatch):
+    """Schema/runtime-semantics check: when a record DOES carry
+    ``context_window_tokens``, the accessor returns it verbatim -- mirrors
+    ``max_output_tokens``'s own already-established alias-resolution
+    contract exactly (bare/vendor-prefixed/dotted/dashed spellings)."""
+    fake_config = tmp_path / "models.json"
+    fake_config.write_text(
+        '{"models": [{"id": "acme-model-1-0", "provider": "anthropic", '
+        '"status": "current", "price": {"input": 1.0, "output": 2.0}, '
+        '"context_window_tokens": 123456, "source": "test", "retrieved": "2026-01-01"}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENANT_MODELS_CONFIG", str(fake_config))
+    mr._load_config.cache_clear()
+    try:
+        assert mr.context_window_tokens("anthropic", "acme-model-1-0") == 123456
+        # Alias-tolerant: dashed <-> dotted version spelling.
+        assert mr.context_window_tokens("anthropic", "acme-model-1.0") == 123456
+    finally:
+        mr._load_config.cache_clear()
+
+
 def test_configured_default_phase_models_are_current():
     """Defaults must be CURRENT, not merely non-retired.
 

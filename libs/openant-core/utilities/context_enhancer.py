@@ -24,7 +24,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .model_config import CLAUDE_SONNET_4_20250514
-from .llm_client import TokenTracker, get_global_tracker
+from .llm_client import (TokenTracker, get_global_tracker,
+                         incomplete_markers, turn_has_spend,
+                         unpriced_kinds_from)
 from .llm import (
     LLMAuthError,
     LLMConnectionError,
@@ -709,6 +711,13 @@ class ContextEnhancer:
         _summary_output_tokens = 0
         _summary_cost_usd = 0.0
         _summary_unpriced: set[str] = set()
+        # #626/PR#661 hunt F4: the cache kind's own set. Every fold below
+        # that touches ``_summary_unpriced`` has a cache twin — the enhance
+        # phase has FIVE spend sources (checkpoint, agent_metadata, the
+        # error path's agent_state, the retry's state, the discarded-attempt
+        # prior map) and the kind had to be taught to all five or it died on
+        # whichever path a given run took.
+        _summary_unpriced_cache: set[str] = set()
         # #609: prior-attempt spend per unit, keyed by unit id. Written on
         # the MAIN THREAD ONLY, at exactly two discard points (the retry
         # wipe below, and the errored-checkpoint seed in the resume loop)
@@ -732,9 +741,10 @@ class ContextEnhancer:
             usage = {"input_tokens": _summary_input_tokens,
                      "output_tokens": _summary_output_tokens,
                      "cost_usd": round(_summary_cost_usd, 6)}
-            if _summary_unpriced:
-                usage["cost_incomplete"] = True
-                usage["unpriced_models"] = sorted(_summary_unpriced)
+            # #626/PR#661 hunt F4: both kinds, one rule
+            # (utilities.llm_client.incomplete_markers), present-only.
+            usage.update(incomplete_markers(_summary_unpriced,
+                                            _summary_unpriced_cache))
             from utilities.llm_client import _accounting_error_count
             _errs = _accounting_error_count()
             if _errs:
@@ -767,8 +777,10 @@ class ContextEnhancer:
                     _summary_input_tokens += cp_usage.get("input_tokens", 0)
                     _summary_output_tokens += cp_usage.get("output_tokens", 0)
                     _summary_cost_usd += cp_usage.get("cost_usd", 0.0)
-                    # #216: restore the incomplete-cost marker per unit.
-                    _summary_unpriced.update(cp_usage.get("unpriced_models") or [])
+                    # #216 + #626: restore BOTH incomplete-cost kinds.
+                    _cp_u, _cp_c = unpriced_kinds_from(cp_usage)
+                    _summary_unpriced.update(_cp_u)
+                    _summary_unpriced_cache.update(_cp_c)
                     # Count errors for non-completed units
                     if uid not in processed_ids and cp_data.get("agent_context", {}).get("error"):
                         _summary_errors += 1
@@ -783,8 +795,8 @@ class ContextEnhancer:
                             "input_tokens": cp_usage.get("input_tokens", 0),
                             "output_tokens": cp_usage.get("output_tokens", 0),
                             "cost_usd": cp_usage.get("cost_usd", 0.0),
-                            "unpriced_models": list(
-                                cp_usage.get("unpriced_models") or []),
+                            "unpriced_models": list(_cp_u),
+                            "unpriced_cache_models": list(_cp_c),
                         }
                 except (json.JSONDecodeError, OSError):
                     pass
@@ -795,10 +807,18 @@ class ContextEnhancer:
                                       usage=_usage_dict())
 
             # Inject prior usage into tracker so step_report captures the total
-            if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
+            # F661-3: the ONE spend predicate — the cost disjunct is what
+            # keeps cache-only restored spend (0 tokens, real dollars) from
+            # being orphaned while _usage_dict() reports it in full.
+            if turn_has_spend(input_tokens=_summary_input_tokens,
+                              output_tokens=_summary_output_tokens,
+                              cost_usd=_summary_cost_usd,
+                              unpriced=_summary_unpriced,
+                              unpriced_cache=_summary_unpriced_cache):
                 self.tracker.add_prior_usage(
                     _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
-                    unpriced_models=sorted(_summary_unpriced) or None)
+                    unpriced_models=sorted(_summary_unpriced) or None,
+                    unpriced_cache_models=sorted(_summary_unpriced_cache) or None)
                 # #281: refresh the caller's phase baseline AFTER the
                 # injection so its "Enhance" delta excludes restored usage.
                 if phase_baseline is not None:
@@ -910,7 +930,9 @@ class ContextEnhancer:
                 _summary_input_tokens += int(state.get("input_tokens", 0) or 0)
                 _summary_output_tokens += int(state.get("output_tokens", 0) or 0)
                 _summary_cost_usd += float(state.get("cost_usd", 0.0) or 0.0)
-                _summary_unpriced.update(state.get("unpriced_models") or [])
+                _st_u, _st_c = unpriced_kinds_from(state)
+                _summary_unpriced.update(_st_u)
+                _summary_unpriced_cache.update(_st_c)
             elif classification == INCOMPLETE_CLASSIFICATION:
                 # #293: the agent's degenerate exit (no completed finish call)
                 # is the third state — not a completion, not an error.
@@ -922,7 +944,9 @@ class ContextEnhancer:
             _summary_input_tokens += meta.get("input_tokens", 0)
             _summary_output_tokens += meta.get("output_tokens", 0)
             _summary_cost_usd += meta.get("cost_usd", 0.0)
-            _summary_unpriced.update(meta.get("unpriced_models") or [])
+            _mu, _mc = unpriced_kinds_from(meta)
+            _summary_unpriced.update(_mu)
+            _summary_unpriced_cache.update(_mc)
             # #609 hunt r2: folds run unconditionally; only the WRITE is
             # checkpoint-gated — the no-checkpoint-dir path accumulates
             # the same totals as the checkpointed one (nothing reads them
@@ -1011,15 +1035,19 @@ class ContextEnhancer:
                 _wiped_err = unit.get("agent_context", {}).get("error")
                 _wiped_state = ((_wiped_err.get("agent_state") or {})
                                 if isinstance(_wiped_err, dict) else {})
-                if (_wiped_state.get("input_tokens")
-                        or _wiped_state.get("output_tokens")
-                        or _wiped_state.get("unpriced_models")):
+                _wiped_u, _wiped_c = unpriced_kinds_from(_wiped_state)
+                # F661-3: the ONE spend predicate. The kinds are passed
+                # explicitly so the gate and the accumulate below agree on the
+                # same merged sets.
+                if turn_has_spend(_wiped_state, unpriced=_wiped_u,
+                                  unpriced_cache=_wiped_c):
                     # key: the SAME expression the save reads (get("id",
                     # "unknown") - #609 hunt: an id-less unit's moved spend
                     # was silently dropped when the keys diverged).
                     _prev = _prior_spend.setdefault(unit.get("id", "unknown"), {
                         "input_tokens": 0, "output_tokens": 0,
-                        "cost_usd": 0.0, "unpriced_models": []})
+                        "cost_usd": 0.0, "unpriced_models": [],
+                        "unpriced_cache_models": []})
                     _prev["input_tokens"] += int(
                         _wiped_state.get("input_tokens", 0) or 0)
                     _prev["output_tokens"] += int(
@@ -1027,8 +1055,10 @@ class ContextEnhancer:
                     _prev["cost_usd"] += float(
                         _wiped_state.get("cost_usd", 0.0) or 0.0)
                     _prev["unpriced_models"] = sorted(
-                        set(_prev["unpriced_models"])
-                        | set(_wiped_state.get("unpriced_models") or []))
+                        set(_prev["unpriced_models"]) | set(_wiped_u))
+                    _prev["unpriced_cache_models"] = sorted(
+                        set(_prev.get("unpriced_cache_models") or [])
+                        | set(_wiped_c))
                 # Clear previous error
                 unit["agent_context"] = {}
                 uid, classification, elapsed, _ = _enhance_one(unit)
@@ -1063,8 +1093,9 @@ class ContextEnhancer:
                         _re_state.get("output_tokens", 0) or 0)
                     _summary_cost_usd += float(
                         _re_state.get("cost_usd", 0.0) or 0.0)
-                    _summary_unpriced.update(
-                        _re_state.get("unpriced_models") or [])
+                    _re_u, _re_c = unpriced_kinds_from(_re_state)
+                    _summary_unpriced.update(_re_u)
+                    _summary_unpriced_cache.update(_re_c)
                 # Accumulate retry usage
                 meta = unit.get("agent_context", {}).get("agent_metadata", {})
                 _summary_input_tokens += meta.get("input_tokens", 0)
@@ -1072,8 +1103,11 @@ class ContextEnhancer:
                 _summary_cost_usd += meta.get("cost_usd", 0.0)
                 # #609: the retry's unpriced ids reach the tracker via its
                 # record_call; the summary marker must follow (the same
-                # fold _update_summary does for the initial pass).
-                _summary_unpriced.update(meta.get("unpriced_models") or [])
+                # fold _update_summary does for the initial pass) — #626:
+                # both kinds.
+                _rm_u, _rm_c = unpriced_kinds_from(meta)
+                _summary_unpriced.update(_rm_u)
+                _summary_unpriced_cache.update(_rm_c)
                 # Folds run BEFORE the _summary_cp guard (fold-always,
                 # guard-the-write — the no-checkpoint-dir path accumulates
                 # the same totals as the checkpointed one).
@@ -1198,15 +1232,25 @@ class ContextEnhancer:
         usage_cost = (float(meta.get("cost_usd", 0.0) or 0.0)
                       + float(state.get("cost_usd", 0.0) or 0.0)
                       + float(prior.get("cost_usd", 0.0) or 0.0))
-        usage_unpriced = sorted(
-            set(meta.get("unpriced_models") or [])
-            | set(state.get("unpriced_models") or [])
-            | set(prior.get("unpriced_models") or []))
+        _m_u, _m_c = unpriced_kinds_from(meta)
+        _s_u, _s_c = unpriced_kinds_from(state)
+        _p_u, _p_c = unpriced_kinds_from(prior)
+        usage_unpriced = sorted(set(_m_u) | set(_s_u) | set(_p_u))
+        # #626/PR#661 hunt F4: the cache kind merges across the SAME three
+        # sources. Dropping it here made the resume reader — which forwards
+        # the ids into the tracker — see nothing on a real enhance resume,
+        # exactly as #598 described for the #216 kind.
+        usage_unpriced_cache = sorted(set(_m_c) | set(_s_c) | set(_p_c))
         # #598 review: the unpriced term — a zero-token call whose only
         # trace is the unpriced id must still write the usage block, or
         # a resume loses the marker (#609 extends the gate to all three
         # sources).
-        if usage_in or usage_out or usage_unpriced:
+        # F661-3: the ONE spend predicate, over the SAME three merged
+        # sources the block below writes — a cache-only attempt costs real
+        # dollars at zero tokens, and the resume reader sums these blocks.
+        if turn_has_spend(input_tokens=usage_in, output_tokens=usage_out,
+                          cost_usd=usage_cost, unpriced=usage_unpriced,
+                          unpriced_cache=usage_unpriced_cache):
             cp_data["usage"] = {
                 "input_tokens": usage_in,
                 "output_tokens": usage_out,
@@ -1216,6 +1260,10 @@ class ContextEnhancer:
                 # reader (which forwards them into the tracker) read
                 # nothing on a real enhance resume.
                 "unpriced_models": usage_unpriced,
+                # #626: the cache kind, present-only so a no-cache unit's
+                # checkpoint record is byte-identical to the pre-#626 shape.
+                **({"unpriced_cache_models": usage_unpriced_cache}
+                   if usage_unpriced_cache else {}),
             }
         # #317: collision-safe AND under the save lock (this runs in a
         # ThreadPoolExecutor worker — the resolve+write pair must be
