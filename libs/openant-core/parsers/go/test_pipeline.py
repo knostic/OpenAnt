@@ -36,8 +36,10 @@ Example:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -50,6 +52,36 @@ if str(_core_root) not in sys.path:
     sys.path.insert(0, str(_core_root))
 
 from utilities.file_io import open_utf8, read_json, run_utf8, write_json
+
+# #686: the repo's only cross-platform Python file lock, reused rather than
+# re-implemented. It is `msvcrt.locking` on Windows and `fcntl.flock`
+# elsewhere, and its acquisition is DEADLINE-BOUNDED on both branches
+# (#325/PR #450: a blocking `LOCK_EX` let one wedged holder block every other
+# process without limit). Two reasons not to grow a second copy here: PR #43's
+# ruling, that a duplicate of a primitive master already has gets closed; and
+# tests/test_issue481_bare_open_conformance.py, whose sweep covers this file
+# and names the by-design prod `open` sites as exactly two -- `open_utf8` and
+# parser_adapter's try/finally-closed lock handle -- so a hand-rolled handle
+# here would be an unlisted third. The import direction is safe: this
+# orchestrator is a SUBPROCESS of core/parser_adapter.py, never an import of
+# it, so there is no cycle.
+from core.parser_adapter import _file_lock
+
+# The lockfile sits next to the binary it guards, which keeps it on the same
+# filesystem as the build target -- the clause PR #422 carried over from the JS
+# bootstrap's `.openant-npm-install.lock`. The wait budget outlasts a cold
+# build of the parser module by a wide margin; past it `_file_lock` raises its
+# own named diagnosis instead of spinning.
+_GO_BUILD_LOCK_NAME = '.openant-go-build.lock'
+_GO_BUILD_LOCK_WAIT_S = 600
+
+# The staging directory's name prefix. A constant, not a literal at the call
+# site, because `.gitignore` has to carry the same prefix -- a rename in one
+# place and not the other puts an untracked directory in every checkout that
+# runs a Go scan. The leading dot is load-bearing twice: the Go tool skips
+# `.`/`_` directories when it loads the package, and `git status` reports an
+# untracked directory by name, which the ignore pattern then matches.
+_GO_BUILD_STAGING_PREFIX = '.openant-go-build-'
 
 
 def normalize_go_function_records(raw_functions: dict) -> dict:
@@ -214,6 +246,66 @@ class GoPipelineTest:
                         return True
         return False
 
+    def _build_go_parser(self, go_parser_dir: str) -> bool:
+        """Build the Go parser and publish it with one atomic rename.
+
+        The build writes into a staging directory inside *go_parser_dir* and the
+        result is moved onto the live path with ``os.replace``. Three details
+        are load-bearing rather than cosmetic:
+
+        * the staging directory is INSIDE the destination's own directory, so
+          source and target share a filesystem. ``os.replace`` is atomic only
+          within one volume; across volumes it degrades to copy+delete and
+          loses the property (PR #43's finding, and the reason
+          ``utilities.file_io.write_json`` stages its temp with
+          ``dir=directory``). The dot prefix also keeps the staging directory
+          invisible to the Go tool, which skips ``.``/``_`` directories;
+        * the ``-o`` basename stays ``go_parser``, so the toolchain picks the
+          executable suffix exactly as it did when it wrote the live path
+          directly, and the destination is derived from the name it ACTUALLY
+          produced. The published layout is therefore unchanged on every
+          platform, including a toolchain that appends ``.exe``;
+        * nothing but the rename touches the live path, so a build that fails
+          -- or a rename the OS refuses -- leaves the previous good binary
+          standing instead of a truncated one.
+        """
+        staging = tempfile.mkdtemp(prefix=_GO_BUILD_STAGING_PREFIX, dir=go_parser_dir)
+        try:
+            result = run_utf8(
+                ['go', 'build', '-o', os.path.join(staging, 'go_parser'), '.'],
+                cwd=go_parser_dir,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                print(f"Error building Go parser: {result.stderr}")
+                return False
+            built = os.path.join(staging, 'go_parser')
+            if not os.path.exists(built) and os.path.exists(built + '.exe'):
+                built += '.exe'
+            if not os.path.exists(built):
+                print("Error building Go parser: `go build` reported success but "
+                      f"left no executable in {staging}")
+                return False
+            destination = os.path.join(go_parser_dir, os.path.basename(built))
+            try:
+                os.replace(built, destination)
+            except OSError as exc:
+                # The rename is the only step that touches the live path. On
+                # POSIX it is safe even while a scan is running the old binary:
+                # that process holds the inode, and the directory entry is what
+                # moves. Windows refuses to replace an image that is currently
+                # executing, and refusing is the right outcome -- the previous
+                # good binary stays in place and the caller gets a diagnosis.
+                print(f"Error publishing Go parser to {destination}: {exc}")
+                return False
+            return True
+        finally:
+            # Best effort: the staging directory is ours alone and holds at most
+            # the artifact we just moved out of it. A leftover (hard kill
+            # between the build and this cleanup) is inert and gitignored.
+            shutil.rmtree(staging, ignore_errors=True)
+
     def setup(self):
         """Create output directory and build Go parser if needed."""
         os.makedirs(self.output_dir, exist_ok=True)
@@ -225,19 +317,53 @@ class GoPipelineTest:
         # that already had a cached binary — the source was fixed but the old
         # binary kept running. The binary is gitignored, so this staleness check
         # is the only thing that makes a source change take effect.
+        #
+        # #686: the rebuild that this check authorizes is serialized, and its
+        # result is published atomically. Previously two concurrent scans both
+        # read "stale" and both ran `go build -o go_parser .` onto the single
+        # path every scan execs -- and the toolchain publishes with a rename
+        # that falls back to a byte COPY (shell.go:174-183), which writes the
+        # destination in place, so on that fallback a scan could exec a
+        # partially written binary. Both halves are needed and neither
+        # substitutes for the other: a lock alone still leaves the publish
+        # non-atomic on the copy path, and an atomic publish alone still runs
+        # the whole build twice. This is the same shape the JS npm bootstrap
+        # (core/parser_adapter.py::_ensure_js_parser_dependencies) and the CLI's
+        # venv install (#62/PR #422) already use, re-check-under-the-lock
+        # included.
+        #
+        # The first check is deliberately OUTSIDE the lock, as in the JS
+        # bootstrap: a scan that finds the binary fresh has nothing to
+        # serialize against, because the only other writer publishes by rename
+        # -- it will exec either the old binary or the new one, never a
+        # half-written one.
         go_parser_dir = os.path.join(self.parser_dir, 'go_parser')
         if self._go_binary_stale(go_parser_dir):
-            print("Building Go parser...")
-            result = run_utf8(
-                ['go', 'build', '-o', 'go_parser', '.'],
-                cwd=go_parser_dir,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                print(f"Error building Go parser: {result.stderr}")
+            # fable r1 F2: the LOCK OPEN itself can fail (an unwritable package
+            # dir, an EACCES on the lockfile) and at the base that surface was
+            # a clean False with a diagnosis. The JS bootstrap catches OSError
+            # around its own whole serialized section for exactly this reason;
+            # this catches only the lock/build/publish span (KeyboardInterrupt
+            # and friends re-raise via the OSError-specific except) and returns
+            # the base's clean SURFACE (printed diagnosis, False). One shape
+            # is cleaner than the base: `go` absent from PATH raised an
+            # uncaught FileNotFoundError traceback there; this prints the
+            # diagnosis and returns False (fable r2's nit — the same exit-1
+            # and the same parser_adapter RuntimeError downstream).
+            try:
+                with _file_lock(Path(go_parser_dir) / _GO_BUILD_LOCK_NAME,
+                                what="the go_parser build",
+                                wait_seconds=_GO_BUILD_LOCK_WAIT_S):
+                    # Re-check under the lock: another scan may have published
+                    # a fresh binary while we were waiting for it.
+                    if self._go_binary_stale(go_parser_dir):
+                        print("Building Go parser...")
+                        if not self._build_go_parser(go_parser_dir):
+                            return False
+                        print("  Go parser built successfully")
+            except OSError as exc:
+                print(f"Error building Go parser: {exc}")
                 return False
-            print("  Go parser built successfully")
 
         print()
         return True

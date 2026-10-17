@@ -252,6 +252,20 @@ type Finding struct {
 	// — old artifacts) + its provenance (model | derived).
 	Severity       string `json:"severity"`
 	SeveritySource string `json:"severity_source"`
+	// #745: the delegation-dismissed SAFE row's followable edge. The
+	// concern went elsewhere: Scope names the analysis scoping
+	// (function_local — the pipeline assembles each unit as "ANALYZE THIS
+	// FUNCTION ONLY"), DeferredTo carries the unit's dataset call edges in
+	// BOTH directions (the corpus's delegations go UP — "the risk exists at
+	// the callers" — and DOWN — "the dangerous operation lives in a
+	// helper this unit calls"), the same ids the result rows key on), and
+	// DeferredRowless names the deferred units with NO result row (pruned
+	// by the reachability pass or never analyzed — the evaporation case,
+	// distinguishable from an examined-and-safe one). Empty on non-safe
+	// verdicts: the concern is in the row's own function.
+	Scope           string   `json:"scope"`
+	DeferredTo      []string `json:"deferred_to"`
+	DeferredRowless []string `json:"deferred_rowless"`
 }
 
 // SeverityColor returns the badge color for the severity. Unknown values

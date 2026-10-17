@@ -551,7 +551,7 @@ HARDCODED_AGENTIC = True
 ### Node.js
 ```bash
 cd /path/to/openant/parsers/javascript
-npm install  # Installs dependencies for scanner and generator
+npm ci  # Installs dependencies for scanner and generator (from the committed lock, #795)
 ```
 
 ### Python
