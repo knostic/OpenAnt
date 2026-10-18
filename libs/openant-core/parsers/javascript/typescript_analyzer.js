@@ -242,8 +242,26 @@ class TypeScriptAnalyzer {
       );
     };
 
-    // Step 2: Extract functions from each file
+    // Step 2: Extract functions from each file.
+    // #806: declaration files (.d.ts — the TS analogue of a C header)
+    // produce ZERO analysis units: their content is ambient declarations
+    // (bodies absent by design), so a unit from one is a body-less
+    // cost/false-positive item that the reachability consumer then has to
+    // filter (the openbao corpus: 24 .d.ts files / 50 extracted
+    // functions / 0 reached the dataset — every one pure processing
+    // cost). The C parser's declaration-vs-definition split is the
+    // design contrast this mirrors: the prototypes are RECORDED, never
+    // analyzed. The type-aware check (ts-morph's isDeclarationFile) is
+    // the layer that gates unit creation — the context_assembler's
+    // .d.ts exclusion guards context, and the scanner still COLLECTS the
+    // files (the declaration content stays available to any layer that
+    // wants it); the fix is about units, not collection.
+    let declarationFilesSkipped = 0;
     for (const sourceFile of this.project.getSourceFiles()) {
+      if (sourceFile.isDeclarationFile()) {
+        declarationFilesSkipped += 1;
+        continue;
+      }
       try {
         this.extractFunctionsFromFile(sourceFile);
       } catch (error) {
@@ -265,6 +283,11 @@ class TypeScriptAnalyzer {
     // `call_graph` / `reverse_call_graph` built in Step 5.
     for (const sourceFile of this.project.getSourceFiles()) {
       if (filesWithErrors.has(filePathOf(sourceFile))) continue;
+      // #806: a declaration file has no extracted functions (Step 2
+      // skipped it), so it has no edges either — skip it here too so the
+      // two loops stay symmetric and a future edit to one cannot
+      // diverge from the other.
+      if (sourceFile.isDeclarationFile()) continue;
       try {
         this.buildCallGraphForFile(sourceFile);
       } catch (error) {
@@ -324,10 +347,24 @@ class TypeScriptAnalyzer {
       call_graph: this.resolvedCallGraph,
       reverse_call_graph: this.reverseCallGraph,
       indirect_calls: this.indirectCalls,
-      statistics: {
-        files_processed: totalInputFiles - totalErrors,
-        files_with_errors: totalErrors,
-      },
+      statistics: (() => {
+        // #806: the declaration-vs-definition split's observability —
+        // the .d.ts files were COLLECTED and LOADED (they count in
+        // files_processed) and produced zero units by design; the count
+        // rides its own key so the skip is visible in the analyzer's
+        // output (never inside the processed/errors partition). ABSENT
+        // when zero — the sibling families' "absent when unmeasurable"
+        // doctrine (#602): a run with no declaration files has nothing
+        // to report, and the exact-shape consumers keep their contracts.
+        const s = {
+          files_processed: totalInputFiles - totalErrors,
+          files_with_errors: totalErrors,
+        };
+        if (declarationFilesSkipped > 0) {
+          s.declaration_files_skipped = declarationFilesSkipped;
+        }
+        return s;
+      })(),
     };
   }
 
