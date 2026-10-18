@@ -2220,7 +2220,11 @@ def _print_summary(result: ScanResult) -> None:
             line += (f"; {result.metrics.stage2_disagreed_protected} "
                      f"reclassified protected-by-controls")
         print(line + ")", file=sys.stderr)
-    print(f"  Cost:           ${result.usage.total_cost_usd:.4f}", file=sys.stderr)
+    # #786: an unpriced model's under-count must not read as a complete
+    # figure on the line the operator actually reads.
+    from core.tracking import cost_marker
+    print(f"  Cost:           ${result.usage.total_cost_usd:.4f}"
+          f"{cost_marker(result.usage)}", file=sys.stderr)
     print(f"  Output:         {result.output_dir}", file=sys.stderr)
     if result.skipped_steps:
         print(f"  Skipped:        {', '.join(result.skipped_steps)}", file=sys.stderr)

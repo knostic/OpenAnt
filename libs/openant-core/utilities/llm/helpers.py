@@ -128,6 +128,13 @@ def simple_completion(
         # #211 pass-through capture: provider detail fields verbatim
         # (never in the cost math — see TokenTracker.record_call).
         usage_details=result.usage_details,
+        # #797 (the r1-F2 catch): the provider's own reported cost,
+        # PRESENT-ONLY — the None path must keep the call shape
+        # byte-identical (duck-typed record_call consumers with
+        # keyword-only signatures exist in the wild; the kwarg must
+        # appear only when there is a cost to carry).
+        **({"provider_cost_usd": result.provider_cost_usd}
+           if result.provider_cost_usd is not None else {}),
     )
     return result
 
