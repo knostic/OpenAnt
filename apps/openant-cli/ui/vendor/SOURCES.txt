@@ -103,21 +103,85 @@
 #         first, narrower corpus, which is why this limit is written down
 #         instead of implied.
 #
-# dompurify-3.4.15.min.js
-#   source: https://cdn.jsdelivr.net/npm/dompurify@3.4.15/dist/purify.min.js
-#   npm anchor: registry.npmjs.org/dompurify/-/dompurify-3.4.15.tgz
-#   dist.integrity (of the .tgz, not of the inner file): sha512-EUBjM+B+lkDE41iE82DDSCfkoPGfXx8IxFxPMjNzm/Uk4xDet77rTN9wqlxlVg71kK7XGuUMv6wUxJUwwv+Xyw==
-#   sha256: f263b05369e050fa175d4ecb9c9358eb4253602d510297adfb31df48b2f1c4d5
-#   verified: 2026-09-12 — the tarball sha512 was re-derived and MATCHED the
-#         registry dist.integrity at write time; the committed bytes are the
-#         tarball's dist/purify.min.js, verbatim. Currency bump from 3.4.13
-#         (the pre-#577 blob was itself genuine — byte-identical to the
-#         3.4.13 dist, and 3.4.13 is the version that fixed the
-#         GHSA-55q2-fjhq-7xh7 advisory). 3.4.14 and 3.4.15 carry no advisory
-#         ids; upstream's notes name bypass preconditions (risky tags
-#         allow-listed; XML-content clobbering) that this app's inert
-#         MD_SANITIZE allowlist does not meet — this is a hygiene/currency
-#         bump of the sole sanitizer, not a claim that a known exploit is
-#         closed. The trailing sourceMappingURL comment references a map the
-#         /assets route never serves (allowlisted) — cosmetic, kept verbatim
-#         for byte fidelity.
+# dompurify-3.4.17.min.js (the #717 patch bump from 3.4.15; the #332 recipe)
+#   source: https://cdn.jsdelivr.net/npm/dompurify@3.4.17/dist/purify.min.js
+#   npm anchor: registry.npmjs.org/dompurify/-/dompurify-3.4.17.tgz
+#   dist.integrity (of the .tgz, not of the inner file): sha512-B/pSlYVHQ58kqISD/yDjuJ1yfzI34m1gF4lAod2bwSRhiN4K5Cl3H8Af7hqB2PmTL911tdEudnnXn5FnhRoz0w==
+#   sha256: cd37898f9782adf54820c413191b5691803f0f137c799d6edcfd38523b4c2c31
+#   verified: 2026-10-16 — the tarball sha512 was re-derived and MATCHED the
+#         registry dist.integrity at write time (its sha1 also matched
+#         dist.shasum, 074bbb24eaa419535ac19ffe7f663104b0e1543d); the
+#         committed bytes are the tarball's dist/purify.min.js, verbatim,
+#         29,828 bytes, banner "DOMPurify 3.4.17". The out-of-band
+#         cross-check the LIMITATION note above demands was ALSO run: the
+#         jsDelivr copy of dompurify@3.4.17/dist/purify.min.js is
+#         BYTE-IDENTICAL to the registry tarball's inner file (same sha256),
+#         and the SUPERSEDED 3.4.15 blob's own sha256 was re-derived from the
+#         3.4.15 registry tarball and matched the record it is replacing
+#         (f263b053…, 29,369 B) — i.e. the previous entry was genuine and the
+#         extraction convention is unchanged. Two cosmetic byte-shape
+#         differences from 3.4.15, kept verbatim for fidelity: the file no
+#         longer ends in a newline, and a `;` precedes the trailing
+#         sourceMappingURL comment (3.4.16 migrated the build from rollup to
+#         rolldown — a MINIFIER change, not a source change). The
+#         sourceMappingURL still references a map the /assets route never
+#         serves (not allowlisted in handleAsset) — cosmetic.
+#         Upstream delta 3.4.15 -> 3.4.17: TWELVE changes across TWO releases
+#         (re-derived from the upstream GitHub release notes, not the
+#         renovate body — the #583 review round's standing correction).
+#         3.4.16 (2026-09-23): IN_PLACE node removal with hooks; IN_PLACE
+#         sanitization with raw-text roots; ESM default exports landing in
+#         CommonJS declarations; the rollup -> rolldown build migration
+#         (performance); dependency bumps.
+#         3.4.17 (2026-10-12): IN_PLACE + SAFE_FOR_TEMPLATES + shadow roots;
+#         IN_PLACE handling of nodes that hooks or custom elements touch
+#         during sanitization; the SMIL `attributeName` guard in XHTML mode;
+#         hardening of smaller edge cases (namespaces, literal-text
+#         elements, `isValidAttribute()`); a purify-edge compatibility test
+#         runner; an IN_PLACE README risk note; dependency bumps.
+#         NO ADVISORY IDS in either release — this is a currency/hygiene bump
+#         of the sole sanitizer, not a claim that a known exploit is closed.
+#         REACH, stated honestly: this app calls `DOMPurify.sanitize(string,
+#         MD_SANITIZE)` and assigns the returned STRING to innerHTML. It sets
+#         no IN_PLACE, no SAFE_FOR_TEMPLATES, no RETURN_DOM*, no hooks, no
+#         setConfig, and touches no shadow root (grep-verified across all
+#         four embedded pages), and the pages are HTML, never XHTML — so the
+#         IN_PLACE family (most of both releases) and the XHTML-mode SMIL
+#         guard are OFF THIS APP'S PATH. The on-path items are the 3.4.17
+#         namespace / literal-text-element / isValidAttribute hardening.
+#         SANITIZE DIFFERENTIAL (the two-oracle sweep #583's review round
+#         declared OWED and #678's narrower one-shape corpus did not pay —
+#         run here, out-of-band, jsdom in a vm realm per version, the
+#         MD_SANITIZE golden copied verbatim from ui/vendor_test.go):
+#         ORACLE 1, 50 raw shapes (one per ALLOWED_TAGS/ALLOWED_ATTR class,
+#         one per FORBID floor entry, the javascript:/data:/vbscript:/
+#         protocol-relative/entity-encoded URL families, on*-handler shapes,
+#         the mXSS families named by the release notes — noscript, svg
+#         foreignObject, mglyph+style, table+form, annotation-xml — the
+#         literal-text elements — textarea, title, xmp, plaintext, iframe
+#         srcdoc — the SMIL attributeName/animate/xlink namespace shapes,
+#         custom elements, template, slot, and the SAFE_FOR_TEMPLATES
+#         mustache/ERB expression shapes): 50 of 50 BYTE-IDENTICAL, 0 deltas.
+#         The execution-class assertion held on BOTH versions for all 50: no
+#         script/iframe/svg/math/style/form/img/object/embed/link/base/meta
+#         element, no on* attribute, and no javascript:/vbscript: URL
+#         survives the policy at either version.
+#         ORACLE 2, the pages' REAL pipeline (marked.parse -> sanitize ->
+#         the innerHTML string): the browser-smoke canary
+#         testdata/browser-smoke/golden_input.md renders BYTE-IDENTICAL,
+#         1,565 bytes both sides — golden_expected.html does not move on this
+#         bump — plus a 10-shape markdown corpus (raw-html script/img, GFM
+#         autolink, javascript: link, table, code fence, an html block whose
+#         attribute value contains '>', numeric character references, nested
+#         blockquote+list, heading attr): 10 of 10 identical, 0 deltas.
+#         PROTOTYPE-POLLUTION re-verification (the defense-in-depth claim
+#         ui/vendor_test.go records): polluting Object.prototype with
+#         ADD_TAGS / ALLOWED_TAGS / ALLOW_UNKNOWN_PROTOCOLS inside the
+#         sanitizer's own realm leaves the output byte-identical at BOTH
+#         3.4.15 and 3.4.17 — the config reader still ignores inherited keys.
+#         STATED LIMIT, honestly: the corpora above are hand-built shape
+#         corpora, not a sweep over a real scan-summary archive; a behaviour
+#         change reachable only from markup no shape above spells would be
+#         invisible to it. What the differential DOES establish is that every
+#         policy class this app pins, every family the two releases' own
+#         notes name, and the live golden render are unmoved.

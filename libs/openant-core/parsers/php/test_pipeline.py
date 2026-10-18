@@ -47,7 +47,9 @@ from typing import Set
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from utilities.file_io import open_utf8, read_json, run_utf8, write_json
 from utilities.context_enhancer import ContextEnhancer
-from utilities.agentic_enhancer import EntryPointDetector, ReachabilityAnalyzer, blackout_warning, library_seed_ids
+from utilities.agentic_enhancer import (EntryPointDetector, ReachabilityAnalyzer,
+                                          blackout_warning, library_seed_ids,
+                                          reachability_filter_record)
 
 # Local imports
 from repository_scanner import RepositoryScanner
@@ -311,7 +313,11 @@ class PHPPipelineTest:
             # silently blacking out the dataset (the dominant failure mode for
             # library / no-entry-point targets). Degrade to keep-all + warn instead
             # of a silent 0-unit result.
+            _keep_all_why = None
             if not self.entry_points and original_count > 0:
+                # #768: the net's own condition, named — the record's warning
+                # must state what happened, not stderr alone.
+                _keep_all_why = "No entry points detected"
                 print("  [Warning] No entry points detected — keeping all units "
                       "unfiltered to avoid a silent blackout.", file=sys.stderr)
                 self.reachable_units = {u.get("id", "") for u in units}
@@ -328,13 +334,13 @@ class PHPPipelineTest:
 
             dataset["units"] = filtered_units
             dataset["metadata"] = dataset.get("metadata", {})
-            dataset["metadata"]["reachability_filter"] = {
-                "original_units": original_count,
-                "entry_points": len(self.entry_points),
-                "reachable_units": len(filtered_units),
-                "filtered_out": original_count - len(filtered_units),
-                "reduction_percentage": round((1 - len(filtered_units) / original_count) * 100, 1) if original_count > 0 else 0
-            }
+            # #768: the ONE record shape (the core path's contract: the
+            # seed-class counts on BOTH branches + the keep-all warning),
+            # built by the shared classifier so the pipeline sites cannot
+            # drift from the core record.
+            dataset["metadata"]["reachability_filter"] = reachability_filter_record(
+                detector, original_count, len(self.entry_points),
+                len(filtered_units), keep_all_why=_keep_all_why)
 
             _blackout = blackout_warning(detector.entry_point_details, original_count,
                                          len(filtered_units),
