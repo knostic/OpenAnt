@@ -471,6 +471,11 @@ class VerifyResult:
     # out of inconclusive — the scanner envelope retires their Stage-1
     # inconclusive count by exactly this (the sum-to-total partition).
     escalated_inconclusive_moved: int = 0
+    # #743: the SAFE-disagreement rows (origin safe, admitted by
+    # stage2_candidates' classification arm) whose Stage-2 adjudication
+    # MOVED them out of safe — the envelope retires their Stage-1 safe
+    # count by exactly this (the same partition).
+    escalated_safe_moved: int = 0
     confirmed_vulnerabilities: int = 0
     # PR #69 F5: findings whose Stage-2 verification could not COMPLETE
     # (degenerate path or adapter error). Counted separately so the scanner

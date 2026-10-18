@@ -31,7 +31,7 @@ from core.step_report import step_context
 from core import tracking
 from utilities.llm_client import get_global_tracker
 from utilities.child_interp import resolved_core_path
-from utilities.file_io import read_json, write_json
+from utilities.file_io import normalize_results, read_json, write_json
 from utilities.llm.adapter import LLMAuthError
 
 # Import app context generator (optional)
@@ -284,7 +284,13 @@ def _post_verify_metrics(analyze_metrics, verify_result) -> "AnalysisMetrics":
         + getattr(verify_result, "consistency_protected", 0),
         safe=analyze_metrics.safe
         + getattr(verify_result, "disagreed", 0)
-        + getattr(verify_result, "consistency_safe", 0),
+        + getattr(verify_result, "consistency_safe", 0)
+        # #743: retire the Stage-1 count for the SAFE-disagreement rows
+        # Stage 2 moved out of safe — they are re-bucketed by their
+        # Stage-2 outcome (confirmed/disagreed_*/error_count already
+        # count them); without this the sum-to-total partition over-sums
+        # by exactly the moved count (the #744 retirement's sibling).
+        - getattr(verify_result, "escalated_safe_moved", 0),
         errors=analyze_metrics.errors + verify_result.error_count,
         verified=verify_result.findings_verified,
         stage2_agreed=verify_result.agreed,
@@ -1276,13 +1282,36 @@ def scan_repository(
         analyze_result.metrics.vulnerable > 0
         or analyze_result.metrics.bypassable > 0
     )
+    # #743 (the T1-r3 catch): the Stage-2 gate's authority is the admission
+    # filter (stage2_candidates — the same predicate run_verification
+    # applies to its loaded rows), not the raw vulnerable/bypassable count:
+    # a scan where Stage 1 marked every unit SAFE has has_findings False
+    # while the candidate set is non-empty (the classification-disagreement
+    # rows — and #830's claim-carrying inconclusive rows, the same hole on
+    # the same rails) — the all-SAFE corpus is the #743 headline shape, so
+    # the gate must open for it. This PRE-VERIFY has_findings snapshot gates
+    # the verify skip branches; the downstream consumers read the
+    # monotone post-verify re-derivation below.
+    has_stage2_candidates = False
+    if verify and not has_findings:
+        from core.verifier import stage2_gate_open
+        _rows = read_json(analyze_result.results_path) or {}
+        if isinstance(_rows, dict):
+            # the fa17 rule: normalize ONCE at every load boundary — a
+            # non-dict element inside ``results`` (the trust-boundary
+            # class) must not crash the gate read (the T1-r5 F2 catch:
+            # defense-in-depth, the sink is proven, the producer is thin)
+            normalize_results(_rows, "results")
+        has_stage2_candidates = stage2_gate_open(
+            analyze_result.metrics,
+            _rows.get("results", []) if isinstance(_rows, dict) else [])
 
     # #621: the verify step stamps the attacker-model descriptor on its
     # result (the summary's server-rendered Methodology reads it verbatim);
     # None on every path that did not run verification.
     attacker_model = None
 
-    if verify and has_findings:
+    if verify and (has_findings or has_stage2_candidates):
         from core.verifier import run_verification
 
         print(_step_label("Running verification (Stage 2)..."), file=sys.stderr)
@@ -1355,6 +1384,23 @@ def scan_repository(
         print(_step_label("Skipping verification (--no-verify or not requested)."),
               file=sys.stderr)
         _record_skip(result, "verify", "not_requested")
+    # #743 (the T1-r4 consequence + the T1-r5 F1 correction): has_findings
+    # above is the PRE-VERIFY Stage-1 snapshot — it gates the verify skip
+    # branches. The DOWNSTREAM consumers (dynamic-test at Step 7's
+    # decision, the report step's disclosures) must see the POST-VERIFY
+    # truth MONOTONE-OR-ed onto the snapshot: a widened-gate scan (the
+    # 0-positive corpus) whose Stage 2 upgrades a row leaves the
+    # post-verify metrics carrying it, and a Stage-1-True scan must NEVER
+    # lose its gates (the #69 F4/F5 fail-safe: an unverified or errored
+    # row is DISCLOSURE_ELIGIBLE — a naive re-derivation from the
+    # post-verify count alone flips True→False on the
+    # verify-succeeded-confirmed-none path and skips the disclosure
+    # fail-safe). The ``or`` keeps it a no-op on every pre-existing path.
+    has_findings = (
+        has_findings
+        or result.metrics.vulnerable > 0
+        or result.metrics.bypassable > 0
+    )
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------

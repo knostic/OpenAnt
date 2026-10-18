@@ -1516,7 +1516,12 @@ class FindingVerifier:
             # would spend a consistency LLM call on a non-comparison, and
             # the group's verdict negotiation must never anchor a
             # vulnerable sibling toward the inconclusive candidate.
-            if str(result.get("stage1_finding", "")).lower() == "inconclusive":
+            # #743: the SAFE-disagreement origin is excluded for the same
+            # three reasons — a {vulnerable, escalated-safe} group is a
+            # non-comparison, and the negotiation must never anchor a
+            # vulnerable sibling toward the escalated candidate.
+            _stage1 = str(result.get("stage1_finding", "")).lower()
+            if _stage1 in ("inconclusive", "safe"):
                 continue
             # Extract pattern key from route_key
             route_key = result.get("route_key", "")

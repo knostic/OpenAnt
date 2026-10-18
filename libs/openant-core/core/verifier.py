@@ -90,6 +90,14 @@ def _verify_template_texts():
     ]
 
 
+# #743: the enhance classifications that DISAGREE with a Stage-1 SAFE —
+# the enum's "the unit is exploitable / vulnerable-internal" values
+# (context_enhancer's classification vocabulary: exploitable |
+# vulnerable_internal | security_control | neutral | unknown).
+_SAFE_DISAGREEMENT_CLASSIFICATIONS = frozenset({
+    "exploitable", "vulnerable_internal"})
+
+
 def stage2_candidates(all_results: list) -> list:
     """#744: the Stage-2 admission filter.
 
@@ -100,6 +108,22 @@ def stage2_candidates(all_results: list) -> list:
     incomplete" vs "no claim") is exactly the distinction the issue names,
     and the producer-side definition (#744's prompt block) now instructs
     the model to fill the claim artifacts when it has a concrete suspect.
+
+    #743: the classification-disagreement arm. A SAFE row whose result
+    carries an enhance classification of ``exploitable`` or
+    ``vulnerable_internal`` is the enhancer's own DISAGREEMENT with
+    Stage 1 — two stages looked at the same unit and one said "safe"
+    while the other said "exploitable". The issue's ruling: those rows
+    enter Stage 2 (a SAFE rationale resting on a factually false claim
+    about the code is otherwise never re-examined — Stage 2 read only
+    vulnerable/bypassable rows, and the consistency pass fired only on
+    mixed-verdict groups; the corpus: 36 SAFE rows carried
+    exploitable(20)/vulnerable_internal(16)). ``security_control`` and
+    ``neutral`` AGREE with safe; ``unknown`` carries no claim — the arm
+    admits exactly the two disagreement values. The stamp is
+    agentic-mode today (analysis_core writes it on the result row; the
+    single-shot path carries none), so the arm's scope is the agentic
+    corpus.
     """
     out = []
     for r in all_results:
@@ -107,6 +131,15 @@ def stage2_candidates(all_results: list) -> list:
             str(r.get("finding") or r.get("verdict", "")).lower())
         if verdict in ("vulnerable", "bypassable"):
             out.append(r)
+            continue
+        if verdict == "safe":
+            # #743: the classification-disagreement arm (see the
+            # docstring above) — the two enhance values that mean "the
+            # enhancer says this unit is NOT safe".
+            cls = r.get("security_classification")
+            if (isinstance(cls, str)
+                    and cls.strip() in _SAFE_DISAGREEMENT_CLASSIFICATIONS):
+                out.append(r)
             continue
         if verdict == "inconclusive":
             # #744 (the r1-F2 catch): cwe_id is MODEL-SUPPLIED and stored
@@ -119,6 +152,23 @@ def stage2_candidates(all_results: list) -> list:
             if has_cwe or has_vector:
                 out.append(r)
     return out
+
+
+# #743 (the T1-r3 catch): the scanner's Stage-2 GATE predicate — the
+# admission filter's authority, not the raw vulnerable/bypassable count.
+# A scan where Stage 1 marked every unit SAFE (the #743 headline shape:
+# the all-SAFE corpus where the enhancer's classification disagreement is
+# the ONLY second look) has a zero vulnerable/bypassable count while the
+# stage2_candidates set is non-empty (the classification-disagreement
+# rows — and #830's claim-carrying inconclusive rows, the same hole on
+# the same rails); gating Stage 2 on the raw count alone skipped it.
+def stage2_gate_open(metrics, rows: list) -> bool:
+    """#743: True when Stage 2 has anything to examine — a Stage-1
+    positive (vulnerable/bypassable) OR a non-empty admission set."""
+    if (getattr(metrics, "vulnerable", 0) > 0
+            or getattr(metrics, "bypassable", 0) > 0):
+        return True
+    return bool(stage2_candidates(rows))
 
 
 def run_verification(
@@ -135,7 +185,9 @@ def run_verification(
 ) -> VerifyResult:
     """Run Stage 2 attacker-simulation verification on Stage 1 results.
 
-    Stage-2 candidates are verified: every ``vulnerable``/``bypassable`` finding, plus — #744 — an ``inconclusive`` row carrying a concrete claim.
+    Stage-2 candidates are verified: every ``vulnerable``/``bypassable`` finding, plus — #744 — an ``inconclusive`` row carrying a concrete claim,
+    plus — #743 — a ``safe`` row whose enhance classification
+    (``exploitable``/``vulnerable_internal``) disagrees with the Stage-1 verdict.
     Results are written to ``results_verified.json`` in *output_dir*.
 
     Checkpoints are always enabled. Per-finding verification results are
@@ -199,11 +251,13 @@ def run_verification(
     # branch (and the consistency pass) overwrite ``finding`` with the Stage-2
     # outcome, so the origin must be its own key before the batch runs; the
     # envelope's retirement (the r1-F1 fix) reads it after the batch.
+    # #743: the stamp generalizes to the SAFE-disagreement origin — the
+    # same retirement rails read it (the safe-origin arm).
     for _r in vulnerable_results:
         _v = fold_legacy_finding(
             str(_r.get("finding") or _r.get("verdict", "")).lower())
-        if _v == "inconclusive":
-            _r["stage1_finding"] = "inconclusive"
+        if _v in ("inconclusive", "safe"):
+            _r["stage1_finding"] = _v
 
     findings_input = len(vulnerable_results)
     print(f"[Verify] {findings_input} Stage-2 candidate findings to verify "
@@ -427,6 +481,10 @@ def run_verification(
         # inconclusive — the envelope retires their Stage-1 count.
         escalated_inconclusive_moved=_counts.get(
             "escalated_inconclusive_moved", 0),
+        # #743: the SAFE-disagreement rows Stage 2 moved out of safe —
+        # the same retirement for the safe origin (the envelope's safe
+        # line subtracts it; the sum-to-total partition).
+        escalated_safe_moved=_counts.get("escalated_safe_moved", 0),
         confirmed_vulnerabilities=confirmed_vulnerabilities,
         needs_review=needs_review,
         error_count=error_count,
@@ -564,6 +622,13 @@ def _count_verification_outcomes(verified_results: list) -> dict:
         # already count them); without the subtraction the sum-to-total
         # partition over-sums by exactly the moved count (the #681 class).
         "escalated_inconclusive_moved": 0,
+        # #743: the escalated-SAFE ORIGIN count whose Stage-2 adjudication
+        # MOVED it out of safe — the same retirement for the #743 origin
+        # (the envelope's safe line retires the Stage-1 count; the
+        # destination buckets — confirmed/disagreed_*/error_count —
+        # already count the row; without the subtraction the
+        # sum-to-total partition over-sums by exactly the moved count).
+        "escalated_safe_moved": 0,
     }
     for r in verified_results:
         # #744 (the r2-1 catch): the origin check runs BEFORE the error arm —
@@ -577,6 +642,22 @@ def _count_verification_outcomes(verified_results: list) -> dict:
                 or "").lower())
         _finding_early = fold_legacy_finding(
             str(r.get("finding") or r.get("verdict", "")).lower())
+        # the T1-r1 F1 catch (FAM-REPORT-2, EXECUTED through the real
+        # finding_verifier): a finish that AGREES but truncates mid-answer
+        # is flipped by the parse (finding_verifier's FAM-REPORT-2 block)
+        # to agree=False + correct_finding=<the more-severe verdict> +
+        # incomplete=True, and the result assembly propagates
+        # finding=correct_finding — an INCOMPLETE-UPGRADE. The row lands in
+        # needs_review (a SIDE metric, not an envelope column), so an
+        # origin-retirement that fires on the moved ``finding`` alone
+        # under-sums the #681 partition by exactly one. The gate below:
+        # the retirement fires on ERROR unconditionally (the r3-1/r4-1
+        # precedence — the except arm surfaces error=… AND the minimal
+        # incomplete dict, and the error re-buckets the row into
+        # error_count, an envelope column), and on a REAL move only when
+        # the row is NOT incomplete.
+        _incomplete_early = bool(
+            (r.get("verification") or {}).get("incomplete"))
         # #744 (the r3-1 catch): an escalated row that ERRORED retires its
         # Stage-1 inconclusive count UNCONDITIONALLY — the except arm never
         # touches ``finding`` (the row keeps finding=='inconclusive'), so
@@ -584,7 +665,8 @@ def _count_verification_outcomes(verified_results: list) -> dict:
         # still over-summed (sum=4/total=3 through the real _verify_one).
         if _origin_early == "inconclusive" and (
                 bool(r.get("error")) or (
-                    _finding_early != "inconclusive"
+                    not _incomplete_early
+                    and _finding_early != "inconclusive"
                     and _finding_early != "")):
             # #744 (the r4-1 catch): an OFF-ENUM rewrite ('Probably Fine' —
             # the #679 class, written verbatim by the disagree branch) also
@@ -593,6 +675,23 @@ def _count_verification_outcomes(verified_results: list) -> dict:
             # over-ran (sum=4/total=3). Retirement = origin inconclusive +
             # (errored OR re-bucketed anywhere — on-enum or off).
             counts["escalated_inconclusive_moved"] += 1
+        # #743: the SAFE-origin sibling — a Stage-2 candidate admitted by
+        # the classification-disagreement arm retires its Stage-1 safe
+        # count when Stage 2 MOVES it out of safe: errored (the error
+        # re-buckets it, r3-1's lesson carries over verbatim), rewritten
+        # to any other verdict (on-enum or off — r4-1's lesson), but NOT
+        # when it lands back on safe (agree, or a self-contradictory
+        # disagree-to-safe drift row): the envelope's base term then
+        # already holds it and the destination buckets add nothing. The
+        # T1-r1 F1 gate (see _incomplete_early above) applies verbatim:
+        # the FAM-REPORT-2 incomplete-upgrade must NOT retire (needs_review
+        # is a side metric — retiring under-sums the partition).
+        if _origin_early == "safe" and (
+                bool(r.get("error")) or (
+                    not _incomplete_early
+                    and _finding_early != "safe"
+                    and _finding_early != "")):
+            counts["escalated_safe_moved"] += 1
         if r.get("error"):
             counts["error_count"] += 1
             continue
@@ -663,6 +762,11 @@ def _count_verification_outcomes(verified_results: list) -> dict:
                 # vulnerable-origin rows (whose Stage-1 count the
                 # confirmed_vulnerabilities replacement already dropped);
                 # for an inconclusive origin it would double-count.
+                # #743: a SAFE origin does NOT skip — its base term is the
+                # safe line, not inconclusive, so landing here is a MOVE
+                # safe→inconclusive: the retirement fired above (finding
+                # != safe) and this arm is the row's destination (the
+                # mirror of the vulnerable-origin replacement drop).
                 if _origin_early != "inconclusive":
                     counts["disagreed_inconclusive"] += 1
             elif finding == "protected":
@@ -677,7 +781,17 @@ def _count_verification_outcomes(verified_results: list) -> dict:
                 # own bucket, threaded to metrics.protected.
                 counts["disagreed_protected"] += 1
             else:
-                counts["disagreed"] += 1
+                # #743: a SAFE-origin row landing back on safe (the drift
+                # shape agree=False + correct_finding=safe —
+                # self-contradictory for an escalated safe row, but the
+                # #679/#744 lessons say off-shape arrivals happen; an
+                # actual agreement never reaches this arm, it is caught at
+                # the agree branch above) keeps its Stage-1 count in the
+                # envelope's base term; the plain disagreed add-on (whose
+                # Stage-1 half is the vulnerable-origin replacement drop)
+                # would double-count.
+                if _origin_early != "safe":
+                    counts["disagreed"] += 1
         # #302: direction. `verdict` is the UN-overwritten Stage-1 original;
         # FINDING_VERDICT_ORDER ranks severity (vulnerable first). A missing
         # original abstains — never guessed. Runs for agreed records too: the
