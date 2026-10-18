@@ -391,6 +391,63 @@ func isFuncValuedIndexArg(idx ast.Expr) bool {
 	return false
 }
 
+// compositeMethodValueRef reports whether expr, appearing as a VALUE inside a
+// composite literal, is a METHOD VALUE on a locally-typed receiver —
+// `b.pathLoginUpdate` with no call parentheses — and returns the CallInfo that
+// resolves it against the receiver's static type (#746).
+//
+// NO element-type guard is applied here, and none is needed: the RESOLUTION is
+// the type check. resolveCalls sends an IsMethod CallInfo to resolveMethodCall,
+// which looks only inside methodsByType[receiverType] and requires the
+// "."+methodName suffix — so a plain FIELD read (`Out{T: cfg.Timeout}`) names
+// no method of cfg's type and yields no edge, and a selector on a receiver
+// whose type the body model cannot name yields an empty ReceiverTypes and so
+// no edge either. Go forbids a field and a method sharing a name on one TYPE,
+// so within the receiver's own package a selector that resolves to a method of
+// the static type is a method value, not a field read — but methodsByType is
+// keyed repo-wide on the BARE type name, so a same-named type in ANOTHER
+// package can satisfy the suffix and the cross-package fallback would then
+// fabricate an edge for a field read (fable cycle-8 r1 F1(a): two packages
+// each declaring `backend`, one with a `view` field, one with a `view()`
+// method). The composite-literal CallInfo therefore carries CompositeValue
+// and resolveCalls REJECTS cross-package targets on that path — the guard
+// fable r1 correctly demanded. The bare-IDENT path keeps
+// funcValuedElementType's shape guard above (resolveSimpleCall's unique-name
+// fallback would fabricate on a name collision); this selector path needs
+// the package gate instead (with the dot-import edge-loss residual
+// declared, fable r2 D3: varTypes holds the other package's bare type name
+// legitimately only under `import . "m/f"`, and the gate trades that rare
+// real edge for the deterministic fabrication kill).
+//
+// Deliberately ABSTAINS when the receiver names one of this file's import
+// aliases (`Route{H: handlers.Login}`): that is a package-qualified reference,
+// which resolves through resolvePackageCall — a different, disjoint surface.
+// Recorded as a documented limitation with its own regression test.
+func compositeMethodValueRef(expr ast.Expr, imports map[string]string,
+	varTypes map[string][]string) (CallInfo, bool) {
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok {
+		return CallInfo{}, false
+	}
+	base, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return CallInfo{}, false // a.b.M / f().M: no nameable receiver variable
+	}
+	if _, isImport := imports[base.Name]; isImport {
+		return CallInfo{}, false // package-qualified: resolvePackageCall's surface
+	}
+	recvTypes := varTypes[base.Name]
+	if len(recvTypes) == 0 || sel.Sel.Name == "" {
+		return CallInfo{}, false
+	}
+	return CallInfo{
+		Name:          sel.Sel.Name,
+		IsMethod:      true,
+		Receiver:      base.Name,
+		ReceiverTypes: recvTypes,
+	}, true
+}
+
 func (c *CallGraphBuilder) parseImports(fullPath, relPath string) {
 	file, err := parser.ParseFile(c.fset, fullPath, nil, parser.ImportsOnly)
 	if err != nil {
@@ -418,6 +475,16 @@ type CallInfo struct {
 	Name     string // Simple function name
 	Receiver string // Receiver for method calls (e.g., "obj" in obj.Method())
 	Package  string // Package alias for package.Func() calls
+	// CompositeValue marks the #746 path: a method value read as a VALUE
+	// inside a composite literal (`Callback: b.X,`), not a call. The
+	// receiver's type model (collectVarTypes) holds BARE type names, so on
+	// this path a resolution that lands in ANOTHER package is a bare-name
+	// collision in every shape the body model can produce EXCEPT a
+	// dot-import (`import . "m/f"` — the declared residual, fable r2 D3 /
+	// r3-2) — resolveCalls rejects cross-package targets for this path,
+	// trading that rare real edge for the deterministic fabrication kill
+	// (fable cycle-8 r1 F1(a)).
+	CompositeValue bool
 	IsMethod bool   // True if this is a method call
 	IsSelf   bool   // True if receiver is "self" or matches current receiver
 	// ReceiverTypes is the STATIC type(s) the receiver variable holds, inferred
@@ -499,6 +566,45 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 				}
 			}
 			return true
+		}
+
+		// #746: a method value held inside a COMPOSITE LITERAL — a
+		// struct-literal field (&framework.PathOperation{Callback:
+		// b.pathLoginUpdate}), a named-func-type container value
+		// (map[logical.Operation]framework.OperationFunc{...}), or a slice
+		// element — is a REFERENCE to that method from the enclosing
+		// function. Before this, three things conspired to drop it: this
+		// walk had no *ast.CompositeLit case at all, so a literal in a
+		// function BODY was never read for references; compositeFuncTargets
+		// reads only *ast.Ident, so a SelectorExpr value was dropped where
+		// the walk did reach a literal; and funcValuedElementType requires a
+		// SYNTACTIC *ast.FuncType element type, so a NAMED func type made the
+		// whole literal abstain. The result was the dominant Vault/OpenBao
+		// handler-registration idiom recording no edge: the path-constructor
+		// was kept and every handler it registered pruned as an orphan.
+		//
+		// A reference is not a call, but for reachability it is the signal
+		// that matters and over-seeding is the safe direction (#299's own
+		// rationale, item 1). The C parser already records exactly this class
+		// — parsers/c/call_graph_builder.py's _initializer_targets: "a
+		// function referenced in an initialiser is a reachability edge from
+		// the enclosing unit" (#298) — so this closes a cross-parser parity
+		// gap, not a new policy. Nothing is invented: see
+		// compositeMethodValueRef for why the resolution IS the type guard.
+		if lit, ok := n.(*ast.CompositeLit); ok {
+			for _, elt := range lit.Elts {
+				value := elt
+				if kv, ok := elt.(*ast.KeyValueExpr); ok {
+					value = kv.Value
+				}
+				if mi, ok := compositeMethodValueRef(value, imports, varTypes); ok {
+					if !isBuiltin(mi.Name) {
+						mi.CompositeValue = true
+						calls = append(calls, mi)
+					}
+				}
+			}
+			return true // keep descending: nested literals and inner calls
 		}
 
 		call, ok := n.(*ast.CallExpr)
@@ -928,8 +1034,25 @@ func (c *CallGraphBuilder) resolveCalls(callerID string, callerInfo FunctionInfo
 			// nothing (no edge) rather than to an unrelated same-named method;
 			// several candidate types (a reassigned receiver) UNION their
 			// methods so no reachable method is hidden.
+			//
+			// #746/fable-r1-F1(a): the composite-literal path keys the
+			// receiver's type by its BARE name, so a same-named type in
+			// ANOTHER package (Vault names every plugin type `backend`)
+			// collides in methodsByType and the smallest-funcID fallback
+			// would fabricate an edge for a plain FIELD read. A cross-package
+			// target here is a bare-name collision in every shape the body
+			// model can produce EXCEPT a dot-import (`import . "m/f"`,
+			// where varTypes holds the other package's bare type name
+			// legitimately) — declared residual (fable r2 D3): the gate
+			// trades that rare real edge for the deterministic
+			// fabrication kill.
 			for _, rt := range call.ReceiverTypes {
-				appendTarget(c.resolveMethodCall(call.Name, rt, callerInfo.FilePath))
+				target := c.resolveMethodCall(call.Name, rt, callerInfo.FilePath)
+				if call.CompositeValue && target != "" &&
+					filepath.Dir(target) != filepath.Dir(callerInfo.FilePath) {
+					continue
+				}
+				appendTarget(target)
 			}
 		case call.Package != "":
 			// Package-qualified call
@@ -976,6 +1099,27 @@ func (c *CallGraphBuilder) resolveMethodCall(methodName, receiverType, currentFi
 		for _, funcID := range c.methodsByType[strings.TrimPrefix(receiverType, "*")] {
 			pick(funcID)
 		}
+	}
+
+	// #781: the bare-name cross-package fabrication kill. methodsByType and
+	// varTypes carry BARE type names, and a bare-written type is the caller's
+	// OWN package's type by construction — an imported type is written
+	// qualified (a SelectorExpr), exprTypeName returns "" for it, and it
+	// contributes nothing to the body model. A winner in ANOTHER package is
+	// therefore a bare-name collision in every shape the body model can
+	// produce EXCEPT a dot-import (import . "m/f") or a type alias
+	// (type B = otherpkg.B) — the two shapes where the other package's type
+	// IS written bare; both are the declared residuals (the alias shape
+	// widens the class #746's CompositeValue gate declared), the same trade:
+	// the gate trades those rare real edges for the deterministic
+	// fabrication kill. This covers every IsMethod resolution routed here —
+	// the direct call b.view() and the method-value-then-call
+	// f := b.view; f() — where the caller's own package's same-named type
+	// does not provide the method (a func-typed FIELD or a plain name
+	// collision) and the fall-through would fabricate
+	// a:backend.mk -> z:backend.view.
+	if best != "" && filepath.Dir(best) != callerPkg {
+		return ""
 	}
 
 	return best
@@ -1191,14 +1335,30 @@ func (c *CallGraphBuilder) resolveSimpleCall(funcName, currentFile, currentPkg s
 	}
 
 	// Priority 2: Same package (different file)
+	//
+	// #777: the first-match-wins over c.functionsByFile's map iteration
+	// flipped //go:build-tagged twins — two same-named functions in two
+	// same-dir files (procgroup_unix.go / procgroup_other.go), where the
+	// build-constraint-correct target is decided by build tags the parser
+	// never reads. Scan ALL the same-dir candidates and keep the
+	// lexicographically smallest funcID: a strict total order over distinct
+	// funcIDs — the same tie-break class resolveMethodCall's funcID < best
+	// pick already ships in-tree — so the edge is stable across runs (a
+	// deterministic wrong-twin beats a coin-flip edge — the reachability
+	// consumer sees one stable graph instead of a different one per parse).
+	best := ""
 	for file, funcs := range c.functionsByFile {
 		if filepath.Dir(file) == filepath.Dir(currentFile) {
 			for _, funcID := range funcs {
-				if strings.HasSuffix(funcID, ":"+funcName) {
-					return funcID
+				if strings.HasSuffix(funcID, ":"+funcName) &&
+					(best == "" || funcID < best) {
+					best = funcID
 				}
 			}
 		}
+	}
+	if best != "" {
+		return best
 	}
 
 	// Priority 3: Unique name match

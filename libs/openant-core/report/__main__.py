@@ -66,7 +66,9 @@ def cmd_summary(args):
     with open_utf8(output_path, "w") as f:
         f.write(report)
     print(f"  -> {output_path}")
-    print(f"  Cost: ${usage['cost_usd']:.4f} ({usage['total_tokens']:,} tokens)")
+    from core.tracking import cost_marker
+    print(f"  Cost: ${usage['cost_usd']:.4f} ({usage['total_tokens']:,} tokens)"
+          f"{cost_marker(usage)}")
 
 
 def cmd_disclosures(args):

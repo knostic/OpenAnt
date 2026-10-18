@@ -34,7 +34,7 @@ def extract(tmp_path, files: dict, skip_tests: bool = True) -> dict:
     for name, src in files.items():
         p = tmp_path / name
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(src)
+        p.write_text(src, newline="\n")  # LF-explicit: the corpora are LF-designed (a CRLF translation on Windows breaks the boundary-shaped fixtures - the #723 windows CI leg)
     scan = RepositoryScanner(str(tmp_path), skip_tests=skip_tests).scan()
     return FunctionExtractor(str(tmp_path), scan).extract()
 

@@ -226,6 +226,12 @@ class CompletionResult:
     # "delivered content vs N dropped blocks alongside the forwarded
     # usage", not a fabricated per-kind token attribution.
     dropped_block_kinds: dict | None = field(default=None, repr=False)
+    # #797: the provider's OWN reported cost for this call (OpenRouter's
+    # ``usage.cost``, on every response — the authoritative charged number
+    # the local table can only approximate). PRESENT-ONLY: None when the
+    # provider reported none (the OpenAI/Anthropic direct paths fabricate
+    # nothing); the tracker PREFERS it over the local table when present.
+    provider_cost_usd: float | None = field(default=None, repr=False)
 
     def __post_init__(self):
         # Accept list for ergonomic construction by adapters; freeze

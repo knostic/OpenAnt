@@ -1100,7 +1100,9 @@ def generate_summary_report(
         f.write(report_text)
 
     print(f"  Summary report: {output_path}", file=sys.stderr)
-    print(f"  Cost: ${usage['cost_usd']:.4f} ({usage['total_tokens']:,} tokens)", file=sys.stderr)
+    from core.tracking import cost_marker
+    print(f"  Cost: ${usage['cost_usd']:.4f} ({usage['total_tokens']:,} tokens)"
+          f"{cost_marker(usage)}", file=sys.stderr)
 
     # Record in global tracker so step_context picks it up
     _record_usage_in_tracker(usage, report_binding)
@@ -1240,7 +1242,9 @@ def generate_disclosure_docs(
     merged_usage = _merge_usage(all_usages) if all_usages else {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
 
     print(f"  Disclosures: {count} files in {output_dir}", file=sys.stderr)
-    print(f"  Cost: ${merged_usage['cost_usd']:.4f} ({merged_usage['total_tokens']:,} tokens)", file=sys.stderr)
+    from core.tracking import cost_marker
+    print(f"  Cost: ${merged_usage['cost_usd']:.4f} ({merged_usage['total_tokens']:,} tokens)"
+          f"{cost_marker(merged_usage)}", file=sys.stderr)
 
     # Record in global tracker so step_context picks it up
     _record_usage_in_tracker(merged_usage, report_binding)
