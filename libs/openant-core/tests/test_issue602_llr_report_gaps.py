@@ -277,15 +277,21 @@ def test_aggregate_lifts_the_new_keys():
 def test_split_batch_halves_commit_their_own_skips():
     """The claimed receipt, made real: a max_tokens parent batch discards
     its own skip; each split half commits ITS OWN skips exactly once
-    (nothing subtracted, nothing double-counted) — and the cross-half
-    references read as skips by batching geometry (the disclosed
-    non-invariance: split-recovered runs read higher)."""
+    (nothing subtracted, nothing double-counted). #798 widened the
+    validation universe to the DATASET, so a cross-half reference is no
+    longer a skip — each half's skip is now a GENUINE invention (one
+    external_input/low in half 1, one entry_point/high in half 2), and
+    the commit-point accounting is unchanged."""
     from utilities.llm import CompletionResult, TextBlock
     parent_body = json.dumps({"signals": [
         _sig("ghost.py:x")]})  # discarded with the truncated batch
-    halves_body = json.dumps({"signals": [
-        _sig("a.py:f"),                            # the half's own unit
-        _sig("b.py:g", "external_input", "low"),   # the OTHER half — a skip
+    half1_body = json.dumps({"signals": [
+        _sig("a.py:f"),                                   # the half's own unit
+        _sig("ghost.py:low", "external_input", "low"),    # a genuine invention
+    ]})
+    half2_body = json.dumps({"signals": [
+        _sig("b.py:g"),                                   # the half's own unit
+        _sig("ghost.py:high", "entry_point", "high"),     # a genuine invention
     ]})
 
     class _SplitAdapter:
@@ -301,8 +307,9 @@ def test_split_batch_halves_commit_their_own_skips():
                     content=[TextBlock(parent_body)],
                     stop_reason="max_tokens", input_tokens=1,
                     output_tokens=1, usage_details=None)
+            body = half1_body if self.calls == 2 else half2_body
             return CompletionResult(  # each half — accepted
-                content=[TextBlock(halves_body)], stop_reason="end_turn",
+                content=[TextBlock(body)], stop_reason="end_turn",
                 input_tokens=1, output_tokens=1, usage_details=None)
 
     stats = {}
@@ -370,6 +377,8 @@ def test_step_report_carries_the_skip_keys(monkeypatch, tmp_path):
         stats["signals_skipped_unknown_unit"] = 2
         stats["signals_skipped_unknown_unit_by_class"] = {
             "entry_point/high": 1, "external_input/low": 1}
+        # #798: the resume-comparability key must reach the report too
+        stats["signals_cache_adopted"] = 1
         return []
 
     monkeypatch.setattr(lr, "analyze_reachability", _fake_analyze)
@@ -378,6 +387,9 @@ def test_step_report_carries_the_skip_keys(monkeypatch, tmp_path):
         lambda dataset, signals: {"signals_applied": 0,
                                   "entry_points_promoted": 0,
                                   "units_touched": 0,
+                                  # #798: the apply-time drop counter
+                                  # must reach the report
+                                  "signals_dropped_unknown_unit": 1,
                                   # a NON-default set — a regression that
                                   # ignores the run's promote_set (the #345
                                   # class) must flip this test's result
@@ -399,6 +411,11 @@ def test_step_report_carries_the_skip_keys(monkeypatch, tmp_path):
     # the promotable subset: entry_point/high is NOT in THIS run's
     # promote_set (["medium"]) — a hardcoded "high" would fabricate 1
     assert s["signals_skipped_promotable"] == 0
+    # #798: the two new counters reach the step report — the resume's
+    # record explains its own zero (the cache-adopted companion), and
+    # the apply-time drop is visible on the real scan path
+    assert s["signals_cache_adopted"] == 1
+    assert s["signals_dropped_unknown_unit"] == 1
 
 
 def test_reporter_forwards_the_decomposition_executed(tmp_path):
