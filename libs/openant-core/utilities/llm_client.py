@@ -589,6 +589,7 @@ class TokenTracker:
         pricing: dict[str, float] | None = None,
         usage_details: dict | list | None = None,
         turns: int | None = None,
+        provider_cost_usd: float | None = None,
     ) -> dict:
         """
         Record a single LLM call.
@@ -620,6 +621,14 @@ class TokenTracker:
                 ``completion_tokens`` already includes reasoning differs
                 by route — summing would double-count on including
                 routes).
+            provider_cost_usd: #797 — the provider's OWN reported cost
+                for this call (OpenRouter's ``usage.cost``, surfaced by the
+                adapter on the CompletionResult). PREFERRED over the local
+                table when present: the authoritative charged number IS the
+                cost (no lookup, no unpriced marker, the record carries
+                ``cost_source: "provider"``); None keeps the two existing
+                paths byte-identical (the table; the #216 loud path for the
+                residual gap — models that report neither).
             turns: #624 — the number of LLM completions this record
                 covers: 1 (the default) for a single completion
                 (``usage_details`` dict/None); REQUIRED for an agentic
@@ -653,7 +662,18 @@ class TokenTracker:
         cache_read_incl = _counts.read_incl
         cache_write_incl = _counts.write_incl
         has_cache_usage = _counts.any
-        if pricing is None:
+        # #797: the provider's own reported cost — the PREFERRED source.
+        # The authoritative charge (the local table approximates it): no
+        # lookup, no #216 unpriced marker for this call, the record names
+        # its source. The cache TOKEN line items still record; the
+        # cache-UNPRICED marker is suppressed by design — the provider's
+        # number IS the priced total, so a cache-table gap no longer
+        # makes the call's cost incomplete (the r1-F3 correction: the
+        # marker lived in the else-arm the preference skips).
+        _provider_reported = (provider_cost_usd is not None)
+        if _provider_reported:
+            total_cost = float(provider_cost_usd)
+        elif pricing is None:
             # #598: an omitted/missing ``pricing`` is UNKNOWN pricing — the
             # #216 loud path below. The legacy Anthropic-catalogue
             # substitution (deleted) silently reported a plausible
@@ -719,6 +739,10 @@ class TokenTracker:
             # per-turn list form, turns without details appear as None
             # ENTRIES), never summed into the totals below, never in cost.
             **({"usage_details": usage_details} if usage_details is not None else {}),
+            # #797: the cost's SOURCE, present-only — "provider" names the
+            # authoritative reported number; absent means the local table
+            # (or the #216 loud $0).
+            **({"cost_source": "provider"} if _provider_reported else {}),
         }
 
         # Update totals (thread-safe)

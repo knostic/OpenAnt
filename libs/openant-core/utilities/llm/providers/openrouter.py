@@ -282,7 +282,20 @@ class OpenRouterAdapter:
             raise _classify_error(exc, report_429=True) from redacted_cause_from(exc)
 
         _raise_on_error_finish(response)
-        return _response_to_unified(response, adapter="OpenRouterAdapter")
+        result = _response_to_unified(response, adapter="OpenRouterAdapter")
+        # #797: OpenRouter reports the charged cost on EVERY response
+        # (``usage.cost`` — the issue's executed probe: gpt-4o-mini
+        # 1.8e-06, claude-sonnet-5.5 3e-05, on all three observed routings,
+        # no extra body required). The shared unifier deliberately keeps
+        # usage_details OUT of the cost math (#211) — the cost is its own
+        # present-only field: the authoritative number the local table can
+        # only approximate. Absent stays absent (never fabricated).
+        _provider_cost = getattr(response, "usage", None)
+        if _provider_cost is not None:
+            _cost = getattr(_provider_cost, "cost", None)
+            if _cost is not None:
+                result.provider_cost_usd = float(_cost)
+        return result
 
     def validate(self, model: str) -> None:
         try:
