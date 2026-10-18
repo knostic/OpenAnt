@@ -3,16 +3,16 @@ anthropic[bedrock]==1.15.0
 openai==3.35.1
 google-genai==2.31.0
 anyio==4.15.1
-certifi==2026.7.22
+certifi==2026.10.18
 distro==1.9.0
 docstring_parser==0.18.0
 h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
-httpx2==2.13.1  # NOTE: never call httpx2.alias_httpx() here — it rebinds `import httpx`
+httpx2==2.14.0  # NOTE: never call httpx2.alias_httpx() here — it rebinds `import httpx`
 # process-wide and would corrupt the httpx<1 exception handling in the
 # openai/google-genai adapters (see providers/{openai,google}.py)
-httpcore2==2.13.1
+httpcore2==2.14.0
 truststore==0.10.5
 idna==3.20
 jiter==0.17.0

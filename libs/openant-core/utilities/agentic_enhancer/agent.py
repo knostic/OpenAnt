@@ -300,6 +300,11 @@ class ContextAgent:
         total_output_tokens = 0
         # #211 pass-through capture: per-turn usage detail dicts, verbatim.
         per_turn_usage_details: list = []
+        # #797: the per-turn PROVIDER-cost accumulator (the issue's
+        # evidence path was agentic): each turn's reported cost sums; None
+        # when no turn reported one (present-only semantics, never a
+        # fabricated 0.0).
+        per_turn_provider_cost: float | None = None
 
         while iterations < MAX_ITERATIONS:
             iterations += 1
@@ -376,11 +381,26 @@ class ContextAgent:
                     # rate limit as a non-retryable KeyError.
                     try:
                         turn_details = per_turn_usage_details + turn.entries
+                        # #797 (the r1-F4 catch): the raising turn's OWN
+                        # billed usage has NO cost channel (the unifier's
+                        # error paths attach tokens, never the harvested
+                        # cost) — threading the accumulated provider cost
+                        # here would label the conversation 'provider' while
+                        # that turn's charge is missing (a silent under-
+                        # count; at base the same shape took the LOUD path).
+                        # Fall back to the table/loud path when the raising
+                        # turn billed anything.
+                        _err_provider_cost = (
+                            per_turn_provider_cost
+                            if not (exc_in or exc_out or turn.billed)
+                            else None)
                         call_record = self.tracker.record_call(
                             model=self.binding.model,
                             input_tokens=total_input_tokens + exc_in,
                             output_tokens=total_output_tokens + exc_out,
                             pricing=lookup_pricing(self.binding),
+                            **({"provider_cost_usd": _err_provider_cost}
+                               if _err_provider_cost is not None else {}),
                             usage_details=turn_details,
                             turns=len(turn_details),
                         )
@@ -448,6 +468,10 @@ class ContextAgent:
             total_input_tokens += result.input_tokens
             total_output_tokens += result.output_tokens
             per_turn_usage_details.append(result.usage_details)
+            # #797: accumulate the provider's own reported cost per turn
+            if result.provider_cost_usd is not None:
+                per_turn_provider_cost = (
+                    (per_turn_provider_cost or 0.0) + result.provider_cost_usd)
 
             assistant_content = result.content
             stop_reason = result.stop_reason
@@ -472,6 +496,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    provider_cost_usd=per_turn_provider_cost,
                     usage_details=per_turn_usage_details,
                     turns=len(per_turn_usage_details),
                 )
@@ -547,6 +572,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    provider_cost_usd=per_turn_provider_cost,
                     usage_details=per_turn_usage_details,
                     turns=len(per_turn_usage_details),
                 )
@@ -577,6 +603,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    provider_cost_usd=per_turn_provider_cost,
                     usage_details=per_turn_usage_details,
                     turns=len(per_turn_usage_details),
                 )
@@ -619,6 +646,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    provider_cost_usd=per_turn_provider_cost,
                     usage_details=per_turn_usage_details,
                     turns=len(per_turn_usage_details),
                 )
@@ -651,6 +679,11 @@ class ContextAgent:
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
             pricing=lookup_pricing(self.binding),
+            # #797 (the r1-F1 catch): the SIXTH record site — a tool-heavy
+            # unit that exhausts MAX_ITERATIONS is the exit a rich agent run
+            # most plausibly takes; the accumulated provider cost must ride
+            # it like every other exit.
+            provider_cost_usd=per_turn_provider_cost,
             usage_details=per_turn_usage_details,
             turns=len(per_turn_usage_details),
         )

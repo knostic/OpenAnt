@@ -9,6 +9,7 @@ def generate_report(
     results: list[DynamicTestResult],
     repo_name: str = "unknown",
     total_cost_usd: float = 0.0,
+    total_unpriced: "list[str] | None" = None,
 ) -> str:
     """Generate a DYNAMIC_TEST_RESULTS.md markdown report.
 
@@ -40,7 +41,12 @@ def generate_report(
         f"**Date:** {now}",
         f"**Total Findings Tested:** {total - skipped}",
         f"**Skipped (no Docker template for language):** {skipped}",
-        f"**Total Cost:** ${total_cost_usd:.4f}",
+        f"**Total Cost:** ${total_cost_usd:.4f}"
+        + ((f" — run cost incomplete: {len(total_unpriced)} unpriced "
+            f"model(s) — this figure may exclude their spend"
+            if total_unpriced is not None else
+            f" — INCOMPLETE: {len({m for r in results for m in (r.unpriced_models or [])})} unpriced model(s) (an under-count)"
+            if any(r.unpriced_models for r in results) else "")),
         "",
         "## Summary",
         "",
@@ -75,7 +81,9 @@ def generate_report(
                 f"**Status:** {r.status}",
                 f"**Details:** {r.details}",
                 f"**Time:** {r.elapsed_seconds:.1f}s",
-                f"**Generation Cost:** ${r.generation_cost_usd:.4f}",
+                f"**Generation Cost:** ${r.generation_cost_usd:.4f}"
+                + (f" — INCOMPLETE: {len(r.unpriced_models or [])} unpriced model(s) (an under-count)"
+                   if getattr(r, "unpriced_models", None) else ""),
                 "",
             ])
 

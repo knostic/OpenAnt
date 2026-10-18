@@ -37,6 +37,28 @@ def get_usage() -> UsageInfo:
     )
 
 
+def cost_marker(usage: "UsageInfo | dict") -> str:
+    """#786: the human-line completeness marker for an unpriced run.
+
+    The #616/#663 rule — an unpriced cost must read incomplete, never as a
+    complete-looking figure — is carried by every machine channel
+    (``cost_incomplete`` + ``unpriced_models`` on UsageInfo / the totals
+    dict); this renders it on the human lines. Accepts a ``UsageInfo`` or a
+    totals/usage ``dict`` (both spellings exist across the callers); returns
+    "" when the flag is clear, so a fully-priced run's lines are unchanged.
+    """
+    if isinstance(usage, dict):
+        incomplete = bool(usage.get("cost_incomplete", False))
+        models = usage.get("unpriced_models") or []
+    else:
+        incomplete = bool(getattr(usage, "cost_incomplete", False))
+        models = list(getattr(usage, "unpriced_models", None) or [])
+    if not incomplete:
+        return ""
+    n = len(models) if models else 1
+    return f" (incomplete: {n} unpriced model(s) — an under-count)"
+
+
 def log_usage(prefix: str = "", baseline: "UsageInfo | None" = None):
     """Log a usage summary to stderr.
 
@@ -69,8 +91,24 @@ def log_usage(prefix: str = "", baseline: "UsageInfo | None" = None):
     # summary spend, and the threat-model repo-explorer loop (which
     # records nothing to the tracker at all — a named follow-up) all lie
     # outside the counts (tracker-observed, not network claims).
+    # #786 (T1 rounds 1+2, F1->F-B): the phase line's marker. The per-phase
+    # unpriced ledger does not exist (the tracker's set only GROWS — a model
+    # unpriced before the baseline and dispatched again this phase can never
+    # appear in a set difference), so the delta arithmetic both over-reports
+    # (a fully-priced phase after an unpriced one) and UNDER-reports (the
+    # re-spending case — the #616 violation). The honest conservative form:
+    # when the RUN's cost is incomplete, the phase figure is not provably
+    # complete — say that, never asserting the phase figure itself is an
+    # under-count (the run-scoped note), never claiming completeness.
+    if baseline is None:
+        marker = cost_marker(usage)
+    else:
+        unpriced = {m for m in (getattr(usage, "unpriced_models", None) or [])}
+        marker = ("" if not unpriced else
+                  f" (run cost incomplete: {len(unpriced)} unpriced "
+                  f"model(s) — this phase's figure may exclude their spend)")
     print(
         f"  {label}{turns} completions ({calls} records), "
-        f"{tokens:,} tokens, ${cost:.4f}",
+        f"{tokens:,} tokens, ${cost:.4f}{marker}",
         file=sys.stderr,
     )

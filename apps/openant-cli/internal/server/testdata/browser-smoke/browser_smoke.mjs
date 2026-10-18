@@ -115,6 +115,22 @@ const drain = async (page, name) => {
       dompurifyProbeBlocked++;
       continue;
     }
+    // The SECOND half of the same probe, reported by Chromium >= 156 (the
+    // playwright 1.64.1 bump): DOMPurify's load-time self-test also sets an
+    // inline ATTRIBUTE on its throwaway element, which the pages'
+    // `script-src 'self' 'nonce-...'` policy blocks as script-src-attr.
+    // Chromium 153 reported only the style half. THE NARROWNESS IS THE WHOLE
+    // POINT and is one clause tighter than the style arm above: the directive
+    // AND `blocked=inline` AND the vendored dompurify ASSET as the source.
+    // A real inline-handler leak surviving the markdown path is sourced from
+    // the PAGE, so it still fails here -- and independently trips the
+    // `onerror`/`onclick` ABSENT canaries and the console 'Refused to execute
+    // inline event handler' backstop, neither of which this filter touches.
+    if (v.startsWith('script-src-attr blocked=inline')
+        && v.includes('/assets/dompurify-')) {
+      dompurifyProbeBlocked++;
+      continue;
+    }
     note(name, 'csp violation: ' + v);
     violationsSeen++;
   }
