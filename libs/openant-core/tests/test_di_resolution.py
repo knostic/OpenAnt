@@ -4,7 +4,7 @@ Tests that the TypeScript analyzer extracts constructor parameter types
 and the dependency resolver uses them to resolve DI-injected service calls.
 
 Requires Node.js and npm dependencies installed:
-  cd parsers/javascript && npm install
+  cd parsers/javascript && npm ci
 """
 import json
 import subprocess

@@ -113,9 +113,39 @@ class UsageInfo:
     # flows into step reports and scan.report.json via tracking.get_usage.
     cost_incomplete: bool = False
     unpriced_models: list = field(default_factory=list)
+    # #626: the cache line items. Cached and uncached input stay
+    # separated; cache-unpriceable models keep the run incomplete.
+    #
+    # These do NOT follow the #624 always-present asdict decision: they are
+    # PRESENT-ONLY in the serialized envelope (see to_dict below). The
+    # FIELDS always exist, so typed consumers keep attribute access and the
+    # 0/[] defaults; only the dict envelope omits what a run did not
+    # measure. A run that used no cache therefore serializes byte-identically
+    # to the pre-#626 shape, which is the discipline get_totals /
+    # get_summary / the call record / the step snapshot already follow, and
+    # which tests/patch/test_run_traced_wrapper.py:304 asserts by exact
+    # dict equality on this very envelope.
+    total_cache_read_tokens: int = 0
+    total_cache_write_tokens: int = 0
+    unpriced_cache_models: list = field(default_factory=list)
+
+    #: the #626 cache keys, dropped from to_dict() when the run measured
+    #: none of them (present-only). Per field, never all-or-nothing — a
+    #: read-only cache run must not assert a cache_write of zero.
+    _CACHE_ENVELOPE_KEYS = (
+        "total_cache_read_tokens",
+        "total_cache_write_tokens",
+        "unpriced_cache_models",
+    )
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # present-only: a falsy cache line item was not measured, so the
+        # envelope stays silent about it rather than claiming a zero.
+        for k in self._CACHE_ENVELOPE_KEYS:
+            if not d.get(k):
+                d.pop(k, None)
+        return d
 
 
 @dataclass
@@ -156,13 +186,22 @@ class AnalyzeResult:
     results_path: str
     metrics: AnalysisMetrics = field(default_factory=AnalysisMetrics)
     usage: UsageInfo = field(default_factory=UsageInfo)
+    # #802: the kept-set delta — the prior run's checkpoint rows whose
+    # units are not in this run's population, classified by prior verdict
+    # (``core.checkpoint.build_resume_delta``'s block). PRESENT-ONLY in
+    # to_dict: None (nothing dropped, or a fresh run) writes no key — the
+    # delta is a WARNING-shaped surface, not a per-run field.
+    resume_delta: dict | None = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "results_path": self.results_path,
             "metrics": self.metrics.to_dict(),
             "usage": self.usage.to_dict(),
         }
+        if self.resume_delta:
+            d["resume_delta"] = self.resume_delta
+        return d
 
 
 @dataclass
@@ -321,6 +360,9 @@ class EnhanceResult:
     # the empty dict = no incompletes (the present-only serialization)
     incomplete_summary: dict = field(default_factory=dict)
     usage: UsageInfo = field(default_factory=UsageInfo)
+    # #802: the kept-set delta (``build_resume_delta``'s block) — same
+    # shape + present-only semantics as AnalyzeResult's.
+    resume_delta: dict | None = None
 
     def to_dict(self) -> dict:
         result = {
@@ -336,6 +378,8 @@ class EnhanceResult:
         result["total_units"] = self.total_units
         if self.incomplete_summary:
             result["incomplete_summary"] = self.incomplete_summary
+        if self.resume_delta:
+            result["resume_delta"] = self.resume_delta
         return result
 
 
@@ -370,6 +414,12 @@ def verify_step_summary(result: "VerifyResult") -> dict:
         # #622: the protected-correction sibling joins the shared summary
         # (and the reconciliation bound above).
         "disagreed_protected": result.disagreed_protected,
+        # #681: the consistency-rewrite destinations — the display threads
+        # them beside their #622 sibling so the surface agrees with the
+        # scanner envelope (the three-surfaces-one-authority framing).
+        "consistency_protected": result.consistency_protected,
+        "consistency_safe": result.consistency_safe,
+        "consistency_inconclusive": result.consistency_inconclusive,
         "confirmed_vulnerabilities": result.confirmed_vulnerabilities,
         "needs_review": result.needs_review,
         "error_count": result.error_count,
@@ -409,6 +459,13 @@ class VerifyResult:
     # ``protected`` and they never fold into ``safe`` (the ->protected
     # sibling of the #509/#510 inconclusive arm).
     disagreed_protected: int = 0
+    # #681: agreed rows the post-batch CONSISTENCY pass rewrote (the
+    # volunteered findings_to_update class) — bucketed by destination so
+    # the scanner envelope folds them (the recount already counted them
+    # by their final finding; the envelope was the outlier surface).
+    consistency_protected: int = 0
+    consistency_safe: int = 0
+    consistency_inconclusive: int = 0
     confirmed_vulnerabilities: int = 0
     # PR #69 F5: findings whose Stage-2 verification could not COMPLETE
     # (degenerate path or adapter error). Counted separately so the scanner
@@ -449,6 +506,9 @@ class VerifyResult:
             # "eliminated" number silently narrower than its parts.
             "disagreed_inconclusive": self.disagreed_inconclusive,
             "disagreed_protected": self.disagreed_protected,
+            "consistency_protected": self.consistency_protected,
+            "consistency_safe": self.consistency_safe,
+            "consistency_inconclusive": self.consistency_inconclusive,
             "confirmed_vulnerabilities": self.confirmed_vulnerabilities,
             "needs_review": self.needs_review,
             "error_count": self.error_count,

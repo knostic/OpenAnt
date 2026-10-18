@@ -154,6 +154,50 @@ def _atomic_unlink(path: str) -> None:
         pass
 
 
+# #802: the kept-set delta block — the ONE shared shape. The analyze seed's
+# foreign-row skip, both enhance paths' dir censuses, and the verify leg's
+# checkpoint census feed it (id, errored-prior-run) pairs; the analyze,
+# enhance (agentic), and verify phases' _summary.json files carry the SAME
+# block (the result objects where they exist — AnalyzeResult and
+# EnhanceResult), so a resume that shrinks the covered population is
+# reported with provenance (which units left, with their prior verdicts)
+# instead of being absorbed while the headline error count falls. The id
+# sample is capped at 20 (the campaign's own log-line precedent — a 12k-
+# unit resume cannot inline every id, but the OPERATOR must see the first
+# ones to recognize the class). The block is DIAGNOSTIC: it reports what
+# left scope; it does not re-queue anything (the retry ledger is the
+# named follow-up).
+RESUME_DELTA_ID_SAMPLE_CAP = 20
+
+
+def build_resume_delta(dropped_rows) -> dict | None:
+    """Build the #802 kept-set delta block from (unit_id, errored) pairs.
+
+    Args:
+        dropped_rows: an iterable of ``(unit_id, errored_prior_run)``
+            tuples — one per checkpoint row whose unit is NOT in this
+            run's population, classified by the row's prior verdict
+            (each phase's own errored-row predicate: the analyze seed's
+            ``analyze_result_is_error``, the enhance paths' error-key
+            checks).
+
+    Returns:
+        The block — ``dropped_from_scope``, the errored/completed split,
+        and the capped sorted ``dropped_errored_ids`` sample — or None
+        when nothing dropped (callers serialize it PRESENT-ONLY).
+    """
+    rows = list(dropped_rows)
+    if not rows:
+        return None
+    errored_ids = sorted(str(uid) for uid, was_error in rows if was_error)
+    return {
+        "dropped_from_scope": len(rows),
+        "dropped_errored_prior_run": len(errored_ids),
+        "dropped_completed_prior_run": len(rows) - len(errored_ids),
+        "dropped_errored_ids": errored_ids[:RESUME_DELTA_ID_SAMPLE_CAP],
+    }
+
+
 def save_checkpoint_under_lock(ckpt_dir: str, unit_id: str, data: dict) -> str:
     """Resolve + write a unit's checkpoint under the #317 save lock (the
     TOCTOU guard for worker-thread saves). The caller is responsible for
@@ -458,6 +502,7 @@ class StepCheckpoint:
         phase: str = "in_progress",
         usage: dict | None = None,
         incomplete: int = 0,
+        resume_delta: dict | None = None,
     ):
         """Write/overwrite _summary.json in checkpoint dir.
 
@@ -476,6 +521,14 @@ class StepCheckpoint:
                 buckets are always emitted so ``completed + incomplete +
                 errors == total_units`` is visible and checkable; callers
                 that predate the third bucket default it to 0.
+            resume_delta: #802 — the kept-set delta (``build_resume_delta``'s
+                block): the prior run's checkpoint rows whose units are NOT
+                in this run's population, with their prior verdicts. A
+                resume that silently absorbs the prior run's unfinished work
+                (an errored unit leaving scope, the headline error count
+                falling) reads as repair otherwise. PRESENT-ONLY: None (or
+                an empty block — a fresh run, or nothing dropped) writes no
+                key.
         """
         self.ensure_dir()
         filepath = os.path.join(self.dir, SUMMARY_FILE)
@@ -491,6 +544,10 @@ class StepCheckpoint:
         }
         if usage is not None:
             data["usage"] = usage
+        if resume_delta:
+            # #802: present-only — the block appears exactly when a prior
+            # run's rows fell out of this run's population.
+            data["resume_delta"] = resume_delta
         write_json(filepath, data)
     @staticmethod
     def read_summary(checkpoint_dir: str) -> dict | None:

@@ -12,8 +12,11 @@ Contract locked here (PASS-THROUGH CAPTURE ONLY):
   ``CompletionResult.usage_details`` VERBATIM — present-only; a field the
   provider did not report is ABSENT from the dict (never a fabricated 0);
 - ``record_call`` stores ``usage_details`` verbatim in the call record;
-- detail fields NEVER feed the cost formula and are NEVER summed into the
-  token totals — the reported cost number is UNCHANGED by this capture
+- the REASONING detail fields never feed the cost formula and are never summed
+  into the token totals — the reported cost number is unchanged by their capture.
+  (#626/#661 amended the blanket exclusion for the CACHE fields: they now price
+  at their own multipliers and total as separate line items; the reasoning-token
+  invariant below pins the unamended half.)
   (whether ``completion_tokens`` already includes reasoning differs by
   provider/route; summing would double-count on including routes — the
   cost-math question stays deferred per the issue's ruling);

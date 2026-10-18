@@ -1,4 +1,4 @@
-"""#325: the npm-install bootstrap and its lock are bounded.
+"""#325: the npm ci bootstrap and its lock are bounded.
 
 `_ensure_js_parser_dependencies` ran `npm install` with no `timeout=`, behind a
 blocking `fcntl.flock(LOCK_EX)` with no acquisition deadline. A stalled npm hung its
@@ -9,7 +9,7 @@ reporter subprocess calls (the issue's scope note: the convention was never exte
 to the other call sites).
 
 The fix (the issue's suggestions):
-- `timeout=` on the npm install (a generous bound — the parse steps use 1800s —
+- `timeout=` on the npm ci bootstrap (a generous bound — the parse steps use 1800s —
   still converts an indefinite hang into a diagnosable failure);
 - a BOUNDED lock acquisition (`LOCK_EX | LOCK_NB` in a retry loop with a deadline) so
   a wedged holder cannot block every other process without limit;
@@ -36,7 +36,7 @@ def test_npm_install_has_a_timeout():
     j = src.find("_npm_proc.wait(")
     assert j > 0
     call_text = src[j:j + 300]
-    assert "timeout=" in call_text, "the npm install carries no timeout"
+    assert "timeout=" in call_text, "the npm bootstrap carries no timeout"
     assert "1800" in call_text or "_NPM_INSTALL_TIMEOUT_S" in call_text
 
 
@@ -92,7 +92,7 @@ def test_npm_install_timeout_error_is_diagnosable(tmp_path, monkeypatch):
         return real_which(name, path=path)
 
     monkeypatch.setattr(pa.shutil, "which", fake_which)
-    with pytest.raises(RuntimeError, match="exceeded the 1s install bound"):
+    with pytest.raises(RuntimeError, match=r"`npm ci` \(from .*exceeded the 1s install bound"):
         pa._ensure_js_parser_dependencies()
     # the stub's process group is gone (no orphan sleeper)
     r = pa.subprocess.run(["pgrep", "-f", f"sleep 30"], capture_output=True, text=True)
