@@ -343,9 +343,12 @@ def test_source_cannot_forge_the_file_boundary_marker(hostile_repo: Path):
         "parsers/c/unit_generator.py",
         "parsers/php/unit_generator.py",
         "parsers/zig/unit_generator.py",
+        "parsers/rust/unit_generator.py",
+        "parsers/swift/unit_generator.py",
         "parsers/javascript/unit_generator.js",
         "parsers/javascript/context_assembler.js",
         "parsers/go/go_parser/types.go",
+        "utilities/agentic_enhancer/agent.py",
     ],
 )
 def test_every_producer_neutralizes_before_concatenating(producer: str):
