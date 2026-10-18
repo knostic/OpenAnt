@@ -1150,10 +1150,16 @@ def parse_trace_summary(stderr_text: str) -> "dict | None":
     cost = re.search(r"^Cost\s+\$([\d,]+(?:\.\d+)?)\s*$", block, re.MULTILINE)
     if not (calls or tokens or cost):
         return None
+    # #786: run_traced's own completeness footnote (a line OUTSIDE the
+    # anchored rows, so this parser and the Cost regex are unchanged);
+    # its presence means the case's dollars are an under-count.
+    incomplete = re.search(r"^Cost completeness:\s+incomplete",
+                           block, re.MULTILINE) is not None
     return {
         "llm_calls": int(calls.group(1)) if calls else None,
         "tokens": int(tokens.group(1).replace(",", "")) if tokens else None,
         "cost_usd": float(cost.group(1).replace(",", "")) if cost else None,
+        "cost_incomplete": incomplete,
         "source": "run_traced.py Trace Summary (stderr); cost rounded to cents",
     }
 
@@ -1820,7 +1826,8 @@ CSV_COLUMNS = (
     "order", "case_id", "cve", "display_name", "group", "language", "manifest", "repo", "sha",
     "category", "decision", "status", "failure_kind", "reason", "exit_code", "attempts",
     "started_at", "finished_at", "duration_seconds", "llm_calls", "retry_like_llm_calls",
-    "skipped_stages", "tokens", "cost_usd", "provider", "model", "patcher_commit",
+    "skipped_stages", "tokens", "cost_usd", "cost_incomplete", "provider",
+    "model", "patcher_commit",
     "blind_rule_id", "blind_status", "anomalies", "attempt_dir", "trust_report",
     "run_manifest", "stderr_log",
 )
@@ -1916,6 +1923,7 @@ def case_row(layout: BatchLayout, state: dict) -> dict:
         "skipped_stages": result.get("skipped_stages") or [],
         "tokens": usage.get("tokens"),
         "cost_usd": usage.get("cost_usd"),
+        "cost_incomplete": bool(usage.get("cost_incomplete")),
         "provider": rm.get("provider"),
         "model": rm.get("model"),
         "patcher_commit": rm.get("patcher_commit"),
@@ -2088,6 +2096,7 @@ def build_summary(layout: BatchLayout, batch: dict, states: list, *, interrupted
             "cases_with_usage": len(usage_rows),
             "total_tokens": sum(r["tokens"] for r in usage_rows if r["tokens"] is not None) if usage_rows else None,
             "total_cost_usd": round(sum(r["cost_usd"] for r in usage_rows if r["cost_usd"] is not None), 2) if usage_rows else None,
+            "cost_incomplete": any(bool(r.get("cost_incomplete")) for r in usage_rows),
             "source": "run_traced.py Trace Summary (stderr); cost rounded to cents per case",
         },
         "blind_evaluation": {
@@ -2179,7 +2188,11 @@ def render_markdown(summary: dict) -> str:
         ("Mean LLM calls per completed case", mean),
         ("Cases with retry-like LLM calls", llm["cases_with_retry_like_calls"]),
         ("Tokens (cases with usage)", f"{usage['total_tokens']:,} ({usage['cases_with_usage']} case(s))" if usage["total_tokens"] is not None else "—"),
-        ("Cost USD (cases with usage)", f"${usage['total_cost_usd']:.2f} ({usage['cases_with_usage']} case(s), rounded per case)" if usage["total_cost_usd"] is not None else "—"),
+        ("Cost USD (cases with usage)",
+         (f"${usage['total_cost_usd']:.2f} ({usage['cases_with_usage']} case(s), rounded per case)"
+          + (" — INCOMPLETE: ≥1 case ran an unpriced model (an under-count)"
+             if usage.get("cost_incomplete") else ""))
+         if usage["total_cost_usd"] is not None else "—"),
     ]
     out += [f"| {k} | {_md(v)} |" for k, v in stats]
 

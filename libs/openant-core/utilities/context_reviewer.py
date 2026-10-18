@@ -13,6 +13,7 @@ import sys
 from typing import Optional
 
 from .llm import PhaseBinding, simple_text
+from .json_extract import extract_json_object
 from .context_corrector import gather_source_files, search_files_for_context
 
 
@@ -323,14 +324,10 @@ class ContextReviewer:
         try:
             return json.loads(response)
         except json.JSONDecodeError:
-            # Try to find JSON in the response
-            start = response.find("{")
-            end = response.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    return json.loads(response[start:end])
-                except json.JSONDecodeError:
-                    pass
+            # #673: the shared depth-0 scanner, not a first-{/last-} slice.
+            recovered = extract_json_object(response)
+            if recovered is not None:
+                return recovered
 
         # Fallback: use LLM to correct malformed JSON. Pass THIS phase's schema
         # so the corrector recovers reviewer shape (no verdict) instead of

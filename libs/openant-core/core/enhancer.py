@@ -119,7 +119,11 @@ def enhance_dataset(
     print(f"[Enhance] Units to enhance: {len(units)}", file=sys.stderr)
 
     # Set up progress reporter
-    progress = ProgressReporter("Enhance", len(units), tracker=tracker)
+    # #685: the Done/summary cost lines report THIS step's spend, read
+    # against the same mutable holder the "Enhance" log_usage line uses —
+    # so the #281 refresh at the checkpoint-injection site covers them too.
+    progress = ProgressReporter("Enhance", len(units), tracker=tracker,
+                                cost_baseline=_phase_baseline)
 
     def _on_unit_done(unit_id: str, classification: str, unit_elapsed: float):
         progress.report(
@@ -223,5 +227,9 @@ def enhance_dataset(
         # #615: the kind histogram (the empty dict serializes without the
         # key via to_dict's present-only gate)
         incomplete_summary=incomplete_summary,
+        # #802: the kept-set delta the resume paths hold at their
+        # stale-restored intersections (present-only; None on a fresh run
+        # or when nothing dropped).
+        resume_delta=getattr(enhancer, "_resume_delta", None),
         usage=usage,
     )

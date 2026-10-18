@@ -186,13 +186,22 @@ class AnalyzeResult:
     results_path: str
     metrics: AnalysisMetrics = field(default_factory=AnalysisMetrics)
     usage: UsageInfo = field(default_factory=UsageInfo)
+    # #802: the kept-set delta — the prior run's checkpoint rows whose
+    # units are not in this run's population, classified by prior verdict
+    # (``core.checkpoint.build_resume_delta``'s block). PRESENT-ONLY in
+    # to_dict: None (nothing dropped, or a fresh run) writes no key — the
+    # delta is a WARNING-shaped surface, not a per-run field.
+    resume_delta: dict | None = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "results_path": self.results_path,
             "metrics": self.metrics.to_dict(),
             "usage": self.usage.to_dict(),
         }
+        if self.resume_delta:
+            d["resume_delta"] = self.resume_delta
+        return d
 
 
 @dataclass
@@ -351,6 +360,9 @@ class EnhanceResult:
     # the empty dict = no incompletes (the present-only serialization)
     incomplete_summary: dict = field(default_factory=dict)
     usage: UsageInfo = field(default_factory=UsageInfo)
+    # #802: the kept-set delta (``build_resume_delta``'s block) — same
+    # shape + present-only semantics as AnalyzeResult's.
+    resume_delta: dict | None = None
 
     def to_dict(self) -> dict:
         result = {
@@ -366,6 +378,8 @@ class EnhanceResult:
         result["total_units"] = self.total_units
         if self.incomplete_summary:
             result["incomplete_summary"] = self.incomplete_summary
+        if self.resume_delta:
+            result["resume_delta"] = self.resume_delta
         return result
 
 
