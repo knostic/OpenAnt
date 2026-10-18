@@ -22,7 +22,8 @@ from pathlib import Path
 
 from core.schemas import AnalyzeResult, AnalysisMetrics
 from core import tracking
-from core.checkpoint import StepCheckpoint, analyze_result_is_error
+from core.checkpoint import (StepCheckpoint, analyze_result_is_error,
+                             build_resume_delta)
 from core.progress import ProgressReporter
 
 # Import existing analysis machinery
@@ -477,7 +478,10 @@ def _seed_summary(existing: dict, unit_ids: frozenset | set | None = None,
     spend (the test pins the consistency both ways).
 
     Returns: completed, input_tokens, output_tokens, cost_usd,
-    unpriced_models (the #216 marker).
+    unpriced_models (the #216 marker), resume_delta (the #802 kept-set
+    delta: the dropped foreign rows classified by their prior verdicts —
+    PRESENT-ONLY: the key is absent when nothing dropped or the population
+    is unconstrained).
     """
     completed = 0
     input_tokens = 0
@@ -490,8 +494,17 @@ def _seed_summary(existing: dict, unit_ids: frozenset | set | None = None,
     # the resumed phase reported a complete cost after cache-unpriced spend.
     unpriced_cache: set = set()
     _unit_by_id = {u.get("id"): u for u in (units or [])}
+    # #802: the foreign rows — checkpointed units NOT in this run's
+    # population — were skipped "counted nowhere" (the #316/#324 famD
+    # exclusion). A row that ERRORED in the prior run is the exact work a
+    # resume exists to finish; when it leaves scope the headline error
+    # count falls and reads as repair. The delta records what left, with
+    # prior verdicts, so the absorption is visible.
+    _dropped_rows: list[tuple] = []
     for _id, _cp in existing.items():
         if unit_ids is not None and _id not in unit_ids:
+            _dropped_rows.append(
+                (_id, analyze_result_is_error(_cp.get("result") or {})))
             continue
         # #611: a STALE row (sentinel-stamped, re-enhancement migrated it)
         # is re-analyzed — seeding it as completed double-counts on the
@@ -513,7 +526,8 @@ def _seed_summary(existing: dict, unit_ids: frozenset | set | None = None,
         _u, _c = unpriced_kinds_from(_usage)
         unpriced.update(_u)
         unpriced_cache.update(_c)
-    return {
+    _resume_delta = build_resume_delta(_dropped_rows)
+    seed = {
         "completed": completed,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -521,6 +535,11 @@ def _seed_summary(existing: dict, unit_ids: frozenset | set | None = None,
         "unpriced_models": unpriced,
         "unpriced_cache_models": unpriced_cache,
     }
+    if _resume_delta is not None:
+        # #802: present-only in the seed too (the callers thread it the
+        # same way into _summary.json).
+        seed["resume_delta"] = _resume_delta
+    return seed
 
 
 def _count_verdicts(results):
@@ -840,6 +859,13 @@ def run_analysis(
     _summary_cost_usd = _seed["cost_usd"]
     _summary_unpriced: set[str] = _seed["unpriced_models"]
     _summary_unpriced_cache: set[str] = _seed["unpriced_cache_models"]
+    # #802: the kept-set delta — the prior run's checkpoint rows whose
+    # units are not in THIS run's population, classified by prior verdict.
+    # Threaded into every _summary.json write (present-only) and the
+    # AnalyzeResult, so a resume that absorbs the prior run's unfinished
+    # work reports what left instead of reading clean while the error
+    # count falls.
+    _resume_delta = _seed.get("resume_delta")
 
     def _usage_dict():
         usage = {"input_tokens": _summary_input_tokens,
@@ -887,7 +913,8 @@ def run_analysis(
     # Write initial summary
     checkpoint.write_summary(total, _summary_completed, _summary_errors,
                              _summary_error_breakdown, phase="in_progress",
-                             usage=_usage_dict(), incomplete=_summary_incomplete)
+                             usage=_usage_dict(), incomplete=_summary_incomplete,
+                             resume_delta=_resume_delta)
 
     def _summary_callback(finding, usage=None):
         """Update summary counters after each unit. Called from main thread."""
@@ -907,7 +934,8 @@ def run_analysis(
             _summary_cost_usd += usage.get("cost_usd", 0.0)
         checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                  _summary_error_breakdown, phase="in_progress",
-                                 usage=_usage_dict(), incomplete=_summary_incomplete)
+                                 usage=_usage_dict(), incomplete=_summary_incomplete,
+                                 resume_delta=_resume_delta)
 
     # --- Stage 1: Detection ---
     results, code_by_route = _run_detection(
@@ -992,7 +1020,8 @@ def run_analysis(
             _summary_cost_usd += retry_usage.get("cost_usd", 0.0)
             checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                      _summary_error_breakdown, phase="in_progress",
-                                     usage=_usage_dict(), incomplete=_summary_incomplete)
+                                     usage=_usage_dict(), incomplete=_summary_incomplete,
+                                 resume_delta=_resume_delta)
 
             # Update checkpoint
             if checkpoint is not None:
@@ -1012,7 +1041,8 @@ def run_analysis(
     # Write final summary with phase="done"
     checkpoint.write_summary(total, _summary_completed, _summary_errors,
                              _summary_error_breakdown, phase="done",
-                             usage=_usage_dict(), incomplete=_summary_incomplete)
+                             usage=_usage_dict(), incomplete=_summary_incomplete,
+                             resume_delta=_resume_delta)
 
     tracking.log_usage("Stage 1", _phase_baseline)
 
@@ -1091,4 +1121,7 @@ def run_analysis(
         results_path=results_path,
         metrics=metrics,
         usage=usage,
+        # #802: the kept-set delta rides the result (the scan-level
+        # consumer's field; present-only in to_dict).
+        resume_delta=_resume_delta,
     )

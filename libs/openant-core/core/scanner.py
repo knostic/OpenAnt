@@ -1348,6 +1348,28 @@ def scan_repository(
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------
+    # #799: the dynamic-test DECISION — made BEFORE the pipeline output is
+    # built. Every knowable skip class (not_requested / no_candidates /
+    # docker_unavailable) is recorded at its source so Step 6's build
+    # carries the true skipped set; the human summary reads
+    # pipeline_output.json (not scan.report.json) and the LLM faithfully
+    # renders whatever array it is given — a skip recorded after the
+    # build ships a "No steps were skipped." falsehood in the deliverable
+    # while the machine artifacts disagree about the same fact. Only the
+    # RUN branch is deferred to Step 7 below; its attempted-run `failed`
+    # class (the one class unknowable here) REBUILDS the output after the
+    # attempt.
+    _dt_will_run = False
+    if not dynamic_test:
+        _record_skip(result, "dynamic-test", "not_requested")
+    elif not has_findings:
+        _record_skip(result, "dynamic-test", "no_candidates")
+    elif not shutil.which("docker"):
+        _record_skip(result, "dynamic-test", "docker_unavailable")
+    else:
+        _dt_will_run = True
+
+    # ---------------------------------------------------------------
     # Step 6: Build pipeline_output.json
     # ---------------------------------------------------------------
     from core.reporter import build_pipeline_output
@@ -1356,23 +1378,21 @@ def scan_repository(
 
     pipeline_output_path = os.path.join(output_dir, "pipeline_output.json")
 
-    with step_context("build-output", output_dir, inputs={
-        "results_path": active_results_path,
-    }) as ctx:
-        build_pipeline_output(
+    # #799: one builder closure, TWO call sites — the Step-6 build and the
+    # Step-7 failed-attempt rebuild (the only late skip class).
+    def _build_pipeline_output_file():
+        return build_pipeline_output(
             results_path=active_results_path,
             output_path=pipeline_output_path,
             repo_name=repo_name or os.path.basename(repo_path),
             repo_url=repo_url,
             commit_sha=commit_sha,
             language=result.language,
+            # #304: an absent context is UNKNOWN, not a fabricated web_app —
+            # the deliverable must never present a guess as an observation.
             application_type=(
                 app_context_path and _read_app_type(app_context_path)
             ) or "unknown",
-            # #304: an absent context is UNKNOWN, not a fabricated web_app —
-            # the deliverable must never present a guess as an observation
-            # (context_source: "none" carries the real state one field away;
-            # the summary template now joins the two for the reader).
             processing_level=processing_level,
             step_reports=collected_step_reports,
             context_source=result.context_source,
@@ -1391,22 +1411,30 @@ def scan_repository(
             parse_errors=result.parse_errors,
             excluded_languages=result.excluded_languages,
             degraded=result.degraded,
+            # #600: the discovery block — re-derived from the same on-disk
+            # scan artifacts (idempotent).
             coverage=_collect_coverage(result),
-            # #600: the discovery block for the deliverable — re-derived
-            # from the same on-disk scan artifacts (idempotent; the parse
-            # step computed the same block into its own summary).
             discovery=_collect_discovery(_probe_from_result(result)),
-            # Authoritative skip data so pipeline_output.json reflects real
-            # pipeline status (esp. a non-aborting verify failure) instead of
-            # always reporting "nothing skipped". At this point (Step 6) all
-            # pre-build skips incl. verify are already recorded; dynamic-test/
-            # report skips are recorded later and remain in scan.report.json.
+            # #799: the skipped set the human summary renders — the
+            # dynamic-test decision was made BEFORE this build; the
+            # attempted-run failed class rebuilds via this same closure.
             skipped_steps=list(result.skipped_steps),
             skipped_step_reasons=dict(result.skipped_step_reasons),
             # #621: the attacker-model descriptor the verify step stamped —
             # present-only (None when verify never ran stays absent).
             attacker_model=attacker_model,
         )
+
+    with step_context("build-output", output_dir, inputs={
+        "results_path": active_results_path,
+    }) as ctx:
+        # #799: the closure carries the true skipped set — the dynamic-test
+        # decision was made BEFORE this build (see the #799 hoist above), so
+        # every knowable skip class is in the file the summary reads; the
+        # attempted-run `failed` class (Step 7) rebuilds via the same
+        # closure; the REPORT step's own skip remains post-build (#799's
+        # Not-claimed boundary, the issue names it).
+        _build_pipeline_output_file()
 
         ctx.outputs = {"pipeline_output_path": pipeline_output_path}
 
@@ -1417,61 +1445,82 @@ def scan_repository(
     # ---------------------------------------------------------------
     # Step 7: Dynamic Test (optional, off by default)
     # ---------------------------------------------------------------
-    if dynamic_test and has_findings:
-        if not shutil.which("docker"):
+    # #799: the DECISION was hoisted above the Step-6 build (every knowable
+    # skip class recorded at its source); this block only ACTS on it — the
+    # run branch, or the skip line for the recorded reason. The skip
+    # records themselves are NOT repeated here.
+    if _dt_will_run:
+        from core.dynamic_tester import run_tests
+
+        print(_step_label("Running dynamic tests (Docker)..."), file=sys.stderr)
+
+        with step_context("dynamic-test", output_dir, inputs={
+            "pipeline_output_path": pipeline_output_path,
+            "llm": binding_policy_summary(registry, "dynamic_test"),
+        }) as ctx:
+            # Dynamic test is OPTIONAL: a failure here must not discard
+            # completed work (step_context re-raises otherwise).
+            try:
+                dt_result = run_tests(
+                    pipeline_output_path=pipeline_output_path,
+                    output_dir=output_dir,
+                    registry=registry,
+                    # #521: the declared-runtime channel — the scanned
+                    # repo's root, so the derivation reads the TARGET's
+                    # manifests (the dead-input fix; the scan entry
+                    # previously omitted it).
+                    repo_path=repo_path,
+                )
+
+                ctx.summary = dynamic_test_step_summary(dt_result)
+                ctx.outputs = {
+                    "results_json_path": dt_result.results_json_path,
+                    "results_md_path": dt_result.results_md_path,
+                }
+
+                result.dynamic_test_path = dt_result.results_json_path
+
+                print(f"  Dynamic test: {dt_result.confirmed} confirmed, "
+                      f"{dt_result.not_reproduced} not reproduced", file=sys.stderr)
+            except Exception as e:
+                print(f"  WARNING: Dynamic test failed: {e}", file=sys.stderr)
+                print("  Continuing without dynamic-test results.", file=sys.stderr)
+                ctx.status = "skipped"
+                ctx.summary = {"skipped": True, "reason": str(e)}
+                _record_skip(result, "dynamic-test", "failed")
+                # #799: the failed attempt is the ONE skip class the Step-6
+                # build could not know — REBUILD the output through the same
+                # closure so this late skip reaches the file the human
+                # summary reads (the same "No steps were skipped" falsehood
+                # would ship otherwise). The rebuild is BEST-EFFORT (r1-F3):
+                # a raise here (disk full, a permission flip) must not turn
+                # an optional step's failure into a scan abort — the Step-6
+                # file stays, degrading only the failed class to the
+                # pre-#799 state, never worse than base.
+                try:
+                    _build_pipeline_output_file()
+                except Exception as rebuild_exc:
+                    print(f"  WARNING: could not rebuild pipeline_output.json "
+                          f"after the dynamic-test failure: {rebuild_exc}",
+                          file=sys.stderr)
+
+        collected_step_reports.append(
+            _load_step_report(output_dir, "dynamic-test"),
+        )
+    else:
+        # the reason was recorded pre-build; only the operator-facing line
+        # prints here (the position of the line in the step sequence is
+        # unchanged from the pre-#799 flow)
+        _dt_reason = result.skipped_step_reasons.get("dynamic-test", "not_requested")
+        if _dt_reason == "docker_unavailable":
             print(_step_label("Skipping dynamic test (Docker not found)."),
                   file=sys.stderr)
-            _record_skip(result, "dynamic-test", "docker_unavailable")
+        elif _dt_reason == "no_candidates":
+            print(_step_label("Skipping dynamic test (no findings to test)."),
+                  file=sys.stderr)
         else:
-            from core.dynamic_tester import run_tests
-
-            print(_step_label("Running dynamic tests (Docker)..."), file=sys.stderr)
-
-            with step_context("dynamic-test", output_dir, inputs={
-                "pipeline_output_path": pipeline_output_path,
-                "llm": binding_policy_summary(registry, "dynamic_test"),
-            }) as ctx:
-                # Dynamic test is OPTIONAL: a failure here must not discard
-                # completed work (step_context re-raises otherwise).
-                try:
-                    dt_result = run_tests(
-                        pipeline_output_path=pipeline_output_path,
-                        output_dir=output_dir,
-                        registry=registry,
-                        # #521: the declared-runtime channel — the scanned
-                        # repo's root, so the derivation reads the TARGET's
-                        # manifests (the dead-input fix; the scan entry
-                        # previously omitted it).
-                        repo_path=repo_path,
-                    )
-
-                    ctx.summary = dynamic_test_step_summary(dt_result)
-                    ctx.outputs = {
-                        "results_json_path": dt_result.results_json_path,
-                        "results_md_path": dt_result.results_md_path,
-                    }
-
-                    result.dynamic_test_path = dt_result.results_json_path
-
-                    print(f"  Dynamic test: {dt_result.confirmed} confirmed, "
-                          f"{dt_result.not_reproduced} not reproduced", file=sys.stderr)
-                except Exception as e:
-                    print(f"  WARNING: Dynamic test failed: {e}", file=sys.stderr)
-                    print("  Continuing without dynamic-test results.", file=sys.stderr)
-                    ctx.status = "skipped"
-                    ctx.summary = {"skipped": True, "reason": str(e)}
-                    _record_skip(result, "dynamic-test", "failed")
-
-            collected_step_reports.append(
-                _load_step_report(output_dir, "dynamic-test"),
-            )
-    elif dynamic_test and not has_findings:
-        print(_step_label("Skipping dynamic test (no findings to test)."),
-              file=sys.stderr)
-        _record_skip(result, "dynamic-test", "no_candidates")
-    else:
-        print(_step_label("Skipping dynamic test (not enabled)."), file=sys.stderr)
-        _record_skip(result, "dynamic-test", "not_requested")
+            print(_step_label("Skipping dynamic test (not enabled)."),
+                  file=sys.stderr)
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------
