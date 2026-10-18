@@ -201,6 +201,28 @@ class RedactedCause(Exception):
         self.request_id = request_id
 
 
+def _http_status_from(exc: BaseException) -> object:
+    """The HTTP status an SDK exception exposes, the Google shape included.
+
+    The major SDKs expose ``.status_code``; the google-genai SDK's
+    ``ServerError``/``APIError`` family instead carries the HTTP code on
+    ``.code`` (#770 — code-traced at the tested 2.21.0). Each branch is
+    VALIDATED as an HTTP status before it is returned: a generic ``.code``
+    need not be one (an errno, an exit code, OpenAI's string error codes),
+    and a bogus status would flip retry verdicts just like the gap this
+    closes — or, unvalidated, a non-int ``.status_code`` would reach the
+    dict arm's ``>= 500`` compare as a TypeError that aborts the retry pass
+    outright.
+    """
+    for attr in ("status_code", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and 100 <= value <= 599:
+            return value
+    return None
+
+
 def redacted_cause_from(exc: BaseException) -> RedactedCause:
     """Build a :class:`RedactedCause` from a raw SDK exception.
 
@@ -209,9 +231,12 @@ def redacted_cause_from(exc: BaseException) -> RedactedCause:
     report builder's ``__cause__`` read is preserved. The returned object
     is meant to be used as ``raise LLM*Error(...) from redacted_cause_from(
     exc)`` — see this module's F2 note for why this replaces ``from exc``.
+
+    ``status_code`` falls back to the validated ``.code`` shape (#770): a
+    Google 5xx redacted here must keep the status its retry verdict reads.
     """
     return RedactedCause(
         redact_secrets(str(exc)),
-        status_code=getattr(exc, "status_code", None),
+        status_code=_http_status_from(exc),
         request_id=getattr(exc, "request_id", None),
     )

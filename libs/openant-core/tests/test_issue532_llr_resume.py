@@ -318,27 +318,33 @@ class TestBoundaries:
                              tracker=FakeTracker())
         assert len(adapter.calls) == 1
 
-    def test_out_of_batch_signal_not_carried(self, tmp_path):
-        """The disclosed behavior change: valid_unit_ids is per-batch, so a
-        signal for a unit outside the producing batch is ungrounded by
-        construction — adopted state must equal applied state."""
+    def test_out_of_batch_signal_carried_and_persisted(self, tmp_path):
+        """THE #798 behavior change (the #532 boundary, re-drawn): the
+        validation universe is the DATASET, so a signal for a unit outside
+        the producing batch is a REAL signal — returned AND persisted
+        into the target's own record (the stash+merge at the target's
+        record write), so a resume's adopted state still equals the
+        applied state."""
         cp = str(tmp_path / "llm_reach_checkpoints")
         # Two units, batch size forces two batches (one unit each).
         dataset = {"units": [_make_unit("a:f1"), _make_unit("b:f2")]}
-        canned = [_canned(_sig("a:f1"), _sig("b:f2")),  # batch 1: a:f1 (+ out-of-batch b:f2)
-                  _canned()]                             # batch 2: b:f2 (nothing)
+        canned = [_canned(_sig("a:f1"), _sig("b:f2")),  # batch 1: a:f1 (+ cross-batch b:f2)
+                  _canned()]                             # batch 2: b:f2 (nothing new)
         signals = analyze_reachability(
             dataset, binding=_binding(FakeAdapter(canned)), batch_size=1,
             checkpoint_path=cp, tracker=FakeTracker(),
         )
-        # b:f2's signal came from batch 1 (out of batch) — filtered there.
-        assert {s.unit_id for s in signals} == {"a:f1"}
-        # The out-of-batch signal must NOT have been persisted into b:f2's
-        # record (batch 2 reviewed it and found nothing — signals == []).
+        # b:f2's signal came from batch 1 (out of batch) — CARRIED now
+        # (the dataset-wide validation universe).
+        assert {s.unit_id for s in signals} == {"a:f1", "b:f2"}
+        # The cross-batch signal must have been MERGED into b:f2's own
+        # record (written by batch 2) — absent records are the retry
+        # marker, and a signal that applies but never persists would
+        # diverge the resume's adopted state from the applied state.
         import json as _json
         with open(os.path.join(cp, "b_f2.json")) as fh:
             rec_b = _json.load(fh)
-        assert rec_b["signals"] == []
+        assert [s["unit_id"] for s in rec_b["signals"]] == ["b:f2"]
         assert rec_b["projection_sha"]
         # And a:f1's record carries only its own in-batch signal.
         with open(os.path.join(cp, "a_f1.json")) as fh:
