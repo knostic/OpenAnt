@@ -38,6 +38,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from .context_enhancer import _build_error_info, _summary_error_bucket
 from .llm_client import (TokenTracker, error_path_turn,
                          get_global_tracker, incomplete_markers,
                          turn_has_spend, unpriced_kinds_from)
@@ -56,6 +57,7 @@ from .llm import (
 # simple_text's default — a private 4096 here is how PR #242's raise never
 # reached verify on any route.
 from .llm.helpers import DEFAULT_MAX_TOKENS
+from .json_extract import extract_json_object
 
 # Null logger that discards all messages (used when no logger provided)
 _null_logger = logging.getLogger("null_verifier")
@@ -909,14 +911,21 @@ class FindingVerifier:
                                      usage=_usage_dict(), incomplete=_summary_incomplete,
                                      resume_delta=_resume_delta)
 
-        def _summary_callback(detail, usage=None):
+        def _summary_callback(detail, usage=None, error_msg=None,
+                             error_info=None):
             """Update summary counters after each unit. Called from main thread."""
             nonlocal _summary_completed, _summary_incomplete, _summary_errors
             nonlocal _summary_error_breakdown
             nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
             if detail == "error":
                 _summary_errors += 1
-                _summary_error_breakdown["api"] = _summary_error_breakdown.get("api", 0) + 1
+                # #800: the taxonomy split — the analyze sibling's shape
+                # (a context-overflow 400 files under its own class,
+                # distinct from a transient 429; the hardcoded "api"
+                # bucket made the two indistinguishable).
+                _bucket = _summary_error_bucket(error_msg, error_info)
+                _summary_error_breakdown[_bucket] = \
+                    _summary_error_breakdown.get(_bucket, 0) + 1
             elif detail.startswith("incomplete"):
                 # #293: the third state — the loop never reached a verdict.
                 # _verify_one tags incomplete units "incomplete:<finding>"
@@ -1051,6 +1060,11 @@ class FindingVerifier:
             # NEVER read as safe — it is unverified and needs manual review.
             err_msg = f"{type(e).__name__}: {e}"
             result["error"] = err_msg
+            # #800 (r1-F2): the structured taxonomy on the verify path
+            # too — analyze's results carry error_info (the #663 route);
+            # without it the classifier sees only the string and the
+            # word-bounded codes must carry the class.
+            result["error_info"] = _build_error_info(e)
             # Surface a minimal verification dict marked incomplete so any
             # consumer that branches on ``verification.incomplete`` also treats
             # it as needs-review rather than a clean verdict.
@@ -1094,7 +1108,9 @@ class FindingVerifier:
                         cp_data["usage"] = usage
                     checkpoint.save(key, cp_data)
                 if summary_callback:
-                    summary_callback(detail, usage=usage)
+                    summary_callback(detail, usage=usage,
+                                     error_msg=result.get("error"),
+                                     error_info=result.get("error_info"))
                 if progress_callback:
                     progress_callback(route_key, detail, unit_elapsed)
         except KeyboardInterrupt:
@@ -1135,7 +1151,9 @@ class FindingVerifier:
                         cp_data["usage"] = usage
                     checkpoint.save(key, cp_data)
                 if summary_callback:
-                    summary_callback(detail, usage=usage)
+                    summary_callback(detail, usage=usage,
+                                     error_msg=result.get("error"),
+                                     error_info=result.get("error_info"))
                 if progress_callback:
                     progress_callback(route_key, f"{detail}  [{worker}]", unit_elapsed)
         except KeyboardInterrupt:
@@ -1719,13 +1737,12 @@ class FindingVerifier:
 
     def _parse_json_from_text(self, text: str) -> Optional[dict]:
         """Extract JSON object from text, with LLM correction fallback."""
-        try:
-            start = text.find('{')
-            end = text.rfind('}') + 1
-            if start >= 0 and end > start:
-                return json.loads(text[start:end])
-        except json.JSONDecodeError:
-            pass
+        # #673: the shared depth-0 scanner, not a first-{/last-} slice -- a
+        # brace anywhere in the surrounding prose invalidated that span and
+        # sent a perfectly-extractable verification to the paid corrector.
+        recovered = extract_json_object(text)
+        if recovered is not None:
+            return recovered
 
         # Fallback: use LLM to correct malformed JSON. Pass the verifier's
         # `finish` schema so the corrector recovers verifier shape (no verdict)
