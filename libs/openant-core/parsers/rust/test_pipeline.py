@@ -153,6 +153,12 @@ def main():
             dependency_depth=args.dependency_depth,
         )
         dataset, analyzer_output = generator.generate(name=args.name)
+        # #768: the filter's record reaches the DATASET (the reader surface
+        # the reporter lifts into reports) — the filter attached it to the
+        # call-graph output; the generator's dataset is where it lives.
+        _rf = call_graph_output.get("_reachability_filter")
+        if _rf is not None:
+            dataset.setdefault("metadata", {})["reachability_filter"] = _rf
         generator.save_results(str(output_dir), dataset, analyzer_output)
         print(
             f"  Generated {dataset['statistics']['total_units']} units",
@@ -200,7 +206,7 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
     the Zig/PHP/Ruby/C parser pipelines for the identical shape).
     """
     try:
-        from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector, blackout_warning, classify_seeds, library_seed_ids, real_entry_point_ids
+        from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector, blackout_warning, library_seed_ids, real_entry_point_ids, reachability_filter_record
         from utilities.agentic_enhancer.reachability_analyzer import ReachabilityAnalyzer
     except ImportError:
         print(
@@ -235,10 +241,15 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
     # a real bin/route still have real seeds, so they filter normally. `--library-
     # mode` (which adds non-synthetic public-API seeds) also defeats the fallback.
     real_entry_points = real_entry_point_ids(entry_points, functions)
+    _keep_all_why = None
     if not real_entry_points and functions:
-        why = ("Only synthetic fuzz-harness entry points detected"
-               if entry_points else "No entry points detected")
-        print(f"  [Warning] {why} — keeping all units unfiltered to avoid a silent "
+        # r1-F3/r2-F1: the record's warning names the remedy on BOTH arms —
+        # the pipeline's own stderr prints the --library-mode hint
+        # unconditionally, and core's record carries it; the record must too.
+        _keep_all_why = ("Only synthetic fuzz-harness entry points detected"
+                         if entry_points else "No entry points detected") + \
+            " (use --library-mode to seed the exported public API)"
+        print(f"  [Warning] {_keep_all_why} — keeping all units unfiltered to avoid a silent "
               "blackout. Use --library-mode to seed the exported public API.",
               file=sys.stderr)
         reachable = set(functions.keys())
@@ -261,16 +272,35 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
         if k in reachable
     }
 
-    _blackout = blackout_warning(detector.entry_point_details, len(functions),
-                                 len(filtered_functions), library_mode=library_mode)
-    # #520: the seed-class counts ride the result dict (this pipeline's
-    # surface is the return value — stderr-only delivery, like zig's; the
-    # counts have no downstream reader today and are informational).
-    _struct, _inc = classify_seeds(detector.entry_point_details)
-    result["_seed_class_counts"] = {
-        "structural_entry_points": _struct, "incidental_entry_points": _inc}
-    if _blackout:
-        print(f"  [Advisory] {_blackout}", file=sys.stderr)
+    # #768: the ONE record shape (the core path's contract), built by the
+    # shared builder — rust had NO metadata.reachability_filter record at
+    # all (stderr was the only witness); the #520 seed-class fold that rode
+    # the inert _seed_class_counts field becomes load-bearing here (the
+    # counts now reach the dataset's record, a downstream reader).
+    #
+    # r1-F1: the record counts DATASET UNITS, not call-graph functions —
+    # the generator drops the synthetic fuzz harnesses (instrumentation,
+    # not analysis targets), so a functions-based count exceeds the
+    # dataset's total_units and the reporter's --limit subset check reads
+    # the excess as a FALSE subset warning. The unit-aligned counts: the
+    # non-synthetic population.
+    _n_units = sum(1 for _f in functions.values()
+                   if not _f.get("synthetic_harness"))
+    _n_reachable_units = sum(1 for _f in filtered_functions.values()
+                             if not _f.get("synthetic_harness"))
+    result["_reachability_filter"] = reachability_filter_record(
+        detector, _n_units, len(entry_points),
+        _n_reachable_units, keep_all_why=_keep_all_why)
+    if not _keep_all_why:
+        # r1-F3 (core parity): the FILTERED arm stamps the blackout advisory
+        # when it fires — the keep-all arm NEVER does (core's keep-all branch
+        # returns early; the keep-all warning IS the whole story there).
+        _blackout = blackout_warning(detector.entry_point_details,
+                                     _n_units, _n_reachable_units,
+                                     library_mode=library_mode)
+        if _blackout:
+            result["_reachability_filter"]["blackout_advisory"] = _blackout
+            print(f"  [Advisory] {_blackout}", file=sys.stderr)
 
     return result
 
