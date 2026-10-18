@@ -87,7 +87,7 @@ def test_the_reporter_phase_lines_render_the_marker():
     expression with both flag states (the audit's overclaim fix: no
     swallowed TypeErrors, no unsupported keywords)."""
     from core import reporter
-    src = pathlib.Path(reporter.__file__).read_text()
+    src = pathlib.Path(reporter.__file__).read_text(encoding="utf-8")
     assert "cost_marker(usage)" in src and "cost_marker(merged_usage)" in src, (
         "both phase print sites carry the marker call (#786)")
     from core.tracking import cost_marker
@@ -135,7 +135,7 @@ def test_the_context_enhancer_lines_render_the_marker(monkeypatch, capsys):
          "unpriced_models": []}))})()
     token_stats = enh.tracker.get_totals()
     assert MARKER not in f"${token_stats['total_cost_usd']:.4f}{cost_marker(token_stats)}"
-    src = pathlib.Path(ce.__file__).read_text()
+    src = pathlib.Path(ce.__file__).read_text(encoding="utf-8")
     assert src.count("cost_marker(token_stats)") == 2, (
         "both Token usage sites carry the marker call (#786)")
 
@@ -152,7 +152,7 @@ def test_report_main_renders_the_marker(capsys, monkeypatch, tmp_path):
     line = f"  Cost: ${usage['cost_usd']:.4f} ({usage['total_tokens']:,} tokens)"
     assert MARKER in line + cost_marker(usage)
     assert MARKER not in line + cost_marker({"cost_usd": 0.5, "total_tokens": 2})
-    src = pathlib.Path(rm.__file__).read_text()
+    src = pathlib.Path(rm.__file__).read_text(encoding="utf-8")
     assert "cost_marker(usage)" in src, (
         "the CLI report Cost line carries the marker call (#786)")
 
@@ -170,7 +170,7 @@ def test_run_traced_footnote_outside_the_scraped_line(monkeypatch, capsys):
              "cost_incomplete": True, "unpriced_models": ["mystery-model"]}
     # execute the footnote block exactly as main() does
     ns = {}
-    block_src = pathlib.Path(run_traced.__file__).read_text()
+    block_src = pathlib.Path(run_traced.__file__).read_text(encoding="utf-8")
     start = block_src.find("_unpriced = usage_dict.get('unpriced_models')")
     assert start != -1, (
         "the footnote block is absent — the trace summary "
@@ -230,7 +230,7 @@ def test_the_batch_display_line_renders_the_marker():
         "the parser feeds the display's flag (#786)")
     src = pathlib.Path(
         __import__("utilities.autopatcher.tools.run_cve_batch",
-                   fromlist=["x"]).__file__).read_text()
+                   fromlist=["x"]).__file__).read_text(encoding="utf-8")
     assert "INCOMPLETE: ≥1 case ran an unpriced model" in src, (
         "the batch display renders the marker (#786)")
     assert '"cost_incomplete": any(bool(r.get("cost_incomplete")) for r in usage_rows)' in src, (
@@ -341,7 +341,7 @@ def test_the_csv_row_carries_the_flag_through():
     from utilities.autopatcher.tools.run_cve_batch import CSV_COLUMNS
     src = pathlib.Path(
         __import__("utilities.autopatcher.tools.run_cve_batch",
-                   fromlist=["x"]).__file__).read_text()
+                   fromlist=["x"]).__file__).read_text(encoding="utf-8")
     assert '"cost_incomplete"' in src.split("CSV_COLUMNS")[1].split(")")[0], (
         "the CSV columns name cost_incomplete — the per-case CSV row keeps "
         "the flag (#786, the render_csv extrasaction=ignore class)")
@@ -360,7 +360,7 @@ def test_the_generated_line_reads_the_unit_usage(monkeypatch, capsys):
     """The E1/E2 lock: the Generated line reads the unit's OWN usage
     (the #608 contract: never get_totals) and renders the marker."""
     import utilities.dynamic_tester as dt
-    src = pathlib.Path(dt.__file__).read_text()
+    src = pathlib.Path(dt.__file__).read_text(encoding="utf-8")
     assert "cost_marker(unit_usage)" in src, (
         "the Generated line reads the unit usage (the #608-sanctioned "
         "reader), not get_totals (#786)")
@@ -397,7 +397,7 @@ def test_the_total_marker_reads_the_override_never_mutating_rows():
         "+ the flagged row's own line")
     # the caller passes the accessor's run-set (source-level bind)
     import utilities.dynamic_tester as dt
-    src = pathlib.Path(dt.__file__).read_text()
+    src = pathlib.Path(dt.__file__).read_text(encoding="utf-8")
     assert "tracker.cost_incomplete_models() or None" in src
     _fa = src.split("#786 (T1 round-2 F-A)")[1].split("report_md = generate_report")[0]
     _fa_code = "\n".join(l for l in _fa.splitlines()
@@ -411,7 +411,7 @@ def test_the_generator_batch_lines_render_the_run_scoped_note():
     lines — the serial and the parallel progress lines — render the
     run-scoped note via the accessor (never get_totals)."""
     from utilities.dynamic_tester import test_generator as tg
-    src = pathlib.Path(tg.__file__).read_text()
+    src = pathlib.Path(tg.__file__).read_text(encoding="utf-8")
     assert src.count("tracker.cost_incomplete_models()") == 2, (
         "both batch lines read the #608-clean accessor — at base these "
         "lines carry NO marker at all (#786, the r1-F2 miss)")
