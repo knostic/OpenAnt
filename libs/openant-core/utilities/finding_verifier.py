@@ -38,7 +38,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .llm_client import TokenTracker, get_global_tracker
+from .context_enhancer import _build_error_info, _summary_error_bucket
+from .llm_client import (TokenTracker, error_path_turn,
+                         get_global_tracker, incomplete_markers,
+                         turn_has_spend, unpriced_kinds_from)
 from .llm import (
     LLMRateLimitError,
     Message,
@@ -54,6 +57,7 @@ from .llm import (
 # simple_text's default — a private 4096 here is how PR #242's raise never
 # reached verify on any route.
 from .llm.helpers import DEFAULT_MAX_TOKENS
+from .json_extract import extract_json_object
 
 # Null logger that discards all messages (used when no logger provided)
 _null_logger = logging.getLogger("null_verifier")
@@ -500,32 +504,47 @@ class FindingVerifier:
                     messages=messages,
                 )
             except Exception as exc:
-                exc_in = int(getattr(exc, "input_tokens", 0) or 0)
-                exc_out = int(getattr(exc, "output_tokens", 0) or 0)
-                # Only LLMResponseError carries the raising turn's tokens;
+                # Only LLMResponseError carries the raising turn's usage;
                 # connection/auth/limit errors contribute nothing (and a
                 # turn-1 failure with zero accumulated usage writes NO
                 # record — the helpers' guard, mirrored: record_call
                 # appends a $0 call record unconditionally otherwise).
-                if (total_input_tokens or total_output_tokens
-                        or exc_in or exc_out):
+                #
+                # #626 round 4: the raising turn is read through the ONE
+                # shared error-path constructor (llm_client.error_path_turn,
+                # beside normalize_cache_usage) — the same channel the F-A1
+                # fix built for helpers.simple_completion. It brings the two
+                # things this site re-derived and got wrong:
+                #   * the turn's own ``usage_details``, instead of a
+                #     hard-coded None entry. #626 prices the cache entirely
+                #     off usage_details, so the None dropped the rejected
+                #     turn's cache read from the cost AND from both cache
+                #     line items, with cost_incomplete FALSE: $0.075 against
+                #     $0.120 real on the shipped claude-opus-5 rate.
+                #   * ``billed``, which consults the CACHE counts. On the
+                #     EXCLUSIVE (anthropic) shape a full cache hit arrives as
+                #     0 input / 0 output with a 90k billed read, so the old
+                #     input/output-only guard dropped that call WHOLESALE.
+                # It also never raises (#609 ENG-1): the bare int() coercions
+                # here could turn an accounting failure into a replacement of
+                # the original exception, whose retryability class is what
+                # the callers key on.
+                turn = error_path_turn(exc)
+                if (total_input_tokens or total_output_tokens or turn.billed):
                     # The raising turn's usage is ONLY on the exception
                     # (the accumulation below runs after complete returns).
-                    # Its per-turn list entry is appended ONLY when the
-                    # exception carries tokens (LLMResponseError) — a
-                    # connection/auth/limit raise billed nothing for the
-                    # raising turn, so no entry is added for it (the list
-                    # length equals the turns billed). Conversation-level
-                    # record, never relabeled per-request.
+                    # Its per-turn list entry is appended ONLY when the turn
+                    # BILLED, so the list length stays the count of turns
+                    # billed (#624). Conversation-level record, never
+                    # relabeled per-request.
+                    turn_details = per_turn_usage_details + turn.entries
                     self.tracker.record_call(
                         model=self.binding.model,
-                        input_tokens=total_input_tokens + exc_in,
-                        output_tokens=total_output_tokens + exc_out,
+                        input_tokens=total_input_tokens + turn.input_tokens,
+                        output_tokens=total_output_tokens + turn.output_tokens,
                         pricing=lookup_pricing(self.binding),
-                        usage_details=per_turn_usage_details
-                        + ([None] if (exc_in or exc_out) else []),
-                        turns=len(per_turn_usage_details
-                        + ([None] if (exc_in or exc_out) else [])),
+                        usage_details=turn_details,
+                        turns=len(turn_details),
                     )
                 raise
 
@@ -772,8 +791,13 @@ class FindingVerifier:
         _restored_ok = 0
         _restored_incomplete = 0
         _errored_retried = 0
+        # #802: the current population's keys — the verify census keys the
+        # delta on these (the checkpoint rows NOT in this batch are the
+        # prior run's rows whose findings left scope).
+        _current_keys: set = set()
         for r in results:
             key = r.get("unit_id") or r.get("route_key", "unknown")
+            _current_keys.add(key)
             cp_data = checkpointed.get(key)
             if cp_data and not _cp_is_error(cp_data):
                 # Restore verification data from checkpoint
@@ -816,6 +840,11 @@ class FindingVerifier:
         _summary_output_tokens = 0
         _summary_cost_usd = 0.0
         _summary_unpriced: set[str] = set()
+        # #626/PR#661 hunt F4: the cache kind's own set — the per-unit
+        # checkpoint carries ``unpriced_cache_models`` and this restore read
+        # ``unpriced_models`` only, so verify/_summary.json and the resume
+        # both reported a complete cost after cache-unpriced spend.
+        _summary_unpriced_cache: set[str] = set()
 
         # Sum usage from ALL existing checkpoints (including errored ones
         # — their cost was already spent in a prior run)
@@ -824,25 +853,52 @@ class FindingVerifier:
             _summary_input_tokens += _cp_usage.get("input_tokens", 0)
             _summary_output_tokens += _cp_usage.get("output_tokens", 0)
             _summary_cost_usd += _cp_usage.get("cost_usd", 0.0)
-            # #216: restore the incomplete-cost marker per unit.
-            _summary_unpriced.update(_cp_usage.get("unpriced_models") or [])
+            # #216 + #626: restore BOTH incomplete-cost kinds per unit,
+            # through the one reader that knows which keys carry them.
+            _u, _c = unpriced_kinds_from(_cp_usage)
+            _summary_unpriced.update(_u)
+            _summary_unpriced_cache.update(_c)
+
+        # #802: the kept-set delta — the verify leg's foreign rows
+        # (checkpoint keys NOT in this batch) were never visited: a prior
+        # run's ERRORED verify row whose finding left scope is unfinished
+        # work silently absorbed (the same 88-casualty class the analyze
+        # and enhance legs report). Classify each dropped row by THIS
+        # phase's own errored-row predicate and thread the block into
+        # every summary write, present-only.
+        _resume_delta = None
+        if checkpoint is not None:
+            from core.checkpoint import build_resume_delta
+            _dropped_rows = [
+                (_key, _cp_is_error(_cp))
+                for _key, _cp in checkpointed.items()
+                if _key not in _current_keys
+            ]
+            _resume_delta = build_resume_delta(_dropped_rows)
 
         def _usage_dict():
             usage = {"input_tokens": _summary_input_tokens,
                      "output_tokens": _summary_output_tokens,
                      "cost_usd": round(_summary_cost_usd, 6)}
-            # #216: persist the unpriced set into _summary.json (mirrors
-            # analyzer's — a resume-of-resume keeps the marker).
-            if _summary_unpriced:
-                usage["cost_incomplete"] = True
-                usage["unpriced_models"] = sorted(_summary_unpriced)
+            # #216 + #626: persist both unpriced kinds into _summary.json
+            # (mirrors analyzer's — a resume-of-resume keeps the markers),
+            # each under its own key and present-only.
+            usage.update(incomplete_markers(_summary_unpriced,
+                                            _summary_unpriced_cache))
             return usage
 
         # Inject prior usage into tracker so step_report captures the total
-        if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
+        # F661-3: the ONE spend predicate — cost included (astra's falsifier
+        # measured exactly this site: $0.120 restored, $0.000 injected).
+        if turn_has_spend(input_tokens=_summary_input_tokens,
+                          output_tokens=_summary_output_tokens,
+                          cost_usd=_summary_cost_usd,
+                          unpriced=_summary_unpriced,
+                          unpriced_cache=_summary_unpriced_cache):
             self.tracker.add_prior_usage(
                 _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
-                unpriced_models=sorted(_summary_unpriced) or None)
+                unpriced_models=sorted(_summary_unpriced) or None,
+                unpriced_cache_models=sorted(_summary_unpriced_cache) or None)
             # #281: refresh the caller's phase baseline AFTER the injection
             # so its "Stage 2" delta excludes the restored usage.
             if phase_baseline is not None:
@@ -852,16 +908,24 @@ class FindingVerifier:
         if checkpoint is not None:
             checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                      _summary_error_breakdown, phase="in_progress",
-                                     usage=_usage_dict(), incomplete=_summary_incomplete)
+                                     usage=_usage_dict(), incomplete=_summary_incomplete,
+                                     resume_delta=_resume_delta)
 
-        def _summary_callback(detail, usage=None):
+        def _summary_callback(detail, usage=None, error_msg=None,
+                             error_info=None):
             """Update summary counters after each unit. Called from main thread."""
             nonlocal _summary_completed, _summary_incomplete, _summary_errors
             nonlocal _summary_error_breakdown
             nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
             if detail == "error":
                 _summary_errors += 1
-                _summary_error_breakdown["api"] = _summary_error_breakdown.get("api", 0) + 1
+                # #800: the taxonomy split — the analyze sibling's shape
+                # (a context-overflow 400 files under its own class,
+                # distinct from a transient 429; the hardcoded "api"
+                # bucket made the two indistinguishable).
+                _bucket = _summary_error_bucket(error_msg, error_info)
+                _summary_error_breakdown[_bucket] = \
+                    _summary_error_breakdown.get(_bucket, 0) + 1
             elif detail.startswith("incomplete"):
                 # #293: the third state — the loop never reached a verdict.
                 # _verify_one tags incomplete units "incomplete:<finding>"
@@ -873,10 +937,27 @@ class FindingVerifier:
                 _summary_input_tokens += usage.get("input_tokens", 0)
                 _summary_output_tokens += usage.get("output_tokens", 0)
                 _summary_cost_usd += usage.get("cost_usd", 0.0)
+                # #626/PR#661 V1: fold the FRESH unit's incompleteness, BOTH
+                # kinds. This hop folded the three numeric keys and neither
+                # ID set, while ``_usage_dict`` reads only the restore
+                # loop's accumulators (:833-837) — so verify/_summary.json
+                # reported a COMPLETE cost after a first run's unpriced
+                # spend, and a resumed run kept the restored ids while
+                # silently losing this run's. The ids DO arrive here:
+                # ``_verify_one`` returns ``tracker.get_unit_usage()``,
+                # which stamps both kinds via ``incomplete_markers``.
+                # The sets are mutated in place (no ``nonlocal``) and both
+                # batch runners invoke this callback from the MAIN thread
+                # (the sequential loop and the ``as_completed`` loop), the
+                # same contract the counter folds above rely on.
+                _fresh_u, _fresh_c = unpriced_kinds_from(usage)
+                _summary_unpriced.update(_fresh_u)
+                _summary_unpriced_cache.update(_fresh_c)
             if checkpoint is not None:
                 checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                          _summary_error_breakdown, phase="in_progress",
-                                         usage=_usage_dict(), incomplete=_summary_incomplete)
+                                         usage=_usage_dict(), incomplete=_summary_incomplete,
+                                         resume_delta=_resume_delta)
 
         remaining = len(results_to_verify)
         # #542 (the #435 family, PR #472's verify sibling): "already done"
@@ -903,7 +984,8 @@ class FindingVerifier:
         if checkpoint is not None:
             checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                      _summary_error_breakdown, phase="done",
-                                     usage=_usage_dict(), incomplete=_summary_incomplete)
+                                     usage=_usage_dict(), incomplete=_summary_incomplete,
+                                     resume_delta=_resume_delta)
 
         # Step 2: Consistency cross-check (barrier — needs all results)
         results = self._check_consistency(results, code_by_route)
@@ -978,6 +1060,11 @@ class FindingVerifier:
             # NEVER read as safe — it is unverified and needs manual review.
             err_msg = f"{type(e).__name__}: {e}"
             result["error"] = err_msg
+            # #800 (r1-F2): the structured taxonomy on the verify path
+            # too — analyze's results carry error_info (the #663 route);
+            # without it the classifier sees only the string and the
+            # word-bounded codes must carry the class.
+            result["error_info"] = _build_error_info(e)
             # Surface a minimal verification dict marked incomplete so any
             # consumer that branches on ``verification.incomplete`` also treats
             # it as needs-review rather than a clean verdict.
@@ -1021,7 +1108,9 @@ class FindingVerifier:
                         cp_data["usage"] = usage
                     checkpoint.save(key, cp_data)
                 if summary_callback:
-                    summary_callback(detail, usage=usage)
+                    summary_callback(detail, usage=usage,
+                                     error_msg=result.get("error"),
+                                     error_info=result.get("error_info"))
                 if progress_callback:
                     progress_callback(route_key, detail, unit_elapsed)
         except KeyboardInterrupt:
@@ -1062,7 +1151,9 @@ class FindingVerifier:
                         cp_data["usage"] = usage
                     checkpoint.save(key, cp_data)
                 if summary_callback:
-                    summary_callback(detail, usage=usage)
+                    summary_callback(detail, usage=usage,
+                                     error_msg=result.get("error"),
+                                     error_info=result.get("error_info"))
                 if progress_callback:
                     progress_callback(route_key, f"{detail}  [{worker}]", unit_elapsed)
         except KeyboardInterrupt:
@@ -1646,13 +1737,12 @@ class FindingVerifier:
 
     def _parse_json_from_text(self, text: str) -> Optional[dict]:
         """Extract JSON object from text, with LLM correction fallback."""
-        try:
-            start = text.find('{')
-            end = text.rfind('}') + 1
-            if start >= 0 and end > start:
-                return json.loads(text[start:end])
-        except json.JSONDecodeError:
-            pass
+        # #673: the shared depth-0 scanner, not a first-{/last-} slice -- a
+        # brace anywhere in the surrounding prose invalidated that span and
+        # sent a perfectly-extractable verification to the paid corrector.
+        recovered = extract_json_object(text)
+        if recovered is not None:
+            return recovered
 
         # Fallback: use LLM to correct malformed JSON. Pass the verifier's
         # `finish` schema so the corrector recovers verifier shape (no verdict)

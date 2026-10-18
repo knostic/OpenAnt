@@ -223,5 +223,9 @@ def enhance_dataset(
         # #615: the kind histogram (the empty dict serializes without the
         # key via to_dict's present-only gate)
         incomplete_summary=incomplete_summary,
+        # #802: the kept-set delta the resume paths hold at their
+        # stale-restored intersections (present-only; None on a fresh run
+        # or when nothing dropped).
+        resume_delta=getattr(enhancer, "_resume_delta", None),
         usage=usage,
     )

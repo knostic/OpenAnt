@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Set
 
 from utilities.file_io import write_json
+from core.file_boundary import neutralize_boundaries
 
 
 class UnitGenerator:
@@ -177,7 +178,13 @@ class UnitGenerator:
         primary_code = func_info.get("code", "")
         files_included = [func_info["file_path"]]
         if not upstream:
-            return primary_code, files_included
+            # #723: every part joined below is scanned-repo source; a
+            # boundary-shaped line in it is indistinguishable from a real
+            # separator once joined, and the consumer's split truncates the
+            # target at it. The producer defangs (the C/php/python/ruby/zig
+            # generators' pattern; swift was the only join-capable generator
+            # with zero neutralization).
+            return neutralize_boundaries(primary_code), files_included
 
         # Sort the dependency set before assembling — `upstream` is a set, and its
         # iteration order would otherwise vary with PYTHONHASHSEED, making the
@@ -188,7 +195,7 @@ class UnitGenerator:
             if dep_info:
                 deps_by_file.setdefault(dep_info["file_path"], []).append(dep_id)
 
-        code_parts = [primary_code]
+        code_parts = [neutralize_boundaries(primary_code)]
         for file_path, dep_ids in sorted(deps_by_file.items()):
             if file_path == func_info["file_path"]:
                 # Same-file deps STILL need a boundary so the consumer's
@@ -201,14 +208,20 @@ class UnitGenerator:
                     dep_info = self.functions.get(dep_id)
                     if dep_info:
                         same_file_code.append(dep_info.get("code", ""))
-                if same_file_code:
-                    code_parts.append(self.FILE_BOUNDARY + "\n".join(same_file_code))
+                joined = "\n".join(
+                    neutralize_boundaries(c) for c in same_file_code)
+                if joined.strip():
+                    if file_path not in files_included:
+                        files_included.append(file_path)
+                    code_parts.append(self.FILE_BOUNDARY + joined)
             else:
-                if file_path not in files_included:
-                    files_included.append(file_path)
                 file_code = [self.functions[d].get("code", "") for d in dep_ids if d in self.functions]
-                if file_code:
-                    code_parts.append(self.FILE_BOUNDARY + "\n".join(file_code))
+                joined = "\n".join(
+                    neutralize_boundaries(c) for c in file_code)
+                if joined.strip():
+                    if file_path not in files_included:
+                        files_included.append(file_path)
+                    code_parts.append(self.FILE_BOUNDARY + joined)
 
         return "\n\n".join(code_parts), files_included
 

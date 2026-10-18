@@ -527,6 +527,47 @@ def classify_seeds(entry_point_details):
     return structural, incidental
 
 
+def reachability_filter_record(detector, original_count, entry_point_count,
+                                reachable_count, *, keep_all_why=None) -> dict:
+    """#768: the ONE ``metadata.reachability_filter`` record shape every
+    producing path writes — the core Python path's contract, so the record
+    no longer diverges per producing path.
+
+    Before #768 the paths diverged: the core Python path wrote ``warning``
+    plus the seed-class counts (the #520 fold), five per-language pipelines
+    (javascript/c/go/php/ruby) wrote a bare five-field record with neither,
+    and rust and zig wrote NO record at all (their stderr was the only
+    witness) — so a maintainer reading a keep-all report could not tell
+    which shape produced it, and a record carrying neither key read as a
+    completed 0.0%-reduction scan with nothing naming what happened.
+
+    The shape (both branches): the five count fields + the seed-class counts
+    (``classify_seeds`` — shared, so the pipeline sites cannot drift), plus
+    on the keep-all branch (``keep_all_why`` names the net's own condition):
+    the ``warning`` key stating that filtering was NOT applied. The keep-all
+    reduction is the int 0 (matching core's hardcoded 0 on its keep-all
+    branch, not ``round()``'s 0.0). ``blackout_advisory`` is stamped by the
+    caller where it fires (its own key, never the reserved warning slot).
+    """
+    keep_all = keep_all_why is not None
+    rec = {
+        "original_units": original_count,
+        "entry_points": entry_point_count,
+        "reachable_units": original_count if keep_all else reachable_count,
+        "filtered_out": 0 if keep_all else original_count - reachable_count,
+        "reduction_percentage": 0 if keep_all else (
+            round((1 - reachable_count / original_count) * 100, 1)
+            if original_count > 0 else 0),
+    }
+    rec["structural_entry_points"], rec["incidental_entry_points"] = (
+        classify_seeds(detector.entry_point_details))
+    if keep_all:
+        rec["warning"] = (
+            f"{keep_all_why} — kept all units unfiltered to avoid a silent "
+            "blackout; reachable filtering was NOT applied.")
+    return rec
+
+
 def _is_non_runtime_main(file_path: str) -> bool:
     """True when a `main` in this file runs at build/example/bench time rather
     than as the crate's deployed runtime entry point, so it must NOT count as a

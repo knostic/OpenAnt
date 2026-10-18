@@ -1039,6 +1039,7 @@ def generate_summary_report(
     results_path: str,
     output_path: str,
     llm_config_name: str | None = None,
+    registry=None,
 ) -> ReportResult:
     """Generate LLM-based summary report (Markdown).
 
@@ -1083,12 +1084,14 @@ def generate_summary_report(
         raise RuntimeError(f"Invalid pipeline output: {e}")
 
     # Resolve the report-phase binding once and pass it through.
-    # ``generate_summary_report`` is always invoked standalone via
-    # ``openant report -f summary`` — no upstream scanner has
-    # pre-validated the registry, so probe it here.
-    cf = load_config_file()
-    registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
-    probe_registry_or_raise(registry)
+    # #684: when the scanner invokes this mid-scan, it passes its own
+    # STARTUP-VALIDATED registry — the report uses the config the scan
+    # validated (no disk re-read, no second paid probe). The standalone
+    # path (no registry param) still probes.
+    if registry is None:
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+        probe_registry_or_raise(registry)
     report_binding = registry.get("report")
     report_text, usage = _generate_summary(pipeline_data, report_binding)
 
@@ -1134,6 +1137,7 @@ def generate_disclosure_docs(
     results_path: str,
     output_dir: str,
     llm_config_name: str | None = None,
+    registry=None,
 ) -> ReportResult:
     """Generate per-vulnerability disclosure documents.
 
@@ -1179,11 +1183,12 @@ def generate_disclosure_docs(
 
     # Resolve the report-phase binding once and reuse across the
     # ThreadPoolExecutor — adapters are stateless dispatchers, safe
-    # to share. Probe the registry upfront (standalone-invocation
-    # path; same rationale as generate_summary_report).
-    cf = load_config_file()
-    registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
-    probe_registry_or_raise(registry)
+    # to share. #684: the scanner's validated registry threads through;
+    # the standalone path probes.
+    if registry is None:
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+        probe_registry_or_raise(registry)
     report_binding = registry.get("report")
 
     product_name = pipeline_data["repository"]["name"]
@@ -1312,4 +1317,17 @@ def _usage_to_info(usage: dict):
         total_cost_usd=usage.get("cost_usd", 0.0),
         cost_incomplete=bool(usage.get("cost_incomplete", False)),
         unpriced_models=list(usage.get("unpriced_models") or []),
+        # #626: the cache line items reached this bridge and were dropped,
+        # so ReportResult.usage always read 0/0/[] while the tracker's
+        # totals (-> scan.report.json) carried the real figures — one scan
+        # shipping two different answers. unpriced_cache_models stays its
+        # OWN list: a PRICED model whose cache multipliers are missing is
+        # not a model with no pricing record at all (whose spend is omitted
+        # outright — a lower bound). PR#661 hunt F1: the cache kind's error
+        # DIRECTION is opposite for the exclusive and inclusive field
+        # shapes, so none is asserted here (see
+        # utilities.llm_client.PricedUsage.unpriced_cache).
+        total_cache_read_tokens=int(usage.get("cache_read_tokens") or 0),
+        total_cache_write_tokens=int(usage.get("cache_write_tokens") or 0),
+        unpriced_cache_models=list(usage.get("unpriced_cache_models") or []),
     )

@@ -790,11 +790,26 @@ def call_llm(prompt: str, model: str = GPT_4O_MINI, stage: str = "unknown") -> s
     # same TokenTracker.record_call() the seven-phase scan pipeline uses --
     # so a live run's cost shows up via core.tracking.get_usage() / step
     # reports instead of always reading $0.
+    #
+    # #626/PR#661 hunt F2: usage_details is forwarded too, exactly as the
+    # scan path's producer does (utilities/llm/helpers.py:114). Without it
+    # this producer sat OUTSIDE the cache accounting: the SAME implicitly
+    # cached call read cost_incomplete=True through a scan and
+    # cost_incomplete=False through `openant patch`, and that flag is the
+    # trust gate -- run_traced.py's --json `usage` block and the e2e
+    # harness's verdict both key on it. `result` is the shared
+    # utilities.llm CompletionResult, whose anthropic/openai/google adapters
+    # populate usage_details from the provider's own counters (OpenAI and
+    # Gemini cache IMPLICITLY, with no opt-in, on any long prefix -- and the
+    # Auto Patcher's prompts are large), so this is live today, not after
+    # any cache_control rollout. Verbatim pass-through: never summed into
+    # the token totals (#211).
     get_global_tracker().record_call(
         model=model_to_use,
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
         pricing=getattr(adapter, "pricing", {}).get(model_to_use),
+        usage_details=result.usage_details,
     )
 
     record = {

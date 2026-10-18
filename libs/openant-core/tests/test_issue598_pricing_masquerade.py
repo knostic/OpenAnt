@@ -265,18 +265,35 @@ def test_the_enhancer_checkpoint_writer_persists_the_ids(tmp_path):
 
 
 def test_the_dynamic_test_writer_and_restore_are_pinned():
-    """The dynamic-test side: (a) a source pin on the two writer lines and
-    the restore line (the deep-refute showed each revertibly invisibly);
+    """The dynamic-test side: (a) a source pin on the two writer sites and
+    the restore site (the deep-refute showed each revertibly invisibly);
     (b) the to_dict roundtrip EXECUTED — the persisted schema carries the
     ids. The full run-harness writer test (the #333-shape extension) is
-    the named follow-up."""
+    the named follow-up.
+
+    RE-POINTED by PR#661 hunt F4, and made STRONGER rather than merely
+    text-updated. The old pin matched one literal source line twice. That
+    line is now a tuple-unpack through
+    ``utilities.llm_client.unpriced_kinds_from``, which writes BOTH
+    incompleteness kinds (#216 and #626) at the same two sites — so the pin
+    now counts the two-kind writer AND asserts the #626 kind is in the
+    round-trip, which the literal-line version could never have caught."""
     src = (PROJECT_ROOT / "utilities" / "dynamic_tester" / "__init__.py"
            ).read_text(encoding="utf-8")
-    assert src.count('result.unpriced_models = list(unit_usage.get('
-                     '"unpriced_models") or [])') == 2
+    # the two writer sites — both kinds, one expression each
+    assert src.count("result.unpriced_cache_models) = "
+                     "unpriced_kinds_from(unit_usage)") == 2
+    # the restore site — both kinds
     assert ('unpriced_models=list(cp_data.get("unpriced_models") '
+            'or []),') in src
+    assert ('unpriced_cache_models=list(\n'
+            '                    cp_data.get("unpriced_cache_models") '
             'or []),') in src
     from utilities.dynamic_tester.models import DynamicTestResult
     d = DynamicTestResult(finding_id="F1", status="CONFIRMED", details="",
-                          unpriced_models=["m/a"]).to_dict()
+                          unpriced_models=["m/a"],
+                          unpriced_cache_models=["m/c"]).to_dict()
     assert d["unpriced_models"] == ["m/a"]
+    assert d["unpriced_cache_models"] == ["m/c"]
+    # and the two kinds are never merged (F661-3)
+    assert "m/c" not in d["unpriced_models"]
