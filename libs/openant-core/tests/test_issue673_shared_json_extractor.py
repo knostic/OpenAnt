@@ -230,7 +230,8 @@ def test_no_sibling_module_still_ships_the_naive_slice():
     for path in sorted(root.rglob("*.py")):
         if path == home or "tests" in path.relative_to(root).parts:
             continue
-        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+        for lineno, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1):
             if naive.search(line):
                 offenders.append(f"{path.relative_to(root)}:{lineno}: {line.strip()}")
     assert not offenders, (
@@ -439,7 +440,7 @@ def test_the_shared_helper_imports_nothing_but_the_standard_library():
     bad = []
     # parsed, not grepped: the module's own docstring quotes the forbidden
     # import as prose, and a regex over lines reads that as an offence.
-    for node in ast.walk(ast.parse(home.read_text())):
+    for node in ast.walk(ast.parse(home.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".")[0] in local:
