@@ -466,6 +466,11 @@ class VerifyResult:
     consistency_protected: int = 0
     consistency_safe: int = 0
     consistency_inconclusive: int = 0
+    # #744 (the r1-F1 fix): the escalated rows (origin inconclusive,
+    # admitted by stage2_candidates) whose Stage-2 adjudication MOVED them
+    # out of inconclusive — the scanner envelope retires their Stage-1
+    # inconclusive count by exactly this (the sum-to-total partition).
+    escalated_inconclusive_moved: int = 0
     confirmed_vulnerabilities: int = 0
     # PR #69 F5: findings whose Stage-2 verification could not COMPLETE
     # (degenerate path or adapter error). Counted separately so the scanner

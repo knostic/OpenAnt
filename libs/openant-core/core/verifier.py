@@ -14,7 +14,8 @@ import sys
 from pathlib import Path
 
 from core.schemas import VerifyResult
-from core.verdict_taxonomy import FINDING_VERDICT_ORDER, fold_legacy_finding
+from core.verdict_taxonomy import (FINDING_VERDICT_ORDER, coerce_cwe_id,
+                                   fold_legacy_finding)
 from core import tracking
 from core.checkpoint import StepCheckpoint
 from core.progress import ProgressReporter
@@ -89,6 +90,37 @@ def _verify_template_texts():
     ]
 
 
+def stage2_candidates(all_results: list) -> list:
+    """#744: the Stage-2 admission filter.
+
+    Admits every vulnerable/bypassable row, plus an INCONCLUSIVE row that
+    CARRIES a concrete claim — ``cwe_id`` (a non-zero int) or
+    ``attack_vector`` (a non-empty string). A bare inconclusive (no claim
+    artifacts) stays out: the campaign's shape ("a claim made, proof
+    incomplete" vs "no claim") is exactly the distinction the issue names,
+    and the producer-side definition (#744's prompt block) now instructs
+    the model to fill the claim artifacts when it has a concrete suspect.
+    """
+    out = []
+    for r in all_results:
+        verdict = fold_legacy_finding(
+            str(r.get("finding") or r.get("verdict", "")).lower())
+        if verdict in ("vulnerable", "bypassable"):
+            out.append(r)
+            continue
+        if verdict == "inconclusive":
+            # #744 (the r1-F2 catch): cwe_id is MODEL-SUPPLIED and stored
+            # verbatim — a string "918" (or "CWE-918") is exactly the
+            # fa15/fa16 trust-boundary class; coerce like the reporter's
+            # own finding_identity_key does, never trust the type.
+            has_cwe = coerce_cwe_id(r.get("cwe_id")) != 0
+            vector = r.get("attack_vector")
+            has_vector = isinstance(vector, str) and vector.strip() != ""
+            if has_cwe or has_vector:
+                out.append(r)
+    return out
+
+
 def run_verification(
     results_path: str,
     output_dir: str,
@@ -103,7 +135,7 @@ def run_verification(
 ) -> VerifyResult:
     """Run Stage 2 attacker-simulation verification on Stage 1 results.
 
-    Only findings with verdict ``vulnerable`` or ``bypassable`` are verified.
+    Stage-2 candidates are verified: every ``vulnerable``/``bypassable`` finding, plus — #744 — an ``inconclusive`` row carrying a concrete claim.
     Results are written to ``results_verified.json`` in *output_dir*.
 
     Checkpoints are always enabled. Per-finding verification results are
@@ -156,14 +188,25 @@ def run_verification(
     all_results = experiment.get("results", [])
     code_by_route = experiment.get("code_by_route", {})
 
-    # Filter to vulnerable/bypassable only
-    vulnerable_results = [
-        r for r in all_results
-        if str(r.get("finding") or r.get("verdict", "")).lower() in ("vulnerable", "bypassable")
-    ]
+    # Filter to vulnerable/bypassable, plus the #744 escalation: an
+    # INCONCLUSIVE row that CARRIES a concrete claim (cwe_id or
+    # attack_vector present) is a vulnerable-candidate — "claim I could
+    # not finish" is not "no claim", and the campaign's three such rows
+    # each asserted a concrete sink the filter could not tell apart.
+    vulnerable_results = stage2_candidates(all_results)
+
+    # #744: stamp the ESCALATED rows' origin — the verifier's disagreement
+    # branch (and the consistency pass) overwrite ``finding`` with the Stage-2
+    # outcome, so the origin must be its own key before the batch runs; the
+    # envelope's retirement (the r1-F1 fix) reads it after the batch.
+    for _r in vulnerable_results:
+        _v = fold_legacy_finding(
+            str(_r.get("finding") or _r.get("verdict", "")).lower())
+        if _v == "inconclusive":
+            _r["stage1_finding"] = "inconclusive"
 
     findings_input = len(vulnerable_results)
-    print(f"[Verify] {findings_input} vulnerable/bypassable findings to verify "
+    print(f"[Verify] {findings_input} Stage-2 candidate findings to verify "
           f"(out of {len(all_results)} total)", file=sys.stderr)
 
     if findings_input == 0:
@@ -377,6 +420,10 @@ def run_verification(
         consistency_protected=_counts["consistency_protected"],
         consistency_safe=_counts["consistency_safe"],
         consistency_inconclusive=_counts["consistency_inconclusive"],
+        # #744 (the r1-F1 fix): the escalated rows Stage 2 moved out of
+        # inconclusive — the envelope retires their Stage-1 count.
+        escalated_inconclusive_moved=_counts.get(
+            "escalated_inconclusive_moved", 0),
         confirmed_vulnerabilities=confirmed_vulnerabilities,
         needs_review=needs_review,
         error_count=error_count,
@@ -500,13 +547,49 @@ def _count_verification_outcomes(verified_results: list) -> dict:
         "needs_review": 0,
         "confirmed_vulnerabilities": 0,
         "error_count": 0,
-        # #302: the direction of Stage-2 changes — one-directionality is
-        # structural (only Stage-1 positives enter), and the artifacts must
-        # show it rather than leave it inferable from raw records.
+        # #302: the direction of Stage-2 changes — the artifacts must show
+        # it rather than leave it inferable from raw records. (#744
+        # superseded the 'only Stage-1 positives enter' half: the
+        # claim-carrying inconclusive rows now join the candidates; the
+        # direction REPORTING — downgraded/upgraded — is unchanged.)
         "downgraded": 0,
         "upgraded": 0,
+        # #744 (the r1-F1 catch): the escalated-inconclusive ORIGIN count
+        # whose Stage-2 adjudication MOVED it out of inconclusive — the
+        # envelope must retire the Stage-1 count for these rows (they are
+        # re-bucketed by Stage 2's outcome: confirmed/disagreed/consistency
+        # already count them); without the subtraction the sum-to-total
+        # partition over-sums by exactly the moved count (the #681 class).
+        "escalated_inconclusive_moved": 0,
     }
     for r in verified_results:
+        # #744 (the r2-1 catch): the origin check runs BEFORE the error arm —
+        # an escalated row whose Stage-2 adapter RAISED is re-bucketed as an
+        # error, and the envelope must still retire its Stage-1 inconclusive
+        # count (the error continue fired first and the retirement never
+        # happened: sum=4/total=3 on the error outcome).
+        _origin_early = fold_legacy_finding(
+            str(r.get("stage1_finding")
+                or (r.get("verification", {}) or {}).get("stage1_verdict")
+                or "").lower())
+        _finding_early = fold_legacy_finding(
+            str(r.get("finding") or r.get("verdict", "")).lower())
+        # #744 (the r3-1 catch): an escalated row that ERRORED retires its
+        # Stage-1 inconclusive count UNCONDITIONALLY — the except arm never
+        # touches ``finding`` (the row keeps finding=='inconclusive'), so
+        # the finding!=inconclusive clause skipped it and the error outcome
+        # still over-summed (sum=4/total=3 through the real _verify_one).
+        if _origin_early == "inconclusive" and (
+                bool(r.get("error")) or (
+                    _finding_early != "inconclusive"
+                    and _finding_early != "")):
+            # #744 (the r4-1 catch): an OFF-ENUM rewrite ('Probably Fine' —
+            # the #679 class, written verbatim by the disagree branch) also
+            # retires: the #679 arm re-buckets it to error_count, so the
+            # in-FINDING_VERDICT_ORDER clause skipped it and the sum
+            # over-ran (sum=4/total=3). Retirement = origin inconclusive +
+            # (errored OR re-bucketed anywhere — on-enum or off).
+            counts["escalated_inconclusive_moved"] += 1
         if r.get("error"):
             counts["error_count"] += 1
             continue
@@ -569,7 +652,16 @@ def _count_verification_outcomes(verified_results: list) -> dict:
                 # ``disagreed`` into ``safe`` (safe += disagreed), which
                 # would reclassify an explicitly-unconfirmable finding as
                 # safe in the aggregate metrics. Its own bucket.
-                counts["disagreed_inconclusive"] += 1
+                # #744 (the r3-2 catch): an ESCALATED row landing here does
+                # NOT increment — its Stage-1 inconclusive count is still
+                # in the envelope's base term (the row's finding is
+                # 'inconclusive' again, so the retirement correctly did NOT
+                # fire), and the #509 add-on was designed for
+                # vulnerable-origin rows (whose Stage-1 count the
+                # confirmed_vulnerabilities replacement already dropped);
+                # for an inconclusive origin it would double-count.
+                if _origin_early != "inconclusive":
+                    counts["disagreed_inconclusive"] += 1
             elif finding == "protected":
                 # #622: the verifier disagreed and corrected the verdict to
                 # ``protected`` — the unit is protected-by-controls,

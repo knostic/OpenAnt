@@ -313,7 +313,7 @@ python experiment.py --dataset <repo>_exploitable --verify-verbose
 
 **Purpose:** Verify Stage 1 findings using attacker simulation on **vulnerable and bypassable units only**.
 
-**Input:** Only units from Step 7 whose Stage 1 verdict is `vulnerable` or `bypassable`. Do NOT send `safe`, `protected`, `inconclusive`, or error results to Stage 2.
+**Input:** Units from Step 7 whose Stage 1 verdict is `vulnerable` or `bypassable`, plus — #744 — an `inconclusive` row that CARRIES a concrete claim (a non-zero `cwe_id` or a non-empty `attack_vector`): such a row escalates as a vulnerable-candidate. A bare `inconclusive` (no claim artifacts) is NOT sent, and `safe`/`protected`/error results are never sent.
 
 **Command:**
 ```bash

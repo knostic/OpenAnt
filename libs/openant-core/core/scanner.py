@@ -266,9 +266,19 @@ def _post_verify_metrics(analyze_metrics, verify_result) -> "AnalysisMetrics":
         total=analyze_metrics.total,
         vulnerable=verify_result.confirmed_vulnerabilities,
         bypassable=0,
-        inconclusive=analyze_metrics.inconclusive
-        + getattr(verify_result, "disagreed_inconclusive", 0)
-        + getattr(verify_result, "consistency_inconclusive", 0),
+        inconclusive=(
+            analyze_metrics.inconclusive
+            + getattr(verify_result, "disagreed_inconclusive", 0)
+            + getattr(verify_result, "consistency_inconclusive", 0)
+            # #744 (the r1-F1 catch): retire the Stage-1 count for the
+            # ESCALATED rows Stage 2 moved out of inconclusive — they are
+            # re-bucketed by the outcome (confirmed/disagreed/consistency
+            # already count them); without this the sum-to-total partition
+            # over-sums by exactly the moved count (sum=4/total=3 in the
+            # hunt's executed probe — the #681 class the envelope exists
+            # to prevent).
+            - getattr(verify_result, "escalated_inconclusive_moved", 0)
+        ),
         protected=analyze_metrics.protected
         + getattr(verify_result, "disagreed_protected", 0)
         + getattr(verify_result, "consistency_protected", 0),

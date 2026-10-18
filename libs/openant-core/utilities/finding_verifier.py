@@ -1491,6 +1491,15 @@ class FindingVerifier:
         groups = {}
 
         for result in results:
+            # #744 (the r1-F6 catch): an ESCALATED row (origin inconclusive —
+            # stage2_candidates admitted it carrying a claim) does not join
+            # the pattern groups: its Stage-1 verdict is a different
+            # population from the vulnerable-origin rows, a mixed group
+            # would spend a consistency LLM call on a non-comparison, and
+            # the group's verdict negotiation must never anchor a
+            # vulnerable sibling toward the inconclusive candidate.
+            if str(result.get("stage1_finding", "")).lower() == "inconclusive":
+                continue
             # Extract pattern key from route_key
             route_key = result.get("route_key", "")
 
