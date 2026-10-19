@@ -52,7 +52,15 @@ def _zero_counts(**overrides):
                 # consistency_update record); the dict-equality asserts
                 # stay semantically identical.
                 consistency_protected=0, consistency_safe=0,
-                consistency_inconclusive=0)
+                consistency_inconclusive=0,
+                # #744: the escalated-origin retirement count — zero in
+                # this suite's shapes (none carry an inconclusive origin);
+                # the dict-equality asserts stay semantically identical.
+                escalated_inconclusive_moved=0,
+                # #743: the SAFE-origin retirement count — zero in this
+                # suite's shapes (none carry an escalated safe origin);
+                # the dict-equality asserts stay semantically identical.
+                escalated_safe_moved=0)
     base.update(overrides)
     return base
 

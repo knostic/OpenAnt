@@ -1509,6 +1509,20 @@ class FindingVerifier:
         groups = {}
 
         for result in results:
+            # #744 (the r1-F6 catch): an ESCALATED row (origin inconclusive —
+            # stage2_candidates admitted it carrying a claim) does not join
+            # the pattern groups: its Stage-1 verdict is a different
+            # population from the vulnerable-origin rows, a mixed group
+            # would spend a consistency LLM call on a non-comparison, and
+            # the group's verdict negotiation must never anchor a
+            # vulnerable sibling toward the inconclusive candidate.
+            # #743: the SAFE-disagreement origin is excluded for the same
+            # three reasons — a {vulnerable, escalated-safe} group is a
+            # non-comparison, and the negotiation must never anchor a
+            # vulnerable sibling toward the escalated candidate.
+            _stage1 = str(result.get("stage1_finding", "")).lower()
+            if _stage1 in ("inconclusive", "safe"):
+                continue
             # Extract pattern key from route_key
             route_key = result.get("route_key", "")
 
