@@ -546,3 +546,32 @@ def test_limit_mode_serializes_present_only():
                             units_enhanced=1, total_units=1,
                             limit_mode="entry-path-bfs")
     assert stamped.to_dict()["limit_mode"] == "entry-path-bfs"
+
+
+# ---------------------------------------------------------------------------
+# S14 — THE NON-BINDING LIMIT (the mislabel this PR's own intent forbids).
+# `--limit N` with N >= len(units) selects NOTHING: select_units_for_limit
+# early-returns the units unreordered and unsliced. The first cut still
+# stamped `entry-path-bfs`, so the artifact claimed a priority selection that
+# never ran -- verbatim the failure #739 exists to remove ("the mode is
+# printed so a limited run never reads as a priority-based sample when it is
+# not"). The label must name the truth: no selection ran.
+# ---------------------------------------------------------------------------
+def test_a_non_binding_limit_is_not_labelled_a_priority_selection():
+    from core.enhancer import (LIMIT_MODE_ENTRY_PATH, LIMIT_MODE_NOT_BINDING,
+                               limit_selection_mode, select_units_for_limit,
+                               limit_mode_for)
+    units = [_unit("a.go:A", entry=True, calls=["b.go:B"]),
+             _unit("b.go:B"), _unit("c.go:C")]
+    # the seeding predicate is unchanged: it answers "is there a BFS source?"
+    assert limit_selection_mode(units) == LIMIT_MODE_ENTRY_PATH
+    # but with a limit that does not bind, NOTHING is selected...
+    assert select_units_for_limit(units, 10) == units
+    # ...so the REPORTED mode must say so, not name a BFS that never ran.
+    assert limit_mode_for(units, 10) == LIMIT_MODE_NOT_BINDING, (
+        "a limit >= len(units) reordered and sliced nothing; labelling it "
+        "entry-path-bfs is the exact mislabel #739 exists to remove")
+    # the boundary: a limit that DOES bind keeps the priority label
+    assert limit_mode_for(units, 2) == LIMIT_MODE_ENTRY_PATH
+    # and the equality case selects nothing either (len == limit)
+    assert limit_mode_for(units, 3) == LIMIT_MODE_NOT_BINDING

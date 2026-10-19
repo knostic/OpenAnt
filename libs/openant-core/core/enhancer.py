@@ -41,6 +41,15 @@ from utilities.llm import (
 # and a priority sort must not lose).
 LIMIT_MODE_ENTRY_PATH = "entry-path-bfs"
 LIMIT_MODE_FILE_ORDER = "file-order-head-slice"
+# #739 fix round: a ``--limit N`` with N >= len(units) selects NOTHING --
+# ``select_units_for_limit`` early-returns the units unreordered and unsliced. The
+# first cut still stamped ``entry-path-bfs`` there, so the artifact claimed a
+# priority selection that never ran: verbatim the failure this change exists to
+# remove ("the mode is printed so a limited run never reads as a priority-based
+# sample when it is not"). A third value names that state, rather than reusing the
+# empty string -- empty already MEANS "no limit ran", and a non-binding limit DID
+# run, so collapsing the two would lose the distinction an operator needs.
+LIMIT_MODE_NOT_BINDING = "no-selection-all-units-under-limit"
 
 
 def limit_selection_mode(units) -> str:
@@ -55,6 +64,22 @@ def limit_selection_mode(units) -> str:
                 and isinstance(u.get("id"), str) and u.get("id")):
             return LIMIT_MODE_ENTRY_PATH
     return LIMIT_MODE_FILE_ORDER
+
+
+def limit_mode_for(units, limit) -> str:
+    """#739 fix round: THE ONE DERIVATION of the REPORTED selection mode.
+
+    ``limit_selection_mode`` answers a different question -- "does this dataset
+    carry a BFS source?" -- and is still the predicate ``select_units_for_limit``
+    branches on. What the REPORT needs is "what did the selection actually do",
+    and those diverge in exactly one place: a limit that does not bind. Deriving
+    the label here, from the same (units, limit) pair the selection sees, is what
+    stops the stamp and the selection from disagreeing again."""
+    if not limit:
+        return ""
+    if len(units) <= limit:
+        return LIMIT_MODE_NOT_BINDING
+    return limit_selection_mode(units)
 
 
 def select_units_for_limit(units, limit):
@@ -220,7 +245,7 @@ def enhance_dataset(
         # file-order head-slice only when no entry point is seeded — and
         # the mode is printed so a limited run never reads as a
         # priority-based sample when it is not.
-        _limit_mode = limit_selection_mode(units)
+        _limit_mode = limit_mode_for(units, limit)
         units = select_units_for_limit(units, limit)
         dataset["units"] = units  # so the agentic/single-shot paths enhance only these
         print(f"[Enhance] Limit {limit}: selection mode {_limit_mode}",
