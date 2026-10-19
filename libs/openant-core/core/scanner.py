@@ -632,6 +632,30 @@ def scan_repository(
                     }
                     ctx.outputs = {"app_context_path": app_context_path}
                     print(f"  App type: {context.application_type}", file=sys.stderr)
+                    # #738 (the issue's shape 2): the DEFAULT-mode directive.
+                    # The parse-time reachability filter ran BEFORE this
+                    # classification existed and pruned the exported public
+                    # API; without --llm-reachability there is no
+                    # post-context re-filter to derive the seeding into —
+                    # the operator must re-run, and the scan must SAY so,
+                    # never leave the pruned set reading as complete
+                    # coverage. (With --llm-reachability the re-filter
+                    # derives it — the shape-1 half — so the directive is
+                    # only for the mode that cannot.)
+                    if (context.application_type == "library"
+                            and not library_mode
+                            and not llm_reachability
+                            and processing_level != "all"):
+                        print(
+                            "  NOTE: app-context classified this target as "
+                            "a library, but the structural reachability "
+                            "filter ran without --library-mode — it covers "
+                            "only what its seeds reach, never the "
+                            "library's exported public API (re-run with "
+                            "--library-mode, or --llm-reachability, whose "
+                            "post-context re-filter derives it "
+                            "automatically).",
+                            file=sys.stderr)
                 except Exception as e:
                     print(f"  WARNING: App context generation failed: {e}",
                           file=sys.stderr)
@@ -782,6 +806,16 @@ def scan_repository(
                     pre_filter_count = len(dataset.get("units", []))
                     post_filter_count = pre_filter_count
                     refilter_supported = False
+                    # #738 (the T1-r1 F1 catch): the derived-mode flag is a
+                    # PRE-STAGE local, initialized here — the summary build
+                    # reads it UNCONDITIONALLY below, and the re-filter
+                    # block is level- and call-graph-gated (a --level all
+                    # run or a parser that persists no call_graph.json
+                    # never enters it; an in-block-only assignment left
+                    # EVERY such run crashing the step into skipped/failed
+                    # with an UnboundLocalError — the #268 guard swallowed
+                    # it and the whole llm-reach telemetry silently went).
+                    _derived_library_mode = False
 
                     # Re-apply the structural reachability filter using
                     # LLM-promoted entry points as additional BFS seeds.
@@ -797,6 +831,35 @@ def scan_repository(
                         cg_dirs = resolve_call_graph_dirs(output_dir)
                         if cg_dirs:
                             from core.parser_adapter import apply_reachability_filter
+
+                            # #738: derive the library seeding from the
+                            # classification the app-context step already
+                            # wrote (the issue's shape 1). The parse-time
+                            # filter ran BEFORE app-context existed, so a
+                            # library's exported public API is already
+                            # pruned; THIS post-context re-filter is the one
+                            # place the classification can still matter.
+                            # Derive only when the CLI flag is absent AND
+                            # the payload says library — and RECORD it: the
+                            # classification is nondeterministic across
+                            # runs (the issue's compounding hazard — a
+                            # resume can flip library to unsupported), so
+                            # the artifact must show WHICH mode the run
+                            # used, never silently.
+                            if (not library_mode and app_context_path
+                                    and _read_app_type(app_context_path)
+                                    == "library"):
+                                _derived_library_mode = True
+                                print(
+                                    "  NOTE: app-context classified this "
+                                    "target as a library; the re-filter "
+                                    "seeds the exported public API "
+                                    "(--library-mode DERIVED from the "
+                                    "classification — set the flag "
+                                    "explicitly to pin it across runs).",
+                                    file=sys.stderr)
+                            _effective_library_mode = (
+                                library_mode or _derived_library_mode)
 
                             llm_promoted_ids = {
                                 u["id"] for u in dataset.get("units", [])
@@ -846,7 +909,11 @@ def scan_repository(
                                     extra_entry_points=scope_entry_points_to_units(
                                         llm_promoted_ids, lang_units
                                     ),
-                                    library_mode=library_mode,
+                                    # #738: the derived-or-explicit mode —
+                                    # the classification the step can
+                                    # already see, never the stale CLI-only
+                                    # decision.
+                                    library_mode=_effective_library_mode,
                                 )
                                 kept.extend(filtered.get("units", []))
                                 _rf = (filtered.get("metadata") or {}).get(
@@ -904,6 +971,24 @@ def scan_repository(
                                         else 0
                                     ),
                                     "per_language": _per_lang,
+                                    # #738: the derived-mode disclosure rides
+                                    # the AGGREGATE too — the operator diffing
+                                    # two dataset.json coverage deltas (the
+                                    # issue's 23-vs-288 case) reads THIS
+                                    # record, not the step report; the
+                                    # classification lottery can flip the
+                                    # derived mode across runs and the
+                                    # per-language library_mode keys below
+                                    # explain the delta only when the
+                                    # derivation is named beside them.
+                                    **({"library_mode_derived": True}
+                                       if _derived_library_mode else {}),
+                                    # #738: the top-level seeding mode —
+                                    # the per-language records carry it, but
+                                    # this whitelist is what the aggregate
+                                    # keeps; the operator diffing datasets
+                                    # reads the TOP level.
+                                    "library_mode": _effective_library_mode,
                                 }
                                 # Lift any per-language advisory (e.g. an empty-seed
                                 # blackout — a language that flowed through unfiltered
@@ -1015,6 +1100,16 @@ def scan_repository(
                             "signals_cache_adopted", 0),
                         "post_filter_units": post_filter_count,
                         "refilter_supported": refilter_supported,
+                        # #738: present-only — this re-filter DERIVED the
+                        # library seeding from the app-context
+                        # classification (the CLI flag was absent). The
+                        # artifact must show which mode the run used: the
+                        # classification is nondeterministic across runs,
+                        # so a consumer comparing two scans of the same
+                        # repo needs this marker to explain the coverage
+                        # delta.
+                        **({"library_mode_derived": True}
+                           if _derived_library_mode else {}),
                         # #294: the honest coverage numbers — units_reviewed
                         # counts what was SENT for review, not what was
                         # actually reviewed.
