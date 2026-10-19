@@ -1191,6 +1191,18 @@ def scan_repository(
                     "incomplete_count": enhance_result.incomplete_count,
                     "total_units": enhance_result.total_units,
                 }
+                # #739: a limited run's selection mode, present-only — the
+                # report names WHAT the limit selected by, stamped AT THE
+                # SLICE SITE over the population the slice actually
+                # selected from (the #213 diff-selected subset under
+                # diff-mode: a label over the unfiltered corpus could
+                # promise a priority the diff-subset selection never
+                # used — the T1-r1 F1 catch; the re-read of the dataset
+                # is gone with it).
+                if limit and getattr(enhance_result, "limit_mode", ""):
+                    ctx.summary["limit_mode"] = enhance_result.limit_mode
+                    print(f"  Limit {limit}: selection mode "
+                          f"{ctx.summary['limit_mode']}", file=sys.stderr)
                 if enhance_result.error_summary:
                     ctx.summary["error_summary"] = enhance_result.error_summary
                 # #615: the degenerate-exit kind histogram
