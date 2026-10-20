@@ -53,7 +53,7 @@ def test_records_carry_cache_multipliers():
 def test_record_without_cache_rates_has_no_multipliers():
     # a non-Claude record (or an unpriced-cache provider) carries none —
     # its cached usage (if any) takes the incomplete path, never $0
-    gpt = pricing_map("openai").get("gpt-4o")
+    gpt = pricing_map("ollama").get("qwen3.8:27b")
     assert gpt is not None and "cache_read" not in gpt
 
 
@@ -106,12 +106,12 @@ def test_per_turn_list_sums_cache():
 
 def test_cache_without_multipliers_marks_incomplete():
     t = TokenTracker()
-    t.record_call(model="gpt-4o", input_tokens=10, output_tokens=10,
-                  pricing=pricing_map("openai")["gpt-4o"],
+    t.record_call(model="qwen3.8:27b", input_tokens=10, output_tokens=10,
+                  pricing=pricing_map("ollama")["qwen3.8:27b"],
                   usage_details={"cached_tokens": 5_000})
     totals = t.get_totals()
     assert totals["cost_incomplete"]
-    assert "gpt-4o" in totals["unpriced_cache_models"]
+    assert "qwen3.8:27b" in totals["unpriced_cache_models"]
 
 
 def test_usageinfo_carries_cache_fields():
@@ -191,12 +191,14 @@ def test_google_inclusive_cache_not_double_billed():
 
 # T1 round-2 (F-A): an UNPRICED inclusive cache must degrade to the
 # full-rate upper bound (master's direction), never a $0 under-report —
-# the shipped census has no openai/google cache rates, and OpenAI
-# auto-caches, so this is the default OpenAI/Google path.
+# post-#690 the unrated class is the ollama records, the unpublished-cache
+# google 2.0/1.5 models and the divergent-price z-ai routes (the openai
+# census is rated now); the formula's contract serves any future unrated
+# record the same way.
 def test_unpriced_inclusive_cache_degrades_to_upper_bound():
     t = TokenTracker()
     rec = t.record_call(
-        model="gpt-4o", input_tokens=6_000, output_tokens=500,
+        model="qwen3.8:27b", input_tokens=6_000, output_tokens=500,
         pricing={"input": 2.5, "output": 10.0},   # NO cache multipliers
         usage_details={"cached_tokens": 4_096})
     # the full input at the full rate (the over-estimate, like master) —
@@ -204,7 +206,7 @@ def test_unpriced_inclusive_cache_degrades_to_upper_bound():
     assert round(rec["cost_usd"], 9) == round((6_000*2.5 + 500*10.0)/1e6, 9)
     totals = t.get_totals()
     assert totals["cost_incomplete"]
-    assert "gpt-4o" in totals["unpriced_cache_models"]
+    assert "qwen3.8:27b" in totals["unpriced_cache_models"]
 
 
 # the EXCLUSIVE semantics (anthropic) must not regress: input_tokens
@@ -233,7 +235,7 @@ def test_step_report_carries_unpriced_cache_models(tmp_path):
              "cost_incomplete": True,
              "unpriced_models": [],
              "cache_read": 5_000,
-             "unpriced_cache_models": ["gpt-4o"]}
+             "unpriced_cache_models": ["qwen3.8:27b"]}
     _orig = _sr._snapshot_usage
     _sr._snapshot_usage = lambda: (0.001, _snap)
     try:
@@ -245,7 +247,7 @@ def test_step_report_carries_unpriced_cache_models(tmp_path):
         assert _files, "no step report written"
         _rep = _json.loads(_files[0].read_text())
         _tu = _rep.get("token_usage", {})
-        assert _tu.get("unpriced_cache_models") == ["gpt-4o"], (
+        assert _tu.get("unpriced_cache_models") == ["qwen3.8:27b"], (
             "the cache-unpriced model is dropped from the step report "
             "(F661-2: #216's name-the-model broken for cache-only incompleteness)")
     finally:
@@ -256,34 +258,102 @@ def test_step_report_carries_unpriced_cache_models(tmp_path):
 # config/models.json is pinned — reverting any single model's cache rates
 # must fail here (the per-model data rows are guarded, not just sonnet's).
 def test_every_cache_rated_record_is_pinned():
+    """The #690 census pin: EVERY cache-rated record enumerated (the
+    census, 2026-10-20: 10 anthropic + 11 bedrock + 9 openai + 4 google
+    + 21 openrouter, the z-ai pair left UNRATED-with-reason — their
+    shipped base prices diverge from the route listing). Pinning the set
+    — not iterating whatever is present — is what makes a single record's
+    reversion FAIL here (the linkage demand: each data row is guarded).
+    The SHAPE contract per family: the two-sided families carry write
+    (the openai family's write is KNOWN at 1.0 — no premium on the
+    pre-5.6 models, OpenRouter's docs — never the one-sided absent
+    shape); the read-only family (google — no published write) must
+    NOT carry one."""
     import json as _json
     from pathlib import Path
     _cfg = _json.loads(
         (Path(__file__).resolve().parents[3] / "config" / "models.json").read_text())
     _rated = {rec["id"]: rec for rec in _cfg["models"]
               if isinstance(rec, dict) and isinstance(rec.get("cache"), dict)}
-    # the EXPECTED set (the census, 2026-09-21): the ten claude-family
-    # records. Pinning the set — not iterating whatever is present — is
-    # what makes a single record's reversion FAIL here (the linkage
-    # demand: each data row is guarded).
     _expected = {
-        "claude-fable-5", "claude-fable-5-1", "claude-haiku-4-5-20251001",
-        "claude-mythos-5", "claude-mythos-5-1", "claude-opus-4-7",
-        "claude-opus-4-8", "claude-opus-5", "claude-sonnet-4-6",
+        "anthropic.claude-fable-5",
+        "anthropic.claude-fable-5-1",
+        "anthropic.claude-opus-4-7",
+        "anthropic.claude-opus-5",
+        "anthropic.claude-sonnet-5",
+        "anthropic/claude-fable-5",
+        "anthropic/claude-fable-5.1",
+        "anthropic/claude-haiku-4.5",
+        "anthropic/claude-opus-4.7",
+        "anthropic/claude-opus-4.8",
+        "anthropic/claude-opus-5",
+        "anthropic/claude-sonnet-4.6",
+        "anthropic/claude-sonnet-5",
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-haiku-4-5-20251001",
+        "claude-mythos-5",
+        "claude-mythos-5-1",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-4-6",
         "claude-sonnet-5",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-pro",
+        "gemini-3.7-flash",
+        "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "global.anthropic.claude-opus-4-8",
+        "global.anthropic.claude-sonnet-4-6",
+        "google/gemini-2.5-flash",
+        "google/gemini-2.5-flash-lite",
+        "google/gemini-2.5-pro",
+        "google/gemini-3.7-flash",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o1",
+        "o3",
+        "o3-mini",
+        "o4-mini",
+        "openai/gpt-4.1",
+        "openai/gpt-4.1-mini",
+        "openai/gpt-4.1-nano",
+        "openai/gpt-4o",
+        "openai/gpt-4o-mini",
+        "openai/o1",
+        "openai/o3",
+        "openai/o3-mini",
+        "openai/o4-mini",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "us.anthropic.claude-opus-4-8",
+        "us.anthropic.claude-sonnet-4-6",
     }
     assert set(_rated) == _expected, (
         f"the cache-rated census changed: {set(_rated) ^ _expected}")
+    _read_only = {
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-pro",
+        "gemini-3.7-flash",
+    }
     for name, rec in _rated.items():
         _c = rec["cache"]
         assert isinstance(_c["read"], (int, float)) and _c["read"] > 0, name
-        assert "write" in _c, f"{name}: read without write (the anthropic shape has both)"
-        assert isinstance(_c["write"], (int, float)) and _c["write"] > 0, name
+        assert isinstance(_c.get("source"), str) and _c["source"].strip(), (
+            f"{name}: a rated record without a source receipt")
+        if name in _read_only:
+            assert _c.get("write") is None, (
+                f"{name}: the read-only shape gained a write")
+        else:
+            assert isinstance(_c["write"], (int, float)) and _c["write"] > 0, (
+                f"{name}: the two-sided shape lost its write")
 
 
-# The cache-delta pin (the linkage gate's demand): the step report's
-# cache_read delta + the snapshot's line items — reverting the copy loop
-# or the snapshot keys must fail here.
+
 def test_step_report_carries_cache_deltas(tmp_path):
     from core.step_report import step_context
     from core import step_report as _sr
@@ -323,15 +393,15 @@ def test_real_snapshot_carries_cache_line_items():
     from utilities.llm_client import get_global_tracker
     reset_tracking()
     t = get_global_tracker()
-    _gpt = pricing_map("openai")["gpt-4o"]  # priced, NO cache multipliers
+    _gpt = pricing_map("ollama")["qwen3.8:27b"]  # priced, NO cache multipliers
     t.record_call(
-        model="gpt-4o", input_tokens=100, output_tokens=10,
+        model="qwen3.8:27b", input_tokens=100, output_tokens=10,
         pricing=_gpt,  # the cache-unpriced path: cost_incomplete + the ids
         usage_details={"cached_tokens": 5_000, "cache_write_tokens": 2_000})
     _cost, snap = _snapshot_usage()
     assert snap.get("cache_read") == 5_000, "the snapshot drops cache_read"
     assert snap.get("cache_write") == 2_000, "the snapshot drops cache_write"
-    assert snap.get("unpriced_cache_models") == ["gpt-4o"], (
+    assert snap.get("unpriced_cache_models") == ["qwen3.8:27b"], (
         "the snapshot drops the cache-unpriced ids (F661-2's upstream)")
     assert snap.get("cost_incomplete") is True
     reset_tracking()
@@ -368,10 +438,10 @@ def test_usage_info_envelope_carries_cache_when_present():
     d = UsageInfo(total_calls=1, total_input_tokens=1_000,
                   total_cache_read_tokens=4_096,
                   total_cache_write_tokens=1_000,
-                  unpriced_cache_models=["gpt-4o"]).to_dict()
+                  unpriced_cache_models=["qwen3.8:27b"]).to_dict()
     assert d["total_cache_read_tokens"] == 4_096
     assert d["total_cache_write_tokens"] == 1_000
-    assert d["unpriced_cache_models"] == ["gpt-4o"]
+    assert d["unpriced_cache_models"] == ["qwen3.8:27b"]
 
 
 def test_usage_info_envelope_present_only_per_field():
@@ -383,8 +453,8 @@ def test_usage_info_envelope_present_only_per_field():
     assert read_only["total_cache_read_tokens"] == 4_096
     assert "total_cache_write_tokens" not in read_only
     assert "unpriced_cache_models" not in read_only
-    ids_only = UsageInfo(unpriced_cache_models=["gpt-4o"]).to_dict()
-    assert ids_only["unpriced_cache_models"] == ["gpt-4o"]
+    ids_only = UsageInfo(unpriced_cache_models=["qwen3.8:27b"]).to_dict()
+    assert ids_only["unpriced_cache_models"] == ["qwen3.8:27b"]
     assert "total_cache_read_tokens" not in ids_only
 
 
@@ -408,19 +478,20 @@ _GPT4O_NO_CACHE_RATES = {"input": 2.5, "output": 10.0}
 def test_unit_usage_separates_cache_unpriced_from_unpriced():
     t = TokenTracker()
     t.start_unit_tracking()
-    t.record_call(model="gpt-4o", input_tokens=6_000, output_tokens=500,
+    t.record_call(model="qwen3.8:27b", input_tokens=6_000, output_tokens=500,
                   pricing=_GPT4O_NO_CACHE_RATES,
                   usage_details={"cached_tokens": 4_096})
     u = t.get_unit_usage()
     # present-only (the pre-existing get_unit_usage discipline — the key was
     # never emitted empty): the pricing-unpriced kind is ABSENT here, and
-    # must certainly not name gpt-4o.
-    assert "gpt-4o" not in u.get("unpriced_models", []), (
-        "gpt-4o IS priced (input 2.5 / output 10.0) — only its CACHE rates "
+    # must certainly not name the priced exemplar.
+    assert "qwen3.8:27b" not in u.get("unpriced_models", []), (
+        "the exemplar IS priced (input 0.0 / output 0.0, the explicit-zero "
+        "ollama record) — only its CACHE rates "
         "are absent; naming it under unpriced_models is a false statement "
         "about a priced model, persisted into the checkpoint")
     assert "unpriced_models" not in u
-    assert u["unpriced_cache_models"] == ["gpt-4o"]
+    assert u["unpriced_cache_models"] == ["qwen3.8:27b"]
     assert u["cost_incomplete"] is True, (
         "the figure is still an upper bound — incompleteness must survive "
         "the split")
@@ -444,10 +515,10 @@ def test_enhance_metadata_does_not_call_a_priced_model_unpriced():
     (:350, :447, :524, :556, :600, :635) WITHOUT editing that file — it
     evaluates the literal expression those six sites use. After the split
     they read the pricing-unpriced set only, so agent_metadata stops
-    asserting 'gpt-4o has no pricing record'."""
+    asserting 'the exemplar has no pricing record'."""
     t = TokenTracker()
     t.start_unit_tracking()
-    t.record_call(model="gpt-4o", input_tokens=6_000, output_tokens=500,
+    t.record_call(model="qwen3.8:27b", input_tokens=6_000, output_tokens=500,
                   pricing=_GPT4O_NO_CACHE_RATES,
                   usage_details={"cached_tokens": 4_096})
     # the verbatim agent.py:447-449 expression
@@ -495,7 +566,7 @@ def test_resume_does_not_relabel_cache_unpriced_as_unpriced():
                    output_tokens=100, pricing=_SONNET_PRICING,
                    usage_details={"cache_read_input_tokens": 8_000,
                                   "cache_creation_input_tokens": 1_000})
-    t1.record_call(model="gpt-4o", input_tokens=6_000, output_tokens=500,
+    t1.record_call(model="qwen3.8:27b", input_tokens=6_000, output_tokens=500,
                   pricing=_GPT4O_NO_CACHE_RATES,
                   usage_details={"cached_tokens": 4_096})
     unit = t1.get_unit_usage()
@@ -508,7 +579,7 @@ def test_resume_does_not_relabel_cache_unpriced_as_unpriced():
         cost_usd=ckpt["cost_usd"],
         unpriced_models=ckpt.get("unpriced_models") or None)
     resumed = t2.get_totals()
-    assert "gpt-4o" not in resumed["unpriced_models"], (
+    assert "qwen3.8:27b" not in resumed["unpriced_models"], (
         "the resume persists a FALSE statement about a priced model")
     # the dollars were never the loss — pin that they still survive
     assert round(resumed["total_cost_usd"], 6) == round(ckpt["cost_usd"], 6)
@@ -551,7 +622,7 @@ def test_forward_compat_cache_ids_are_not_folded_into_unpriced_models():
     straight back into the relabel this fix removes."""
     future = {"input_tokens": 100, "output_tokens": 10, "cost_usd": 0.002,
               "cost_incomplete": True, "unpriced_models": [],
-              "unpriced_cache_models": ["gpt-4o"],
+              "unpriced_cache_models": ["qwen3.8:27b"],
               "cache_read_tokens": 4_096}
     t = TokenTracker()
     t.add_prior_usage(
@@ -559,7 +630,7 @@ def test_forward_compat_cache_ids_are_not_folded_into_unpriced_models():
         output_tokens=future["output_tokens"],
         cost_usd=future["cost_usd"],
         unpriced_models=future.get("unpriced_models") or None)
-    assert "gpt-4o" not in t.get_totals()["unpriced_models"]
+    assert "qwen3.8:27b" not in t.get_totals()["unpriced_models"]
 
 
 # FIX-4A, the regression the split would otherwise INTRODUCE.
@@ -609,7 +680,7 @@ def test_llr_checkpoint_record_keeps_cache_incompleteness_loud(tmp_path):
         def get_unit_usage(self):
             return {"input_tokens": 6_000, "output_tokens": 500,
                     "cost_usd": 0.02, "cost_incomplete": True,
-                    "unpriced_cache_models": ["gpt-4o"]}
+                    "unpriced_cache_models": ["qwen3.8:27b"]}
 
         def add_prior_usage(self, input_tokens, output_tokens, cost_usd,
                             unpriced_models=None, **kw):
@@ -620,16 +691,16 @@ def test_llr_checkpoint_record_keeps_cache_incompleteness_loud(tmp_path):
         {"units": [{"id": "a:f1", "unit_type": "function",
                     "code": {"primary_code": "pass"}}]},
         binding=PhaseBinding(phase="llm_reach", adapter=_Adapter(),
-                             model="gpt-4o", provider_name="openai"),
+                             model="qwen3.8:27b", provider_name="ollama"),
         checkpoint_path=cp, tracker=_Tracker())
     with open(_os.path.join(cp, "a_f1.json")) as fh:
         rec = _json.load(fh)
     assert rec["usage"].get("cost_incomplete") is True, (
         "the split must not LOSE the incompleteness flag the relabel used "
         "to carry — the record would read complete for a cache-unpriced unit")
-    assert rec["usage"].get("unpriced_cache_models") == ["gpt-4o"], (
+    assert rec["usage"].get("unpriced_cache_models") == ["qwen3.8:27b"], (
         "and it must say WHICH kind, so the record is not merely loud but true")
-    assert "gpt-4o" not in (rec["usage"].get("unpriced_models") or []), (
+    assert "qwen3.8:27b" not in (rec["usage"].get("unpriced_models") or []), (
         "while never relabelling the priced model as having no pricing record")
 
 
@@ -690,14 +761,14 @@ def test_report_path_marks_cache_unpriced_incomplete():
     figure was COMPLETE. That is the #598 masquerade."""
     from report.generator import _extract_usage
     details = {"cached_tokens": 4_096}
-    usage = _extract_usage(6_000, 500, "gpt-4o", usage_details=details,
+    usage = _extract_usage(6_000, 500, "qwen3.8:27b", usage_details=details,
                            pricing=_GPT4O_NO_CACHE_RATES)
     assert usage["cost_incomplete"] is True, (
         "the cached traffic fell back to the full input rate — the figure is "
         "an upper bound and must not read as complete")
-    assert usage["unpriced_cache_models"] == ["gpt-4o"]
-    assert "gpt-4o" not in (usage.get("unpriced_models") or []), (
-        "gpt-4o IS priced — the two kinds must not merge here either")
+    assert usage["unpriced_cache_models"] == ["qwen3.8:27b"]
+    assert "qwen3.8:27b" not in (usage.get("unpriced_models") or []), (
+        "the exemplar IS priced — the two kinds must not merge here either")
 
 
 def test_report_path_does_not_double_bill_inclusive_cache():
@@ -743,14 +814,14 @@ def test_merge_usage_aggregates_the_cache_line_items():
     merged = _merge_usage([
         {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110,
          "cost_usd": 0.001, "cache_read_tokens": 4_096,
-         "cost_incomplete": True, "unpriced_cache_models": ["gpt-4o"]},
+         "cost_incomplete": True, "unpriced_cache_models": ["qwen3.8:27b"]},
         {"input_tokens": 200, "output_tokens": 20, "total_tokens": 220,
          "cost_usd": 0.002, "cache_read_tokens": 1_000,
-         "cache_write_tokens": 500, "unpriced_cache_models": ["gemini-2.5-pro"]},
+         "cache_write_tokens": 500, "unpriced_cache_models": ["gemini-2.0-flash"]},
     ])
     assert merged["cache_read_tokens"] == 5_096
     assert merged["cache_write_tokens"] == 500
-    assert merged["unpriced_cache_models"] == ["gemini-2.5-pro", "gpt-4o"]
+    assert merged["unpriced_cache_models"] == ["gemini-2.0-flash", "qwen3.8:27b"]
     assert merged["cost_incomplete"] is True
 
 
@@ -772,13 +843,13 @@ def test_usage_to_info_carries_cache_line_items():
         "input_tokens": 6_000, "output_tokens": 500, "total_tokens": 6_500,
         "cost_usd": 0.02, "completions": 1, "cost_incomplete": True,
         "cache_read_tokens": 4_096, "cache_write_tokens": 1_000,
-        "unpriced_cache_models": ["gpt-4o"]})
+        "unpriced_cache_models": ["qwen3.8:27b"]})
     assert info.total_cache_read_tokens == 4_096
     assert info.total_cache_write_tokens == 1_000
-    assert info.unpriced_cache_models == ["gpt-4o"]
+    assert info.unpriced_cache_models == ["qwen3.8:27b"]
     assert info.cost_incomplete is True
     # and the envelope stays present-only (FIX-1 interop)
-    assert info.to_dict()["unpriced_cache_models"] == ["gpt-4o"]
+    assert info.to_dict()["unpriced_cache_models"] == ["qwen3.8:27b"]
 
 
 def test_usage_to_info_without_cache_is_the_pre_626_envelope():
@@ -848,11 +919,11 @@ def test_summary_path_tracker_and_report_result_agree():
     from core.reporter import _usage_to_info
     from report.generator import _extract_usage
     details = {"cached_tokens": 4_096}
-    usage = _extract_usage(6_000, 500, "gpt-4o", usage_details=details,
+    usage = _extract_usage(6_000, 500, "qwen3.8:27b", usage_details=details,
                            pricing=_GPT4O_NO_CACHE_RATES)
     info = _usage_to_info(usage)
     t = TokenTracker()
-    t.record_call(model="gpt-4o", input_tokens=usage["input_tokens"],
+    t.record_call(model="qwen3.8:27b", input_tokens=usage["input_tokens"],
                   output_tokens=usage["output_tokens"],
                   pricing=_GPT4O_NO_CACHE_RATES,
                   usage_details=usage.get("usage_details"),
@@ -861,7 +932,7 @@ def test_summary_path_tracker_and_report_result_agree():
     assert round(totals["total_cost_usd"], 6) == round(info.total_cost_usd, 6)
     assert totals["cost_incomplete"] == info.cost_incomplete is True
     assert (totals.get("unpriced_cache_models")
-            == info.unpriced_cache_models == ["gpt-4o"])
+            == info.unpriced_cache_models == ["qwen3.8:27b"])
     assert (totals.get("total_cache_read_tokens")
             == info.total_cache_read_tokens == 4_096)
 
@@ -889,45 +960,55 @@ def test_summary_path_tracker_and_report_result_agree():
 #     the cache ids.
 # ---------------------------------------------------------------------------
 
-_BEDROCK_SONNET = pricing_map("bedrock")["us.anthropic.claude-sonnet-4-6"]
-_GPT4O = pricing_map("openai")["gpt-4o"]
+# the unpriced fixtures went LITERAL at #690 (the shipped bedrock/openai census
+# is rated now); the class the formula still serves: the still-unrated records
+# (ollama, the unpublished-cache google 2.0/1.5) and any future unrated record.
+_BEDROCK_SONNET = {"input": 3.3, "output": 16.5}   # the bedrock sonnet shape, unrated
+_GPT4O = {"input": 2.5, "output": 10.0}           # the gpt-4o shape, unrated
 
 
 def test_exclusive_unpriced_cache_underreports_and_inclusive_overreports():
     """F1's executable oracle: the two shapes err in OPPOSITE directions, so
-    no single-direction label can be true of both.
+    no single-direction label can be true of both. Re-pinned at #690 (the
+    bedrock/openai/google/openrouter census is now RATED): the oracle runs
+    on LITERAL unpriced records — the class the formula still serves (the
+    shipped unrated census: the ollama records and the unpublished-cache
+    google 2.0/1.5 models; any future unrated record).
 
-    EXCLUSIVE (bedrock, priced, no cache block — 11/11 of the shipped
-    bedrock census): the cached tokens are disjoint from input_tokens and
-    contribute $0 ⇒ the reported figure is BELOW the real bill (a LOWER
-    bound). INCLUSIVE (gpt-4o, priced, no cache block): the cached tokens
-    are already inside input_tokens and bill at the full input rate ⇒ the
+    EXCLUSIVE (a literal anthropic-shaped record, no cache block): the
+    cached tokens are disjoint from input_tokens and contribute $0 — the
+    reported figure is BELOW the real bill (a LOWER bound). INCLUSIVE (a
+    literal openai-shaped record, no cache block): the cached tokens are
+    already inside input_tokens and bill at the full input rate — the
     reported figure is ABOVE the real bill (an UPPER bound).
     """
     from utilities.llm_client import normalize_cache_usage, price_usage
 
-    # --- exclusive: anthropic/bedrock ---
-    excl = price_usage(10_000, 1_000, _BEDROCK_SONNET,
+    _EXCL_LITERAL = {"input": 3.3, "output": 16.5}   # the bedrock sonnet shape, unrated
+    _INCL_LITERAL = {"input": 2.5, "output": 10.0}   # the gpt-4o shape, unrated
+
+    # --- exclusive: the anthropic/bedrock field shape ---
+    excl = price_usage(10_000, 1_000, _EXCL_LITERAL,
                        cache_counts=normalize_cache_usage(
                            {"cache_read_input_tokens": 90_000}))
-    real_excl = ((10_000 / 1e6) * _BEDROCK_SONNET["input"]
-                 + (1_000 / 1e6) * _BEDROCK_SONNET["output"]
-                 + (90_000 / 1e6) * _BEDROCK_SONNET["input"] * 0.1)
+    real_excl = ((10_000 / 1e6) * _EXCL_LITERAL["input"]
+                 + (1_000 / 1e6) * _EXCL_LITERAL["output"]
+                 + (90_000 / 1e6) * _EXCL_LITERAL["input"] * 0.1)
     assert excl.unpriced_cache is True
     assert excl.cost_usd < real_excl, (
         "the exclusive shape's unpriced cache tokens contribute $0 — the "
         "figure CANNOT be an upper bound")
     assert round(excl.cost_usd / real_excl, 3) == 0.625
 
-    # --- inclusive: openai ---
-    incl = price_usage(10_000, 1_000, _GPT4O,
+    # --- inclusive: the openai/google/openrouter field shape ---
+    incl = price_usage(10_000, 1_000, _INCL_LITERAL,
                        cache_counts=normalize_cache_usage(
                            {"cached_tokens": 8_000}))
-    # the real bill if gpt-4o's documented 0.5x read multiplier were
+    # the real bill if the record's documented 0.5x read multiplier were
     # configured: the 8 000 cached tokens at half the input rate.
-    real_incl = ((2_000 / 1e6) * _GPT4O["input"]
-                 + (1_000 / 1e6) * _GPT4O["output"]
-                 + (8_000 / 1e6) * _GPT4O["input"] * 0.5)
+    real_incl = ((2_000 / 1e6) * _INCL_LITERAL["input"]
+                 + (1_000 / 1e6) * _INCL_LITERAL["output"]
+                 + (8_000 / 1e6) * _INCL_LITERAL["input"] * 0.5)
     assert incl.unpriced_cache is True
     assert incl.cost_usd > real_incl, (
         "the inclusive shape's unpriced cache tokens bill at the full input "
