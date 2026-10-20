@@ -112,7 +112,7 @@ CACHE_READ_FIELDS_EXCLUSIVE = ("cache_read_input_tokens",)      # anthropic / be
 CACHE_READ_FIELDS_INCLUSIVE = ("cached_tokens",                 # openai / openrouter
                                "cached_content_token_count")    # google
 CACHE_WRITE_FIELDS_EXCLUSIVE = ("cache_creation_input_tokens",)  # anthropic / bedrock
-CACHE_WRITE_FIELDS_INCLUSIVE = ("cache_write_tokens",)           # openrouter (inside prompt_tokens)
+CACHE_WRITE_FIELDS_INCLUSIVE = ("cache_write_tokens",)           # openrouter (inside prompt_tokens — the OpenAI-normalized usage shape: OpenRouter's usage-object docs (openrouter.ai/docs/features/prompt-caching, fetched 2026-10-20) show cache_write_tokens in prompt_tokens_details, the same inclusive shape as OpenAI's cached_tokens)
 # the union (the captured-verbatim normalization, unchanged)
 CACHE_READ_FIELDS = CACHE_READ_FIELDS_EXCLUSIVE + CACHE_READ_FIELDS_INCLUSIVE
 CACHE_WRITE_FIELDS = CACHE_WRITE_FIELDS_EXCLUSIVE + CACHE_WRITE_FIELDS_INCLUSIVE
@@ -150,7 +150,8 @@ class PricedUsage(NamedTuple):
     #: the run is incomplete. The DIRECTION the figure errs in depends on the
     #: provider's field shape and is OPPOSITE for the two (PR#661 hunt F1 —
     #: the round-1 label asserted "an UPPER bound" for both, which was false
-    #: for 11 of the 11 shipped bedrock records):
+    #: for the ENTIRE shipped bedrock census at the #661 pin — pre-#690
+    #: the bedrock family carried no cache rates; #690 rated all 11):
     #:
     #:   EXCLUSIVE shapes (anthropic/bedrock ``cache_read_input_tokens`` /
     #:     ``cache_creation_input_tokens``) are DISJOINT from ``input_tokens``,
@@ -306,7 +307,7 @@ def price_usage(
     # input_tokens — subtract it from the billed input (it prices at its
     # own multiplier below, never twice). T1 round-2 (F-A): subtract ONLY
     # the portion that actually prices at a multiplier — an unpriced
-    # inclusive cache (the shipped census: no openai/google cache rates)
+    # inclusive cache (the #661-era census had no openai/google rates; the post-#690 unrated class: the ollama records, the unpublished-cache google 2.0/1.5 models, the divergent-price z-ai routes)
     # must degrade to the FULL-RATE upper bound (master's direction,
     # over-estimate + cost_incomplete), never to a $0 under-report of the
     # cached tokens.
@@ -316,11 +317,21 @@ def price_usage(
     if counts.write_incl and "cache_write" in pricing:
         _incl_priced += counts.write_incl
     _billed_input = input_tokens - _incl_priced
+    unpriced_side = False
     if _billed_input < 0:
         _billed_input = 0
+        # the fable-r1 overlap catch (the OpenRouter->Google explicit-cache
+        # shape reports the SAME tokens as both cached_tokens AND
+        # cache_write_tokens, live-verified: prompt=5137, cached=5132,
+        # write=5132 — the subtraction clamps away the whole uncached
+        # remainder, silently under-reporting min(uncached, overlap) x
+        # the input rate with cost_incomplete=False). Unreachable from
+        # OpenAnt today (no explicit-cache breakpoints are ever sent),
+        # but priced-complete since #690 — mark the run INCOMPLETE so the
+        # shape is loud, never silently under-reported.
+        unpriced_side = True
     total_cost = ((_billed_input / 1_000_000) * pricing["input"]
                   + (output_tokens / 1_000_000) * pricing["output"])
-    unpriced_side = False
     if counts.any:
         # #626: the cache portion, priced at its own multipliers of the
         # base input rate. T8 fix (2026-09-21, the retro probe): each side
