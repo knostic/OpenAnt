@@ -2060,6 +2060,15 @@ def _write_scan_report(
         if _STATUS_RANK.get(_st, 0) > _STATUS_RANK.get(_worst_status, 0):
             _worst_status = _st
     _all_errors = [e for sr in step_reports for e in sr.get("errors", [])]
+    # #742: the per-step incomplete counts (step summaries carrying
+    # ``incomplete_count > 0``), for the present-only ``steps_incomplete``
+    # surfacing beside the aggregate status below — the same well-typed
+    # int the step_report derivation degrades ``partial`` on.
+    _steps_incomplete = {}
+    for _sr in step_reports:
+        _ic = (_sr.get("summary") or {}).get("incomplete_count")
+        if isinstance(_ic, int) and _ic > 0:
+            _steps_incomplete[str(_sr.get("step"))] = _ic
     total_input = sum(
         sr.get("token_usage", {}).get("input_tokens", 0) for sr in step_reports
     )
@@ -2100,6 +2109,16 @@ def _write_scan_report(
             # ADDITIVE / non-breaking: disambiguated skip cause per step.
             # `steps_skipped` above stays a flat bare list (consumers read it).
             "steps_skipped_reasons": result.skipped_step_reasons,
+            # #742: WHAT was incomplete, next to the degraded status — a
+            # step whose summary carried ``incomplete_count > 0`` (the
+            # enhancer's iteration-limit discard class, #730) surfaces its
+            # count here so the aggregate names the degraded dimension, not
+            # only that the worst-per-step rule ranked it. Present-only
+            # (added only when at least one step reported incompletes): a
+            # clean scan's summary gains no new key — additive/non-breaking
+            # for every consumer of the dict.
+            **({"steps_incomplete": _steps_incomplete}
+               if _steps_incomplete else {}),
             # Multi-language coverage + which path supplied the security model.
             # Previously omitted here, so a merged/degraded scan and a
             # single-language clean one produced indistinguishable reports.
