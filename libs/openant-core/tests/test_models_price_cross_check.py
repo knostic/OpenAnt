@@ -169,14 +169,11 @@ def _cache_disagreements(records):
 def test_same_family_cache_multipliers_agree_across_providers():
     """The cache analogue of the #344 price row.
 
-    HONEST SCOPE NOTE: the shipped census has ZERO cache-comparable families
-    today — #344's rule puts the cache block on the anthropic record only, so
-    every one of the 8 cache-carrying families has exactly one such record
-    (the bedrock/openrouter siblings carry none). This row therefore guards
-    the FUTURE: it goes live the moment a second provider is given cache
-    rates, which is exactly when a 4x divergence could ship unnoticed. Its
-    checker is proven to fire by the next test, so a green here is "no
-    disagreement", never "nothing was compared".
+    LIVE SINCE #690 + #648: the 4.5/4.6-generation census made the
+    bare/dated pairs (claude-opus-4-5 + its dated spelling, etc.) both
+    carry cache blocks — the row is live and a green here is a real
+    "no disagreement" among the intra-family pairs (the dated spellings
+    normalise to the bare family and all agree at 0.1/1.25).
     """
     conf = find_models_config()
     assert conf is not None, "config/models.json not locatable"
@@ -223,13 +220,12 @@ def test_every_priced_spelling_carries_its_own_familys_cache_multiplier():
     """The alias row — the non-vacuous half of N-A2b.
 
     `pricing_map` pass 2 assigns the SAME entry object to every alias
-    spelling, cache multipliers included. The shipped anthropic map has 17
-    keys, 7 of them aliases carrying `cache_read` (claude-fable-5.1,
-    claude-haiku-4-5, claude-haiku-4.5, claude-mythos-5.1, claude-opus-4.7,
-    claude-opus-4.8, claude-sonnet-4.6). Each must carry the multiplier of a
-    record in ITS OWN family — if the alias normalisation ever merged the
-    0.025x exception pair with its 0.1x sibling, cached reads would misprice
-    4x with no marker.
+    spelling, cache multipliers included. The post-#648 anthropic map has 25
+    keys, 9 of them aliases carrying `cache_read` (the dotted 4.5/4.6 forms
+    + the existing 4.7/4.8/haiku/mythos set). Each must carry the multiplier
+    of a record in ITS OWN family — if the alias normalisation ever merged
+    the 0.025x exception pair with its 0.1x sibling, cached reads would
+    misprice 4x with no marker.
     """
     conf = find_models_config()
     data = json.loads(conf.read_text(encoding="utf-8"))
@@ -256,7 +252,8 @@ def test_every_priced_spelling_carries_its_own_familys_cache_multiplier():
                 checked += 1
     # the census, asserted so a normalisation change that DROPS alias keys
     # cannot quietly shrink this row to nothing
-    assert checked == 17, f"expected 17 cache-carrying priced keys, got {checked}"
+    # #648: +8 keys (the 4 new records + their alias spellings in the map)
+    assert checked == 25, f"expected 25 cache-carrying priced keys, got {checked}"
 
 
 def test_the_documented_cache_exception_pair_is_exactly_two_models():

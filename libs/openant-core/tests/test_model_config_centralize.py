@@ -182,10 +182,26 @@ _EXPECTED_ANTHROPIC_CURRENT = {
     "claude-mythos-5": {"input": 10.00, "output": 50.00},
     "claude-mythos-5-1": {"input": 10.00, "output": 50.00},
     "claude-opus-4-7": {"input": 5.00, "output": 25.00},
+    # #648: the 4.5-generation census + the opus-4-6 status flip — every
+    # rate independently sourced (Anthropic's live pricing page + the live
+    # OpenRouter catalogue, both fetched 2026-10-20, both agreeing).
+    "claude-opus-4-5": {"input": 5.00, "output": 25.00},
+    "claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
+    # #648: the dated snapshot spellings (their own records; the #434
+    # alias machinery also resolves them)
+    "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00},
+    "claude-sonnet-4-5-20250929": {"input": 3.00, "output": 15.00},
+    # #648: the liveness dispute RESOLVED (the page's priced row + the
+    # SDK literal + the OpenRouter listing)
+    "claude-opus-4-6": {"input": 5.00, "output": 25.00},
+    # #648 (the opus-r1 catch): the bare haiku-4-5 spelling — an SDK
+    # literal the census was missing; same rate as the dated form
+    "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
 }
 _RETIRED_OR_UNKNOWN_ANTHROPIC = {
     "claude-opus-4-20250514",
-    "claude-opus-4-6",
+    # #648: claude-opus-4-6 moved to _EXPECTED_ANTHROPIC_CURRENT (the
+    # liveness dispute resolved — the page prices it, the SDK carries it)
     "claude-sonnet-4-20250514",
     # #610: SDK-listed with NO published price row on Anthropic's page —
     # deliberately unpriced (the registry's unknown/null form); pinned

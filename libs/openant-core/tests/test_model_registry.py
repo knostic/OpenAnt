@@ -86,7 +86,9 @@ def test_pricing_map_omits_null_priced_models():
     """A null-priced (retired/unknown) model is ABSENT from the map, not $0."""
     anthropic = mr.pricing_map("anthropic")
     assert anthropic["claude-opus-4-8"]["input"] > 0
-    for retired in ("claude-opus-4-6", "claude-sonnet-4-20250514", "claude-opus-4-20250514"):
+    # #648: claude-opus-4-6 became a PRICED current record; the null-priced
+    # exemplar set uses only the records that are still null
+    for retired in ("claude-sonnet-4-20250514", "claude-opus-4-20250514"):
         assert retired not in anthropic, (
             f"{retired} is null-priced and must be omitted from pricing_map, "
             f"never emitted as a zero dict")

@@ -267,9 +267,21 @@ def test_every_cache_rated_record_is_pinned():
     # what makes a single record's reversion FAIL here (the linkage
     # demand: each data row is guarded).
     _expected = {
-        "claude-fable-5", "claude-fable-5-1", "claude-haiku-4-5-20251001",
-        "claude-mythos-5", "claude-mythos-5-1", "claude-opus-4-7",
-        "claude-opus-4-8", "claude-opus-5", "claude-sonnet-4-6",
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-20251001",
+        "claude-mythos-5",
+        "claude-mythos-5-1",
+        "claude-opus-4-5",
+        "claude-opus-4-5-20251101",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-5-20250929",
+        "claude-sonnet-4-6",
         "claude-sonnet-5",
     }
     assert set(_rated) == _expected, (
