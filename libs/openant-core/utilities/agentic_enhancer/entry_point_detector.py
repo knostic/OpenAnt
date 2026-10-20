@@ -93,6 +93,84 @@ ENTRY_POINT_DECORATORS = [
     # CLI
     r'@click\.(command|group)',
     r'@app\.command',
+    # #836: task-queue / event-dispatch handler idioms — the framework, not
+    # a route, is the invoker: Celery's @shared_task and the app-bound
+    # @app.task / @celery.task / @celery_app.task registrations, and
+    # Django's signal @receiver. The dispatcher lives outside the parsed
+    # repo, so the call graph records no inbound edge and the handler's
+    # whole subtree falls out of reachability at --level reachable
+    # (executed in #836: the mixed-fixture differential — the same body
+    # under @app.route analyzed, under @shared_task pruned as an orphan
+    # indistinguishable from dead code). Idiom-set membership of the same
+    # kind this list already grants @app.route.
+    #
+    # The receiver pattern requires the CALL form — Django's @receiver
+    # always takes the signal argument (@receiver(post_save, ...)), and
+    # the bare name would over-match the @receiver.setter/@receiver.deleter
+    # property idiom and any 'receiver' token inside a decorator's own
+    # argument text (the JS/TS extractor attaches a class's full decorator
+    # source — template strings included — to every method row). A FALSE
+    # seed is not budget-only: the FIRST seed in a repo flips the loud
+    # zero-seed keep-all net (parser_adapter) to a narrow prune, so a
+    # fabricated seed silently prunes units the net previously kept — the
+    # patterns stay pinned to the exact idiom forms for that reason.
+    # The optional qualifier admits @dispatch.receiver(...); with
+    # IGNORECASE the same form matches NGXS's @Receiver({...}) — a real
+    # dispatch handler, over-seeded by the same (defensible) channel: the
+    # lists are not language-scoped.
+    # The task patterns carry a BOUNDARY LOOKAHEAD (?=\(|\s+@|\s*$) (the
+    # astra-r1 + fable-r3 + astra-r2 + astra-r3 catches): the JS/TS
+    # extractor attaches a class's full decorator source — template
+    # strings included — to every method row, and arg-text tokens like
+    # 'info@shared_task.example.com' (the astra-r1 differential: the
+    # unrelated unit silently pruned with no keep-all warning),
+    # 'info@shared_task-jobs.example.com' / '@celery.task:' (the fable-r3
+    # differential), 'Contact @app.task team' (the astra-r2 counterexample),
+    # or 'Contact @app.task (support)' / 'Contact @app.task@support' (the
+    # astra-r3 shapes: the real call form has NO space before '(', and the
+    # real stacked join ALWAYS has whitespace before '@') would otherwise
+    # fabricate seeds. The lookahead accepts exactly the real forms — the
+    # call form '(' immediately after the token, the per-decorator
+    # join-whitespace followed by the next decorator's '@', the bare
+    # decorator at string end — and rejects every dot/hyphen/colon/slash/
+    # plural continuation and the mid-text prose/space-call/zero-space-@
+    # shapes.
+    #
+    # THE EXPLICIT ACCEPTANCE (the astra-r3/r4/r5 demands — no impossibility
+    # claim, every residual named with its cost): THREE matching contexts
+    # remain inside decorator ARGUMENT TEXT, each byte-shape-identical to
+    # a REAL form's matching context (the complete input differs, the
+    # matching context does not — these local SUFFIX lookaheads cannot
+    # distinguish the contexts: a string-ANCHORED pattern could reject
+    # the forged mid-string shapes, but it would reject the real
+    # stacked-join form too, so the acceptance below stands on its
+    # cost-benefit, never on a claim of impossibility):
+    #   * the immediate-call context — 'Contact @app.task(support)' —
+    #     byte-identical to the real call form '@app.task(...)';
+    #   * the whitespace-'@' context — 'Contact @app.task @support' —
+    #     byte-identical to the real stacked join;
+    #   * the exact-end context — a token at the joined string's end —
+    #     byte-identical to the real bare form's end.
+    # Each fabricates a seed whose COST IS NAMED: a false FIRST seed
+    # suppresses the zero-seed keep-all net and SILENTLY PRUNES every
+    # unit the net previously kept loud (the astra executed
+    # differentials). Accepted DELIBERATELY: the idiom membership this
+    # list grants is worth the rare forged seed; the channel is
+    # PRE-EXISTING extractor infrastructure the base patterns already
+    # carry ('info@api.example.com' seeds at BASE via
+    # '@(api|v1|router)\.\w'), so the new patterns expose nothing the
+    # base list does not already ship; the channel's REPAIR (the
+    # extractor not attaching class-decorator argument text to method
+    # rows, or language-scoped lists) is a bigger semantic change than
+    # this issue's ask and belongs to its own change. The Python
+    # extractor strips decorator arguments ('@x(...)'), so python rows
+    # cannot carry the channel. The receiver pattern needs no lookahead:
+    # its call form already rejects every continuation.
+    r'@shared_task(?=\(|\s+@|\s*$)',
+    r'@app\.task(?=\(|\s+@|\s*$)',
+    r'@celery\.task(?=\(|\s+@|\s*$)',
+    r'@celery_app\.task(?=\(|\s+@|\s*$)',
+    r'@(?:\w+\.)?receiver\s*\(',
     # JavaScript/TypeScript (as comments or decorators)
     r'@(Get|Post|Put|Delete|Patch)\(',
     r'@Controller\(',
@@ -376,6 +454,22 @@ class EntryPointDetector:
         # is reachability-safe.
         elif func_data.get('name') == 'main':
             reasons.append('name:main')
+
+        # Check 1b-2 (#836): the AWS Lambda handler NAMING convention — the
+        # platform's default configuration invokes
+        # `def lambda_handler(event, context)` as the deployment's entry
+        # point. A handler's body typically matches no user-input pattern
+        # (the event-dict read is not one), so the name rule is the only
+        # seed route. Idiom-set membership of the same kind Check-1b grants
+        # `main` (also a naming convention, not a configured guarantee),
+        # never a claim that every function with the name is externally
+        # invoked. Exact-match on the row's bare `name` field: python/ruby/
+        # php rows carry the bare name (a method named lambda_handler seeds
+        # — defensible over-seed), while the JS/TS rows carry
+        # `Class.method`, so the convention does not fire there (a
+        # cross-language asymmetry of the name field, documented).
+        if func_data.get('name') == 'lambda_handler':
+            reasons.append('name:lambda_handler')
 
         # Check 1c: A PHP 8 routing attribute (#[Route]/#[Get]/#[Post]/...) marks
         # the method as a route handler INDEPENDENT of the class name. Symfony /
