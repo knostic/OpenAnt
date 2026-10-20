@@ -3,7 +3,7 @@ anthropic[bedrock]==1.15.0
 openai==3.35.1
 google-genai==2.31.0
 anyio==4.15.1
-certifi==2026.10.18
+certifi==2026.10.19
 distro==1.9.0
 docstring_parser==0.18.0
 h11==0.16.0
