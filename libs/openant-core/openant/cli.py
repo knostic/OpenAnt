@@ -121,6 +121,36 @@ def _severity_source_for_result(result: dict, displayed_verdict: str = None) -> 
     return src if src in ("corrected", "derived") else "derived"
 
 
+def _deferred_edges(unit: dict) -> list:
+    """#745: the unit's dataset call edges, BOTH directions, as id strings.
+
+    The delegation-dismissed SAFE row's concern went elsewhere — and the
+    corpus's delegations go UP ("the actual open-redirect risk exists at the
+    callers": the row's direct_callers) and DOWN ("the dangerous operation
+    lives in a helper this unit calls": direct_calls). Both edge sets are the
+    followable ones (the same ids the result rows key on), so the row carries
+    the union, deduped, order-stable.
+
+    The #305 convention ("never a crash"): a malformed dataset entry —
+    metadata not a dict, direct_calls/direct_callers not a list — reads as no
+    edge, never a TypeError and never a char-split of a string value (the
+    dataset is parser-produced, but the read is guarded like every other
+    boundary the row build performs).
+    """
+    meta = unit.get("metadata") if isinstance(unit, dict) else None
+    if not isinstance(meta, dict):
+        return []
+    out: list = []
+    for key in ("direct_calls", "direct_callers"):
+        vals = meta.get(key)
+        if isinstance(vals, list):
+            # only STRING ids (what the parsers emit): a malformed element
+            # (None, a bool, a dict) is dropped, never str()-cast into a
+            # phantom id that renders as an edge.
+            out.extend(c for c in vals if isinstance(c, str))
+    return list(dict.fromkeys(out))
+
+
 def _unit_start_line(unit: dict) -> int:
     """#305 (the adjacent finding in the issue comment): the parsers emit
     ``start_line`` inside ``code.primary_origin`` and it survives
@@ -1125,6 +1155,36 @@ def cmd_checkpoint_status(args):
         return 2
 
 
+def _unrecognized_verdict_rows(findings, verdict_order):
+    """#679: the off-enum rows — a verdict matching no canonical group
+    (and NOT the canonical 'error' spelling, which Stage-1 stamps for
+    analysis failures — those are RECOGNIZED). They were dropped entirely
+    (the omission surface of the false-clean); a local ERROR display
+    group makes them visible without touching the enum."""
+    known = set(verdict_order) | {"error"}
+    return [f for f in findings if f.get("verdict") not in known]
+
+
+def _remediation_for_unrecognized(actionable, error_rows):
+    """#679: the honest remediation message — the false-clean text is
+    suppressed when unclassifiable rows exist (either the canonical
+    error verdict or an off-enum spelling)."""
+    if not actionable and not error_rows:
+        return "<p>No vulnerabilities or security concerns found. All code units are either safe or properly protected.</p>"
+    if not actionable and error_rows:
+        n_err = sum(1 for f in error_rows if f.get("verdict") == "error")
+        n_unknown = len(error_rows) - n_err
+        parts = []
+        if n_err:
+            parts.append(f"{n_err} errored")
+        if n_unknown:
+            parts.append(f"{n_unknown} with an unrecognized verdict")
+        return ("<p>No actionable findings, but "
+                f"{', '.join(parts)} unit(s) were not classified. "
+                "Review them manually.</p>")
+    return None  # the actionable path takes the LLM call
+
+
 def cmd_report_data(args):
     """Prepare pre-computed report data as JSON for the Go HTML renderer.
 
@@ -1211,6 +1271,15 @@ def cmd_report_data(args):
 
             # --- Prepare findings ---
             units_by_id = {u["id"]: u for u in dataset.get("units", [])}
+            # #745: the scan's row keys — a delegation-dismissed SAFE row's
+            # named callees are checked against THIS set so the evaporation
+            # case (a pruned or absent sink-owner: no result row anywhere)
+            # is surfaced on the row instead of lost in the reasoning prose.
+            _scan_route_keys = {
+                str(r.get("route_key", ""))
+                for r in experiment.get("results", [])
+                if isinstance(r, dict)
+            }
 
             verdict_order = list(FINDING_VERDICT_ORDER)
             verdict_colors = {
@@ -1283,6 +1352,19 @@ def cmd_report_data(args):
                     dt_status = dt_result.get("status", "")
                     dt_details = dt_result.get("details", "")
 
+                # #745: the delegation-dismissed SAFE row's followable edge.
+                # The analysis scope is function-local by construction
+                # ("ANALYZE THIS FUNCTION ONLY"), so a SAFE row whose
+                # dangerous operation lives elsewhere names its edge units
+                # HERE — the dataset's call edges in BOTH directions (the
+                # corpus's delegations go UP: the risk at the callers; and
+                # DOWN: the danger in a callee), the same ids the result rows
+                # key on — instead of losing the edge in the reasoning prose;
+                # and a named edge unit with no result row (pruned by the
+                # reachability filter or never analyzed) is surfaced as
+                # rowless, so the evaporation case is distinguishable from
+                # an examined-and-safe one.
+                _deferred = _deferred_edges(unit)
                 findings.append({
                     "verdict": verdict,
                     "verdict_color": verdict_colors.get(verdict, "#6c757d"),
@@ -1301,6 +1383,11 @@ def cmd_report_data(args):
                     "dynamic_test_details": dt_details,
                     "start_line": _unit_start_line(unit),
                     "number": 0,  # assigned after sort
+                    **({"scope": "function_local",
+                        "deferred_to": _deferred,
+                        "deferred_rowless": [
+                            c for c in _deferred if c not in _scan_route_keys]}
+                       if verdict == "safe" else {}),
                 })
 
             # Sort by verdict priority, then by dynamic test status within each group
@@ -1320,6 +1407,22 @@ def cmd_report_data(args):
             ]
 
             findings_by_verdict = []
+            # #679: the assembly + the message live in the testable helper
+            # #679 (the T1 round): the visible-not-classified group carries
+            # BOTH the canonical error rows and the off-enum spellings —
+            # the wording distinguishes them (the html_report.py convention).
+            _error_group = ([f for f in findings if f.get("verdict") == "error"]
+                            + _unrecognized_verdict_rows(findings, verdict_order))
+            if _error_group:
+                findings_by_verdict.append({
+                    "verdict": "error",
+                    "verdict_color": "#6c42f5",
+                    "count": len(_error_group),
+                    "open_by_default": True,
+                    "findings": _error_group,
+                    "subgroups": [],
+                    "has_subgroups": False,
+                })
             for v in verdict_order:
                 group = [f for f in findings if f["verdict"] == v]
                 if not group:
@@ -1373,8 +1476,9 @@ def cmd_report_data(args):
             # --- Remediation guidance (LLM call) ---
             actionable = [f for f in findings if f["verdict"] in ("vulnerable", "bypassable", "inconclusive")]
 
-            if not actionable:
-                remediation_html = "<p>No vulnerabilities or security concerns found. All code units are either safe or properly protected.</p>"
+            _msg = _remediation_for_unrecognized(actionable, _error_group)
+            if _msg is not None:
+                remediation_html = _msg
             else:
                 # attack_vector and analysis are untrusted Stage-1/2 LLM output.
                 # Interpolated raw they could inject prompt instructions (or a

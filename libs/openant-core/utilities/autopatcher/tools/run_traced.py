@@ -862,6 +862,22 @@ def main(argv: "list[str] | None" = None) -> int:
                 ("Cost", f"${usage_dict['total_cost_usd']:.2f}"),
             ],
         )
+        # #786: the completeness footnote — deliberately OUTSIDE the scraped
+        # rows: run_cve_batch's parse_trace_summary matches the anchored
+        # `^Cost\s+\$...` line, so the marker must live on its own line
+        # (a marker inside the Cost row would break the batch's own parser
+        # and silently drop that case's dollars from the batch total).
+        from core.tracking import cost_marker
+        import utilities.autopatcher.progress as progress
+        _unpriced = usage_dict.get('unpriced_models') or []
+        if cost_marker(usage_dict) and not progress.is_quiet():
+            # the same suppression contract as the summary itself; the
+            # count matches the helper's rendering (1 when the list is
+            # empty but the flag is set)
+            print(f"Cost completeness: incomplete — "
+                  f"{max(len(_unpriced), 1)} unpriced "
+                  f"model(s); the Cost above is an under-count",
+                  file=sys.stderr)
     return 0
 
 

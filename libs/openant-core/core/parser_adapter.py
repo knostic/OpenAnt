@@ -596,6 +596,12 @@ def apply_reachability_filter(
             "filtered_out": 0,
             "reduction_percentage": 0,
             "warning": warning,
+            # #738: WHICH seeding mode this filter ran with — the artifact
+            # must explain a coverage delta between two scans of the same
+            # repo (the classification lottery can flip the derived mode
+            # across runs; the operator diffing datasets needs the mode in
+            # the metadata, not only in a step report).
+            "library_mode": bool(library_mode),
         }
         # #520: the seed-class counts on BOTH branches — the keep-all record
         # must not read as "no signal" when synthetic-only seeding was the cause.
@@ -657,6 +663,8 @@ def apply_reachability_filter(
         "reachable_units": len(filtered_units),
         "filtered_out": original_count - len(filtered_units),
         "reduction_percentage": reduction_pct,
+        # #738: the seeding mode, same as the keep-all branch's record.
+        "library_mode": bool(library_mode),
     }
     # #602: the decomposition — units_newly_reachable is derived from the
     # counterfactual baseline (the DATASET units the combined seeds retain
@@ -711,8 +719,11 @@ def apply_reachability_filter(
     # already claim the slot. call_graph/reverse_call_graph are the UN-pruned graphs.
     _rf = dataset["metadata"]["reachability_filter"]
     _pruned_ids = [u.get("id", "") for u in units if u.get("id", "") not in reachable_ids]
+    # #741: original_count is the PARSED total — the denominator the orphan-rate
+    # advisory needs to stay readable when the prune set is small (library mode).
     _extra, _asym_warning, _orphan_advisory = compute_prune_telemetry(
-        reachable_ids, sorted(_pruned_ids), call_graph, reverse_call_graph, output_dir)
+        reachable_ids, sorted(_pruned_ids), call_graph, reverse_call_graph, output_dir,
+        total_parsed_units=original_count)
     _rf.update(_extra)
     # #520 (the fable+astra fold): with the advisory on its own key, the
     # reserved ``warning`` slot belongs to the correctness signals — the
@@ -827,7 +838,7 @@ def _lock_dependency_pins(lock_path: Path) -> dict[str, tuple[str | None, str | 
 
     Three kinds of entry are EXCLUDED, because the two files legitimately
     disagree about them and comparing them would report a correct tree as
-    stale -- which would re-run ``npm install`` on every single parse:
+    stale -- which would re-run ``npm ci`` on every single parse:
 
     * the root ``""`` entry -- it describes this project rather than a
       dependency, and only the committed file carries it;
@@ -863,7 +874,7 @@ def _lock_dependency_pins(lock_path: Path) -> dict[str, tuple[str | None, str | 
 
 
 def _js_deps_installed() -> bool:
-    """Return True only if a *complete and current* npm install is in place.
+    """Return True only if a *complete and current* npm ci install is in place.
 
     Checking that ``node_modules/`` exists is not enough: a prior install that
     was killed (Ctrl+C, OOM, disk full) leaves a partial directory. npm writes
@@ -906,7 +917,7 @@ def _js_deps_installed() -> bool:
     return installed == required
 
 
-# #325: the npm-install bootstrap bound — the parse-step convention (PR
+# #325: the npm ci bootstrap bound — the parse-step convention (PR
 # #135's timeout=1800). Module-level so a test can inject a small bound and
 # EXECUTE the diagnosis path instead of grepping the source for it.
 _NPM_INSTALL_TIMEOUT_S = 1800
@@ -920,7 +931,7 @@ def _ensure_js_parser_dependencies() -> None:
     when a JS repo is actually being parsed, so Python/Go-only users never need npm.
 
     Concurrency: uses a lockfile so two parallel parses don't both run
-    ``npm install`` in the same directory (which can corrupt node_modules).
+    ``npm ci`` in the same directory (which can corrupt node_modules).
     """
     if _js_deps_installed():
         return
@@ -935,16 +946,16 @@ def _ensure_js_parser_dependencies() -> None:
     if npm is None:
         raise RuntimeError(
             "JavaScript parser dependencies are not installed and `npm` is not on PATH. "
-            f"Install Node.js/npm, then run: npm install (from {_JS_PARSER_DIR})"
+            f"Install Node.js/npm, then run: npm ci (from {_JS_PARSER_DIR})"
         )
 
     # Serialize concurrent bootstraps. The lockfile lives next to package.json so
     # it's always on the same filesystem as the install target.
     lock_path = _JS_PARSER_DIR / ".openant-npm-install.lock"
-    # the wait budget outlasts a legitimate install (the bounded npm install
+    # the wait budget outlasts a legitimate install (the bounded npm ci
     # inside the lock holds it for up to 30 minutes): the install bound + 5
     # minutes of slack.
-    with _file_lock(lock_path, what="the npm-install bootstrap",
+    with _file_lock(lock_path, what="the npm ci bootstrap",
                     wait_seconds=1800 + 300):
         # Re-check under the lock: another process may have finished while we waited.
         if _js_deps_installed():
@@ -969,7 +980,7 @@ def _ensure_js_parser_dependencies() -> None:
         # exists to prevent. start_new_session puts npm in its own group
         # so the kill can reach the grandchildren.
         _npm_proc = subprocess.Popen(
-            [npm, "install"],
+            [npm, "ci"],
             cwd=str(_JS_PARSER_DIR),
             stdout=sys.stderr,
             stderr=sys.stderr,
@@ -986,16 +997,20 @@ def _ensure_js_parser_dependencies() -> None:
             _npm_proc.kill()
             _npm_proc.wait()
             raise RuntimeError(
-                f"`npm install` (from {_JS_PARSER_DIR}) exceeded the "
+                f"`npm ci` (from {_JS_PARSER_DIR}) exceeded the "
                 f"{_NPM_INSTALL_TIMEOUT_S}s install bound and was killed "
                 "with its process group. Re-run the command; if it persists, "
                 "inspect the npm output above for the stalled postinstall step."
             ) from None
         if _rc != 0:
             raise RuntimeError(
-                f"`npm install` failed in {_JS_PARSER_DIR} with exit code "
+                f"`npm ci` failed in {_JS_PARSER_DIR} with exit code "
                 f"{_rc}. See npm output above for details; you can "
-                f"reproduce with: npm install (from {_JS_PARSER_DIR})"
+                f"reproduce with: npm ci (from {_JS_PARSER_DIR}). An "
+                "'in sync' EUSAGE error means the committed lock is out "
+                "of sync with package.json -- a maintainer regenerates "
+                "the lock in a PR; do not run `npm install` here (it "
+                "rewrites the tracked lock, #795)."
             )
 
 

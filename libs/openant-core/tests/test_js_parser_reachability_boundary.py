@@ -105,7 +105,7 @@ def _require_node_and_deps():
     if not _ANALYZER.is_file():
         pytest.skip(f"analyzer not found at {_ANALYZER}")
     if not (_JS_PARSER_DIR / "node_modules" / "minimatch").is_dir():
-        pytest.skip("JS parser dependencies are not installed (npm install not run)")
+        pytest.skip("JS parser dependencies are not installed (npm ci not run)")
 
 
 def _probe_env(tmp_path: Path, count_file: Path) -> dict:

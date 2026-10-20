@@ -123,7 +123,24 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
             _summary = report.summary if isinstance(report.summary, dict) else {}
             _counted = _summary.get("error_count")
             _error_count = _counted if isinstance(_counted, int) and _counted > 0 else 0
-            if report.errors or _error_count:
+            # #742: an incomplete unit degrades the step exactly as an
+            # errored one does — the symmetric rule to ``error_count``
+            # (``incomplete_count`` is the enhancer's well-typed int counter
+            # for units that hit the iteration limit and discarded their
+            # gathered context, the #730 class; the campaign measured 2-of-3
+            # runs reporting ``success`` with ``incomplete_count: 1`` as a
+            # summary counter only, and an ALL-incomplete enhancement —
+            # every unit discarded — reading the same green). No fraction
+            # threshold: ``error_count`` has none either, and one
+            # incomplete unit is one unit the step did not deliver.
+            # Deliberately still ``partial``, never ``error`` (the
+            # propagating-exception reserve, #285): the step ran and
+            # recorded what it could not finish.
+            _incomplete = _summary.get("incomplete_count")
+            _incomplete_count = (_incomplete
+                                 if isinstance(_incomplete, int) and _incomplete > 0
+                                 else 0)
+            if report.errors or _error_count or _incomplete_count:
                 report.status = "partial"
 
         report.duration_seconds = round(time.monotonic() - start, 2)

@@ -15,7 +15,7 @@ Output Columns:
     - stage2_justification: Stage 2 explanation
     - stage1_verdict: Initial Stage 1 detection verdict
     - stage1_justification: Stage 1 reasoning
-    - stage1_confidence: Confidence score (0.0-1.0)
+    - stage1_confidence: The Stage-1 evidence-completeness rubric score (0.0-1.0, #736: 0.9+ = the full chain traced in the analyzed code; 0.7-0.89 = one named external assumption; 0.5-0.69 = plausible but partially untraced; 0.3-0.49 = a named suspicion; below 0.3 = a guess) — clamped to the range at parse; a non-numeric model value emits no score
     - agentic_classification: Pre-analysis security classification
 
 Usage:
@@ -136,13 +136,29 @@ def get_stage1_verdict(result: dict) -> str:
     verification = result.get('verification', {})
     verification_note = result.get('verification_note', '')
 
-    # If Stage 2 disagreed, extract original from verification_note
+    # If Stage 2 disagreed, extract original from verification_note.
+    # THE T1's F1 ORDERING: the note parses FIRST — it exists only on
+    # disagreed rows and ALWAYS carries the Stage-1 original, while
+    # `consistency_update.from` holds the PRE-REWRITE finding, which on a
+    # disagreed-then-rewritten row is Stage 2's correction (the apply loop
+    # reads raw_old = correct_finding or finding — finding_verifier.py) —
+    # reading the record first would export Stage-2's verdict as Stage-1.
     if verification_note and 'Changed from' in verification_note:
         # Format: "Changed from X to Y"
         parts = verification_note.split()
         for i, p in enumerate(parts):
             if p == 'from' and i + 1 < len(parts):
                 return parts[i + 1]
+
+    # #682: an AGREED row the consistency pass rewrote carries no
+    # verification_note — the record the apply loop writes
+    # (`consistency_update.from`, finding_verifier.py) holds the Stage-1
+    # original. Read it AFTER the note parse (the F1 ordering: on a
+    # disagreed row the record's `from` is Stage-2's correction, and the
+    # note — which carries the true Stage-1 original — must win).
+    consistency_update = result.get('consistency_update', {})
+    if isinstance(consistency_update, dict) and consistency_update.get('from'):
+        return str(consistency_update['from'])
 
     # If Stage 2 agreed, current finding is Stage 1's finding
     # Fall back to 'verdict' so a verdict-only result exports its verdict, not blank.

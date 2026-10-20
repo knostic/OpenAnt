@@ -132,9 +132,8 @@ def test_corrector_schema_carries_severity_top_level():
     # puts it — otherwise a corrected reply and a clean reply carry severity
     # in two shapes.
     assert '"severity"' in _VULN_SCHEMA
-    top = _VULN_SCHEMA
-    assert top.index('"severity"') < top.index('"vulnerabilities"'), \
-        "severity must appear at the top level, before the nested array"
+    # #683: the flat form — severity is at the top level by construction
+    # (the nested vulnerabilities[] is gone; the whole schema is flat)
 
 
 # ---------------------------------------------------------------------------

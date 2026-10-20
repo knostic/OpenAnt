@@ -212,3 +212,22 @@ def severity_display_verdict(result: dict) -> str:
 # row); these values must never reach the Stage-1 prompt as a
 # "classification" hint, and the census/counter treat them as unclassified.
 SENTINEL_CLASSIFICATIONS = frozenset({"incomplete", "error", "unknown"})
+
+
+def coerce_cwe_id(value) -> int:
+    """#744 (the r2-2 unification): the model-supplied ``cwe_id`` is stored
+    verbatim — a string ``"918"`` / ``"CWE-79"`` / a float ``918.0`` are all
+    real shapes (the fa15/fa16 trust-boundary class). ONE coercion used by
+    every consumer: the Stage-2 admission predicate, the reporter's identity
+    block, and the summary render — never trust the type, never duplicate the
+    rule (the #744 sites: the admission predicate, the identity block, the summary render — finding_identity_key's own #314 hash keeps its int() rule). Non-numeric garbage and booleans coerce to 0.
+    """
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        _t = str(value).strip().upper()
+        if _t.startswith("CWE-"):
+            _t = _t[4:]
+        return int(float(_t))
+    except (ValueError, TypeError, OverflowError):
+        return 0

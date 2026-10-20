@@ -31,7 +31,7 @@ from core.step_report import step_context
 from core import tracking
 from utilities.llm_client import get_global_tracker
 from utilities.child_interp import resolved_core_path
-from utilities.file_io import read_json, write_json
+from utilities.file_io import normalize_results, read_json, write_json
 from utilities.llm.adapter import LLMAuthError
 
 # Import app context generator (optional)
@@ -124,15 +124,15 @@ def _relativize_home(path_str: str) -> str:
 
 
 def _promotable_skip_count(by_class: dict, promote_set) -> int:
-    """#602: the skipped signals that COULD have promoted — an UPPER
-    BOUND: entry_point skips whose confidence is in THIS run's promote
-    set (the promote gate at apply_signals). Upper bound because the
-    skipped signal's target is outside its batch by construction — the
-    count cannot know whether the id exists in another batch (a real
-    lost promotion candidate) or nowhere in the dataset (a hallucinated
-    id, promotable by no gate), nor whether the target was already an
-    entry point. Factored for testability: the guard tolerates malformed
-    keys (never a report-assembly crash)."""
+    """#602/#798: the skipped signals of the promotable CLASS —
+    entry_point skips whose confidence is in THIS run's promote set
+    (the promote gate at apply_signals). #798 changed the meaning: the
+    validation universe is the DATASET, so a skipped id is ABSENT from
+    the dataset by construction — these are promotable-class model
+    INVENTIONS that could never promote, not an upper bound on lost
+    promotions (the in-dataset out-of-batch class it used to bound is
+    carried as a real signal since #798). Factored for testability: the
+    guard tolerates malformed keys (never a report-assembly crash)."""
     total = 0
     for k, v in (by_class or {}).items():
         if (not isinstance(k, str) or not isinstance(v, int)
@@ -243,6 +243,61 @@ def same_model_verification_note(analyze_binding, verify_binding) -> str | None:
             "the model's blind spots, so the disagreement rate does not "
             "establish independence")
     return None
+
+
+def _post_verify_metrics(analyze_metrics, verify_result) -> "AnalysisMetrics":
+    """#681: the post-verify envelope, extracted — ONE authority the tests
+    can drive. The folds (previously inline in scan_repository):
+
+    - ``inconclusive`` += disagreed_inconclusive (#509: an explicitly
+      unconfirmable finding threads to inconclusive, never into safe).
+    - ``protected`` += disagreed_protected (#622: protected-by-controls,
+      not inherently-safe) AND #681: += consistency_protected (an agreed
+      row the consistency pass rewrote — the destination previously
+      reached NO envelope column: the analysis metrics counted the
+      Stage-1 verdict and disagreed_* counts only agree=False rows, so
+      the envelope was the outlier surface against its own recount).
+    - ``safe`` += disagreed (#622: only genuine downgrades to safe) AND
+      #681: += consistency_safe (the same sum-to-total property).
+    - #679: an unrecognised verdict never reaches the disagreed arm — it
+      counts as error_count upstream.
+    """
+    return AnalysisMetrics(
+        total=analyze_metrics.total,
+        vulnerable=verify_result.confirmed_vulnerabilities,
+        bypassable=0,
+        inconclusive=(
+            analyze_metrics.inconclusive
+            + getattr(verify_result, "disagreed_inconclusive", 0)
+            + getattr(verify_result, "consistency_inconclusive", 0)
+            # #744 (the r1-F1 catch): retire the Stage-1 count for the
+            # ESCALATED rows Stage 2 moved out of inconclusive — they are
+            # re-bucketed by the outcome (confirmed/disagreed/consistency
+            # already count them); without this the sum-to-total partition
+            # over-sums by exactly the moved count (sum=4/total=3 in the
+            # hunt's executed probe — the #681 class the envelope exists
+            # to prevent).
+            - getattr(verify_result, "escalated_inconclusive_moved", 0)
+        ),
+        protected=analyze_metrics.protected
+        + getattr(verify_result, "disagreed_protected", 0)
+        + getattr(verify_result, "consistency_protected", 0),
+        safe=analyze_metrics.safe
+        + getattr(verify_result, "disagreed", 0)
+        + getattr(verify_result, "consistency_safe", 0)
+        # #743: retire the Stage-1 count for the SAFE-disagreement rows
+        # Stage 2 moved out of safe — they are re-bucketed by their
+        # Stage-2 outcome (confirmed/disagreed_*/error_count already
+        # count them); without this the sum-to-total partition over-sums
+        # by exactly the moved count (the #744 retirement's sibling).
+        - getattr(verify_result, "escalated_safe_moved", 0),
+        errors=analyze_metrics.errors + verify_result.error_count,
+        verified=verify_result.findings_verified,
+        stage2_agreed=verify_result.agreed,
+        stage2_disagreed=verify_result.disagreed,
+        stage2_disagreed_protected=verify_result.disagreed_protected,
+        needs_review=verify_result.needs_review,
+    )
 
 
 def scan_repository(
@@ -577,6 +632,30 @@ def scan_repository(
                     }
                     ctx.outputs = {"app_context_path": app_context_path}
                     print(f"  App type: {context.application_type}", file=sys.stderr)
+                    # #738 (the issue's shape 2): the DEFAULT-mode directive.
+                    # The parse-time reachability filter ran BEFORE this
+                    # classification existed and pruned the exported public
+                    # API; without --llm-reachability there is no
+                    # post-context re-filter to derive the seeding into —
+                    # the operator must re-run, and the scan must SAY so,
+                    # never leave the pruned set reading as complete
+                    # coverage. (With --llm-reachability the re-filter
+                    # derives it — the shape-1 half — so the directive is
+                    # only for the mode that cannot.)
+                    if (context.application_type == "library"
+                            and not library_mode
+                            and not llm_reachability
+                            and processing_level != "all"):
+                        print(
+                            "  NOTE: app-context classified this target as "
+                            "a library, but the structural reachability "
+                            "filter ran without --library-mode — it covers "
+                            "only what its seeds reach, never the "
+                            "library's exported public API (re-run with "
+                            "--library-mode, or --llm-reachability, whose "
+                            "post-context re-filter derives it "
+                            "automatically).",
+                            file=sys.stderr)
                 except Exception as e:
                     print(f"  WARNING: App context generation failed: {e}",
                           file=sys.stderr)
@@ -727,6 +806,16 @@ def scan_repository(
                     pre_filter_count = len(dataset.get("units", []))
                     post_filter_count = pre_filter_count
                     refilter_supported = False
+                    # #738 (the T1-r1 F1 catch): the derived-mode flag is a
+                    # PRE-STAGE local, initialized here — the summary build
+                    # reads it UNCONDITIONALLY below, and the re-filter
+                    # block is level- and call-graph-gated (a --level all
+                    # run or a parser that persists no call_graph.json
+                    # never enters it; an in-block-only assignment left
+                    # EVERY such run crashing the step into skipped/failed
+                    # with an UnboundLocalError — the #268 guard swallowed
+                    # it and the whole llm-reach telemetry silently went).
+                    _derived_library_mode = False
 
                     # Re-apply the structural reachability filter using
                     # LLM-promoted entry points as additional BFS seeds.
@@ -742,6 +831,35 @@ def scan_repository(
                         cg_dirs = resolve_call_graph_dirs(output_dir)
                         if cg_dirs:
                             from core.parser_adapter import apply_reachability_filter
+
+                            # #738: derive the library seeding from the
+                            # classification the app-context step already
+                            # wrote (the issue's shape 1). The parse-time
+                            # filter ran BEFORE app-context existed, so a
+                            # library's exported public API is already
+                            # pruned; THIS post-context re-filter is the one
+                            # place the classification can still matter.
+                            # Derive only when the CLI flag is absent AND
+                            # the payload says library — and RECORD it: the
+                            # classification is nondeterministic across
+                            # runs (the issue's compounding hazard — a
+                            # resume can flip library to unsupported), so
+                            # the artifact must show WHICH mode the run
+                            # used, never silently.
+                            if (not library_mode and app_context_path
+                                    and _read_app_type(app_context_path)
+                                    == "library"):
+                                _derived_library_mode = True
+                                print(
+                                    "  NOTE: app-context classified this "
+                                    "target as a library; the re-filter "
+                                    "seeds the exported public API "
+                                    "(--library-mode DERIVED from the "
+                                    "classification — set the flag "
+                                    "explicitly to pin it across runs).",
+                                    file=sys.stderr)
+                            _effective_library_mode = (
+                                library_mode or _derived_library_mode)
 
                             llm_promoted_ids = {
                                 u["id"] for u in dataset.get("units", [])
@@ -791,7 +909,11 @@ def scan_repository(
                                     extra_entry_points=scope_entry_points_to_units(
                                         llm_promoted_ids, lang_units
                                     ),
-                                    library_mode=library_mode,
+                                    # #738: the derived-or-explicit mode —
+                                    # the classification the step can
+                                    # already see, never the stale CLI-only
+                                    # decision.
+                                    library_mode=_effective_library_mode,
                                 )
                                 kept.extend(filtered.get("units", []))
                                 _rf = (filtered.get("metadata") or {}).get(
@@ -849,6 +971,24 @@ def scan_repository(
                                         else 0
                                     ),
                                     "per_language": _per_lang,
+                                    # #738: the derived-mode disclosure rides
+                                    # the AGGREGATE too — the operator diffing
+                                    # two dataset.json coverage deltas (the
+                                    # issue's 23-vs-288 case) reads THIS
+                                    # record, not the step report; the
+                                    # classification lottery can flip the
+                                    # derived mode across runs and the
+                                    # per-language library_mode keys below
+                                    # explain the delta only when the
+                                    # derivation is named beside them.
+                                    **({"library_mode_derived": True}
+                                       if _derived_library_mode else {}),
+                                    # #738: the top-level seeding mode —
+                                    # the per-language records carry it, but
+                                    # this whitelist is what the aggregate
+                                    # keeps; the operator diffing datasets
+                                    # reads the TOP level.
+                                    "library_mode": _effective_library_mode,
                                 }
                                 # Lift any per-language advisory (e.g. an empty-seed
                                 # blackout — a language that flowed through unfiltered
@@ -950,8 +1090,26 @@ def scan_repository(
                         # the resume provenance (they were reviewed; their
                         # signals replay under THIS run's promote set).
                         "units_adopted": reach_stats.get("units_adopted", 0),
+                        # #798: how many signals came from the checkpoint
+                        # cache — the resume-comparability companion to
+                        # signals_skipped_unknown_unit (a resume adopts
+                        # cached signals without parsing, so its parse-time
+                        # skip count reads 0 BY CONSTRUCTION; this key
+                        # explains the zero).
+                        "signals_cache_adopted": reach_stats.get(
+                            "signals_cache_adopted", 0),
                         "post_filter_units": post_filter_count,
                         "refilter_supported": refilter_supported,
+                        # #738: present-only — this re-filter DERIVED the
+                        # library seeding from the app-context
+                        # classification (the CLI flag was absent). The
+                        # artifact must show which mode the run used: the
+                        # classification is nondeterministic across runs,
+                        # so a consumer comparing two scans of the same
+                        # repo needs this marker to explain the coverage
+                        # delta.
+                        **({"library_mode_derived": True}
+                           if _derived_library_mode else {}),
                         # #294: the honest coverage numbers — units_reviewed
                         # counts what was SENT for review, not what was
                         # actually reviewed.
@@ -978,34 +1136,47 @@ def scan_repository(
                         # step to partial wrongly.
                         "checkpoint_summary_write_failures": reach_stats.get(
                             "checkpoint_summary_write_failures", 0),
-                        # #602: the skip-class telemetry — unknown-ID signal
-                        # occurrences in ACCEPTED responses (the diagnostic
-                        # log may carry discarded attempts; the counter is
-                        # the accepted-response metric). A skipped signal is
+                        # #602/#798: the skip-class telemetry —
+                        # unknown-ID signal occurrences in ACCEPTED
+                        # responses (the diagnostic log may carry
+                        # discarded attempts; the counter is the
+                        # accepted-response metric). A skipped signal is
                         # NOT a coverage failure: error_count stays
-                        # dropped+failed batches only. Two known exclusions:
-                        # adopted units bypass parse on resume (their skips
-                        # were never persisted); a SPLIT batch narrows
-                        # valid_unit_ids per half, so a cross-half reference
-                        # reads as a skip — the metric is not batch-geometry-
-                        # invariant, and split-recovered runs read higher.
+                        # dropped+failed batches only. #798: the
+                        # validation universe is the DATASET, so a skip
+                        # means absent-from-dataset by construction (a
+                        # genuine model invention) — the metric IS
+                        # batch-geometry-invariant now (the old
+                        # cross-half/cross-batch skip class is a real
+                        # signal since #798), and adopted units bypassing
+                        # parse on resume remains the one exclusion.
                         "signals_skipped_unknown_unit": reach_stats.get(
                             "signals_skipped_unknown_unit", 0),
                         "signals_skipped_unknown_unit_by_class": reach_stats.get(
                             "signals_skipped_unknown_unit_by_class", {}),
-                        # #602: the promotable subset — sized at REPORT
+                        # #602/#798: the promotable subset — sized at REPORT
                         # time from this run's own promote_set (the promote
                         # gate: kind=entry_point, confidence in promote_set),
                         # never by parse_response (which must stay
-                        # policy-free). An UPPER BOUND: the skipped id is
-                        # outside its batch by construction — it may exist
-                        # in another batch or nowhere in the dataset.
+                        # policy-free). #798 changed its meaning: the
+                        # skipped id is ABSENT FROM THE DATASET by
+                        # construction now, so this counts promotable-
+                        # class INVENTIONS that could never promote — not
+                        # an upper bound on lost promotions (the in-dataset
+                        # out-of-batch class it used to bound is carried
+                        # as a real signal since #798).
                         "signals_skipped_promotable":
                             _promotable_skip_count(
                                 reach_stats.get(
                                     "signals_skipped_unknown_unit_by_class",
                                     {}) or {},
                                 summary.get("promote_set") or []),
+                        # #798: the apply-time counterpart — how many
+                        # signals referenced a unit absent from THIS
+                        # dataset (the stale-id class: a checkpoint-adopted
+                        # signal replayed against a changed dataset).
+                        "signals_dropped_unknown_unit": summary.get(
+                            "signals_dropped_unknown_unit", 0),
                         # #541 (the refute round): the #285/#376 partial-
                         # status contract — dropped + failed batches make
                         # the STEP read partial, never success/0/0.
@@ -1115,6 +1286,18 @@ def scan_repository(
                     "incomplete_count": enhance_result.incomplete_count,
                     "total_units": enhance_result.total_units,
                 }
+                # #739: a limited run's selection mode, present-only — the
+                # report names WHAT the limit selected by, stamped AT THE
+                # SLICE SITE over the population the slice actually
+                # selected from (the #213 diff-selected subset under
+                # diff-mode: a label over the unfiltered corpus could
+                # promise a priority the diff-subset selection never
+                # used — the T1-r1 F1 catch; the re-read of the dataset
+                # is gone with it).
+                if limit and getattr(enhance_result, "limit_mode", ""):
+                    ctx.summary["limit_mode"] = enhance_result.limit_mode
+                    print(f"  Limit {limit}: selection mode "
+                          f"{ctx.summary['limit_mode']}", file=sys.stderr)
                 if enhance_result.error_summary:
                     ctx.summary["error_summary"] = enhance_result.error_summary
                 # #615: the degenerate-exit kind histogram
@@ -1206,13 +1389,36 @@ def scan_repository(
         analyze_result.metrics.vulnerable > 0
         or analyze_result.metrics.bypassable > 0
     )
+    # #743 (the T1-r3 catch): the Stage-2 gate's authority is the admission
+    # filter (stage2_candidates — the same predicate run_verification
+    # applies to its loaded rows), not the raw vulnerable/bypassable count:
+    # a scan where Stage 1 marked every unit SAFE has has_findings False
+    # while the candidate set is non-empty (the classification-disagreement
+    # rows — and #830's claim-carrying inconclusive rows, the same hole on
+    # the same rails) — the all-SAFE corpus is the #743 headline shape, so
+    # the gate must open for it. This PRE-VERIFY has_findings snapshot gates
+    # the verify skip branches; the downstream consumers read the
+    # monotone post-verify re-derivation below.
+    has_stage2_candidates = False
+    if verify and not has_findings:
+        from core.verifier import stage2_gate_open
+        _rows = read_json(analyze_result.results_path) or {}
+        if isinstance(_rows, dict):
+            # the fa17 rule: normalize ONCE at every load boundary — a
+            # non-dict element inside ``results`` (the trust-boundary
+            # class) must not crash the gate read (the T1-r5 F2 catch:
+            # defense-in-depth, the sink is proven, the producer is thin)
+            normalize_results(_rows, "results")
+        has_stage2_candidates = stage2_gate_open(
+            analyze_result.metrics,
+            _rows.get("results", []) if isinstance(_rows, dict) else [])
 
     # #621: the verify step stamps the attacker-model descriptor on its
     # result (the summary's server-rendered Methodology reads it verbatim);
     # None on every path that did not run verification.
     attacker_model = None
 
-    if verify and has_findings:
+    if verify and (has_findings or has_stage2_candidates):
         from core.verifier import run_verification
 
         print(_step_label("Running verification (Stage 2)..."), file=sys.stderr)
@@ -1267,33 +1473,8 @@ def scan_repository(
                 # (``needs_review``) or that errored (``error_count``) must NOT inflate
                 # ``safe`` — they are preserved Stage-1 potential vulnerabilities
                 # awaiting manual review. Errors stay in the ``errors`` bucket.
-                result.metrics = AnalysisMetrics(
-                    total=analyze_result.metrics.total,
-                    vulnerable=verify_result.confirmed_vulnerabilities,
-                    bypassable=0,
-                    # #509: a Stage-2 disagreement corrected to
-                    # ``inconclusive`` is an explicitly-unconfirmable finding —
-                    # it threads into inconclusive, NEVER into safe (the
-                    # plain-disagreement fold below covers only genuine
-                    # downgrades to safe).
-                    inconclusive=analyze_result.metrics.inconclusive
-                    + verify_result.disagreed_inconclusive,
-                    # #622: a disagreement corrected to ``protected`` is
-                    # protected-by-controls — the destination category
-                    # reaches the scan metrics (the recount always counted
-                    # it here; the scanner fold was the only divergence).
-                    protected=analyze_result.metrics.protected
-                    + verify_result.disagreed_protected,
-                    # #622: the residual ``disagreed`` (corrected to safe or
-                    # an unrecognised verdict) is ALL that folds into safe.
-                    safe=analyze_result.metrics.safe + verify_result.disagreed,
-                    errors=analyze_result.metrics.errors + verify_result.error_count,
-                    verified=verify_result.findings_verified,
-                    stage2_agreed=verify_result.agreed,
-                    stage2_disagreed=verify_result.disagreed,
-                    stage2_disagreed_protected=verify_result.disagreed_protected,
-                    needs_review=verify_result.needs_review,
-                )
+                result.metrics = _post_verify_metrics(
+                    analyze_result.metrics, verify_result)
             except Exception as e:
                 print(f"  WARNING: Verification failed: {e}", file=sys.stderr)
                 print("  Continuing with unverified Stage 1 results.", file=sys.stderr)
@@ -1310,7 +1491,46 @@ def scan_repository(
         print(_step_label("Skipping verification (--no-verify or not requested)."),
               file=sys.stderr)
         _record_skip(result, "verify", "not_requested")
+    # #743 (the T1-r4 consequence + the T1-r5 F1 correction): has_findings
+    # above is the PRE-VERIFY Stage-1 snapshot — it gates the verify skip
+    # branches. The DOWNSTREAM consumers (dynamic-test at Step 7's
+    # decision, the report step's disclosures) must see the POST-VERIFY
+    # truth MONOTONE-OR-ed onto the snapshot: a widened-gate scan (the
+    # 0-positive corpus) whose Stage 2 upgrades a row leaves the
+    # post-verify metrics carrying it, and a Stage-1-True scan must NEVER
+    # lose its gates (the #69 F4/F5 fail-safe: an unverified or errored
+    # row is DISCLOSURE_ELIGIBLE — a naive re-derivation from the
+    # post-verify count alone flips True→False on the
+    # verify-succeeded-confirmed-none path and skips the disclosure
+    # fail-safe). The ``or`` keeps it a no-op on every pre-existing path.
+    has_findings = (
+        has_findings
+        or result.metrics.vulnerable > 0
+        or result.metrics.bypassable > 0
+    )
     print(file=sys.stderr)
+
+    # ---------------------------------------------------------------
+    # #799: the dynamic-test DECISION — made BEFORE the pipeline output is
+    # built. Every knowable skip class (not_requested / no_candidates /
+    # docker_unavailable) is recorded at its source so Step 6's build
+    # carries the true skipped set; the human summary reads
+    # pipeline_output.json (not scan.report.json) and the LLM faithfully
+    # renders whatever array it is given — a skip recorded after the
+    # build ships a "No steps were skipped." falsehood in the deliverable
+    # while the machine artifacts disagree about the same fact. Only the
+    # RUN branch is deferred to Step 7 below; its attempted-run `failed`
+    # class (the one class unknowable here) REBUILDS the output after the
+    # attempt.
+    _dt_will_run = False
+    if not dynamic_test:
+        _record_skip(result, "dynamic-test", "not_requested")
+    elif not has_findings:
+        _record_skip(result, "dynamic-test", "no_candidates")
+    elif not shutil.which("docker"):
+        _record_skip(result, "dynamic-test", "docker_unavailable")
+    else:
+        _dt_will_run = True
 
     # ---------------------------------------------------------------
     # Step 6: Build pipeline_output.json
@@ -1321,23 +1541,21 @@ def scan_repository(
 
     pipeline_output_path = os.path.join(output_dir, "pipeline_output.json")
 
-    with step_context("build-output", output_dir, inputs={
-        "results_path": active_results_path,
-    }) as ctx:
-        build_pipeline_output(
+    # #799: one builder closure, TWO call sites — the Step-6 build and the
+    # Step-7 failed-attempt rebuild (the only late skip class).
+    def _build_pipeline_output_file():
+        return build_pipeline_output(
             results_path=active_results_path,
             output_path=pipeline_output_path,
             repo_name=repo_name or os.path.basename(repo_path),
             repo_url=repo_url,
             commit_sha=commit_sha,
             language=result.language,
+            # #304: an absent context is UNKNOWN, not a fabricated web_app —
+            # the deliverable must never present a guess as an observation.
             application_type=(
                 app_context_path and _read_app_type(app_context_path)
             ) or "unknown",
-            # #304: an absent context is UNKNOWN, not a fabricated web_app —
-            # the deliverable must never present a guess as an observation
-            # (context_source: "none" carries the real state one field away;
-            # the summary template now joins the two for the reader).
             processing_level=processing_level,
             step_reports=collected_step_reports,
             context_source=result.context_source,
@@ -1356,22 +1574,30 @@ def scan_repository(
             parse_errors=result.parse_errors,
             excluded_languages=result.excluded_languages,
             degraded=result.degraded,
+            # #600: the discovery block — re-derived from the same on-disk
+            # scan artifacts (idempotent).
             coverage=_collect_coverage(result),
-            # #600: the discovery block for the deliverable — re-derived
-            # from the same on-disk scan artifacts (idempotent; the parse
-            # step computed the same block into its own summary).
             discovery=_collect_discovery(_probe_from_result(result)),
-            # Authoritative skip data so pipeline_output.json reflects real
-            # pipeline status (esp. a non-aborting verify failure) instead of
-            # always reporting "nothing skipped". At this point (Step 6) all
-            # pre-build skips incl. verify are already recorded; dynamic-test/
-            # report skips are recorded later and remain in scan.report.json.
+            # #799: the skipped set the human summary renders — the
+            # dynamic-test decision was made BEFORE this build; the
+            # attempted-run failed class rebuilds via this same closure.
             skipped_steps=list(result.skipped_steps),
             skipped_step_reasons=dict(result.skipped_step_reasons),
             # #621: the attacker-model descriptor the verify step stamped —
             # present-only (None when verify never ran stays absent).
             attacker_model=attacker_model,
         )
+
+    with step_context("build-output", output_dir, inputs={
+        "results_path": active_results_path,
+    }) as ctx:
+        # #799: the closure carries the true skipped set — the dynamic-test
+        # decision was made BEFORE this build (see the #799 hoist above), so
+        # every knowable skip class is in the file the summary reads; the
+        # attempted-run `failed` class (Step 7) rebuilds via the same
+        # closure; the REPORT step's own skip remains post-build (#799's
+        # Not-claimed boundary, the issue names it).
+        _build_pipeline_output_file()
 
         ctx.outputs = {"pipeline_output_path": pipeline_output_path}
 
@@ -1382,61 +1608,82 @@ def scan_repository(
     # ---------------------------------------------------------------
     # Step 7: Dynamic Test (optional, off by default)
     # ---------------------------------------------------------------
-    if dynamic_test and has_findings:
-        if not shutil.which("docker"):
+    # #799: the DECISION was hoisted above the Step-6 build (every knowable
+    # skip class recorded at its source); this block only ACTS on it — the
+    # run branch, or the skip line for the recorded reason. The skip
+    # records themselves are NOT repeated here.
+    if _dt_will_run:
+        from core.dynamic_tester import run_tests
+
+        print(_step_label("Running dynamic tests (Docker)..."), file=sys.stderr)
+
+        with step_context("dynamic-test", output_dir, inputs={
+            "pipeline_output_path": pipeline_output_path,
+            "llm": binding_policy_summary(registry, "dynamic_test"),
+        }) as ctx:
+            # Dynamic test is OPTIONAL: a failure here must not discard
+            # completed work (step_context re-raises otherwise).
+            try:
+                dt_result = run_tests(
+                    pipeline_output_path=pipeline_output_path,
+                    output_dir=output_dir,
+                    registry=registry,
+                    # #521: the declared-runtime channel — the scanned
+                    # repo's root, so the derivation reads the TARGET's
+                    # manifests (the dead-input fix; the scan entry
+                    # previously omitted it).
+                    repo_path=repo_path,
+                )
+
+                ctx.summary = dynamic_test_step_summary(dt_result)
+                ctx.outputs = {
+                    "results_json_path": dt_result.results_json_path,
+                    "results_md_path": dt_result.results_md_path,
+                }
+
+                result.dynamic_test_path = dt_result.results_json_path
+
+                print(f"  Dynamic test: {dt_result.confirmed} confirmed, "
+                      f"{dt_result.not_reproduced} not reproduced", file=sys.stderr)
+            except Exception as e:
+                print(f"  WARNING: Dynamic test failed: {e}", file=sys.stderr)
+                print("  Continuing without dynamic-test results.", file=sys.stderr)
+                ctx.status = "skipped"
+                ctx.summary = {"skipped": True, "reason": str(e)}
+                _record_skip(result, "dynamic-test", "failed")
+                # #799: the failed attempt is the ONE skip class the Step-6
+                # build could not know — REBUILD the output through the same
+                # closure so this late skip reaches the file the human
+                # summary reads (the same "No steps were skipped" falsehood
+                # would ship otherwise). The rebuild is BEST-EFFORT (r1-F3):
+                # a raise here (disk full, a permission flip) must not turn
+                # an optional step's failure into a scan abort — the Step-6
+                # file stays, degrading only the failed class to the
+                # pre-#799 state, never worse than base.
+                try:
+                    _build_pipeline_output_file()
+                except Exception as rebuild_exc:
+                    print(f"  WARNING: could not rebuild pipeline_output.json "
+                          f"after the dynamic-test failure: {rebuild_exc}",
+                          file=sys.stderr)
+
+        collected_step_reports.append(
+            _load_step_report(output_dir, "dynamic-test"),
+        )
+    else:
+        # the reason was recorded pre-build; only the operator-facing line
+        # prints here (the position of the line in the step sequence is
+        # unchanged from the pre-#799 flow)
+        _dt_reason = result.skipped_step_reasons.get("dynamic-test", "not_requested")
+        if _dt_reason == "docker_unavailable":
             print(_step_label("Skipping dynamic test (Docker not found)."),
                   file=sys.stderr)
-            _record_skip(result, "dynamic-test", "docker_unavailable")
+        elif _dt_reason == "no_candidates":
+            print(_step_label("Skipping dynamic test (no findings to test)."),
+                  file=sys.stderr)
         else:
-            from core.dynamic_tester import run_tests
-
-            print(_step_label("Running dynamic tests (Docker)..."), file=sys.stderr)
-
-            with step_context("dynamic-test", output_dir, inputs={
-                "pipeline_output_path": pipeline_output_path,
-                "llm": binding_policy_summary(registry, "dynamic_test"),
-            }) as ctx:
-                # Dynamic test is OPTIONAL: a failure here must not discard
-                # completed work (step_context re-raises otherwise).
-                try:
-                    dt_result = run_tests(
-                        pipeline_output_path=pipeline_output_path,
-                        output_dir=output_dir,
-                        registry=registry,
-                        # #521: the declared-runtime channel — the scanned
-                        # repo's root, so the derivation reads the TARGET's
-                        # manifests (the dead-input fix; the scan entry
-                        # previously omitted it).
-                        repo_path=repo_path,
-                    )
-
-                    ctx.summary = dynamic_test_step_summary(dt_result)
-                    ctx.outputs = {
-                        "results_json_path": dt_result.results_json_path,
-                        "results_md_path": dt_result.results_md_path,
-                    }
-
-                    result.dynamic_test_path = dt_result.results_json_path
-
-                    print(f"  Dynamic test: {dt_result.confirmed} confirmed, "
-                          f"{dt_result.not_reproduced} not reproduced", file=sys.stderr)
-                except Exception as e:
-                    print(f"  WARNING: Dynamic test failed: {e}", file=sys.stderr)
-                    print("  Continuing without dynamic-test results.", file=sys.stderr)
-                    ctx.status = "skipped"
-                    ctx.summary = {"skipped": True, "reason": str(e)}
-                    _record_skip(result, "dynamic-test", "failed")
-
-            collected_step_reports.append(
-                _load_step_report(output_dir, "dynamic-test"),
-            )
-    elif dynamic_test and not has_findings:
-        print(_step_label("Skipping dynamic test (no findings to test)."),
-              file=sys.stderr)
-        _record_skip(result, "dynamic-test", "no_candidates")
-    else:
-        print(_step_label("Skipping dynamic test (not enabled)."), file=sys.stderr)
-        _record_skip(result, "dynamic-test", "not_requested")
+            print(_step_label("Skipping dynamic test (not enabled)."),
+                  file=sys.stderr)
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------
@@ -1462,7 +1709,11 @@ def scan_repository(
             try:
                 # Thread the scan's --llm-config through to the report phase
                 # (else it silently falls back to the file's default_llm).
-                generate_summary_report(pipeline_output_path, summary_path, llm_config_name)
+                # #684: thread the SCAN'S validated registry — the report
+                # uses the config the scan validated at startup (no disk
+                # re-read, no second paid probe mid-scan)
+                generate_summary_report(pipeline_output_path, summary_path,
+                                        llm_config_name, registry=registry)
                 result.summary_path = summary_path
                 outputs["summary_path"] = summary_path
                 print(f"  Summary: {summary_path}", file=sys.stderr)
@@ -1473,7 +1724,8 @@ def scan_repository(
             # Only generate disclosures if there are findings
             if has_findings:
                 try:
-                    generate_disclosure_docs(pipeline_output_path, disclosures_dir, llm_config_name)
+                    generate_disclosure_docs(pipeline_output_path, disclosures_dir,
+                                           llm_config_name, registry=registry)
                     outputs["disclosures_dir"] = disclosures_dir
                     print(f"  Disclosures: {disclosures_dir}", file=sys.stderr)
                 except Exception as e:
@@ -1903,6 +2155,15 @@ def _write_scan_report(
         if _STATUS_RANK.get(_st, 0) > _STATUS_RANK.get(_worst_status, 0):
             _worst_status = _st
     _all_errors = [e for sr in step_reports for e in sr.get("errors", [])]
+    # #742: the per-step incomplete counts (step summaries carrying
+    # ``incomplete_count > 0``), for the present-only ``steps_incomplete``
+    # surfacing beside the aggregate status below — the same well-typed
+    # int the step_report derivation degrades ``partial`` on.
+    _steps_incomplete = {}
+    for _sr in step_reports:
+        _ic = (_sr.get("summary") or {}).get("incomplete_count")
+        if isinstance(_ic, int) and _ic > 0:
+            _steps_incomplete[str(_sr.get("step"))] = _ic
     total_input = sum(
         sr.get("token_usage", {}).get("input_tokens", 0) for sr in step_reports
     )
@@ -1943,6 +2204,16 @@ def _write_scan_report(
             # ADDITIVE / non-breaking: disambiguated skip cause per step.
             # `steps_skipped` above stays a flat bare list (consumers read it).
             "steps_skipped_reasons": result.skipped_step_reasons,
+            # #742: WHAT was incomplete, next to the degraded status — a
+            # step whose summary carried ``incomplete_count > 0`` (the
+            # enhancer's iteration-limit discard class, #730) surfaces its
+            # count here so the aggregate names the degraded dimension, not
+            # only that the worst-per-step rule ranked it. Present-only
+            # (added only when at least one step reported incompletes): a
+            # clean scan's summary gains no new key — additive/non-breaking
+            # for every consumer of the dict.
+            **({"steps_incomplete": _steps_incomplete}
+               if _steps_incomplete else {}),
             # Multi-language coverage + which path supplied the security model.
             # Previously omitted here, so a merged/degraded scan and a
             # single-language clean one produced indistinguishable reports.
@@ -2131,7 +2402,11 @@ def _print_summary(result: ScanResult) -> None:
             line += (f"; {result.metrics.stage2_disagreed_protected} "
                      f"reclassified protected-by-controls")
         print(line + ")", file=sys.stderr)
-    print(f"  Cost:           ${result.usage.total_cost_usd:.4f}", file=sys.stderr)
+    # #786: an unpriced model's under-count must not read as a complete
+    # figure on the line the operator actually reads.
+    from core.tracking import cost_marker
+    print(f"  Cost:           ${result.usage.total_cost_usd:.4f}"
+          f"{cost_marker(result.usage)}", file=sys.stderr)
     print(f"  Output:         {result.output_dir}", file=sys.stderr)
     if result.skipped_steps:
         print(f"  Skipped:        {', '.join(result.skipped_steps)}", file=sys.stderr)

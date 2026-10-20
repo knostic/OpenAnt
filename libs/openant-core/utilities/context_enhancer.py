@@ -43,6 +43,8 @@ from .agentic_enhancer import (
 )
 from .rate_limiter import get_rate_limiter, is_retryable_error
 from .file_io import read_json, write_json
+from .json_extract import extract_json_object
+import re as _re
 
 # Avoid circular import — import checkpoint at usage site
 _StepCheckpoint = None
@@ -86,6 +88,148 @@ _ENHANCE_JSON_SCHEMA = """{
     "confidence": 0.0,
     "security_classification": "exploitable | vulnerable_internal | security_control | neutral | unknown"
 }"""
+
+
+def _summary_error_bucket(error_msg, error_info=None) -> str:
+    """#800: classify an analyze/verify summary error into the triage
+    taxonomy. The hardcoded ``"api"`` bucket mixed permanent,
+    deterministic failures with transient ones — the two demand opposite
+    operator responses (never retry vs. retry later) — and a
+    context-overflow 400 was indistinguishable from a 402/429 storm in
+    ``_summary.json``.
+
+    The buckets (checked most-specific first):
+
+    * ``context_overflow`` — the permanent token-ceiling 400s. The
+      campaign's two message shapes: ``prompt is too long`` (Anthropic's
+      wording, which the Bedrock adapter's SDK also emits) and
+      ``maximum context length`` (the unattributed OpenAI-style shape);
+      the ``context_length_exceeded`` literal (OpenAI's error code);
+      Google's ``exceeds the maximum number of input tokens`` / ``input
+      token count`` shape. Retrying can never help: the projection
+      exceeds the provider ceiling.
+    * ``payload_too_large`` — the permanent byte-size 400s (the
+      campaign's ``total text input size exceeds 8 MB`` shape and the
+      request-entity family).
+    * ``quota`` — the #663/#790 entitlement class: an
+      ``LLMRateLimitError`` whose ``kind`` is ``quota`` (a spend cap, a
+      daily cap — the retry gate refuses these; the breakdown must not
+      tell the operator "retry later" for a class the retry pass will
+      not retry).
+    * ``rate_limit`` — the transient 429 class (the adapter's
+      LLMRateLimitError taxonomy via ``error_info["type"]``, or the
+      string shapes — with the HTTP codes WORD-BOUNDED, the #292
+      lesson: an unanchored ``" 429"`` substring matched "afford 42900
+      tokens" on the error_info-less verify path).
+    * ``payment_required`` — the 402 billing class (the campaign's
+      4,894 storm under the old single bucket).
+    * ``api`` — the fallback (the legacy bucket name: an LLM/API
+      failure this taxonomy does not name — backwards-compatible).
+
+    Order matters, twice over:
+
+    * the message signatures are decisive even when the structured
+      ``error_info`` is generic (an api_status dict with status_code 400
+      carries no distinction the classifier could use);
+    * but a NON-generic structured type is decisive over the payload-size
+      SIGNATURE (r5-F4): OpenAI's single-request-over-TPM 429 says
+      ``Request too large for gpt-4o ... on tokens per min`` — the
+      adapter types it ``rate_limit`` and the retry gate retries it, so
+      the breakdown must agree (the r1-F4 consistency), not call a
+      retryable throttle a permanent payload failure. The token-ceiling
+      signatures stay FIRST: a 400 prompt-too-long is never typed
+      rate_limit, and its message is the campaign's own evidence.
+    * a ``parse_error`` type (the producer's unparseable-response class)
+      resolves to the legacy ``api`` (r5-F3): its message is a JSON
+      parser position, which can EMBED a bare 3-digit number
+      (``line 1 column 429 (char 428)``) — a permanent producer fault
+      must never file as a transient HTTP class through the
+      word-bounded code scan.
+    """
+    # #800 (r4-F1): the analyze producer emits a DICT error for the
+    # unparseable-response class (analysis_core.py: "error": {"type":
+    # "parse_error", "message": ...} — the repo's own established shape;
+    # rate_limiter.is_retryable_error dispatches on dict-vs-str for
+    # exactly this producer). Accept BOTH shapes: the dict's message is
+    # the string arm's input, and the dict itself serves as the
+    # structured error_info when none was passed (a parse_error files
+    # under the legacy "api" — its own class is #432-family territory).
+    if isinstance(error_msg, dict):
+        if error_info is None:
+            error_info = error_msg
+        error_msg = (error_msg.get("message")
+                     or error_msg.get("type") or "")
+    msg = str(error_msg or "").lower()
+
+    # The permanent token-ceiling class (the campaign's executed shapes +
+    # Google's first-class wording + Anthropic's input+max_tokens band).
+    for sig in ("prompt is too long", "maximum context length",
+                "context_length_exceeded",
+                "exceeds the maximum number of input tokens",
+                "input token count", "exceed context limit"):
+        if sig in msg:
+            return "context_overflow"
+
+    # The structured route BEFORE the payload signature (r5-F4): a
+    # NON-generic type (the adapter's own taxonomy) names the class;
+    # only the generic api_status/unknown dicts fall through to the
+    # message signatures.
+    if isinstance(error_info, dict):
+        # r5-F3: the parse producer's own type — its message is a parser
+        # position that can embed a bare 3-digit number; the structured
+        # dict NAMES the class, so it is decisive (the word-bounded code
+        # scan must never see it).
+        if error_info.get("type") == "parse_error":
+            return "api"
+        if error_info.get("type") == "rate_limit":
+            # #663/#790: the throttle/quota split rides the kind — a
+            # quota is a hard entitlement limit (never retryable); a
+            # throttle is short-window throughput (retry later).
+            if error_info.get("kind") == "quota":
+                return "quota"
+            return "rate_limit"
+        status = error_info.get("status_code")
+        if status == 402:
+            return "payment_required"
+        if status == 429:
+            return "rate_limit"
+
+    # The permanent payload-size class.
+    for sig in ("total text input size exceeds", "request too large",
+                "payload too large", "request entity too large"):
+        if sig in msg:
+            return "payload_too_large"
+
+    # The verify path carries the adapter's exception CLASS NAME as the
+    # string prefix (finding_verifier's f"{type(e).__name__}: {e}") —
+    # consume it when the structured dict is absent.
+    if msg.startswith("llmratelimiterror"):
+        return "rate_limit"
+
+    # WORD-BOUNDED HTTP codes (the #292 lesson: an unanchored " 429"
+    # matched "afford 42900 tokens" — a 402 body, misfiled). The leading
+    # "error code: NNN" (the adapters' own prefix) wins when present, so
+    # a 402 body carrying a bounded 429 elsewhere ("can only afford
+    # 429.") resolves by its OWN code (r2-F4).
+    m = _re.search(r"error code: (\d{3})\b", msg)
+    if m:
+        # the LEADING code resolves by ITSELF (the arm's own principle):
+        # a 400/5xx body carrying a standalone 429 elsewhere must not
+        # fall through to the bounded scan (the r3-F2 catch —
+        # "invalid parameter 'n': 429" and "too many requests queued
+        # upstream" misfiled as rate_limit)
+        code = m.group(1)
+        if code == "429":
+            return "rate_limit"
+        if code == "402":
+            return "payment_required"
+        return "api"
+    if _re.search(r"\b429\b", msg) or "too many requests" in msg:
+        return "rate_limit"
+    if _re.search(r"\b402\b", msg) or "payment required" in msg:
+        return "payment_required"
+
+    return "api"
 
 
 def _build_error_info(exc: Exception) -> dict:
@@ -134,11 +278,18 @@ def _build_error_info(exc: Exception) -> dict:
     # but the original SDK exception is chained on ``__cause__`` (adapters
     # re-raise ``... from exc``) and the major SDKs expose those there.
     # Surface them when present without reaching into adapter internals.
+    # #770: the status read falls back to the validated ``.code`` shape —
+    # the google-genai SDK's ServerError/APIError carries the HTTP code
+    # there; without the fallback the ``api_status`` dict a Google 5xx
+    # builds carries no status and ``is_retryable_error(dict)`` defaults
+    # it to 0 -> never retried, where the string arm of the same error
+    # retried (the #716 preference flip's silent regression).
+    from .llm._redact import _http_status_from
     for source in (exc, getattr(exc, "__cause__", None)):
         if source is None:
             continue
         if "status_code" not in info:
-            status_code = getattr(source, "status_code", None)
+            status_code = _http_status_from(source)
             if status_code is not None:
                 info["status_code"] = status_code
         if "request_id" not in info:
@@ -281,6 +432,11 @@ class ContextEnhancer:
         self.tracker = tracker or get_global_tracker()
         self.binding = binding
         self.logger = logger or _null_logger
+        # #802: the kept-set delta holder — set by both resume paths at
+        # their stale-restored intersections (the rows a prior run left in
+        # the monotonic checkpoint dir whose units are not in THIS run's
+        # population); core/enhancer.py reads it onto the EnhanceResult.
+        self._resume_delta = None
         self._use_logger = logger is not None
         self.stats = {
             "units_processed": 0,
@@ -472,6 +628,48 @@ class ContextEnhancer:
             )
             os.makedirs(checkpoint_dir, exist_ok=True)
             processed_ids = self._load_completed_units(checkpoint_dir, context_key="llm_context")
+            # #748 (the sibling of the agentic path's fix): the raw dir scan
+            # counts stale ids (units from a prior dataset / outside a diff
+            # scope / manual strays) as restored, inflating the #218 baseline
+            # rebase and the skip set's counts — intersect with THIS dataset.
+            _dataset_ids = {u.get("id") for u in units}
+            # #802: the kept-set delta — the census is the DIR (all rows,
+            # completed AND errored), not the completed set: a FOREIGN
+            # ERRORED row (a prior run's unfinished work whose unit left
+            # scope) is deliberately absent from processed_ids, so the
+            # stale-restored intersection below never sees it — exactly
+            # the 88-casualty class this delta exists to name. This path
+            # writes no _summary.json, so the delta's surfaces are the
+            # phase holder (the EnhanceResult, read by the standalone
+            # enhance CLI's envelope) — the scan-level step report does NOT
+            # aggregate it (a named follow-up, the r1-F3 finding; the
+            # agentic leg's _summary.json is the durable surface inside
+            # scan); the prior-verdict predicate is the error key THIS
+            # path's own error branch stamps (enhancer.py's counter reads
+            # the same key).
+            from core.checkpoint import build_resume_delta
+            _drop_map = self._id_keyed_checkpoint_map(checkpoint_dir)
+            _dropped = []
+            for _sid in set(_drop_map) - _dataset_ids:
+                _row = read_json(_drop_map[_sid])
+                # r1-F2: the row's own context_key (both modes share this
+                # dir; a mode switch between runs must not misclassify a
+                # prior-mode ERRORED row as completed).
+                _ctx_key = (_row or {}).get("context_key", "llm_context")
+                _ctx = (_row or {}).get(_ctx_key, {})
+                _dropped.append(
+                    (_sid, isinstance(_ctx, dict) and bool(_ctx.get("error"))))
+            self._resume_delta = build_resume_delta(_dropped)
+            _stale_restored = processed_ids - _dataset_ids
+            if _stale_restored:
+                # the sample is capped: a diff-scope resume over a shared
+                # checkpoint dir (core/enhancer.py's {output_dir}/enhance_
+                # checkpoints) can carry ~1800 stale ids — the count rides
+                # the message, the units kwarg carries the first 20.
+                self._log("info",
+                          f"Ignoring {len(_stale_restored)} checkpoint id(s) not in this run's unit set",
+                          units=sorted(str(s) for s in _stale_restored)[:20])
+                processed_ids = processed_ids & _dataset_ids
             _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
             # Restore llm_context for already-completed units.
             for unit in units:
@@ -601,11 +799,15 @@ class ContextEnhancer:
                       "data_flows_extracted": self.stats['data_flows_extracted'],
                       "errors": self.stats['errors']
                   })
+        # #786: the marker renders on the phase line — an unpriced model's
+        # under-count never reads as a complete figure.
+        from core.tracking import cost_marker
         self._log("info", "Token usage",
                   input_tokens=token_stats['total_input_tokens'],
                   output_tokens=token_stats['total_output_tokens'],
                   total_tokens=token_stats['total_tokens'],
-                  cost=f"${token_stats['total_cost_usd']:.4f}")
+                  cost=f"${token_stats['total_cost_usd']:.4f}"
+                       f"{cost_marker(token_stats)}")
 
         return dataset
 
@@ -675,6 +877,55 @@ class ContextEnhancer:
 
             # Load completed unit IDs from per-unit checkpoint files
             processed_ids = self._load_completed_units(checkpoint_dir)
+            # #748: the raw dir scan counts whatever a checkpoint file names
+            # — a stale id (a unit from a prior dataset, an unchanged unit
+            # outside a diff scope, a manual stray) is not a member of THIS
+            # dataset, but it inflated the restored count, _summary_completed
+            # past total_units (the corpus's `Done: 1825/1819`), and the
+            # remaining-unit count. The counters key on DATASET membership:
+            # intersect once, here, and every count downstream (the restore
+            # log, restored_callback, _summary_completed, remaining) is
+            # dataset-scoped. The restore loop and units_to_process were
+            # already dataset-keyed (they iterate units) — only the COUNTS
+            # were raw.
+            _dataset_ids = {u.get("id") for u in units}
+            # #802: the campaign's 105-orphan shape — the prior run's rows
+            # whose units are not in THIS population were counted nowhere.
+            # The census is the DIR (all rows, completed AND errored), not
+            # the completed set: _load_completed_units deliberately
+            # excludes errored rows, so a FOREIGN ERRORED row — the exact
+            # unfinished work a resume exists to finish — is invisible to
+            # the stale-restored intersection below (the 88-casualty
+            # class). The delta (classified by each row's prior verdict:
+            # the agent_context.error key this path's own error branch
+            # stamps) reaches the enhance _summary.json and the phase
+            # holder (the EnhanceResult seam).
+            from core.checkpoint import build_resume_delta
+            _drop_map = self._id_keyed_checkpoint_map(checkpoint_dir)
+            _dropped = []
+            for _sid in set(_drop_map) - _dataset_ids:
+                _row = read_json(_drop_map[_sid])
+                # r1-F2: honor the ROW's own context_key (the same
+                # predicate _load_completed_units uses) — both modes share
+                # this dir, so a mode switch between runs (agentic ->
+                # single-shot after a quota storm) must not misclassify a
+                # prior-mode ERRORED row as completed (the 88-casualty
+                # class labeled as its opposite).
+                _ctx_key = (_row or {}).get("context_key", "agent_context")
+                _ctx = (_row or {}).get(_ctx_key, {})
+                _dropped.append(
+                    (_sid, isinstance(_ctx, dict) and bool(_ctx.get("error"))))
+            self._resume_delta = build_resume_delta(_dropped)
+            _stale_restored = processed_ids - _dataset_ids
+            if _stale_restored:
+                # the sample is capped: a diff-scope resume over a shared
+                # checkpoint dir (core/enhancer.py's {output_dir}/enhance_
+                # checkpoints) can carry ~1800 stale ids — the count rides
+                # the message, the units kwarg carries the first 20.
+                self._log("info",
+                          f"Ignoring {len(_stale_restored)} checkpoint id(s) not in this run's unit set",
+                          units=sorted(str(s) for s in _stale_restored)[:20])
+                processed_ids = processed_ids & _dataset_ids
             _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
 
             # Restore agent_context from checkpoint files into units
@@ -707,6 +958,16 @@ class ContextEnhancer:
         _summary_incomplete = _restored_incomplete
         _summary_errors = 0
         _summary_error_breakdown = {}
+        # #748: the dataset units the resume seed counted as errors, with the
+        # error TYPE each carried. The seed keys on units whose checkpoint is
+        # errored; those units are re-attempted by this run's main loop, so
+        # _update_summary must RETIRE the seed when one lands non-error (the
+        # corpus's `errors: 528` with zero errored checkpoints on disk) —
+        # and it retires the BREAKDOWN type too: the retry round decrements
+        # errors only because it cannot know which type it re-covers; the
+        # seed knows. The dict is also what keeps a re-errored seed from
+        # double-counting: one unit, one error.
+        _seeded_error_types: dict[str, str] = {}
         _summary_input_tokens = 0
         _summary_output_tokens = 0
         _summary_cost_usd = 0.0
@@ -786,6 +1047,13 @@ class ContextEnhancer:
                         _summary_errors += 1
                         err = cp_data["agent_context"]["error"]
                         err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
+                        # #748: remember WHICH dataset units the seed counted
+                        # and the error TYPE each carried — the main loop
+                        # re-attempts them and _update_summary retires the
+                        # seed (errors AND the type) on a non-error landing,
+                        # or refuses a second count on a re-error (one unit,
+                        # one error).
+                        _seeded_error_types[uid] = err_type
                         _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
                         # #609: an errored unit is re-attempted by this run
                         # and its checkpoint OVERWRITTEN — seed the run-1
@@ -804,7 +1072,8 @@ class ContextEnhancer:
             _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                       _summary_error_breakdown, phase="in_progress",
                                       incomplete=_summary_incomplete,
-                                      usage=_usage_dict())
+                                      usage=_usage_dict(),
+                                      resume_delta=self._resume_delta)
 
             # Inject prior usage into tracker so step_report captures the total
             # F661-3: the ONE spend predicate — the cost disjunct is what
@@ -908,16 +1177,44 @@ class ContextEnhancer:
 
             return unit_id or "?", classification, unit_elapsed, worker
 
+        def _retire_seeded_error(uid: str) -> None:
+            """#748: retire a seeded error EXACTLY — errors and the breakdown
+            type the seed recorded for this unit. The retry round cannot
+            know which type it re-covers, so its own decrement (unchanged
+            here) leaves the breakdown stale for a unit it recovers — a
+            pre-existing divergence this closure does not touch; the seed
+            KNOWS, so it retires both, and a zeroed count drops the key."""
+            nonlocal _summary_errors, _summary_error_breakdown
+            _summary_errors = max(0, _summary_errors - 1)
+            _t = _seeded_error_types.pop(uid, None)
+            if _t is None:
+                return
+            _n = max(0, _summary_error_breakdown.get(_t, 0) - 1)
+            if _n:
+                _summary_error_breakdown[_t] = _n
+            else:
+                _summary_error_breakdown.pop(_t, None)
+
         def _update_summary(classification, unit):
             """Update summary counters after a unit completes. Called from main thread."""
             nonlocal _summary_completed, _summary_incomplete, _summary_errors
             nonlocal _summary_error_breakdown
             nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
+            uid = unit.get("id", "unknown")
             if classification == "error":
-                _summary_errors += 1
                 err = unit.get("agent_context", {}).get("error", {})
-                err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
-                _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
+                if uid in _seeded_error_types:
+                    # #748: the resume seed already counted this unit's error
+                    # (the checkpoint it restored WAS the error) — one unit,
+                    # one error, and the breakdown keeps the SEEDED type (the
+                    # unit is still one error; a re-errored landing does not
+                    # re-count or re-type it — the retry round's contract).
+                    # Fold the new attempt's spend only.
+                    _seeded_error_types.pop(uid, None)
+                else:
+                    _summary_errors += 1
+                    err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
+                    _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
                 # #609: fold the failed attempt's spend — the error path's
                 # agent_state (attached by agent.py alongside its record_call)
                 # is the ONLY place it exists: agent_metadata is absent on
@@ -936,8 +1233,17 @@ class ContextEnhancer:
             elif classification == INCOMPLETE_CLASSIFICATION:
                 # #293: the agent's degenerate exit (no completed finish call)
                 # is the third state — not a completion, not an error.
+                if uid in _seeded_error_types:
+                    # #748: retire the seed — the unit landed incomplete, not
+                    # errored (the retry round's flip, mirrored for the main
+                    # loop's landing).
+                    _retire_seeded_error(uid)
                 _summary_incomplete += 1
             else:
+                if uid in _seeded_error_types:
+                    # #748: retire the seed — the re-attempted unit landed a
+                    # verdict; the errored checkpoint it restored is gone.
+                    _retire_seeded_error(uid)
                 _summary_completed += 1
             # Accumulate per-unit usage
             meta = unit.get("agent_context", {}).get("agent_metadata", {})
@@ -955,7 +1261,8 @@ class ContextEnhancer:
             if _summary_cp is not None:
                 _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                           _summary_error_breakdown, phase="in_progress",
-                                          usage=_usage_dict(), incomplete=_summary_incomplete)
+                                          usage=_usage_dict(), incomplete=_summary_incomplete,
+                                          resume_delta=self._resume_delta)
 
         if workers <= 1:
             # Sequential mode
@@ -1115,7 +1422,8 @@ class ContextEnhancer:
                     _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                               _summary_error_breakdown, phase="in_progress",
                                               incomplete=_summary_incomplete,
-                                              usage=_usage_dict())
+                                              usage=_usage_dict(),
+                                              resume_delta=self._resume_delta)
 
                 # Save checkpoint (overwrite error with result)
                 if checkpoint_dir:
@@ -1135,7 +1443,8 @@ class ContextEnhancer:
             _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                       _summary_error_breakdown, phase="done",
                                       incomplete=_summary_incomplete,
-                                      usage=_usage_dict())
+                                      usage=_usage_dict(),
+                                      resume_delta=self._resume_delta)
 
         # Compute stats from all units (including previously checkpointed ones)
         agentic_stats = self._compute_agentic_stats(units)
@@ -1165,11 +1474,15 @@ class ContextEnhancer:
                       "incomplete": agentic_stats['incomplete_found'],
                       "errors": agentic_stats['errors']
                   })
+        # #786: the marker renders on the phase line — an unpriced model's
+        # under-count never reads as a complete figure.
+        from core.tracking import cost_marker
         self._log("info", "Token usage",
                   input_tokens=token_stats['total_input_tokens'],
                   output_tokens=token_stats['total_output_tokens'],
                   total_tokens=token_stats['total_tokens'],
-                  cost=f"${token_stats['total_cost_usd']:.4f}")
+                  cost=f"${token_stats['total_cost_usd']:.4f}"
+                       f"{cost_marker(token_stats)}")
 
         return dataset
 
@@ -1435,14 +1748,10 @@ class ContextEnhancer:
         try:
             return json.loads(response)
         except json.JSONDecodeError:
-            # Try to find JSON in the response
-            start = response.find("{")
-            end = response.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    return json.loads(response[start:end])
-                except json.JSONDecodeError:
-                    pass
+            # #673: the shared depth-0 scanner, not a first-{/last-} slice.
+            recovered = extract_json_object(response)
+            if recovered is not None:
+                return recovered
 
         # Fallback: use LLM to correct malformed JSON. Pass THIS phase's schema
         # so the corrector recovers enhancer shape (no verdict) instead of

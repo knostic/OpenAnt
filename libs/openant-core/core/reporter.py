@@ -21,7 +21,8 @@ from pathlib import Path
 
 from core.schemas import ReportResult
 from core.language_registry import fence_for_path
-from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
+from core.verdict_taxonomy import (DISCLOSURE_ELIGIBLE, coerce_cwe_id,
+                                    fold_legacy_finding)
 from core.verdict_taxonomy import (SEVERITIES, SEVERITY_FINDING_VERDICTS,
                                    severity_display_verdict)
 from utilities.child_interp import child_interpreter_env
@@ -392,6 +393,32 @@ def build_pipeline_output(
     all_results = [r for r in experiment.get("results", []) if isinstance(r, dict)]
     code_by_route = experiment.get("code_by_route", {})
     metrics = experiment.get("metrics", {})
+
+    # #744: the INCONCLUSIVE identity surface — the review path. The docs,
+    # the HTML legend, and the remediation guidance all recommend manual
+    # review for this verdict; the pipeline owed them identities, not a
+    # bare count. PRESENT-ONLY: a run with no inconclusive rows writes no
+    # block (no crying wolf on clean runs). The disclosure-drop is
+    # UNCHANGED (a disclosure document is a shipped artifact, not a review
+    # path — this block IS the review path).
+    _inconclusive_findings = []
+    for _r in all_results:
+        # #744 (the r1-F5 catch): fold the legacy INSUFFICIENT_CONTEXT value
+        # (the #623 promise: one function at every counting sink) — a
+        # resume-adopted legacy row counts here exactly as it does in the
+        # metrics, or the block under-reports beside the count.
+        if fold_legacy_finding(
+                str(_r.get("finding") or _r.get("verdict", "")).lower()) \
+                != "inconclusive":
+            continue
+        _rk = _r.get("route_key") or _r.get("unit_id", "unknown")
+        _inconclusive_findings.append({
+            "file": _rk.split(":")[0] if ":" in _rk else "unknown",
+            "function": (_rk.split(":", 1)[1] if ":" in _rk else _rk),
+            "cwe_id": coerce_cwe_id(_r.get("cwe_id", 0)),
+            "attack_vector": str(_r.get("attack_vector") or ""),
+            "reasoning": str(_r.get("reasoning") or ""),
+        })
 
     # Use confirmed_findings if present (verified results), else filter manually
     confirmed = experiment.get("confirmed_findings")
@@ -890,6 +917,9 @@ def build_pipeline_output(
             "safe": metrics.get("safe", 0),
             "protected": metrics.get("protected", 0),
             "inconclusive": metrics.get("inconclusive", 0),
+            # #744: the identity block (present-only — see the extraction above)
+            **({"inconclusive_findings": _inconclusive_findings}
+               if _inconclusive_findings else {}),
             # #423 (wave r1, three axes — the F13 partition): the metrics
             # recount and the disclosure list are TWO populations that
             # deliberately overlap (verifier.py's #284 note keeps
@@ -1039,6 +1069,7 @@ def generate_summary_report(
     results_path: str,
     output_path: str,
     llm_config_name: str | None = None,
+    registry=None,
 ) -> ReportResult:
     """Generate LLM-based summary report (Markdown).
 
@@ -1083,12 +1114,14 @@ def generate_summary_report(
         raise RuntimeError(f"Invalid pipeline output: {e}")
 
     # Resolve the report-phase binding once and pass it through.
-    # ``generate_summary_report`` is always invoked standalone via
-    # ``openant report -f summary`` — no upstream scanner has
-    # pre-validated the registry, so probe it here.
-    cf = load_config_file()
-    registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
-    probe_registry_or_raise(registry)
+    # #684: when the scanner invokes this mid-scan, it passes its own
+    # STARTUP-VALIDATED registry — the report uses the config the scan
+    # validated (no disk re-read, no second paid probe). The standalone
+    # path (no registry param) still probes.
+    if registry is None:
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+        probe_registry_or_raise(registry)
     report_binding = registry.get("report")
     report_text, usage = _generate_summary(pipeline_data, report_binding)
 
@@ -1097,7 +1130,9 @@ def generate_summary_report(
         f.write(report_text)
 
     print(f"  Summary report: {output_path}", file=sys.stderr)
-    print(f"  Cost: ${usage['cost_usd']:.4f} ({usage['total_tokens']:,} tokens)", file=sys.stderr)
+    from core.tracking import cost_marker
+    print(f"  Cost: ${usage['cost_usd']:.4f} ({usage['total_tokens']:,} tokens)"
+          f"{cost_marker(usage)}", file=sys.stderr)
 
     # Record in global tracker so step_context picks it up
     _record_usage_in_tracker(usage, report_binding)
@@ -1132,6 +1167,7 @@ def generate_disclosure_docs(
     results_path: str,
     output_dir: str,
     llm_config_name: str | None = None,
+    registry=None,
 ) -> ReportResult:
     """Generate per-vulnerability disclosure documents.
 
@@ -1177,11 +1213,12 @@ def generate_disclosure_docs(
 
     # Resolve the report-phase binding once and reuse across the
     # ThreadPoolExecutor — adapters are stateless dispatchers, safe
-    # to share. Probe the registry upfront (standalone-invocation
-    # path; same rationale as generate_summary_report).
-    cf = load_config_file()
-    registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
-    probe_registry_or_raise(registry)
+    # to share. #684: the scanner's validated registry threads through;
+    # the standalone path probes.
+    if registry is None:
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+        probe_registry_or_raise(registry)
     report_binding = registry.get("report")
 
     product_name = pipeline_data["repository"]["name"]
@@ -1235,7 +1272,9 @@ def generate_disclosure_docs(
     merged_usage = _merge_usage(all_usages) if all_usages else {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
 
     print(f"  Disclosures: {count} files in {output_dir}", file=sys.stderr)
-    print(f"  Cost: ${merged_usage['cost_usd']:.4f} ({merged_usage['total_tokens']:,} tokens)", file=sys.stderr)
+    from core.tracking import cost_marker
+    print(f"  Cost: ${merged_usage['cost_usd']:.4f} ({merged_usage['total_tokens']:,} tokens)"
+          f"{cost_marker(merged_usage)}", file=sys.stderr)
 
     # Record in global tracker so step_context picks it up
     _record_usage_in_tracker(merged_usage, report_binding)

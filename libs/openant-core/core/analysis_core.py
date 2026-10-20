@@ -17,6 +17,7 @@ and they depend only on stdlib and shipped packages (utilities/, prompts/).
 from __future__ import annotations
 
 import json
+import math
 from typing import TYPE_CHECKING
 from datetime import datetime
 
@@ -38,6 +39,7 @@ from prompts.prompt_selector import get_analysis_prompt
 from prompts.vulnerability_analysis import get_system_prompt as get_stage1_system_prompt
 from utilities.context_reviewer import ContextReviewer
 from utilities.json_corrector import JSONCorrector
+from utilities.json_extract import UNDECODABLE, scan_depth0_spans
 from utilities.llm import PhaseBinding, simple_text
 
 if TYPE_CHECKING:  # avoids a runtime cycle: context/ imports utilities/ which
@@ -187,6 +189,62 @@ def _normalize_result(result: dict) -> dict:
     if "cwe_name" not in result:
         result["cwe_name"] = None
 
+    # #736: the confidence rubric's READ-SIDE half — the emitted surface
+    # can only ever carry a DEFINED 0.0-1.0 float. The rubric (the five
+    # evidence-completeness bands) lives at the prompt's reply shape; this
+    # is the single normalization chokepoint every verdict dict passes
+    # through, so the bound is enforced HERE: a numeric value is clamped
+    # to the range (1.5 -> 1.0, -0.3 -> 0.0); a NON-NUMERIC value (the
+    # "high"/None/garbage class a free-form field invites) reads as NO
+    # confidence — set to None so the reporter's present-only gate omits
+    # it (an unusable number presented as a triage signal is the exact
+    # #736 finding; the #215 present-only contract treats it as absent,
+    # never a fabricated 0). int 1 (a "1" the model emitted without the
+    # decimal) coerces to the float — the range check runs on the
+    # COERCED value (bool is excluded: True is 1.0's integer twin and
+    # never a confidence).
+    # #736: the bound runs only when the key is PRESENT — absent stays
+    # absent (never fabricated), the #215 present-only contract.
+    if "confidence" in result:
+        _conf = result["confidence"]
+        if isinstance(_conf, bool):
+            result["raw_confidence"] = _conf
+            result["confidence"] = None
+        elif isinstance(_conf, (int, float)):
+            # #736 (the T1-r2 F8 catch): a giant int (>=309 digits — the
+            # bare-digit-string class json.loads yields) raises
+            # OverflowError inside isfinite's float conversion, which the
+            # analyze loop catches as a non-retryable ERROR and the
+            # unit's verdict is LOST (the base kept it); bound the int
+            # BEFORE any float conversion — a value that overflows the
+            # conversion is out of range by definition, so it routes to
+            # the no-confidence branch.
+            try:
+                _bounded = max(0.0, min(1.0, float(_conf)))
+            except (OverflowError, ValueError):
+                _bounded = None
+            if _bounded is None:
+                result["raw_confidence"] = _conf
+                result["confidence"] = None
+            else:
+                # #736 (the T1-r1 F1 catch): NaN/Infinity are NON-FINITE —
+                # Python's comparisons are False against NaN, so
+                # min(1.0, nan) returns 1.0 and the clamp FABRICATED the
+                # MAXIMUM confidence from json.loads' accepted bare-NaN
+                # token (the exact unusable-number-as-signal class, in the
+                # worst direction). Non-finite routes to no-confidence.
+                result["confidence"] = (
+                    _bounded if math.isfinite(_conf) else None)
+                if not math.isfinite(_conf):
+                    result["raw_confidence"] = _conf
+        elif _conf is not None:
+            # a non-numeric OR non-finite present value (the free-form
+            # field's "high"/garbage/NaN class) preserved raw, reads as NO
+            # confidence
+            result["raw_confidence"] = _conf
+            result["confidence"] = None
+        # None stays None (the present-but-null shape: no confidence)
+
     return result
 
 
@@ -241,58 +299,33 @@ def parse_response(response: str) -> dict:
     # (Accepted residual, pre-existing in the prior find/rfind code: adversarial
     # stray quotes in prose can still steer depth parity; the safe fallback is
     # always ERROR->retry.)
-    decoder = json.JSONDecoder()
+    # #673: the scan itself now lives in utilities.json_extract -- ONE home for
+    # the mechanism the eight sibling modules also needed. Each span is decoded
+    # in isolation there, which bounds the JSONDecodeError position math to the
+    # span (avoids O(n^2) on multi-MB responses, PY-NEW-2) and hands back the
+    # span TEXT for the malformed-verdict check below. The verdict policy stays
+    # here, unchanged: the scanner is generic, the ambiguity rules are not.
+    spans, in_string = scan_depth0_spans(response)
     verdict_objs = []
     malformed_verdict_spans = 0
-    depth = 0
-    in_string = False
-    escape = False
-    obj_start = None
-    for pos, ch in enumerate(response):
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-        elif ch == "{":
-            if depth == 0:
-                obj_start = pos
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and obj_start is not None:
-                    # Decode the balanced depth-0 span in isolation: bounds the
-                    # JSONDecodeError position math to the span (avoids O(n^2) on
-                    # multi-MB responses, PY-NEW-2) and gives the span text for
-                    # the malformed-verdict check.
-                    span = response[obj_start:pos + 1]
-                    try:
-                        obj = decoder.decode(span)
-                        if isinstance(obj, dict) and ("verdict" in obj or "finding" in obj):
-                            verdict_objs.append(obj)
-                    except json.JSONDecodeError:
-                        # Count as a competing verdict only if the failed span
-                        # carries a verdict/finding KEY (quoted, single or double)
-                        # -- so a malformed real verdict triggers the ambiguity
-                        # guard, but a preamble code block that merely contains the
-                        # word "finding" does not over-reject to ERROR.
-                        # ACCEPTED TRADE-OFF: a preamble that echoes verdict-SHAPED
-                        # broken JSON (e.g. `{"verdict": v}` in analyzed code) also
-                        # counts, so a legit lone verdict beside it is sent to
-                        # ERROR+retry rather than recovered. That is a recovery-rate
-                        # cost, not a wrong verdict (the retry re-derives it) -- the
-                        # deliberate safe direction, chosen over risking the
-                        # PY-NEW-1 false negative (malformed real verdict beside a
-                        # clean example -> example returned as SAFE).
-                        if any(k in span for k in ('"verdict"', "'verdict'", '"finding"', "'finding'")):
-                            malformed_verdict_spans += 1
-                    obj_start = None
+    for span, obj in spans:
+        if obj is UNDECODABLE:
+            # Count as a competing verdict only if the failed span carries a
+            # verdict/finding KEY (quoted, single or double) -- so a malformed
+            # real verdict triggers the ambiguity guard, but a preamble code
+            # block that merely contains the word "finding" does not
+            # over-reject to ERROR.
+            # ACCEPTED TRADE-OFF: a preamble that echoes verdict-SHAPED broken
+            # JSON (e.g. `{"verdict": v}` in analyzed code) also counts, so a
+            # legit lone verdict beside it is sent to ERROR+retry rather than
+            # recovered. That is a recovery-rate cost, not a wrong verdict (the
+            # retry re-derives it) -- the deliberate safe direction, chosen over
+            # risking the PY-NEW-1 false negative (malformed real verdict beside
+            # a clean example -> example returned as SAFE).
+            if any(k in span for k in ('"verdict"', "'verdict'", '"finding"', "'finding'")):
+                malformed_verdict_spans += 1
+        elif isinstance(obj, dict) and ("verdict" in obj or "finding" in obj):
+            verdict_objs.append(obj)
     if not in_string and len(verdict_objs) == 1 and malformed_verdict_spans == 0:
         return _normalize_result(verdict_objs[0])
 

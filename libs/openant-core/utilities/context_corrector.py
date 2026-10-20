@@ -11,6 +11,7 @@ Uses LLM-based semantic search instead of keyword matching.
 """
 
 import json
+import math
 import os
 import sys
 
@@ -19,6 +20,7 @@ from typing import Optional
 
 from .llm_client import TokenTracker, get_global_tracker
 from .llm import PhaseBinding, simple_text
+from .json_extract import extract_json_object
 
 
 # Maximum characters per batch (leaving room for prompt overhead)
@@ -363,15 +365,9 @@ def _parse_json_response(response: str) -> Optional[dict]:
     try:
         return json.loads(response)
     except json.JSONDecodeError:
-        # Try to find JSON in the response
-        start = response.find("{")
-        end = response.rfind("}") + 1
-        if start >= 0 and end > start:
-            try:
-                return json.loads(response[start:end])
-            except json.JSONDecodeError:
-                pass
-    return None
+        # #673: the shared depth-0 scanner, not a first-{/last-} slice -- a
+        # brace anywhere in the surrounding prose invalidated that span.
+        return extract_json_object(response)
 
 
 class ContextCorrector:
@@ -579,14 +575,10 @@ class ContextCorrector:
             result = json.loads(response)
             return self._normalize_result(result)
         except json.JSONDecodeError as e:
-            start = response.find("{")
-            end = response.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    result = json.loads(response[start:end])
-                    return self._normalize_result(result)
-                except json.JSONDecodeError:
-                    pass
+            # #673: the shared depth-0 scanner, not a first-{/last-} slice.
+            result = extract_json_object(response)
+            if result is not None:
+                return self._normalize_result(result)
 
             # If all parsing failed, try LLM correction
             if hasattr(self, 'binding') and self.binding:
@@ -694,6 +686,33 @@ class ContextCorrector:
         else:
             result.pop("severity", None)
             result.pop("severity_source", None)
+        # #736 mirror of core's bound (the twin-parity contract
+        # #316/#324/#427/#215 all honor): the confidence clamps to
+        # [0.0, 1.0] (non-finite included — NaN's min() fabricates 1.0,
+        # the core function's T1-r1 F1 catch); a bool/non-numeric/
+        # non-finite present value reads as no confidence with the raw
+        # preserved; absent stays absent.
+        if "confidence" in result:
+            _conf = result["confidence"]
+            if isinstance(_conf, bool):
+                result["raw_confidence"] = _conf
+                result["confidence"] = None
+            elif isinstance(_conf, (int, float)):
+                # the T1-r2 F8 mirror: a giant int overflows the float
+                # conversion — bound inside the try, out-of-range by
+                # definition routes to no-confidence (same as core).
+                try:
+                    _bounded = max(0.0, min(1.0, float(_conf)))
+                except (OverflowError, ValueError):
+                    _bounded = None
+                if _bounded is None or not math.isfinite(_conf):
+                    result["raw_confidence"] = _conf
+                    result["confidence"] = None
+                else:
+                    result["confidence"] = _bounded
+            elif _conf is not None:
+                result["raw_confidence"] = _conf
+                result["confidence"] = None
         return result
 
 

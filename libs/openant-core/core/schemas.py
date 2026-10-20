@@ -186,13 +186,22 @@ class AnalyzeResult:
     results_path: str
     metrics: AnalysisMetrics = field(default_factory=AnalysisMetrics)
     usage: UsageInfo = field(default_factory=UsageInfo)
+    # #802: the kept-set delta — the prior run's checkpoint rows whose
+    # units are not in this run's population, classified by prior verdict
+    # (``core.checkpoint.build_resume_delta``'s block). PRESENT-ONLY in
+    # to_dict: None (nothing dropped, or a fresh run) writes no key — the
+    # delta is a WARNING-shaped surface, not a per-run field.
+    resume_delta: dict | None = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "results_path": self.results_path,
             "metrics": self.metrics.to_dict(),
             "usage": self.usage.to_dict(),
         }
+        if self.resume_delta:
+            d["resume_delta"] = self.resume_delta
+        return d
 
 
 @dataclass
@@ -351,6 +360,15 @@ class EnhanceResult:
     # the empty dict = no incompletes (the present-only serialization)
     incomplete_summary: dict = field(default_factory=dict)
     usage: UsageInfo = field(default_factory=UsageInfo)
+    # #802: the kept-set delta (``build_resume_delta``'s block) — same
+    # shape + present-only semantics as AnalyzeResult's.
+    resume_delta: dict | None = None
+    # #739: the selection mode a --limit run used, stamped AT THE SLICE
+    # SITE over the population the slice actually selected from (the
+    # #213 diff-selected subset when diff-mode annotated the dataset) —
+    # present-only: an unlimited run serializes byte-identical to the
+    # pre-#739 shape. Empty string = no limit ran.
+    limit_mode: str = ""
 
     def to_dict(self) -> dict:
         result = {
@@ -366,6 +384,10 @@ class EnhanceResult:
         result["total_units"] = self.total_units
         if self.incomplete_summary:
             result["incomplete_summary"] = self.incomplete_summary
+        if self.resume_delta:
+            result["resume_delta"] = self.resume_delta
+        if self.limit_mode:
+            result["limit_mode"] = self.limit_mode
         return result
 
 
@@ -400,6 +422,12 @@ def verify_step_summary(result: "VerifyResult") -> dict:
         # #622: the protected-correction sibling joins the shared summary
         # (and the reconciliation bound above).
         "disagreed_protected": result.disagreed_protected,
+        # #681: the consistency-rewrite destinations — the display threads
+        # them beside their #622 sibling so the surface agrees with the
+        # scanner envelope (the three-surfaces-one-authority framing).
+        "consistency_protected": result.consistency_protected,
+        "consistency_safe": result.consistency_safe,
+        "consistency_inconclusive": result.consistency_inconclusive,
         "confirmed_vulnerabilities": result.confirmed_vulnerabilities,
         "needs_review": result.needs_review,
         "error_count": result.error_count,
@@ -439,6 +467,23 @@ class VerifyResult:
     # ``protected`` and they never fold into ``safe`` (the ->protected
     # sibling of the #509/#510 inconclusive arm).
     disagreed_protected: int = 0
+    # #681: agreed rows the post-batch CONSISTENCY pass rewrote (the
+    # volunteered findings_to_update class) — bucketed by destination so
+    # the scanner envelope folds them (the recount already counted them
+    # by their final finding; the envelope was the outlier surface).
+    consistency_protected: int = 0
+    consistency_safe: int = 0
+    consistency_inconclusive: int = 0
+    # #744 (the r1-F1 fix): the escalated rows (origin inconclusive,
+    # admitted by stage2_candidates) whose Stage-2 adjudication MOVED them
+    # out of inconclusive — the scanner envelope retires their Stage-1
+    # inconclusive count by exactly this (the sum-to-total partition).
+    escalated_inconclusive_moved: int = 0
+    # #743: the SAFE-disagreement rows (origin safe, admitted by
+    # stage2_candidates' classification arm) whose Stage-2 adjudication
+    # MOVED them out of safe — the envelope retires their Stage-1 safe
+    # count by exactly this (the same partition).
+    escalated_safe_moved: int = 0
     confirmed_vulnerabilities: int = 0
     # PR #69 F5: findings whose Stage-2 verification could not COMPLETE
     # (degenerate path or adapter error). Counted separately so the scanner
@@ -479,6 +524,9 @@ class VerifyResult:
             # "eliminated" number silently narrower than its parts.
             "disagreed_inconclusive": self.disagreed_inconclusive,
             "disagreed_protected": self.disagreed_protected,
+            "consistency_protected": self.consistency_protected,
+            "consistency_safe": self.consistency_safe,
+            "consistency_inconclusive": self.consistency_inconclusive,
             "confirmed_vulnerabilities": self.confirmed_vulnerabilities,
             "needs_review": self.needs_review,
             "error_count": self.error_count,
