@@ -309,8 +309,7 @@ func runScan(cmd *cobra.Command, args []string) {
 	}
 
 	// Build the diff manifest from the decision before checkpoint
-	// detection so that any PR-mode checkout happens first and the scan
-	// dir is up-to-date.
+	// detection so that the scan dir is up-to-date.
 	manifestOpts := diffOpts{}
 	// #668: PR is stamp-only (the fetch already happened in selectMode); it does NOT set opts.pr (which means "fetch this")
 	manifestOpts.prNumber = decision.PR
@@ -319,9 +318,28 @@ func runScan(cmd *cobra.Command, args []string) {
 		manifestOpts.scope = decision.Scope
 		manifestOpts.staged = decision.Staged
 	}
-	manifestPath, err := prepareDiffManifest(repoPath, scanOutput, manifestOpts)
+
+	// #665 cycle 2: a --pr run scans the ISOLATED worktree, never the
+	// user's checkout — every tree reader below (the manifest builder,
+	// the Python engine, the metadata stamps) reads the PR head; the
+	// user's tree stays exactly where it was, and a concurrent --pr run
+	// cannot re-point this run's HEAD (each run owns its worktree).
+	scanPath := repoPath
+	if decision.PRWorktree != "" {
+		scanPath = decision.PRWorktree
+	}
+	// os.Exit bypasses defers, so the workspace cleanup is EXPLICIT at
+	// every exit arm from here down (a no-op unless this run fetched a PR).
+	cleanupPR := func() {
+		if decision.PRWorktree != "" {
+			git.CleanupPRWorktree(repoPath, decision.PRWorktree, decision.PRRef)
+		}
+	}
+
+	manifestPath, _, err := prepareDiffManifest(scanPath, scanOutput, manifestOpts)
 	if err != nil {
 		output.PrintError(err.Error())
+		cleanupPR()
 		os.Exit(2)
 	}
 
@@ -346,7 +364,9 @@ func runScan(cmd *cobra.Command, args []string) {
 	}
 
 	// Build Python CLI args
-	pyArgs := []string{"scan", repoPath}
+	// #665 cycle 2: the engine reads the ISOLATED worktree on --pr (the
+	// user's tree is never the scanned tree on that path)
+	pyArgs := []string{"scan", scanPath}
 	if scanOutput != "" {
 		pyArgs = append(pyArgs, "--output", scanOutput)
 	}
@@ -403,15 +423,17 @@ func runScan(cmd *cobra.Command, args []string) {
 	// placeholders. #539: an explicit flag wins; the project context is the
 	// fallback (a bare-path scan has no project context — the flags are the
 	// only way in).
-	// #557: detection runs AFTER resolveScanMode (the --pr path checks
-	// out the PR head in mode.go's FetchPR — scan.go:178) — hoisting this
-	// above would stamp the pre-checkout SHA (the review round's ordering
-	// hazard).
-	detectedSHA := git.HeadSHA(repoPath)
+	// #557: detection runs AFTER resolveScanMode (the --pr path
+	// materializes the PR head in mode.go's FetchPR) — hoisting this
+	// above would stamp the pre-fetch SHA (the review round's ordering
+	// hazard). #665 cycle 2: the stamp reads scanPath — on --pr that is
+	// the isolated worktree whose HEAD is the PR head, so the metadata
+	// still names the scanned tree.
+	detectedSHA := git.HeadSHA(scanPath)
 	// #562: the origin remote, normalized (scp→https, credentials never
 	// persist). The detection is informational — a non-git path or a
 	// remote-less repo yields "" and the tier is skipped.
-	detectedURL := git.NormalizeRemote(git.RemoteURL(repoPath))
+	detectedURL := git.NormalizeRemote(git.RemoteURL(scanPath))
 	repoName, repoURL, commitSHA, metadataWarn := resolveRepoMetadataFull(
 		scanRepoName, scanRepoURL, scanCommitSHA, ctx, detectedSHA,
 		detectedURL)
@@ -442,6 +464,7 @@ func runScan(cmd *cobra.Command, args []string) {
 	if err != nil {
 		finalizeScanMetaIfProject(ctx, config.ScanStatusFailed)
 		output.PrintError(err.Error())
+		cleanupPR()
 		os.Exit(2)
 	}
 
@@ -455,6 +478,7 @@ func runScan(cmd *cobra.Command, args []string) {
 	}
 
 	if result.Envelope.Status == "interrupted" {
+		cleanupPR()
 		os.Exit(130)
 	} else if jsonOutput {
 		output.PrintJSON(result.Envelope)
@@ -466,6 +490,7 @@ func runScan(cmd *cobra.Command, args []string) {
 		output.PrintErrors(result.Envelope.Errors)
 	}
 
+	cleanupPR()
 	os.Exit(result.ExitCode)
 }
 
@@ -542,10 +567,19 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 	// `scan -l go` lands artifacts under python/ while this record lands
 	// under go/ (issue #667 tracks that alignment).
 	if ctx != nil && ctx.Project != nil {
+		// #665 cycle 2: the branch stamps the SCANNED tree — on --pr that
+		// is the isolated worktree, whose detached HEAD reads "" via
+		// CurrentBranch (the pre-isolation behavior when the checkout
+		// itself was detached). Stamping the user's branch instead would
+		// mislabel a scan of the PR head as a scan of main.
+		branchRepo := repoPath
+		if decision.PRWorktree != "" {
+			branchRepo = decision.PRWorktree
+		}
 		meta := config.NewScanMeta(
 			decision.Kind,
 			ctx.Project.CommitSHA,
-			git.CurrentBranch(repoPath),
+			git.CurrentBranch(branchRepo),
 			scanLanguage,
 		)
 		meta.Base = decision.Base

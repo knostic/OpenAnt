@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/knostic/open-ant-cli/internal/git"
 	"github.com/knostic/open-ant-cli/internal/languages"
 	"github.com/knostic/open-ant-cli/internal/output"
 	"github.com/knostic/open-ant-cli/internal/python"
@@ -116,10 +117,22 @@ func runParse(cmd *cobra.Command, args []string) {
 		output.PrintError(err.Error())
 		os.Exit(2)
 	}
-	manifestPath, err := prepareDiffManifest(repoPath, parseOutput, stepOpts)
+	// #665 cycle 2: on --pr the PR head materializes in an ISOLATED
+	// worktree (the user's checkout is never touched); the manifest was
+	// built against it, the engine parses it, and the exit arms below own
+	// the cleanup (prepareDiffManifest already cleaned on its own error
+	// paths — an error return carries no cleanup debt).
+	manifestPath, prwt, err := prepareDiffManifest(repoPath, parseOutput, stepOpts)
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)
+	}
+	scanPath := repoPath
+	if prwt.Worktree != "" {
+		scanPath = prwt.Worktree
+	}
+	cleanupPR := func() {
+		git.CleanupPRWorktree(repoPath, prwt.Worktree, prwt.Ref)
 	}
 
 	// Construct dataset name from project metadata: org-repo-shortSHA
@@ -133,11 +146,12 @@ func runParse(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	pyArgs := buildParsePyArgs(repoPath, parseOutput, datasetName, parseLanguage, parseLevel, manifestPath, parseFresh, parseLibraryMode)
+	pyArgs := buildParsePyArgs(scanPath, parseOutput, datasetName, parseLanguage, parseLevel, manifestPath, parseFresh, parseLibraryMode)
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, resolvedAPIKey(), nil)
 	if err != nil {
 		output.PrintError(err.Error())
+		cleanupPR()
 		os.Exit(2)
 	}
 
@@ -151,5 +165,6 @@ func runParse(cmd *cobra.Command, args []string) {
 		output.PrintErrors(result.Envelope.Errors)
 	}
 
+	cleanupPR()
 	os.Exit(result.ExitCode)
 }

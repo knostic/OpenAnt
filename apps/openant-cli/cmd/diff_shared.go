@@ -49,63 +49,85 @@ func (o diffOpts) validate() error {
 	return nil
 }
 
+// prWorkspace is the per-run --pr isolation state (#665 cycle 2): the
+// worktree holding the PR head and the unique ref it was fetched into.
+// The zero value means "not a --pr run this call". The caller hands it to
+// git.CleanupPRWorktree at its exit arms; on an error return from
+// prepareDiffManifest the cleanup has already run.
+type prWorkspace struct {
+	Worktree string
+	Ref      string
+}
+
 // prepareDiffManifest resolves the base ref (via --pr or --diff-base),
 // builds the manifest, and writes it under outputDir. Returns the manifest
-// path, or "" if not in diff mode.
+// path and the --pr workspace (zero when not a --pr fetch), or "" and the
+// zero workspace if not in diff mode.
 //
 // outputDir must already exist (the caller should mkdir it). repoPath is
 // the absolute path to the working copy the diff is computed against.
 //
-// For --pr, the working tree is mutated (a detached checkout of the fetched PR
-// ref — the unique ref of internal/git/diff.go, not a shared branch). Callers that
-// care about HEAD stability must be aware.
-func prepareDiffManifest(repoPath, outputDir string, opts diffOpts) (string, error) {
+// For --pr, the PR head materializes in an ISOLATED temporary worktree —
+// the user's checkout is never touched (#665 arms 2+3: no persistent
+// mutation, and concurrent runs each read their own tree). The manifest is
+// built against that worktree, whose HEAD is the PR head, so the
+// manifest's head_sha is the PR the run was invoked with even when a
+// sibling run fetches concurrently.
+func prepareDiffManifest(repoPath, outputDir string, opts diffOpts) (string, prWorkspace, error) {
 	if !opts.isSet() {
-		return "", nil
+		return "", prWorkspace{}, nil
 	}
 	if err := opts.validate(); err != nil {
-		return "", err
+		return "", prWorkspace{}, err
 	}
 	if outputDir == "" {
-		return "", fmt.Errorf("diff mode requires an output directory (use --output or `openant init` to set up a project)")
+		return "", prWorkspace{}, fmt.Errorf("diff mode requires an output directory (use --output or `openant init` to set up a project)")
 	}
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		return "", fmt.Errorf("create output dir %s: %w", outputDir, err)
+		return "", prWorkspace{}, fmt.Errorf("create output dir %s: %w", outputDir, err)
 	}
 
+	var prwt prWorkspace
 	var m *git.Manifest
 	if opts.staged {
 		built, err := git.BuildStagedManifest(repoPath, opts.scope)
 		if err != nil {
-			return "", fmt.Errorf("build staged diff manifest: %w", err)
+			return "", prWorkspace{}, fmt.Errorf("build staged diff manifest: %w", err)
 		}
 		m = built
 	} else {
 		baseRef := opts.base
+		manifestRepo := repoPath
 		if opts.pr > 0 {
-			fetched, err := git.FetchPR(repoPath, opts.pr, nil)
+			fetched, wt, ref, err := git.FetchPR(repoPath, opts.pr, nil)
 			if err != nil {
-				return "", err
+				return "", prWorkspace{}, err
 			}
 			baseRef = fetched
+			manifestRepo = wt
+			prwt = prWorkspace{Worktree: wt, Ref: ref}
 			if !quiet {
-				fmt.Fprintf(os.Stderr, "PR #%d: base=%s (fetched into a unique ref, checked out detached)\n", opts.pr, baseRef)
+				fmt.Fprintf(os.Stderr, "PR #%d: base=%s (fetched into a unique ref, materialized in an isolated worktree)\n", opts.pr, baseRef)
 			}
 		}
 		stampPR := opts.pr
 		if stampPR == 0 {
 			stampPR = opts.prNumber // #668: the resolved PR (from modeDecision.PR), not a fetch request
 		}
-		built, err := git.BuildManifest(repoPath, baseRef, opts.scope, stampPR)
+		built, err := git.BuildManifest(manifestRepo, baseRef, opts.scope, stampPR)
 		if err != nil {
-			return "", fmt.Errorf("build diff manifest: %w", err)
+			// the workspace this call created is cleaned HERE — the
+			// error return carries no cleanup debt to the caller
+			git.CleanupPRWorktree(repoPath, prwt.Worktree, prwt.Ref)
+			return "", prWorkspace{}, fmt.Errorf("build diff manifest: %w", err)
 		}
 		m = built
 	}
 
 	manifestPath := filepath.Join(outputDir, "diff_manifest.json")
 	if err := git.WriteManifest(manifestPath, m); err != nil {
-		return "", err
+		git.CleanupPRWorktree(repoPath, prwt.Worktree, prwt.Ref)
+		return "", prWorkspace{}, err
 	}
 
 	if !quiet {
@@ -120,7 +142,7 @@ func prepareDiffManifest(repoPath, outputDir string, opts diffOpts) (string, err
 		output.PrintKeyValue("Changed files", fmt.Sprintf("%d", len(m.ChangedFiles)))
 	}
 
-	return manifestPath, nil
+	return manifestPath, prwt, nil
 }
 
 func shortSHA(sha string) string {

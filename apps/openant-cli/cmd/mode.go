@@ -37,6 +37,12 @@ type modeDecision struct {
 	Scope  string
 	Staged bool
 	PR     int // #668: stamp-only (the resolved PR; does not trigger a fetch)
+	// #665 cycle 2: the ISOLATED worktree holding the PR head, and the
+	// unique ref it was fetched into. Set only on the --pr arm (the run
+	// that fetched); the caller reads the scanned tree from PRWorktree
+	// and hands both to git.CleanupPRWorktree at its exit arms.
+	PRWorktree string
+	PRRef      string
 }
 
 // errBaselineNonInteractive is returned when init/scan is invoked without
@@ -52,7 +58,8 @@ var errBaselineNonInteractive = errors.New(
 // Decision precedence:
 //  1. Validate flag combinations.
 //  2. --full → full
-//  3. --pr → diff against PR base (mutates working tree)
+//  3. --pr → diff against PR base (the PR head materializes in an
+//     isolated worktree; the user's checkout is never touched)
 //  4. --diff-base → diff against ref
 //  5. --incremental → diff against last successful scan (errors if none)
 //  6. No flag, no baseline → full (silent)
@@ -77,11 +84,12 @@ func selectMode(o modeOpts) (modeDecision, error) {
 	}
 
 	if o.pr > 0 {
-		baseRef, err := git.FetchPR(o.repoPath, o.pr, nil)
+		baseRef, wt, ref, err := git.FetchPR(o.repoPath, o.pr, nil)
 		if err != nil {
 			return modeDecision{}, err
 		}
-		return modeDecision{Kind: config.ScanKindDiff, Base: baseRef, Scope: scope, PR: o.pr}, nil
+		return modeDecision{Kind: config.ScanKindDiff, Base: baseRef, Scope: scope,
+			PR: o.pr, PRWorktree: wt, PRRef: ref}, nil
 	}
 
 	if o.diffBase != "" {
