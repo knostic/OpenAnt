@@ -39,8 +39,13 @@ def _family(model_id: str) -> str:
     s = re.sub(r"^anthropic\.", "", s)
     s = re.sub(r"-v\d+:\d+$", "", s)                   # Bedrock version suffix
     s = re.sub(r":[a-z0-9-]+$", "", s)                   # OpenRouter variant (:free, :thinking, :batch)
-    s = re.sub(r"-\d{8}$", "", s)                     # Anthropic date stamp
-    return s.replace(".", "-")                        # 4.5 vs 4-5 conventions
+    s = s.replace(".", "-")                            # 4.5 vs 4-5 conventions
+    # the date stamp runs AFTER the dot->dash swap: the alias spellings
+    # carry the date dot-attached (claude-haiku-4-5.20251001) and only the
+    # swapped form matches the -\d{8}$ rule (the #690 bedrock alias catch —
+    # the pre-#690 order left the dot-date as a phantom family suffix)
+    s = re.sub(r"-\d{8}$", "", s)
+    return s
 
 
 def _priced_records(data):
@@ -158,9 +163,23 @@ def _cache_disagreements(records):
             fam[_family(r["id"])].append(r)
     out = []
     for family, recs in sorted(fam.items()):
-        base = recs[0]
-        for r in recs[1:]:
+        # the opus-r1 catch: the base must be a NON-ANNOTATED record (the
+        # price row's own wave-r1 rule) — an annotated record as the base
+        # would launder every sibling's divergence
+        comparable = [r for r in recs
+                      if not (isinstance(r.get("cache_diverges"), str)
+                              and r["cache_diverges"].strip())]
+        base = comparable[0] if comparable else recs[0]
+        for r in recs:
             if _cache_mult(r) != _cache_mult(base):
+                # the #690 hatch (mirroring price_diverges): an annotated
+                # divergence names the ROUTE difference and is allowed —
+                # the openrouter google routes list cache writes at their
+                # own prices while Google's page publishes none.
+                _why = (isinstance(r.get("cache_diverges"), str)
+                        and r["cache_diverges"].strip())
+                if _why:
+                    continue
                 out.append(f"{family}: {r['id']} caches at {_cache_mult(r)} "
                            f"but {base['id']} caches at {_cache_mult(base)}")
     return out
@@ -169,11 +188,20 @@ def _cache_disagreements(records):
 def test_same_family_cache_multipliers_agree_across_providers():
     """The cache analogue of the #344 price row.
 
-    LIVE SINCE #690 + #648: the 4.5/4.6-generation census made the
-    bare/dated pairs (claude-opus-4-5 + its dated spelling, etc.) both
-    carry cache blocks — the row is live and a green here is a real
-    "no disagreement" among the intra-family pairs (the dated spellings
-    normalise to the bare family and all agree at 0.1/1.25).
+    LIVE SINCE #690, AND #648 DID NOT CHANGE ITS SCOPE (the old note that
+    said "zero cache-comparable families" is history): 21 comparable
+    families — the 8 claude families across anthropic+bedrock+openrouter
+    (the 0.025x exception pair agreeing on all three providers), the 9
+    openai families across openai+openrouter (the per-model 0.5x/0.25x
+    ratios agreeing), and the 4 gemini families across google+openrouter
+    (the reads agreeing at 0.1x; the openrouter routes' writes
+    hatch-annotated — Google's page publishes no write). #648's three new
+    cache-bearing families (claude-opus-4-5, claude-sonnet-4-5 and the
+    newly-priced claude-opus-4-6) are ANTHROPIC-ONLY — no bedrock or
+    openrouter sibling carries them — so they raise the cache-bearing
+    family count 23 -> 26 while leaving the COMPARABLE (multi-provider)
+    count at 21. A green here is a real "no disagreement", never
+    "nothing was compared".
     """
     conf = find_models_config()
     assert conf is not None, "config/models.json not locatable"
@@ -220,12 +248,21 @@ def test_every_priced_spelling_carries_its_own_familys_cache_multiplier():
     """The alias row — the non-vacuous half of N-A2b.
 
     `pricing_map` pass 2 assigns the SAME entry object to every alias
-    spelling, cache multipliers included. The post-#648 anthropic map has 25
-    keys, 9 of them aliases carrying `cache_read` (the dotted 4.5/4.6 forms
-    + the existing 4.7/4.8/haiku/mythos set). Each must carry the multiplier
-    of a record in ITS OWN family — if the alias normalisation ever merged
-    the 0.025x exception pair with its 0.1x sibling, cached reads would
-    misprice 4x with no marker.
+    spelling, cache multipliers included. The #690 census as widened by
+    #648 cache-rates 61 records across five providers
+    (anthropic/bedrock/openai/google/openrouter) and the maps carry 130
+    cache-bearing keys incl. their alias spellings (the bedrock region
+    twins, the OpenRouter slug spellings). #648 contributes exactly 8 of
+    them to the anthropic map (17 -> 25): the five record-id keys
+    claude-opus-4-5, claude-opus-4-5-20251101, claude-sonnet-4-5,
+    claude-sonnet-4-5-20250929 and claude-opus-4-6 (the status flip makes
+    that one priced), plus the three dotted alias spellings
+    claude-opus-4.5, claude-opus-4.6 and claude-sonnet-4.5 — the bare
+    claude-haiku-4-5 record adds NO key because its spelling already
+    shipped as an alias (the opus-r1 catch). Each must carry the
+    multiplier of a record in ITS OWN family — if the alias normalisation
+    ever merged the 0.025x exception pair with its 0.1x sibling, cached
+    reads would misprice 4x with no marker.
     """
     conf = find_models_config()
     data = json.loads(conf.read_text(encoding="utf-8"))
@@ -252,8 +289,11 @@ def test_every_priced_spelling_carries_its_own_familys_cache_multiplier():
                 checked += 1
     # the census, asserted so a normalisation change that DROPS alias keys
     # cannot quietly shrink this row to nothing
-    # #648: +8 keys (the 4 new records + their alias spellings in the map)
-    assert checked == 25, f"expected 25 cache-carrying priced keys, got {checked}"
+    # the #690 census as widened by #648: every cache-carrying priced key
+    # across ALL five providers' maps (the record ids + their alias
+    # spellings). 122 (#690) + 8 (#648's anthropic keys) = 130, derived by
+    # running this very census on the merged tree, never transcribed.
+    assert checked == 130, f"expected 130 cache-carrying priced keys, got {checked}"
 
 
 def test_the_documented_cache_exception_pair_is_exactly_two_models():
@@ -269,24 +309,49 @@ def test_the_documented_cache_exception_pair_is_exactly_two_models():
         mult = _cache_mult(r)
         if mult is not None:
             reads[mult[0]].add(r["id"])
-            writes.add(mult[1])
-    assert set(reads) == {0.1, 0.025}, set(reads)
-    assert reads[0.025] == {"claude-fable-5-1", "claude-mythos-5-1"}
-    assert writes == {1.25}, writes
+            if mult[1] is not None:      # the read-only records carry no write
+                writes.add(mult[1])
+    # the #690 census: the reads are the per-family published ratios —
+    # the anthropic/bedrock 0.1x with the documented 0.025x exception pair,
+    # the openai per-model 0.5x/0.25x, the google 0.1x; the writes are
+    # 1.25x (anthropic/bedrock/the openrouter claude+google routes at
+    # their own published per-model prices)
+    assert set(reads) == {0.1, 0.025, 0.5, 0.25}, set(reads)
+    assert reads[0.025] == {
+        "claude-fable-5-1", "claude-mythos-5-1",
+        "anthropic.claude-fable-5-1", "anthropic/claude-fable-5.1",
+    }, reads[0.025]
+    assert reads[0.5] == {"gpt-4o", "gpt-4o-mini", "o1", "o3-mini",
+                          "openai/gpt-4o", "openai/gpt-4o-mini",
+                          "openai/o1", "openai/o3-mini"}, reads[0.5]
+    assert reads[0.25] == {"gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
+                           "o3", "o4-mini", "openai/gpt-4.1",
+                           "openai/gpt-4.1-mini", "openai/gpt-4.1-nano",
+                           "openai/o3", "openai/o4-mini"}, reads[0.25]
+    # the openai family's writes are KNOWN at 1.0 (no premium — OpenRouter's
+    # docs: 'no cost on models before the GPT-5.6 family'); the google
+    # routes' writes are the OpenRouter listings; anthropic/bedrock 1.25x
+    assert writes == {1.25, 1.0, 0.3, 0.2778, 0.8333, 0.0556}, writes
 
 
-def test_cache_block_lives_only_on_anthropic_records():
-    """#344's letter for the cache kind: the multipliers are Anthropic's
-    documented prompt-caching rates, so no other provider's record may claim
-    them (a bedrock/openrouter gateway reprices and would need its own
-    sourced block + the agreement row above)."""
+def test_cache_block_lives_only_on_sourced_records():
+    """#344's letter, SUPERSEDED at #690: the multipliers are SOURCED PER
+    PROVIDER now (OpenAI/Google's own pages, the OpenRouter listings,
+    Bedrock's docs + Anthropic's per-model rates), so the block lives on
+    any record that carries a source receipt — and every one must: an
+    unsourced cache block is a pasted rate, the exact mistake the census
+    discipline exists to stop. The family-AGREEMENT row (and the
+    cache_diverges hatch) covers the cross-provider consistency; this row
+    covers the provenance."""
     conf = find_models_config()
     data = json.loads(conf.read_text(encoding="utf-8"))
     offenders = [r["id"] for r in _priced_records(data)
                  if _cache_mult(r) is not None
-                 and r.get("provider") != "anthropic"]
+                 and not (isinstance(r.get("cache", {}).get("source"), str)
+                          and r["cache"]["source"].strip())]
     assert offenders == [], offenders
-    # non-vacuous: there ARE non-anthropic priced records to be wrong about
-    others = [r["id"] for r in _priced_records(data)
-              if r.get("provider") != "anthropic"]
-    assert len(others) >= 20, len(others)
+    # non-vacuous: the census is now cross-provider (the #690 rate set)
+    non_anthropic_rated = [r["id"] for r in _priced_records(data)
+                           if _cache_mult(r) is not None
+                           and r.get("provider") != "anthropic"]
+    assert len(non_anthropic_rated) >= 40, len(non_anthropic_rated)

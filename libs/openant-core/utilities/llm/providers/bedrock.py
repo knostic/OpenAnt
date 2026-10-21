@@ -121,6 +121,20 @@ def reset_warnings() -> None:
         _api_key_warned = False
 
 
+# #646: the validate() probe's per-request timeout (SECONDS) — a cheap
+# 1-token liveness check, not a full request: with the 600 s adapter
+# default and max_retries=5 a black-holed probe fails after ~61
+# minutes worst case; 15 s anchors the Go wizard's probe
+# (llm_probe_google.go: http.Client{Timeout: 15 * time.Second}), so
+# the probe fails in ~104 s worst case (the client's max_retries=5
+# inherited: 6 jittered attempts under a 15 s deadline — the
+# opus-r1 wire measurement), down from the ~61 minutes of the
+# unbounded 600 s shape; the Go wizard's ONE-attempt probe is
+# tighter still. The request path's 600 s default and its
+# max_retries are UNTOUCHED.
+PROBE_TIMEOUT_SECONDS = 15
+
+
 class BedrockAdapter:
     """:class:`LLMAdapter` implementation backed by ``anthropic.AnthropicBedrock``."""
 
@@ -298,6 +312,7 @@ class BedrockAdapter:
         # backoff — it is a one-shot probe at scan startup.
         try:
             self._client.messages.create(
+                timeout=PROBE_TIMEOUT_SECONDS,  # #646: the probe's tight deadline
                 model=model,
                 max_tokens=1,
                 messages=[{"role": "user", "content": "hi"}],

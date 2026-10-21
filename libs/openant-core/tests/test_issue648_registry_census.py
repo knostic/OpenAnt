@@ -137,11 +137,6 @@ def test_the_census_covers_the_sdk_literals():
     import typing
     from core.model_registry import pricing_map as _pm
     assert "claude-opus-4-5" in _pm("anthropic")
-    # the prod-hunk DATA file named as a string constant in the body
-    # (the #698 data-read pattern — the census reads the registry file
-    # through the pricing_map reader; this string is the load-bearing
-    # proof of the read)
-    _data_file = "config/models.json"
     # the opus-r1 catch: the SDK's Model is Union[Literal[...], str], NOT a
     # bare Literal — typing.get_args unpacks the union; the first arg is the
     # Literal, whose __args__ carry the model strings
