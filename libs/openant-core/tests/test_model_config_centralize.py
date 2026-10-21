@@ -197,6 +197,20 @@ _EXPECTED_ANTHROPIC_CURRENT = {
     # #648 (the opus-r1 catch): the bare haiku-4-5 spelling — an SDK
     # literal the census was missing; same rate as the dated form
     "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
+    # #648 (the S6 witness's remainder): the 5.5 generation. The SDK's
+    # model-literal union carries claude-opus-5-5, claude-sonnet-5-5 and
+    # claude-haiku-5-5, and NO record priced them — the S6 census row
+    # failed on the first of them. Every rate independently sourced
+    # (Anthropic's live pricing page + the live OpenRouter catalogue, both
+    # fetched 2026-10-21, both agreeing to the cent). Note that Opus 5.5
+    # is the first Opus to price BELOW its predecessor ($4/$20 against
+    # Opus 5's $5/$25), so this snapshot's value is NOT the family rate.
+    "claude-opus-5-5": {"input": 4.00, "output": 20.00},
+    "claude-sonnet-5-5": {"input": 2.00, "output": 10.00},
+    # Haiku 5.5's BASE (prompts up to 100k) row — the page prices this one
+    # model by prompt length and the record models the base tier only; the
+    # record's own source field names the untracked over-100k tier.
+    "claude-haiku-5-5": {"input": 0.10, "output": 0.50},
 }
 _RETIRED_OR_UNKNOWN_ANTHROPIC = {
     "claude-opus-4-20250514",

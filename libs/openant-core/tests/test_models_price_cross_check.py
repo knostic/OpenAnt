@@ -291,16 +291,36 @@ def test_every_priced_spelling_carries_its_own_familys_cache_multiplier():
     # cannot quietly shrink this row to nothing
     # the #690 census as widened by #648: every cache-carrying priced key
     # across ALL five providers' maps (the record ids + their alias
-    # spellings). 122 (#690) + 8 (#648's anthropic keys) = 130, derived by
-    # running this very census on the merged tree, never transcribed.
-    assert checked == 130, f"expected 130 cache-carrying priced keys, got {checked}"
+    # spellings). 122 (#690) + 8 (#648's 4.5-generation anthropic keys)
+    # + 6 (#648's 5.5-generation keys: the three record ids claude-opus-5-5,
+    # claude-sonnet-5-5 and claude-haiku-5-5, each plus its ONE dotted alias
+    # spelling claude-opus-5.5 / claude-sonnet-5.5 / claude-haiku-5.5 —
+    # anthropic's map goes 25 -> 31) = 136, derived by running this very
+    # census on the records tree, never transcribed.
+    assert checked == 136, f"expected 136 cache-carrying priced keys, got {checked}"
 
 
-def test_the_documented_cache_exception_pair_is_exactly_two_models():
+def test_the_documented_cache_exceptions_are_exactly_the_published_groups():
     """#626's census claim, pinned: every anthropic cache read is 0.1x except
-    the documented Fable 5.1 / Mythos 5.1 pair at 0.025x, and every write is
-    1.25x. A rate pasted where a MULTIPLIER belongs (the easy mistake: these
-    are fractions of the base input rate, not $/MTok) fails here."""
+    the DOCUMENTED exception groups, and every write is 1.25x. A rate pasted
+    where a MULTIPLIER belongs (the easy mistake: these are fractions of the
+    base input rate, not $/MTok) fails here.
+
+    RENAMED at #648's 5.5-generation round, because the old name
+    (``..._pair_is_exactly_two_models``) asserted a fact that stopped being
+    true: Anthropic's pricing page now publishes TWO exception groups, not
+    one pair. Its footnotes, fetched 2026-10-21:
+      * 0.025x — "Cache hits and refreshes on Claude Fable 5.1 and Claude
+        Mythos 5.1 are priced at 0.025x the base input price"
+      * 0.05x  — "Cache hits and refreshes on Claude Opus 5.5 and Claude
+        Sonnet 5.5 are priced at 0.05x the base input price"
+      * "All other models use the standard 0.1x multiplier" — which is why
+        claude-haiku-5-5, added in the same round, is pinned at 0.1x and
+        NOT at a 5.5-generation rate. The generation does not set the
+        multiplier; the page does, per model.
+    The assertion is not weakened by the rename: both groups are pinned by
+    EXACT set equality, so adding a model to either one, or inventing a
+    third rate, still fails here."""
     conf = find_models_config()
     data = json.loads(conf.read_text(encoding="utf-8"))
     reads = defaultdict(set)
@@ -316,11 +336,20 @@ def test_the_documented_cache_exception_pair_is_exactly_two_models():
     # the openai per-model 0.5x/0.25x, the google 0.1x; the writes are
     # 1.25x (anthropic/bedrock/the openrouter claude+google routes at
     # their own published per-model prices)
-    assert set(reads) == {0.1, 0.025, 0.5, 0.25}, set(reads)
+    assert set(reads) == {0.1, 0.05, 0.025, 0.5, 0.25}, set(reads)
     assert reads[0.025] == {
         "claude-fable-5-1", "claude-mythos-5-1",
         "anthropic.claude-fable-5-1", "anthropic/claude-fable-5.1",
     }, reads[0.025]
+    # the 0.05x group: the direct-anthropic records only. Unlike the 0.025x
+    # group there is no bedrock (``anthropic.``) or openrouter
+    # (``anthropic/``) sibling spelling, because no such record exists for
+    # the 5.5 generation yet — so this set is 2, not 4, and a bedrock or
+    # openrouter 5.5 record arriving later MUST land here rather than
+    # silently at 0.1x.
+    assert reads[0.05] == {
+        "claude-opus-5-5", "claude-sonnet-5-5",
+    }, reads[0.05]
     assert reads[0.5] == {"gpt-4o", "gpt-4o-mini", "o1", "o3-mini",
                           "openai/gpt-4o", "openai/gpt-4o-mini",
                           "openai/o1", "openai/o3-mini"}, reads[0.5]

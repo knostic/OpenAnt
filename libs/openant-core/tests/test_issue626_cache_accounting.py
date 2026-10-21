@@ -259,12 +259,15 @@ def test_step_report_carries_unpriced_cache_models(tmp_path):
 # must fail here (the per-model data rows are guarded, not just sonnet's).
 def test_every_cache_rated_record_is_pinned():
     """The #690 census pin as widened by #648: EVERY cache-rated record
-    enumerated (the census re-derived on the merged tree, 2026-10-21:
-    16 anthropic + 11 bedrock + 9 openai + 4 google + 21 openrouter = 61,
-    the z-ai pair still UNRATED-with-reason — their shipped base prices
-    diverge from the route listing. #648 takes anthropic 10 -> 16: the five
-    new 4.5-generation records plus claude-opus-4-6, which gains a cache
-    block with its status flip). Pinning the set
+    enumerated (the census re-derived by execution on the records tree,
+    2026-10-21: 19 anthropic + 11 bedrock + 9 openai + 4 google
+    + 21 openrouter = 64, the z-ai pair still UNRATED-with-reason — their
+    shipped base prices diverge from the route listing. #648 takes
+    anthropic 10 -> 19: the five 4.5-generation records, claude-opus-4-6
+    which gains a cache block with its status flip, and the three
+    5.5-generation records the S6 census row demanded — claude-opus-5-5
+    and claude-sonnet-5-5 at the DOCUMENTED 0.05x read exception,
+    claude-haiku-5-5 at the standard 0.1x). Pinning the set
     — not iterating whatever is present — is what makes a single record's
     reversion FAIL here (the linkage demand: each data row is guarded).
     The SHAPE contract per family: the two-sided families carry write
@@ -296,6 +299,7 @@ def test_every_cache_rated_record_is_pinned():
         "claude-fable-5-1",
         "claude-haiku-4-5",
         "claude-haiku-4-5-20251001",
+        "claude-haiku-5-5",
         "claude-mythos-5",
         "claude-mythos-5-1",
         "claude-opus-4-5",
@@ -304,10 +308,12 @@ def test_every_cache_rated_record_is_pinned():
         "claude-opus-4-7",
         "claude-opus-4-8",
         "claude-opus-5",
+        "claude-opus-5-5",
         "claude-sonnet-4-5",
         "claude-sonnet-4-5-20250929",
         "claude-sonnet-4-6",
         "claude-sonnet-5",
+        "claude-sonnet-5-5",
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
         "gemini-2.5-pro",
