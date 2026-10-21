@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 from core.schemas import AnalyzeResult, AnalysisMetrics
+from utilities.llm import LLMAuthError, LLMConfigError
 from core import tracking
 from core.checkpoint import (StepCheckpoint, analyze_result_is_error,
                              build_resume_delta)
@@ -228,6 +229,17 @@ def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_contex
             "usage": tracker.get_unit_usage(),
         }
 
+    except (LLMAuthError, LLMConfigError):
+        # #696: the designed-abort classes re-raise — the llm_reachability
+        # parity anchor ("Auth failures are fatal and recur on every batch —
+        # surface them instead of burying them as a per-batch 'failed'
+        # line"). A rejected thinking policy (LLMConfigError) recurs on
+        # every unit the same way an auth failure does: converting either
+        # into a per-unit ERROR row lets an all-fatal scan read green
+        # (status success, exit 0) while every unit failed. The re-raise
+        # aborts the phase; step_context marks the step error and the
+        # envelope/exit contract follows.
+        raise
     except Exception as e:
         elapsed = time.monotonic() - start
         worker = threading.current_thread().name
@@ -407,6 +419,25 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
         print(_interrupt_report(results, total), file=sys.stderr, flush=True)
         progress.finish()
         raise  # #313: see the sequential handler note
+    except (LLMAuthError, LLMConfigError):
+        # #696 (the fable-hunt zombie catch): the DESIGNED-ABORT classes —
+        # every pending unit is a doomed API call against the same bad
+        # key/policy, so cancel the unstarted (the KI arm's mirror) and
+        # never swallow the raise.
+        executor.shutdown(wait=False, cancel_futures=True)
+        progress.finish()
+        raise
+    except Exception:
+        # #696 (the in-suite wedge catch — the patch-pipeline regression):
+        # a GENERIC exception must keep the base contract — the pending
+        # futures' checkpoint saves COMPLETE (shutdown WITHOUT
+        # cancel_futures), because the checkpointed pipeline's resume
+        # machinery polls for them; cancelling them wedged the pipeline's
+        # retry loop. The raise still aborts the phase; step_context marks
+        # the step error; the envelope/exit contract follows.
+        executor.shutdown(wait=False)
+        progress.finish()
+        raise
     else:
         executor.shutdown(wait=False)
 

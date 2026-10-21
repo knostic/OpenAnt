@@ -326,6 +326,7 @@ class LLMResponseError(LLMError):
         self.usage_details = usage_details
 
 
+
 class LLMRefusalError(LLMResponseError):
     """Provider refused to answer or content-filtered the response.
 
