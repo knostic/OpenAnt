@@ -306,6 +306,10 @@ class ContextAgent:
         # fabricated 0.0).
         per_turn_provider_cost: float | None = None
 
+        # #697: the dropped-block per-kind accumulator for this call
+
+        per_turn_dropped: dict[str, int] = {}
+
         while iterations < MAX_ITERATIONS:
             iterations += 1
 
@@ -403,6 +407,10 @@ class ContextAgent:
                                if _err_provider_cost is not None else {}),
                             usage_details=turn_details,
                             turns=len(turn_details),
+                            # #697 fable-F4: the raising path's record rides
+                            # the per-turn accumulation like every exit.
+                            dropped_block_kinds=(dict(per_turn_dropped)
+                                                 if per_turn_dropped else None),
                         )
                         # the reads live INSIDE the guard's try: a double
                         # returning None from record_call must hit the
@@ -472,6 +480,12 @@ class ContextAgent:
             if result.provider_cost_usd is not None:
                 per_turn_provider_cost = (
                     (per_turn_provider_cost or 0.0) + result.provider_cost_usd)
+            # #697: accumulate the dropped-block per-kind counts per turn
+            # (the #625/#660 diagnostic rides every record like the cost does)
+            if getattr(result, "dropped_block_kinds", None):
+                for _kind, _n in result.dropped_block_kinds.items():
+                    per_turn_dropped[_kind] = (per_turn_dropped.get(_kind, 0)
+                                               + int(_n))
 
             assistant_content = result.content
             stop_reason = result.stop_reason
@@ -497,6 +511,8 @@ class ContextAgent:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     provider_cost_usd=per_turn_provider_cost,
+            dropped_block_kinds=(dict(per_turn_dropped)
+                                 if per_turn_dropped else None),
                     usage_details=per_turn_usage_details,
                     turns=len(per_turn_usage_details),
                 )
@@ -573,6 +589,8 @@ class ContextAgent:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     provider_cost_usd=per_turn_provider_cost,
+            dropped_block_kinds=(dict(per_turn_dropped)
+                                 if per_turn_dropped else None),
                     usage_details=per_turn_usage_details,
                     turns=len(per_turn_usage_details),
                 )
@@ -604,6 +622,8 @@ class ContextAgent:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     provider_cost_usd=per_turn_provider_cost,
+            dropped_block_kinds=(dict(per_turn_dropped)
+                                 if per_turn_dropped else None),
                     usage_details=per_turn_usage_details,
                     turns=len(per_turn_usage_details),
                 )
@@ -647,6 +667,8 @@ class ContextAgent:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     provider_cost_usd=per_turn_provider_cost,
+            dropped_block_kinds=(dict(per_turn_dropped)
+                                 if per_turn_dropped else None),
                     usage_details=per_turn_usage_details,
                     turns=len(per_turn_usage_details),
                 )
@@ -684,6 +706,8 @@ class ContextAgent:
             # most plausibly takes; the accumulated provider cost must ride
             # it like every other exit.
             provider_cost_usd=per_turn_provider_cost,
+            dropped_block_kinds=(dict(per_turn_dropped)
+                                 if per_turn_dropped else None),
             usage_details=per_turn_usage_details,
             turns=len(per_turn_usage_details),
         )

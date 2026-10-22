@@ -188,14 +188,20 @@ def _cache_disagreements(records):
 def test_same_family_cache_multipliers_agree_across_providers():
     """The cache analogue of the #344 price row.
 
-    LIVE SINCE #690 (the scope note that once said "zero cache-comparable
-    families" is history): 21 comparable families — the 8 claude families
-    across anthropic+bedrock+openrouter (the 0.025x exception pair agreeing
-    on all three providers), the 9 openai families across openai+openrouter
-    (the per-model 0.5x/0.25x ratios agreeing), and the 4 gemini families
-    across google+openrouter (the reads agreeing at 0.1x; the openrouter
-    routes' writes hatch-annotated — Google's page publishes no write). A
-    green here is a real "no disagreement", never "nothing was compared".
+    LIVE SINCE #690, AND #648 DID NOT CHANGE ITS SCOPE (the old note that
+    said "zero cache-comparable families" is history): 21 comparable
+    families — the 8 claude families across anthropic+bedrock+openrouter
+    (the 0.025x exception pair agreeing on all three providers), the 9
+    openai families across openai+openrouter (the per-model 0.5x/0.25x
+    ratios agreeing), and the 4 gemini families across google+openrouter
+    (the reads agreeing at 0.1x; the openrouter routes' writes
+    hatch-annotated — Google's page publishes no write). #648's three new
+    cache-bearing families (claude-opus-4-5, claude-sonnet-4-5 and the
+    newly-priced claude-opus-4-6) are ANTHROPIC-ONLY — no bedrock or
+    openrouter sibling carries them — so they raise the cache-bearing
+    family count 23 -> 26 while leaving the COMPARABLE (multi-provider)
+    count at 21. A green here is a real "no disagreement", never
+    "nothing was compared".
     """
     conf = find_models_config()
     assert conf is not None, "config/models.json not locatable"
@@ -242,13 +248,21 @@ def test_every_priced_spelling_carries_its_own_familys_cache_multiplier():
     """The alias row — the non-vacuous half of N-A2b.
 
     `pricing_map` pass 2 assigns the SAME entry object to every alias
-    spelling, cache multipliers included. The #690 census rates 55 records
-    across five providers (anthropic/bedrock/openai/google/openrouter) and
-    the maps carry 122 cache-bearing keys incl. their alias spellings
-    (the bedrock region twins, the OpenRouter slug spellings). Each must
-    carry the multiplier of a record in ITS OWN family — if the alias
-    normalisation ever merged the 0.025x exception pair with its 0.1x
-    sibling, cached reads would misprice 4x with no marker.
+    spelling, cache multipliers included. The #690 census as widened by
+    #648 cache-rates 61 records across five providers
+    (anthropic/bedrock/openai/google/openrouter) and the maps carry 130
+    cache-bearing keys incl. their alias spellings (the bedrock region
+    twins, the OpenRouter slug spellings). #648 contributes exactly 8 of
+    them to the anthropic map (17 -> 25): the five record-id keys
+    claude-opus-4-5, claude-opus-4-5-20251101, claude-sonnet-4-5,
+    claude-sonnet-4-5-20250929 and claude-opus-4-6 (the status flip makes
+    that one priced), plus the three dotted alias spellings
+    claude-opus-4.5, claude-opus-4.6 and claude-sonnet-4.5 — the bare
+    claude-haiku-4-5 record adds NO key because its spelling already
+    shipped as an alias (the opus-r1 catch). Each must carry the
+    multiplier of a record in ITS OWN family — if the alias normalisation
+    ever merged the 0.025x exception pair with its 0.1x sibling, cached
+    reads would misprice 4x with no marker.
     """
     conf = find_models_config()
     data = json.loads(conf.read_text(encoding="utf-8"))
@@ -275,16 +289,38 @@ def test_every_priced_spelling_carries_its_own_familys_cache_multiplier():
                 checked += 1
     # the census, asserted so a normalisation change that DROPS alias keys
     # cannot quietly shrink this row to nothing
-    # the #690 census: every cache-carrying priced key across ALL five
-    # providers' maps (the record ids + their alias spellings)
-    assert checked == 122, f"expected 122 cache-carrying priced keys, got {checked}"
+    # the #690 census as widened by #648: every cache-carrying priced key
+    # across ALL five providers' maps (the record ids + their alias
+    # spellings). 122 (#690) + 8 (#648's 4.5-generation anthropic keys)
+    # + 6 (#648's 5.5-generation keys: the three record ids claude-opus-5-5,
+    # claude-sonnet-5-5 and claude-haiku-5-5, each plus its ONE dotted alias
+    # spelling claude-opus-5.5 / claude-sonnet-5.5 / claude-haiku-5.5 —
+    # anthropic's map goes 25 -> 31) = 136, derived by running this very
+    # census on the records tree, never transcribed.
+    assert checked == 136, f"expected 136 cache-carrying priced keys, got {checked}"
 
 
-def test_the_documented_cache_exception_pair_is_exactly_two_models():
+def test_the_documented_cache_exceptions_are_exactly_the_published_groups():
     """#626's census claim, pinned: every anthropic cache read is 0.1x except
-    the documented Fable 5.1 / Mythos 5.1 pair at 0.025x, and every write is
-    1.25x. A rate pasted where a MULTIPLIER belongs (the easy mistake: these
-    are fractions of the base input rate, not $/MTok) fails here."""
+    the DOCUMENTED exception groups, and every write is 1.25x. A rate pasted
+    where a MULTIPLIER belongs (the easy mistake: these are fractions of the
+    base input rate, not $/MTok) fails here.
+
+    RENAMED at #648's 5.5-generation round, because the old name
+    (``..._pair_is_exactly_two_models``) asserted a fact that stopped being
+    true: Anthropic's pricing page now publishes TWO exception groups, not
+    one pair. Its footnotes, fetched 2026-10-21:
+      * 0.025x — "Cache hits and refreshes on Claude Fable 5.1 and Claude
+        Mythos 5.1 are priced at 0.025x the base input price"
+      * 0.05x  — "Cache hits and refreshes on Claude Opus 5.5 and Claude
+        Sonnet 5.5 are priced at 0.05x the base input price"
+      * "All other models use the standard 0.1x multiplier" — which is why
+        claude-haiku-5-5, added in the same round, is pinned at 0.1x and
+        NOT at a 5.5-generation rate. The generation does not set the
+        multiplier; the page does, per model.
+    The assertion is not weakened by the rename: both groups are pinned by
+    EXACT set equality, so adding a model to either one, or inventing a
+    third rate, still fails here."""
     conf = find_models_config()
     data = json.loads(conf.read_text(encoding="utf-8"))
     reads = defaultdict(set)
@@ -300,11 +336,20 @@ def test_the_documented_cache_exception_pair_is_exactly_two_models():
     # the openai per-model 0.5x/0.25x, the google 0.1x; the writes are
     # 1.25x (anthropic/bedrock/the openrouter claude+google routes at
     # their own published per-model prices)
-    assert set(reads) == {0.1, 0.025, 0.5, 0.25}, set(reads)
+    assert set(reads) == {0.1, 0.05, 0.025, 0.5, 0.25}, set(reads)
     assert reads[0.025] == {
         "claude-fable-5-1", "claude-mythos-5-1",
         "anthropic.claude-fable-5-1", "anthropic/claude-fable-5.1",
     }, reads[0.025]
+    # the 0.05x group: the direct-anthropic records only. Unlike the 0.025x
+    # group there is no bedrock (``anthropic.``) or openrouter
+    # (``anthropic/``) sibling spelling, because no such record exists for
+    # the 5.5 generation yet — so this set is 2, not 4, and a bedrock or
+    # openrouter 5.5 record arriving later MUST land here rather than
+    # silently at 0.1x.
+    assert reads[0.05] == {
+        "claude-opus-5-5", "claude-sonnet-5-5",
+    }, reads[0.05]
     assert reads[0.5] == {"gpt-4o", "gpt-4o-mini", "o1", "o3-mini",
                           "openai/gpt-4o", "openai/gpt-4o-mini",
                           "openai/o1", "openai/o3-mini"}, reads[0.5]
