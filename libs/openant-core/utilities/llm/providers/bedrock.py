@@ -75,6 +75,39 @@ from ..adapter import (
 )
 
 
+# #852: THE INVOKEMODEL BODY'S API VERSION, PINNED EXPLICITLY.
+#
+# The SDK injects this field itself in ``anthropic/lib/bedrock/_client.py``:
+#     options.json_data.setdefault("anthropic_version", ANTHROPIC_API_VERSION)
+# anthropic 2.0.0 DELETED ``DEFAULT_VERSION = "bedrock-2023-05-31"`` and pointed
+# that setdefault at ``ANTHROPIC_API_VERSION``, which moved 2023-06-01 ->
+# 2026-10-21 (2.1.0 is byte-identical to 2.0.0 in both files). Because the key is
+# a ``setdefault``, a caller-supplied value WINS -- so sending it explicitly keeps
+# the wire exactly where it is today, independent of the installed SDK.
+#
+# WHY IT MUST BE PINNED. Anthropic's Bedrock (Opus 4.6 and earlier) page warns
+# that the ARN-versioned models in its table "don't support 2026-10-21 on
+# Bedrock, and requests to them that send it can return a 400 error", and ends:
+# "The Boto3 example sets anthropic_version in its request body and isn't
+# affected." config/models.json ships FOUR of those models as ``status: current``
+# -- {global,us}.anthropic.claude-haiku-4-5-20251001-v1:0 and
+# {global,us}.anthropic.claude-sonnet-4-6 -- two of which are this module's own
+# docstring examples. Retiring them to let a dep bump land would be a coverage
+# regression; pinning the field keeps all eleven Bedrock records serving.
+#
+# SCOPE, stated so it is not mistaken for a wider claim: this pins the BEDROCK
+# body field only. The direct-API adapter (providers/anthropic.py) still sends
+# whatever ``anthropic-version`` header its SDK defaults to, which is correct --
+# the 2026-10-21 Messages-API changes (temperature/top_p/top_k removed, document
+# blocks in assistant messages, citations on user text blocks) were each checked
+# against this tree and none is reached.
+#
+# The value is DELIBERATELY a literal and not read from the SDK: importing the
+# SDK's constant is what broke, and a pin that tracks the thing it is pinning
+# against is not a pin.
+BEDROCK_BODY_API_VERSION = "bedrock-2023-05-31"
+
+
 _MODEL_ACCESS_HINT = (
     " (Bedrock AccessDenied usually means this model is not enabled for "
     "the account in this region — request it under 'Model access' in the "
@@ -223,6 +256,8 @@ class BedrockAdapter:
             "model": model,
             "max_tokens": max_tokens,
             "messages": [_message_to_anthropic(m) for m in messages],
+            # #852: pin the body's API version (see BEDROCK_BODY_API_VERSION).
+            "extra_body": {"anthropic_version": BEDROCK_BODY_API_VERSION},
         }
         if system is not None:
             request["system"] = system
@@ -316,6 +351,11 @@ class BedrockAdapter:
                 model=model,
                 max_tokens=1,
                 messages=[{"role": "user", "content": "hi"}],
+                # #852: validate() is the FIRST call a scan makes
+                # (registry.validate at startup). Pinning only complete() would
+                # 400 every preflight on the four ARN-versioned current records
+                # while the scan body succeeded.
+                extra_body={"anthropic_version": BEDROCK_BODY_API_VERSION},
             )
         except anthropic.AuthenticationError as exc:
             raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
