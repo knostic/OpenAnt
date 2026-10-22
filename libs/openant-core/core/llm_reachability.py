@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from utilities.llm import PhaseBinding
     from context.application_context import ApplicationContext  # noqa: F401
 from utilities.json_extract import extract_json_object
-from utilities.llm_client import unpriced_kinds_from
+from utilities.llm_client import incomplete_markers, unpriced_kinds_from
 from utilities.rate_limiter import is_budget_exhausted_error
 
 
@@ -574,19 +574,27 @@ def analyze_reachability(
                 "cost_usd": round(t.get("total_cost_usd", 0.0)
                                   - _usage_baseline.get("total_cost_usd", 0.0), 6),
             }
-            # #216: the incomplete-cost markers survive the publication;
-            # #605: the accounting-error counter too. Run-cumulative (the
-            # accepted trade in step_report.py:147-163).
-            if t.get("cost_incomplete"):
-                u["cost_incomplete"] = True
-                u["unpriced_models"] = t.get("unpriced_models") or []
-                # #626/PR#661 hunt F4: the cache kind travels under its own
-                # key, present-only (the #216 list stays unconditional here
-                # — its shape is the pre-#626 contract this block ships).
-                if t.get("unpriced_cache_models"):
-                    u["unpriced_cache_models"] = t["unpriced_cache_models"]
-            if t.get("accounting_errors"):
-                u["accounting_errors"] = t.get("accounting_errors")
+            # #216/#626/#605 → #699: the incompleteness markers survive the
+            # publication through the ONE builder (the PR#661 home of the
+            # kinds rule), counter included — the counter implies the flag,
+            # both markers never one without the other (the #644 shape the
+            # step report already ships at step_report.py:219-222).
+            # Run-cumulative (the accepted trade in step_report.py:147-163).
+            u.update(incomplete_markers(
+                t.get("unpriced_models"), t.get("unpriced_cache_models"),
+                t.get("accounting_errors")))
+            # the pre-#626 shape contract this block ships: the #216 list
+            # is unconditional WHEN the tracker's own flag is up (a
+            # cache-only incompleteness still names the empty set). The
+            # condition reads the SOURCE totals, never the built dict —
+            # the historical shapes stay CONTENT-identical (key order in
+            # the cache-only case differs: the empty list lands after the
+            # builder's keys; no reader depends on order); a counter-only
+            # flag (new: the counter now derives one) takes the builder's
+            # natural present-only pair.
+            if t.get("cost_incomplete") and not t.get("unpriced_models"):
+                u["unpriced_models"] = []
+
             # #697: the dropped-block per-kind counts ride this summary
             # too (run-cumulative from the totals, present-only — the
             # reachability calls drop blocks through the same adapter).

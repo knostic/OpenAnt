@@ -382,25 +382,44 @@ def price_usage(
 # ---------------------------------------------------------------------------
 
 
-def incomplete_markers(unpriced=None, unpriced_cache=None) -> dict:
+def incomplete_markers(unpriced=None, unpriced_cache=None,
+                       accounting_errors=0) -> dict:
     """The incompleteness marker keys for a usage/summary dict.
 
-    Returns ``{}`` when neither kind is present (never a fabricated
+    Returns ``{}`` when no kind is present (never a fabricated
     ``cost_incomplete: False`` — absent means "nothing to disclose", and the
     byte-identity contract for a clean run depends on the absence).
 
     Accepts any iterables (sets, lists, None); emits SORTED, de-duplicated
     lists so two restore sites that merged the same ids agree byte-for-byte.
+
+    #699: the #605 accounting-error COUNTER is the third incompleteness
+    kind, and it carries the #633 pairing invariant the five _summary.json
+    writers each implemented differently (llr/dt published the counter
+    without the flag; analyze/verify published neither; enhance alone
+    forced the flag — the #644 shape): an accounting error implies
+    cost_incomplete — "both markers, never one without the other" (the
+    step report's step_report.py:219-222 wording). The pairing now lives
+    HERE, once, for every writer. A non-int / non-positive counter is
+    SKIPPED, never coerced into a fabricated pair (the #697 F3 guard
+    class; bool excluded — True is a flag, not a count).
     """
     _u = sorted(set(unpriced or ()))
     _c = sorted(set(unpriced_cache or ()))
+    _errs = (accounting_errors
+             if isinstance(accounting_errors, int)
+             and not isinstance(accounting_errors, bool)
+             and accounting_errors > 0
+             else 0)
     out: dict = {}
-    if _u or _c:
+    if _u or _c or _errs:
         out["cost_incomplete"] = True
     if _u:
         out["unpriced_models"] = _u
     if _c:
         out["unpriced_cache_models"] = _c
+    if _errs:
+        out["accounting_errors"] = _errs
     return out
 
 

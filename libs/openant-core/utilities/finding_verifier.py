@@ -904,8 +904,16 @@ class FindingVerifier:
             # #216 + #626: persist both unpriced kinds into _summary.json
             # (mirrors analyzer's — a resume-of-resume keeps the markers),
             # each under its own key and present-only.
+            # #699: the #605 accounting-error counter rides the same
+            # builder — the #644 shape (counter => flag), the one pairing
+            # rule every _summary.json writer shares (the enhance sibling's
+            # #609 review note: an inner-guard firing leaves THIS stage's
+            # summary no longer complete-looking while the step report
+            # carries the marker).
+            from utilities.llm_client import _accounting_error_count
             usage.update(incomplete_markers(_summary_unpriced,
-                                            _summary_unpriced_cache))
+                                            _summary_unpriced_cache,
+                                            _accounting_error_count()))
             return usage
 
         # Inject prior usage into tracker so step_report captures the total
