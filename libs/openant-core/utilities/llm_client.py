@@ -585,6 +585,10 @@ class TokenTracker:
             # the billing-reconciliation totals).
             self.total_cache_read_tokens = 0
             self.total_cache_write_tokens = 0
+            # #697: the dropped-block per-kind counts (#625/#660's
+            # diagnostic — computed per call on the CompletionResult,
+            # accumulated here so the run's artifacts can carry it).
+            self._dropped_block_kinds: dict[str, int] = {}
 
     @property
     def total_tokens(self) -> int:
@@ -601,6 +605,7 @@ class TokenTracker:
         usage_details: dict | list | None = None,
         turns: int | None = None,
         provider_cost_usd: float | None = None,
+        dropped_block_kinds: dict[str, int] | None = None,
     ) -> dict:
         """
         Record a single LLM call.
@@ -770,6 +775,19 @@ class TokenTracker:
                 self.total_cache_read_tokens += cache_read + cache_read_incl
             if cache_write or cache_write_incl:
                 self.total_cache_write_tokens += cache_write + cache_write_incl
+            # #697: the per-call dropped-block counts accumulate per kind
+            # (present-only — a call that dropped nothing adds nothing).
+            if dropped_block_kinds:
+                for _kind, _n in dropped_block_kinds.items():
+                    # fable-F3: a non-numeric count is SKIPPED, never
+                    # coerced to a 0-valued key (a present-only dict must
+                    # not grow a zero entry from garbage); bool counts as
+                    # numeric-by-heritage but a bool here is a caller's
+                    # mistake — skip it too.
+                    if isinstance(_n, bool) or not isinstance(_n, (int, float)):
+                        continue
+                    self._dropped_block_kinds[_kind] = (
+                        self._dropped_block_kinds.get(_kind, 0) + int(_n))
 
         # Accumulate to thread-local unit tracking if active
         tl = self._thread_local
@@ -917,6 +935,10 @@ class TokenTracker:
                 out["total_cache_write_tokens"] = self.total_cache_write_tokens
             if self._unpriced_cache_models:
                 out["unpriced_cache_models"] = sorted(self._unpriced_cache_models)
+            # #697: the dropped-block per-kind counts, present-only (a
+            # clean run's totals shape is byte-identical to pre-#697).
+            if self._dropped_block_kinds:
+                out["dropped_block_kinds"] = dict(self._dropped_block_kinds)
             return out
 
     def get_totals(self) -> dict:
@@ -947,6 +969,10 @@ class TokenTracker:
                 out["total_cache_write_tokens"] = self.total_cache_write_tokens
             if self._unpriced_cache_models:
                 out["unpriced_cache_models"] = sorted(self._unpriced_cache_models)
+            # #697: the dropped-block per-kind counts, present-only (a
+            # clean run's totals shape is byte-identical to pre-#697).
+            if self._dropped_block_kinds:
+                out["dropped_block_kinds"] = dict(self._dropped_block_kinds)
             # #605: present-only — a healthy run's totals serialize
             # byte-identical to pre-#605.
             _errs = _accounting_error_count()

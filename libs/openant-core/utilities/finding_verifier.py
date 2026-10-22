@@ -480,6 +480,9 @@ class FindingVerifier:
         # verbatim (None entries for turns whose provider reported none).
         # Passed to record_call as a list; never summed, never in cost.
         per_turn_usage_details: list = []
+        # #697: the dropped-block per-kind accumulator for this call
+        # (the #625/#660 diagnostic rides every record like the usage does)
+        per_turn_dropped: dict[str, int] = {}
 
         while iterations < MAX_ITERATIONS:
             iterations += 1
@@ -545,12 +548,19 @@ class FindingVerifier:
                         pricing=lookup_pricing(self.binding),
                         usage_details=turn_details,
                         turns=len(turn_details),
+                    dropped_block_kinds=(dict(per_turn_dropped)
+                                       if per_turn_dropped else None),
                     )
                 raise
 
             total_input_tokens += response.input_tokens
             total_output_tokens += response.output_tokens
             per_turn_usage_details.append(response.usage_details)
+            # #697: accumulate the dropped-block per-kind counts per turn
+            if getattr(response, "dropped_block_kinds", None):
+                for _kind, _n in response.dropped_block_kinds.items():
+                    per_turn_dropped[_kind] = (per_turn_dropped.get(_kind, 0)
+                                                + int(_n))
 
             assistant_content = response.content
             stop_reason = response.stop_reason
@@ -561,6 +571,7 @@ class FindingVerifier:
                     assistant_content, finding, iterations,
                     total_input_tokens, total_output_tokens,
                     usage_details=per_turn_usage_details,
+                    dropped_block_kinds=dict(per_turn_dropped) or None,
                 )
                 if result:
                     return result
@@ -584,6 +595,8 @@ class FindingVerifier:
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
                     turns=len(per_turn_usage_details),
+                    dropped_block_kinds=(dict(per_turn_dropped)
+                                       if per_turn_dropped else None),
                 )
                 return VerificationResult(
                     agree=False,
@@ -647,6 +660,8 @@ class FindingVerifier:
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
                     turns=len(per_turn_usage_details),
+                    dropped_block_kinds=(dict(per_turn_dropped)
+                                       if per_turn_dropped else None),
                 )
                 return VerificationResult(
                     agree=False,
@@ -666,6 +681,8 @@ class FindingVerifier:
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
                     turns=len(per_turn_usage_details),
+                    dropped_block_kinds=(dict(per_turn_dropped)
+                                       if per_turn_dropped else None),
                 )
                 return self._parse_finish_result(
                     finish_result, finding, iterations,
@@ -690,6 +707,8 @@ class FindingVerifier:
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
                     turns=len(per_turn_usage_details),
+                    dropped_block_kinds=(dict(per_turn_dropped)
+                                       if per_turn_dropped else None),
                 )
                 # Fail-safe (R4-7): see the :380 path above. Don't auto-agree;
                 # keep the Stage-1 verdict surfaced for human triage.
@@ -712,6 +731,8 @@ class FindingVerifier:
             pricing=lookup_pricing(self.binding),
             usage_details=per_turn_usage_details,
             turns=len(per_turn_usage_details),
+                    dropped_block_kinds=(dict(per_turn_dropped)
+                                       if per_turn_dropped else None),
         )
         # Fail-safe (R4-7): exhausting the iteration budget is not agreement.
         # Don't auto-agree; keep the Stage-1 verdict surfaced for human triage.
@@ -1723,6 +1744,7 @@ class FindingVerifier:
         total_input_tokens: int,
         total_output_tokens: int,
         usage_details: list | None = None,
+        dropped_block_kinds: dict | None = None,
     ) -> Optional[VerificationResult]:
         """Try to parse a text response as JSON."""
         for block in assistant_content:
@@ -1741,6 +1763,10 @@ class FindingVerifier:
                         # raising turns — the raising path records at its
                         # own site above).
                         turns=len(usage_details) if usage_details is not None else 1,
+                        # #697: the caller's per-turn accumulation rides this
+                        # record too (present-only).
+                        dropped_block_kinds=(dict(dropped_block_kinds)
+                                             if dropped_block_kinds else None),
                     )
                     return self._parse_finish_result(
                         result, original_finding, iterations,
