@@ -163,7 +163,11 @@ func TestCSPPoliciesPerRoute(t *testing.T) {
 		// 0 matches in chart-4.5.1.umd.min.js, chartjs-plugin-datalabels-
 		// 2.2.0.min.js, and tailwindcss-3.4.17.js (grep -o "new Function(\|
 		// [^A-Za-z_.]eval(" over internal/report/vendor/*.js — 2026-09-12
-		// receipt in the PR). The absence is NOT re-checked here (the blobs
+		// receipt in the PR). RE-JUSTIFIED at the #856 chart.js 4.6.1 bump as
+		// this comment's own "re-justify on any blob bump" clause requires:
+		// 0 matches for the same two shapes over chart-4.6.1.umd.min.js
+		// (2026-10-23), which is why the 4.5.1 name above is history and not
+		// a live claim. The absence is NOT re-checked here (the blobs
 		// are sha-pinned by the report side's own vendor discipline); this
 		// test pins the POLICY SHAPE the absence justifies.
 		if strings.Contains(get("/report/none").Header().Get("Content-Security-Policy"), "unsafe-eval") {
