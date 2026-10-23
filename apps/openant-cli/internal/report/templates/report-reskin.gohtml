@@ -210,6 +210,7 @@
                                     <th class="text-left py-3 px-4 text-knostic-muted font-medium">Duration</th>
                                     <th class="text-left py-3 px-4 text-knostic-muted font-medium">Cost</th>
                                     <th class="text-left py-3 px-4 text-knostic-muted font-medium">Status</th>
+                                    <th class="text-left py-3 px-4 text-knostic-muted font-medium">Details</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -217,8 +218,9 @@
                                 <tr class="border-b border-knostic-border-light {{if even $i}} bg-knostic-card-bg {{end}}">
                                     <td class="py-3 px-4 font-mono text-knostic-navy">{{$step.Step}}</td>
                                     <td class="py-3 px-4">{{$step.Duration}}</td>
-                                    <td class="py-3 px-4">{{$step.Cost}}</td>
+                                    <td class="py-3 px-4">{{$step.Cost}}{{if $step.CostIncomplete}} <span class="text-xs text-orange-500" title="{{$step.UnpricedModelsTitle}}">incomplete</span>{{end}}</td>
                                     <td class="py-3 px-4 {{$step.StatusColor}} font-medium">{{$step.Status}}</td>
+                                    <td class="py-3 px-4 text-xs text-knostic-muted">{{$step.DiagnosticDetails}}</td>
                                 </tr>
                                 {{end}}
                             </tbody>
@@ -227,6 +229,7 @@
                                     <td class="py-3 px-4">Total</td>
                                     <td class="py-3 px-4">{{.FormatDuration}}</td>
                                     <td class="py-3 px-4">{{.FormatTotalCost}}</td>
+                                    <td class="py-3 px-4"></td>
                                     <td class="py-3 px-4"></td>
                                 </tr>
                             </tfoot>
@@ -244,12 +247,13 @@
                                 </div>
                                 <div>
                                     <span class="text-knostic-muted">Cost</span>
-                                    <div class="text-knostic-navy">{{.Cost}}</div>
+                                    <div class="text-knostic-navy">{{.Cost}}{{if .CostIncomplete}} <span class="text-xs text-orange-500" title="{{.UnpricedModelsTitle}}">incomplete</span>{{end}}</div>
                                 </div>
                                 <div>
                                     <span class="text-knostic-muted">Status</span>
                                     <div class="{{.StatusColor}} font-medium">{{.Status}}</div>
                                 </div>
+                                {{if .DiagnosticDetails}}<div class="grid grid-cols-2 gap-2 mt-2"><span class="text-knostic-muted">Details</span><div class="text-xs text-knostic-muted">{{.DiagnosticDetails}}</div></div>{{end}}
                             </div>
                         </div>
                         {{end}}

@@ -201,6 +201,7 @@
                                     <th class="text-left py-3 px-4 text-gray-300 font-medium">Duration</th>
                                     <th class="text-left py-3 px-4 text-gray-300 font-medium">Cost</th>
                                     <th class="text-left py-3 px-4 text-gray-300 font-medium">Status</th>
+                                    <th class="text-left py-3 px-4 text-gray-300 font-medium">Details</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -208,8 +209,9 @@
                                 <tr class="border-b border-gray-800 {{if even $i}} bg-navy-800/50 {{else}} bg-navy-900/30 {{end}}">
                                     <td class="py-3 px-4 font-mono">{{$step.Step}}</td>
                                     <td class="py-3 px-4">{{$step.Duration}}</td>
-                                    <td class="py-3 px-4">{{$step.Cost}}</td>
+                                    <td class="py-3 px-4">{{$step.Cost}}{{if $step.CostIncomplete}} <span class="text-xs text-orange-500" title="{{$step.UnpricedModelsTitle}}">incomplete</span>{{end}}</td>
                                     <td class="py-3 px-4 {{$step.StatusColor}}">{{$step.Status}}</td>
+                                    <td class="py-3 px-4 text-xs text-gray-400">{{$step.DiagnosticDetails}}</td>
                                 </tr>
                                 {{end}}
                             </tbody>
@@ -218,6 +220,7 @@
                                     <td class="py-3 px-4">Total</td>
                                     <td class="py-3 px-4">{{.FormatDuration}}</td>
                                     <td class="py-3 px-4">{{.FormatTotalCost}}</td>
+                                    <td class="py-3 px-4"></td>
                                     <td class="py-3 px-4"></td>
                                 </tr>
                             </tfoot>
@@ -235,12 +238,13 @@
                                 </div>
                                 <div>
                                     <span class="text-gray-400">Cost</span>
-                                    <div class="text-gray-200">{{.Cost}}</div>
+                                    <div class="text-gray-200">{{.Cost}}{{if .CostIncomplete}} <span class="text-xs text-orange-500" title="{{.UnpricedModelsTitle}}">incomplete</span>{{end}}</div>
                                 </div>
                                 <div>
                                     <span class="text-gray-400">Status</span>
                                     <div class="{{.StatusColor}}">{{.Status}}</div>
                                 </div>
+                                {{if .DiagnosticDetails}}<div class="grid grid-cols-2 gap-2 mt-2"><span class="text-gray-400">Details</span><div class="text-xs text-gray-400">{{.DiagnosticDetails}}</div></div>{{end}}
                             </div>
                         </div>
                         {{end}}

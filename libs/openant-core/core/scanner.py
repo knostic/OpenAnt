@@ -1183,6 +1183,17 @@ def scan_repository(
                         "error_count": (reach_stats.get("batches_dropped", 0)
                                         + reach_stats.get("batches_failed", 0)),
                     }
+                    # #700: the reach diagnostic the step rows carry —
+                    # the dataset's aggregated units_newly_reachable (the
+                    # #602 decomposition the reporter already reads at
+                    # reporter.py:800), present-only per #602: ABSENT when
+                    # the baseline was unmeasurable (the keep-all path,
+                    # the no-extras case) — never a fabricated 0.
+                    _nr = ((dataset.get("metadata") or {})
+                           .get("reachability_filter") or {}).get(
+                               "units_newly_reachable")
+                    if isinstance(_nr, int) and not isinstance(_nr, bool):
+                        ctx.summary["units_newly_reachable"] = _nr
                     ctx.outputs = {"signals_path": signals_path}
 
                     print(
