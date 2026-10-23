@@ -332,6 +332,22 @@ type StepReport struct {
 	ErrorCount    int      `json:"error_count"`
 	Errors        []string `json:"errors"`
 	SkippedReason string   `json:"skipped_reason"`
+	// #700: the diagnostic channel — the cost-incompleteness marker (the
+	// #216/#605 keys from the step report's token_usage, so an incomplete
+	// mixed-cost step never renders as a plain "$0.25 / success") and the
+	// discovery/skip counters. All threaded PRESENT-ONLY by the Python
+	// projection (a clean step's JSON stays byte-identical) — the omitempty
+	// tags keep the Go re-marshal honest for absent keys.
+	CostIncomplete            bool     `json:"cost_incomplete,omitempty"`
+	UnpricedModels            []string `json:"unpriced_models,omitempty"`
+	UnpricedCacheModels       []string `json:"unpriced_cache_models,omitempty"`
+	AccountingError           bool     `json:"accounting_error,omitempty"`
+	SignalsSkippedUnknownUnit int      `json:"signals_skipped_unknown_unit,omitempty"`
+	UnitsNewlyReachable       int      `json:"units_newly_reachable,omitempty"`
+	// #600: the display-ready per-language segments, composed and SORTED
+	// by the Python projection (the row's own convention) — Go joins in
+	// order and sorts nothing.
+	ExcludedDirectories []string `json:"excluded_directories,omitempty"`
 }
 
 // StatusColor returns a Tailwind text color class based on step status.
@@ -341,9 +357,68 @@ func (s StepReport) StatusColor() string {
 		return "text-green-400"
 	case "error":
 		return "text-red-400"
+	case "partial":
+		// #700 (the orphaned #376/#285 follow-up, landed): the Python
+		// writer degrades a step to "partial" (step_report.py — errors,
+		// a positive error_count, or incomplete units), and the default
+		// arm rendered it GRAY beside genuinely skipped steps.
+		// text-orange-500 — the class IS in the vendored report.css (a
+		// yellow arm would NOT be; the class-coverage test enforces the
+		// pairing). NOTE: the tailwind recipe scans this file — a class
+		// token in a COMMENT lands in the regenerated CSS (the #700 CI
+		// catch: name the absent class in prose, never as the literal
+		// token).
+		return "text-orange-500"
 	default:
 		return "text-gray-400"
 	}
+}
+
+// UnpricedModelsTitle builds the tooltip attribution for the
+// incompleteness label — the WHICH-MODEL disclosure (#216's
+// name-the-model, extended to both kinds, F1 of the #700 r1 review):
+// a cache-only incompleteness names its model under the cache kind, the
+// #605 sentinel names its CAUSE (the accounting error), and the two RIDE
+// TOGETHER on the production combo shapes (PR#661 F5: a healthy END
+// snapshot's unpriced ids SURVIVE the sentinel — step_report.py:178-184
+// writes accounting_error + the ids; the reader needs BOTH facts, fable
+// r2's F-A). Only a model-less, sentinel-less shape degrades to the
+// honest unattributable marker — never an empty "unpriced: " tail.
+func (s StepReport) UnpricedModelsTitle() string {
+	var parts []string
+	if len(s.UnpricedModels) > 0 {
+		parts = append(parts, "unpriced: "+strings.Join(s.UnpricedModels, ", "))
+	}
+	if len(s.UnpricedCacheModels) > 0 {
+		parts = append(parts, "cache-unpriced: "+strings.Join(s.UnpricedCacheModels, ", "))
+	}
+	if s.AccountingError {
+		parts = append(parts, "accounting error (the cost delta is unavailable)")
+	}
+	if len(parts) > 0 {
+		return "cost incomplete — " + strings.Join(parts, "; ")
+	}
+	return "cost incomplete: unattributable (no model ids)"
+}
+
+// DiagnosticDetails composes the step row's detail line: the #602/#798
+// skip counter, the #602 newly-reachable decomposition, and the #600
+// discovery exclusions PER LANGUAGE (never a cross-language total — the
+// flat count measures prune observations). Every segment is present-only;
+// a clean step composes the empty string and the template renders an
+// empty cell.
+func (s StepReport) DiagnosticDetails() string {
+	var parts []string
+	if s.SignalsSkippedUnknownUnit > 0 {
+		parts = append(parts, fmt.Sprintf("%d signals skipped (unknown unit)", s.SignalsSkippedUnknownUnit))
+	}
+	if s.UnitsNewlyReachable > 0 {
+		parts = append(parts, fmt.Sprintf("%d newly reachable", s.UnitsNewlyReachable))
+	}
+	if len(s.ExcludedDirectories) > 0 {
+		parts = append(parts, "excluded dirs: "+strings.Join(s.ExcludedDirectories, ", "))
+	}
+	return strings.Join(parts, " · ")
 }
 
 // Category holds a verdict category description for the legend table.
