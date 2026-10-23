@@ -65,6 +65,18 @@ from .registry import (
 )
 from .helpers import DEFAULT_MAX_TOKENS, lookup_pricing, simple_completion, simple_text
 
+class LLMConfigError(LLMError):
+    """A configuration/policy the provider refuses up front (#696).
+
+    The designed-abort discriminator: unlike LLMResponseError (a per-unit
+    recoverable response defect), a config error is a property of the RUN —
+    it recurs on every unit (a rejected thinking policy, a thinking budget
+    that leaves no room for the response), so the analyze stage re-raises
+    it to abort the phase (the llm_reachability LLMAuthError parity anchor)
+    instead of burying it as per-unit ERROR rows while the run reads green.
+    """
+
+
 __all__ = [
     # adapter
     "CompletionResult",
@@ -76,6 +88,7 @@ __all__ = [
     "LLMNotFoundError",
     "LLMRateLimitError",
     "LLMRefusalError",
+    "LLMConfigError",
     "LLMResponseError",
     "Message",
     "StopReason",

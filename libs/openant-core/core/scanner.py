@@ -2125,6 +2125,23 @@ def _collect_discovery(result: ScanResult) -> dict:
         block["failed_languages"] = sorted(set(failed))
     return block
 
+def _sum_dropped_block_kinds(step_reports) -> dict[str, int]:
+    """#697: sum the per-kind dropped-block counts across the step reports'
+    own ``token_usage["dropped_block_kinds"]`` blocks.
+
+    Each step's block carries its own per-kind DELTA (step_report.py), so
+    the sum is the scan's total. Present-only: a scan whose steps dropped
+    nothing yields ``{}`` and the aggregate ``token_usage`` keeps exactly
+    the pre-#697 keys (byte-identical healthy artifacts).
+    """
+    out: dict[str, int] = {}
+    for sr in step_reports:
+        for kind, n in ((sr.get("token_usage", {})
+                          .get("dropped_block_kinds")) or {}).items():
+            out[kind] = out.get(kind, 0) + int(n)
+    return dict(sorted(out.items()))
+
+
 def _write_scan_report(
     output_dir: str,
     result: ScanResult,
@@ -2182,6 +2199,11 @@ def _write_scan_report(
         sr.get("token_usage", {}).get("cache_write", 0) or 0
         for sr in step_reports
     )
+    # #697: the per-kind dropped-block counts summed across the step
+    # reports' own token_usage blocks (present-only — a scan whose steps
+    # dropped nothing keeps its aggregate shape byte-identical).
+    _dropped_kinds = _sum_dropped_block_kinds(step_reports)
+
     _unpriced_cache = {
         m for sr in step_reports
         for m in (sr.get("token_usage", {}).get("unpriced_cache_models") or [])
@@ -2331,6 +2353,12 @@ def _write_scan_report(
             **({"accounting_error": True}
                if any(sr.get("token_usage", {}).get("accounting_error")
                       for sr in step_reports) else {}),
+            # #697: the dropped-block per-kind counts SUM across the step
+            # reports (each step's token_usage carries its own per-kind
+            # DELTA — the sum is the scan's total, present-only so a clean
+            # scan's token_usage keeps exactly the pre-#697 keys).
+            **({"dropped_block_kinds": _dropped_kinds}
+               if _dropped_kinds else {}),
         },
     )
 

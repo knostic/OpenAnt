@@ -182,6 +182,12 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
                 if end_snapshot.get("unpriced_cache_models"):
                     report.token_usage["unpriced_cache_models"] = \
                         end_snapshot["unpriced_cache_models"]
+                # #697: the dropped-block per-kind counts survive the
+                # sentinel too (run-cumulative, the #216 disclosure trade)
+                # — present-only.
+                if end_snapshot.get("dropped_block_kinds"):
+                    report.token_usage["dropped_block_kinds"] = dict(
+                        end_snapshot["dropped_block_kinds"])
         else:
             report.cost_usd = round(end_cost - start_cost, 6)
             report.token_usage = {
@@ -196,6 +202,20 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
                               - start_tokens.get(_ck, 0))
                     if _delta:
                         report.token_usage[_ck] = _delta
+            # #697: the step's dropped-block per-kind DELTA (present-only —
+            # a step that dropped nothing keeps its token_usage shape
+            # byte-identical to pre-#697). Per-kind subtraction, never a
+            # whole-dict replace: a resumed step inherits the run-cumulative
+            # counts at start and credits exactly its own drops.
+            _dk_end = end_snapshot.get("dropped_block_kinds") or {}
+            _dk_start = start_tokens.get("dropped_block_kinds") or {}
+            _dk_delta: dict[str, int] = {}
+            for _kind in set(_dk_end) | set(_dk_start):
+                _d = int(_dk_end.get(_kind, 0)) - int(_dk_start.get(_kind, 0))
+                if _d:
+                    _dk_delta[_kind] = _d
+            if _dk_delta:
+                report.token_usage["dropped_block_kinds"] = _dk_delta
             # #216: a step whose cost is incomplete (any call on an unpriced
             # model) must say so IN the artifact — OR the end snapshot's marker
             # (run-cumulative, so a step after unpriced spend also flags).
@@ -253,6 +273,21 @@ def _snapshot_usage() -> tuple[float | None, dict | None]:
             snap["cache_write"] = usage.total_cache_write_tokens
         if usage.unpriced_cache_models:
             snap["unpriced_cache_models"] = usage.unpriced_cache_models
+        # #697: the dropped-block per-kind counts — read from the tracker
+        # totals directly (NEVER from UsageInfo: that dataclass's asdict
+        # reaches result envelopes, so a field there would add a key to
+        # every envelope; the diagnostic stays in the token_usage
+        # channel). Present-only, run-cumulative (the same accepted trade
+        # as #216's cost_incomplete: the snapshot is a point-in-time
+        # totals read; the step report computes the per-kind DELTA from
+        # the start/end snapshot pair).
+        try:
+            from utilities.llm_client import get_global_tracker
+            _dk = get_global_tracker().get_totals().get("dropped_block_kinds")
+            if _dk:
+                snap["dropped_block_kinds"] = dict(_dk)
+        except Exception:
+            pass
         return usage.total_cost_usd, snap
     except Exception as exc:
         # #605: a failed snapshot is a SENTINEL, never a complete-looking

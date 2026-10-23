@@ -63,6 +63,7 @@ from .anthropic import (
 )
 from .._pricing import LazyProviderPricing
 from .._redact import redact_secrets, redacted_cause_from
+from .. import LLMConfigError
 from ..adapter import (
     CompletionResult,
     LLMAuthError,
@@ -268,6 +269,21 @@ class BedrockAdapter:
         if self.thinking is not None:
             request["thinking"] = self.thinking
 
+        # #696 trigger 3 (the fable-hunt sibling catch): the thinking
+        # budget must leave room for the response — the same contract as
+        # the anthropic adapter, mirrored here so the issue's trigger-3
+        # shape cannot survive on a sibling provider.
+        if (self.thinking is not None
+                and self.thinking.get("type") not in (None, "disabled")):
+            budget = self.thinking.get("budget_tokens")
+            if isinstance(budget, int) and budget >= max_tokens:
+                raise LLMConfigError(
+                    f"thinking budget_tokens ({budget}) must be less than "
+                    f"max_tokens ({max_tokens}) — the budget is carved out "
+                    "of the response allowance and leaves no room for the "
+                    "response itself; lower budget_tokens or raise max_tokens"
+                )
+
         # #625 T1 guard (2026-09-21, the retro bug-hunt finding): a
         # thinking-enabled request WITH tools requires the thinking blocks
         # preserved on the echoed assistant turn (Anthropic's documented
@@ -277,7 +293,7 @@ class BedrockAdapter:
         # failure; the full preserved-blocks handling is a separate change.
         if (tools and self.thinking is not None
                 and self.thinking.get("type") not in (None, "disabled")):
-            raise LLMResponseError(
+            raise LLMConfigError(
                 f"BedrockAdapter refuses thinking+tools: thinking blocks must be "
                 "preserved on the echoed assistant turn for multi-turn tool "
                 "loops, and this adapter's loop echo does not carry them "

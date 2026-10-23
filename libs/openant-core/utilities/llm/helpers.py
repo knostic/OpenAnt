@@ -135,6 +135,13 @@ def simple_completion(
         # appear only when there is a cost to carry).
         **({"provider_cost_usd": result.provider_cost_usd}
            if result.provider_cost_usd is not None else {}),
+        # #697: the #625/#660 dropped-block diagnostic rides the same
+        # record — present-only, so a call that dropped nothing keeps the
+        # record_call shape byte-identical (the diagnostic reaches the
+        # tracker totals -> the step report -> the scan aggregate; before
+        # #697 it was computed per call and read by nothing).
+        **({"dropped_block_kinds": dict(result.dropped_block_kinds)}
+           if getattr(result, "dropped_block_kinds", None) else {}),
     )
     return result
 

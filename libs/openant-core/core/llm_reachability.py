@@ -587,6 +587,11 @@ def analyze_reachability(
                     u["unpriced_cache_models"] = t["unpriced_cache_models"]
             if t.get("accounting_errors"):
                 u["accounting_errors"] = t.get("accounting_errors")
+            # #697: the dropped-block per-kind counts ride this summary
+            # too (run-cumulative from the totals, present-only — the
+            # reachability calls drop blocks through the same adapter).
+            if t.get("dropped_block_kinds"):
+                u["dropped_block_kinds"] = dict(t["dropped_block_kinds"])
             return u
         except Exception:  # noqa: BLE001 — a usage read must never kill the pass
             return None
