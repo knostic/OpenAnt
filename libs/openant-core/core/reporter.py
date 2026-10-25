@@ -210,13 +210,13 @@ def finding_identity_key(file_path: str, function: str, cwe_id: int) -> str:
     """#314: a run-stable identity for a finding — a short hash over the
     stable triple (location file, function, CWE).
 
-    VULN-NNN is assigned by list position: drop or add one finding
-    anywhere but the end and every later ID shifts, so the positional ID
-    is not a durable join key across artifacts (a stale
-    dynamic_test_results.json merges one finding's result into a
-    DIFFERENT finding). The identity key is derived from the finding's
-    identity, not its position. Short + hex so it stays human-auditable
-    alongside the display ID."""
+    The finding's DISPLAY ID (#706) is derived FROM this key
+    (``_finding_display_id``): the old positional VULN-NNN was assigned by
+    list position — drop or add one finding anywhere but the end and every
+    later ID shifted, so it was not a durable identifier across runs (a
+    triage spreadsheet or suppression list silently retargeted). The
+    identity key is derived from the finding's identity, not its position;
+    short + hex so it stays human-auditable alongside the join."""
     import hashlib
     try:
         cwe_val = int(cwe_id or 0)
@@ -224,6 +224,77 @@ def finding_identity_key(file_path: str, function: str, cwe_id: int) -> str:
         cwe_val = 0
     payload = f"{file_path}|{function}|{cwe_val}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _finding_cwe(finding: dict, full_result: dict) -> int:
+    """#706: the ONE shared CWE extraction for a confirmed finding — the
+    pre-pass (the identity list) and the emission loop MUST derive the same
+    triple, or the display ID names a different identity than the emitted
+    identity_key (the fable-r2 F-A/F-C catch: the pre-pass's copy had
+    drifted — a non-dict vulnerabilities element crashed it, and its cwe
+    fallback chain missed the full_result source). Mirrors the loop's own
+    read exactly, including the non-dict-element guard."""
+    vulns = finding.get("vulnerabilities", [])
+    # the non-dict-element guard (the loop's own comment: a model can
+    # return vulnerabilities=["str"])
+    vuln = vulns[0] if vulns and isinstance(vulns[0], dict) else {}
+    try:
+        return int(vuln.get("cwe_id") or finding.get("cwe_id")
+                   or full_result.get("cwe_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _finding_display_id(
+        identity_key: str,
+        all_identities: "list[str] | tuple[str, ...]",
+        seen: "set[str] | frozenset[str]") -> str:
+    """#706: the operator-visible finding ID — identity-derived, not
+    positional.
+
+    #416 deferred this half of #314's third suggestion as "a schema-design
+    change"; with the identity key derived one line above the positional
+    assignment, the deferred work is a RENAME. A positional VULN-NNN is not
+    stable across runs (any insertion renumbers everything after it), and
+    consumers that carry an ID across runs — a triage spreadsheet, a
+    suppression list, a cross-reference in a disclosure body — silently
+    retarget. The display ID is now the VULN- prefix + the identity key's
+    leading hex, naming the identity it came from (human-orderable it is
+    not — the issue accepts that).
+
+    TWO-PASS, ORDER-INDEPENDENT (the fable-r1 F1 catch: the first draft's
+    seen-set ladder made a 6-hex prefix collision resolve by LIST ORDER —
+    an inserted finding sharing a prefix took the short form and SILENTLY
+    RETARGETED it, the exact defect this fix exists to remove). Each
+    identity takes the shortest width in (6, 8, 10, 12) whose prefix is
+    unique against every OTHER identity in the set — so when two
+    identities share a 6-hex prefix, BOTH extend to 8: the short form
+    names nobody, and no id ever names a different finding.
+
+    The DISCLOSED RESIDUAL: an ID may LENGTHEN when a colliding finding
+    joins the set (the 6-char form becomes the 8-char form) — a visible
+    diff, never a silent retarget; the ids are a function of the set, not
+    the list order. An exact duplicate identity (the same
+    file/function/CWE twice in one list — the same finding) matches every
+    width against its twin and falls to the positional ``#n`` last resort,
+    deterministic within the run.
+    """
+    prefix = "VULN-"
+    for width in (6, 8, 10, 12):
+        cand = prefix + identity_key[:width]
+        others = {prefix + k[:width] for k in all_identities
+                  if k != identity_key}
+        if cand not in others:
+            if cand not in seen:
+                return cand
+            # an exact duplicate already holds this width's form (the twin
+            # shares the identity, so it is invisible to the k != filter
+            # above) — fall to the positional ladder
+            break
+    n = 2
+    while f"{prefix}{identity_key}#{n}" in seen:
+        n += 1
+    return f"{prefix}{identity_key}#{n}"
 
 
 def _load_reachability_metadata(scan_dir: str) -> dict | None:
@@ -467,8 +538,28 @@ def build_pipeline_output(
         and isinstance(c.get("verification"), dict)
         and c["verification"].get("incomplete"))
 
+    # #706 (the fable-r1 F1 fix — the two-pass derivation): precompute the
+    # identity of every confirmed finding ONCE, in list order, so each
+    # display ID can be derived against the WHOLE set (order-independent:
+    # a shared 6-hex prefix makes BOTH findings extend, never one silently
+    # taking the other's short form). The CWE extraction is the ONE shared
+    # helper (_finding_cwe) — the loop's own read, verbatim, so the
+    # pre-pass identity and the emitted identity_key agree by construction.
+    _confirmed_identities: list[str] = []
+    for finding in confirmed:
+        route_key = finding.get("route_key") or finding.get("unit_id", "unknown")
+        _file = route_key.split(":")[0] if ":" in route_key else "unknown"
+        _func = route_key.split(":", 1)[1] if ":" in route_key else route_key
+        _cwe = _finding_cwe(finding, finding)
+        _confirmed_identities.append(finding_identity_key(_file, _func, _cwe))
+
     # Build findings in PipelineOutput schema
     findings_data = []
+    # #706: the ids already assigned in THIS run — the exact-duplicate
+    # ladder only (a DIFFERENT identity sharing a prefix extends via the
+    # two-pass above; a SAME-identity duplicate falls here, deterministic
+    # by list order within the run)
+    _seen_display_ids: set[str] = set()
     for i, finding in enumerate(confirmed):
         route_key = finding.get("route_key") or finding.get("unit_id", "unknown")
 
@@ -586,12 +677,19 @@ def build_pipeline_output(
 
         _file = route_key.split(":")[0] if ":" in route_key else "unknown"
         _func = route_key.split(":", 1)[1] if ":" in route_key else route_key
-        _cwe = vuln.get("cwe_id") or finding.get("cwe_id") or full_result.get("cwe_id", 0)
+        _identity = _confirmed_identities[i]
         findings_data.append({
-            "id": f"VULN-{i+1:03d}",
-            # #314: the run-stable join key (see finding_identity_key);
-            # VULN-NNN stays as the display ID.
-            "identity_key": finding_identity_key(_file, _func, _cwe),
+            # #706: the display ID is IDENTITY-DERIVED (VULN- + the leading
+            # hex of the identity key below) — a positional VULN-NNN was not
+            # stable across runs (any insertion renumbered everything after
+            # it). #314's suggestion 3, the half #416 deferred — now a
+            # rename, not a redesign. See _finding_display_id.
+            "id": _finding_display_id(_identity, _confirmed_identities,
+                                      _seen_display_ids),
+            # #314: the run-stable join key (see finding_identity_key) —
+            # also the display ID's derivation source (#706).
+            "identity_key": _identity,
+            # (the seen-set update happens after the dict closes)
             "name": vuln.get("name", finding.get("finding", "Unknown Vulnerability")),
             "short_name": vuln.get("short_name", finding.get("verdict", "vuln")),
             "location": {
@@ -656,6 +754,7 @@ def build_pipeline_output(
             "suggested_fix": vuln.get("suggested_fix"),
             "steps_to_reproduce": steps_to_reproduce,
         })
+        _seen_display_ids.add(findings_data[-1]["id"])
 
     # Compute costs and durations from step reports
     costs = {}

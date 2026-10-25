@@ -82,7 +82,7 @@ The module expects a JSON file with the following structure:
   },
   "findings": [
     {
-      "id": "VULN-001",
+      "id": "VULN-1d89f8",
       "name": "Full Vulnerability Name",
       "short_name": "Short Name",
       "location": {
@@ -119,6 +119,10 @@ The module expects a JSON file with the following structure:
   ]
 }
 ```
+#706: the finding IDs are identity-derived (VULN- + the identity_key's
+leading hex) — stable across runs of the same finding set, unlike the
+old positional VULN-NNN.
+
 
 ## Output Style
 
