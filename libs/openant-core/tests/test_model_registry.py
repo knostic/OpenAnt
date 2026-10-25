@@ -100,7 +100,8 @@ def test_configured_default_phase_models_resolve_to_non_retired():
     A fresh, config-less install must not resolve its default phases to a retired
     model (that 404s every scan). Asserted WITHOUT naming which ids are dead:
     each default phase model must resolve to a registry entry whose status is not
-    'retired'. Legacy constants (context_enhancer) are intentionally out of scope.
+    'retired'. The prose/docs surface (the retired-id RECOMMENDING sites) is
+    #703's docs guard — test_issue703_retired_id_recommending_sites.py.
     """
     from utilities.llm.builtins import OPENANT_DEFAULT
 

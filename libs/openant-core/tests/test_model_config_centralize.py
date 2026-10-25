@@ -257,9 +257,6 @@ _EXPECTED_PHASE_MODELS = {
     "llm_reach": "claude-opus-4-8",
     "app_context": "claude-sonnet-4-6",
 }
-_EXPECTED_LEGACY_ENHANCE = "claude-sonnet-4-20250514"
-
-
 def test_c_pricing_maps_match_pre_refactor_snapshot():
     # Values are now sourced from config/models.json via core.model_registry.
     # Behavior-preserving for CURRENT models; retired/unknown ids are omitted.
@@ -301,7 +298,6 @@ def test_c_consumers_resolve_to_pre_refactor_values():
     from utilities.llm.providers.google import GoogleAdapter
     from utilities.llm.providers.openai import OpenAIAdapter
     from utilities.llm.builtins import OPENANT_DEFAULT
-    from utilities.context_enhancer import CONTEXT_ENHANCEMENT_MODEL_LEGACY
 
     # #434: subset semantics — the maps gained alias spellings; the exact
     # keys keep their exact values. #626: pair-compare (cache multipliers
@@ -313,8 +309,6 @@ def test_c_consumers_resolve_to_pre_refactor_values():
         assert (OpenAIAdapter.pricing[k]["input"], OpenAIAdapter.pricing[k]["output"]) == (v["input"], v["output"]), k
     for k, v in _EXPECTED_GOOGLE.items():
         assert (GoogleAdapter.pricing[k]["input"], GoogleAdapter.pricing[k]["output"]) == (v["input"], v["output"]), k
-    assert CONTEXT_ENHANCEMENT_MODEL_LEGACY == _EXPECTED_LEGACY_ENHANCE
-
     resolved = {p: OPENANT_DEFAULT.phases[p].model for p in _EXPECTED_PHASE_MODELS}
     assert resolved == _EXPECTED_PHASE_MODELS
 

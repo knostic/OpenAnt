@@ -2,8 +2,7 @@
 
 Single source of truth for the hard-coded model-ID *strings* used across the
 product source — e.g. ``utilities/llm/builtins.py``'s ``OPENANT_DEFAULT``
-per-phase models and ``utilities/context_enhancer.py``'s
-``CONTEXT_ENHANCEMENT_MODEL_LEGACY``.
+per-phase models.
 
 **Pricing no longer lives here.** Per-provider pricing moved to the shared
 ``config/models.json`` registry, read by ``core/model_registry.py`` (Python) and
@@ -28,10 +27,11 @@ from __future__ import annotations
 CLAUDE_OPUS = "claude-opus-4-8"
 CLAUDE_SONNET = "claude-sonnet-4-6"
 CLAUDE_HAIKU = "claude-haiku-4-5-20251001"
-# Retired IDs kept for historical reports / back-compat.
-CLAUDE_OPUS_4_20250514 = "claude-opus-4-20250514"
-CLAUDE_OPUS_4_6 = "claude-opus-4-6"
-CLAUDE_SONNET_4_20250514 = "claude-sonnet-4-20250514"
+# Retired IDs live ONLY in the shared registry (config/models.json — the
+# status:"retired" records) and in the tests that pin its catalogue: the
+# retired-string constants that used to live here had no remaining readers
+# once #703 deleted CONTEXT_ENHANCEMENT_MODEL_LEGACY (the historical-report
+# and saved-config consumers read the registry/JSON, never these names).
 # Older (pre-4.x) generation names still accepted as legacy CLI/env aliases.
 CLAUDE_3_HAIKU_LEGACY = "claude-3-haiku"
 CLAUDE_3_SONNET_LEGACY = "claude-3-sonnet"

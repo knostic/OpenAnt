@@ -275,7 +275,7 @@ This format matches DVNA/NodeGoat enhanced datasets and is recognized by OpenAnt
 **File**: `utilities/context_enhancer.py`
 
 **Implementation**:
-- Uses Claude Sonnet (`claude-sonnet-4-20250514`) for cost-effective enhancement
+- Uses Claude Sonnet (`claude-sonnet-4-6`) for cost-effective enhancement
 - Identifies missing dependencies that static analysis missed
 - Identifies additional callers based on naming patterns
 - Extracts data flow information (inputs, outputs, tainted variables, security flows)
