@@ -15,7 +15,9 @@ its origin crate, and matches only:
 Path-resolution is the over-match guard: `use evil::thing as fuzz_target` resolves
 to evil::thing and is NOT a harness; a bare `fuzz!` with no afl import is NOT one.
 
-Out of scope (deferred follow-up): macro_rules!-wrapped harnesses.
+Out of scope at the time (deferred follow-up): macro_rules!-wrapped
+harnesses — since lifted by the #704 recognizer (see
+ test_issue704_macro_rules_wrapped_harness.py).
 """
 
 import pathlib
