@@ -924,10 +924,17 @@ def run_analysis(
         # was cache-unpriced. ``incomplete_markers`` stamps both kinds under
         # their own keys, present-only.
         _totals = get_global_tracker().get_totals()
+        # #699: the #605 accounting-error counter rides the same builder —
+        # the #644 shape (counter => flag), the one pairing rule every
+        # _summary.json writer shares. Process-cumulative, the enhance
+        # sibling's accepted trade (#609 review): an inner-guard firing
+        # leaves THIS stage's summary no longer complete-looking.
+        from utilities.llm_client import _accounting_error_count
         usage.update(incomplete_markers(
             set(_summary_unpriced) | set(_totals.get("unpriced_models") or []),
             set(_summary_unpriced_cache)
-            | set(_totals.get("unpriced_cache_models") or [])))
+            | set(_totals.get("unpriced_cache_models") or []),
+            _accounting_error_count()))
         return usage
 
     # Inject prior usage into tracker so step_report captures the total
