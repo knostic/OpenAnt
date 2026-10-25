@@ -33,13 +33,26 @@
 #         channel history are in git.
 #   sha256: 9c146ec362d03090688714f48f0241b4262ea6b19c819bbe020c75a6526d477e
 #
-# chart-4.5.1.umd.min.js
-#   source: https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js
-#   npm anchor: registry.npmjs.org/chart.js/-/chart.js-4.5.1.tgz
-#     dist.integrity: sha512-GIjfiT9dbmHRiYi6Nl2yFCq7kkwdkp1W/lp2J99rX0yo9tgJGn3lKQATztIjb5tVtevcBtIdICNWqlq5+E8/Pw==
-#     (the fetched tarball hashes to it; its inner dist/chart.umd.min.js is the
-#      bytes below — jsdelivr serves the same file, both verified 2026-09-05)
-#   sha256: 48444a82d4edcb5bec0f1965faacdde18d9c17db3063d042abada2f705c9f54a
+# chart-4.6.1.umd.min.js
+#   source: https://cdn.jsdelivr.net/npm/chart.js@4.6.1/dist/chart.umd.min.js
+#   npm anchor: registry.npmjs.org/chart.js/-/chart.js-4.6.1.tgz
+#     dist.integrity: sha512-hJyniucsFmq//EvXYvJ6c6mahPoI3kaxdjVH8awTaJ/fDNWeSqqqArixMJWkWNN6fcYvPU3HneSANFNYtRi61g==
+#     dist.shasum (sha1): 40a924bc0b92544ed66fa3f4873981152fc62c52
+#     (the fetched tarball hashes to BOTH published values; its inner
+#      dist/chart.umd.min.js — the path npm's own jsdelivr/unpkg fields name —
+#      is the bytes below, and the jsdelivr CDN copy is byte-identical to the
+#      tarball's; both verified 2026-10-23)
+#   sha256: 87364cc2b2a76a6684929e7d6b80b18a897794db38400caff1fcf1791c6925d2
+#   bump note (#856): renovate's chart.js manager is a NOTIFIER, not a fixer —
+#     its branch rewrote the name literals and left the blob and this record
+#     behind, by design (see renovate.json). This section, the blob and the
+#     report_vendor_test.go pin were produced by the manual #332 recipe. The
+#     4.5.1 blob was DELETED by this bump (its bytes and sha256
+#     48444a82d4edcb5bec0f1965faacdde18d9c17db3063d042abada2f705c9f54a are in
+#     git), the same way the tailwindcss-3.4.17.js blob was retired above.
+#     Re-justified on these bytes at vendoring time, not assumed: 0 matches for
+#     `new Function(`/`eval(` (the #578-A CSP no-unsafe-eval premise) and 0 for
+#     the four html/template breakout tokens.
 #
 # chartjs-plugin-datalabels-2.2.0.min.js
 #   source: https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js

@@ -6,7 +6,7 @@
     <title>{{.Title}}</title>
     {{/* #540: the prebuilt CSS (the choice-1 migration; the runtime compiler was frozen at the dead Play-CDN channel). Same self-containment: template.CSS embed, no CDN. Cascade: this block comes BEFORE the hand-written <style> below — the hand-written rules win at equal specificity, the same order the runtime-injected stylesheet had (appended at head-end AFTER these blocks) reversed only for utility-vs-handcrafted collisions, none observed (one manual render checked). */}}
     <style>{{ vendorCSS "report.css" }}</style>
-    <script>{{ vendorJS "chart-4.5.1.umd.min.js" }}</script>
+    <script>{{ vendorJS "chart-4.6.1.umd.min.js" }}</script>
     <script>{{ vendorJS "chartjs-plugin-datalabels-2.2.0.min.js" }}</script>
     <style>
         /* Details marker styling */
