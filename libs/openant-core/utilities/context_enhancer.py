@@ -1004,13 +1004,13 @@ class ContextEnhancer:
                      "cost_usd": round(_summary_cost_usd, 6)}
             # #626/PR#661 hunt F4: both kinds, one rule
             # (utilities.llm_client.incomplete_markers), present-only.
-            usage.update(incomplete_markers(_summary_unpriced,
-                                            _summary_unpriced_cache))
+            # #699: the counter's pairing (the #644 shape this writer alone
+            # shipped by hand) moves INTO the builder — one rule for all
+            # five _summary.json writers now.
             from utilities.llm_client import _accounting_error_count
-            _errs = _accounting_error_count()
-            if _errs:
-                usage["accounting_errors"] = _errs
-                usage["cost_incomplete"] = True
+            usage.update(incomplete_markers(_summary_unpriced,
+                                            _summary_unpriced_cache,
+                                            _accounting_error_count()))
             return usage
 
         if checkpoint_dir:
