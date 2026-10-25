@@ -23,7 +23,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
-from .model_config import CLAUDE_SONNET_4_20250514
 from .llm_client import (TokenTracker, get_global_tracker,
                          incomplete_markers, turn_has_spend,
                          unpriced_kinds_from)
@@ -60,10 +59,6 @@ def _get_step_checkpoint():
 _null_logger = logging.getLogger("null")
 _null_logger.addHandler(logging.NullHandler())
 
-
-# The enhance phase's model is supplied by the binding now; this
-# constant is retained only for legacy log lines that reference it.
-CONTEXT_ENHANCEMENT_MODEL_LEGACY = CLAUDE_SONNET_4_20250514
 
 # Max bounded rounds of the post-loop transient-error retry. Each round
 # re-attempts units still carrying a retryable error; rounds stop early once

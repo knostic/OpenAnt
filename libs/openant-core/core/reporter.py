@@ -1322,11 +1322,26 @@ def _record_usage_in_tracker(usage: dict, binding):
             record_accounting_error()
         except Exception:
             # The counting mechanism is unavailable: the stderr line below
-            # is the only remaining signal — still never silent.
-            print("[report] accounting hand-off failed AND the counter "
-                  "is unavailable", file=sys.stderr)
-        print(f"[report] accounting hand-off failed "
-              f"({type(exc).__name__}): {exc}", file=sys.stderr)
+            # is the only remaining signal — still never silent. The print
+            # is itself guarded (#701, the #644 precedent at
+            # agent.py:431-453): a closed/encoding-broken stderr raising
+            # HERE would escape the handler — the diagnostic path becoming
+            # the failure is the exact class this handler exists to
+            # prevent.
+            try:
+                print("[report] accounting hand-off failed AND the counter "
+                      "is unavailable", file=sys.stderr)
+            except Exception:
+                pass  # stderr unavailable — no durable signal remains;
+                      # the return still completes the report path
+        # #701: the always-line is guarded the same way — a closed stderr
+        # must never turn the completed-report hand-off into a raise.
+        try:
+            print(f"[report] accounting hand-off failed "
+                  f"({type(exc).__name__}): {exc}", file=sys.stderr)
+        except Exception:
+            pass  # stderr unavailable — the #605 counter already carried
+                  # the durable signal above
 
 
 def _usage_to_info(usage: dict):

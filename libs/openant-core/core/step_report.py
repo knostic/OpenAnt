@@ -293,7 +293,15 @@ def _snapshot_usage() -> tuple[float | None, dict | None]:
         # #605: a failed snapshot is a SENTINEL, never a complete-looking
         # zero — the caller must skip the subtraction (a fabricated baseline
         # produces negative deltas or charges another step's spend) and
-        # mark the step's accounting incomplete.
-        print(f"[step-report] accounting snapshot failed ({type(exc).__name__}): "
-              f"{exc}", file=sys.stderr)
+        # mark the step's accounting incomplete. The print is itself
+        # guarded (#701, the #644 pattern at agent.py:431-453, the fable
+        # r1 F1 twin): a closed/encoding-broken stderr raising HERE would
+        # escape the sentinel path and kill the step the sentinel exists
+        # to protect — the diagnostic may never become the failure.
+        try:
+            print(f"[step-report] accounting snapshot failed "
+                  f"({type(exc).__name__}): {exc}", file=sys.stderr)
+        except Exception:
+            pass  # stderr unavailable — the (None, None) sentinel is the
+                  # durable signal; the step still completes
         return None, None

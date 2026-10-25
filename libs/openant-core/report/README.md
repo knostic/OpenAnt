@@ -1,6 +1,6 @@
 # Report Generator Module
 
-Generates security reports and disclosure documents from OpenAnt pipeline output using Claude Opus 4.5.
+Generates security reports and disclosure documents from OpenAnt pipeline output using Claude Opus.
 
 ## Usage
 
@@ -178,10 +178,10 @@ generate_all("pipeline_output.json", "output/")
 
 ## Cost
 
-Uses Claude Opus 4.5 (`claude-opus-4-5-20250514`).
+Uses the report phase's configured model — the fresh-install default is
+Claude Opus (`claude-opus-4-8`, $5 input / $25 output per million tokens;
+see `config/models.json` for the registry's own record and provenance).
 
-- Input: ~$15 per million tokens
-- Output: ~$75 per million tokens
 - Typical cost: $1-5 per complete report set
 
 ## Requirements

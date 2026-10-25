@@ -152,7 +152,7 @@ The `_build_pipeline_output()` function was fixed to handle the actual Stage 1 o
 
 ## Key Dependencies
 
-- `utilities/llm_client.py` — `AnthropicClient`, `TokenTracker` (Sonnet model: `claude-sonnet-4-20250514`)
+- `utilities/llm_client.py` — `AnthropicClient`, `TokenTracker` (Sonnet model: `claude-sonnet-4-6`)
 - Docker Engine — must be running for container execution
 - No additional pip packages required (uses stdlib `subprocess` for Docker CLI)
 
