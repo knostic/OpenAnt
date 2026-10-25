@@ -165,7 +165,10 @@ def test_every_prose_model_token_resolves_in_the_registry():
     # the F1 fix site — NAMED so the read is load-bearing for the screen's
     # data channel (the report README carried the nonexistent id this guard
     # exists to catch; it must be IN the scanned scope, never silently out)
-    assert any(str(s).endswith("report/README.md") for s in _PROSE_SURFACES), (
+    # as_posix(): the comparison is SEPARATOR-INDEPENDENT (the windows CI
+    # catch — str(Path) on windows yields backslashes and the forward-slash
+    # endswith failed; every path-string comparison in this suite is posix)
+    assert any(s.as_posix().endswith("report/README.md") for s in _PROSE_SURFACES), (
         "the report README fell out of the guard's scan scope")
     unresolved = []
     for surface in _PROSE_SURFACES:
@@ -246,7 +249,7 @@ def test_the_registry_carries_no_retired_id_in_prose_scope_even_future():
     retired = _retired_ids()
     # the catalogue sites ARE allowed to name retired ids — they must not be
     # in the prose surface set
-    surfaces = {str(s) for s in _PROSE_SURFACES}
+    surfaces = {s.as_posix() for s in _PROSE_SURFACES}
     for catalogue in ("config/models.json",
                       "libs/openant-core/utilities/model_config.py",
                       "libs/openant-core/tests/test_model_registry.py"):
