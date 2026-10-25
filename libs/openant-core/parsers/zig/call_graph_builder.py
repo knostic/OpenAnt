@@ -7,6 +7,7 @@ Builds bidirectional call graphs showing function dependencies.
 import os
 import posixpath
 import re
+import sys
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set
 
@@ -168,8 +169,21 @@ class CallGraphBuilder:
         # every other path).
         try:
             alias_to_target = self._build_alias_index(name_to_ids)
-        except Exception:
+        except Exception as exc:
             alias_to_target = {}
+            # #702 (the intake's silent-fallback class): the wholesale alias
+            # drop must be NAMED, never silent — an empty alias map is
+            # indistinguishable from "no aliases existed" on the artifacts,
+            # and a symmetric wholesale drop passes every consistency check
+            # vacuously. The print is itself guarded (the #644/#701 pattern:
+            # a closed/encoding-broken stderr raising HERE would escape the
+            # graceful-degradation path this handler exists to protect).
+            try:
+                print(f"[zig] call-graph alias index build failed "
+                      f"({type(exc).__name__}): {exc} — every alias-based "
+                      f"edge is dropped for this run", file=sys.stderr)
+            except Exception:
+                pass
 
         for func_id, func_info in self.functions.items():
             code = func_info.get("code", "")
