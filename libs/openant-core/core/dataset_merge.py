@@ -131,6 +131,14 @@ def merge_datasets(outcomes, output_path: str) -> MergeStats:
         # inventing a canonical schema neither parser agreed to, the aggregate
         # below carries only figures the merge can compute unambiguously.
         per_language[outcome.language]["statistics"] = data.get("statistics") or {}
+        # #707: carry THIS language's reachability-filter record into the
+        # per-language block (present-only — an unfiltered language keeps no
+        # key, never a fabricated record). The merge previously spread only
+        # the FIRST language's top-level record, so the reporter read one
+        # language's kept count against every language's total.
+        _lang_rf = (data.get("metadata") or {}).get("reachability_filter")
+        if isinstance(_lang_rf, dict):
+            per_language[outcome.language]["reachability_filter"] = _lang_rf
 
     merged["units"] = merged_units
     merged["statistics"] = {

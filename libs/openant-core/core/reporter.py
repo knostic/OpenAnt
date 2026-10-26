@@ -306,10 +306,13 @@ def _load_reachability_metadata(scan_dir: str) -> dict | None:
     ``pipeline_stats.reachable_units`` reflects reality instead of assuming
     every analyzed unit is reachable. Returns ``None`` when the dataset or the
     record is absent/unreadable (an unfiltered scan, or a parser that recorded
-    none). NOTE: on a multi-language scan the merged ``dataset.json`` currently
-    carries only the first-parsed language's record (see ``dataset_merge`` /
-    BUG-2b); this reader surfaces that record and warns — full per-language
-    accounting is deferred to a follow-up.
+    none). #707 closed the multi-language half of #251's deferral: the merge
+    now carries each language's record under ``metadata.per_language``, and
+    this reader SUMS across languages when any record is present (an
+    unfiltered language contributing its whole unit count to both sides, so
+    the numerator's scope always matches the denominator's) — falling back to
+    the top-level single record (the pre-#707 shape) for datasets without
+    per-language records.
     """
     dataset_path = os.path.join(scan_dir, "dataset.json")
     if not os.path.exists(dataset_path):
@@ -324,7 +327,202 @@ def _load_reachability_metadata(scan_dir: str) -> dict | None:
     if not isinstance(metadata, dict):
         return None
     rf = metadata.get("reachability_filter")
-    return rf if isinstance(rf, dict) else None
+    if not isinstance(rf, dict):
+        rf = None
+    # #707: the per-language accounting. The merge (dataset_merge) carries
+    # each language's own reachability_filter record under
+    # metadata.per_language[lang]; when ANY language's record is present,
+    # the scan-wide figures are the SUM across languages — an UNFILTERED
+    # language (no record) contributes its whole unit count to BOTH sides
+    # (its units are all reachable), so the numerator's language scope
+    # always matches the denominator's. Falls back to the top-level
+    # single record (the pre-#707 shape, still written for the first
+    # language) when no per-language records exist.
+    # F6 (the fable-r1 latent-precedence catch): a top-level record that
+    # already carries its own per_language block IS the scanner's newer
+    # scan-wide aggregate (the post-LLM refilter path) — it outranks the
+    # merge's parse-time per-language records. N1 (the fable-r2 catch):
+    # the scanner's per_language values are FULL RECORDS, not ints — the
+    # artifact's reachability_per_language contract is {lang: kept-int},
+    # so project the kept count here (never the raw record dicts).
+    if isinstance(rf, dict) and isinstance(rf.get("per_language"), dict):
+        pl = rf["per_language"]
+        if all(isinstance(v, dict) for v in pl.values()):
+            projected = {}
+            for lang, rec in pl.items():
+                kept = rec.get("reachable_units") if isinstance(rec, dict) else None
+                if isinstance(kept, int) and not isinstance(kept, bool):
+                    projected[lang] = kept
+            if projected:
+                rf = dict(rf)
+                rf["per_language"] = projected
+        return rf
+    per_lang = metadata.get("per_language")
+    if not isinstance(per_lang, dict):
+        return rf
+    records = {}
+    unfiltered_langs = []
+    malformed = []
+    for lang, block in per_lang.items():
+        if not isinstance(block, dict):
+            continue
+        rec = block.get("reachability_filter")
+        units = block.get("units")
+        if isinstance(rec, dict):
+            if not isinstance(rec.get("reachable_units"), int) or \
+                    isinstance(rec.get("reachable_units"), bool):
+                # a malformed record: its kept count is unknown — counting
+                # its units on the denominator only would fabricate pruning
+                # (the fable-r1 F4 catch); name it and treat the language
+                # as unfiltered (its units all reachable, both sides)
+                malformed.append(lang)
+                if isinstance(units, int) and not isinstance(units, bool):
+                    unfiltered_langs.append((lang, units))
+                continue
+            records[lang] = rec
+        elif isinstance(units, int) and not isinstance(units, bool):
+            unfiltered_langs.append((lang, units))
+    if not records:
+        if malformed and rf is None:
+            # N6 (the fable-r2 catch): every record malformed — no
+            # aggregate is possible, but the silent discard is worse than
+            # the truth: name the languages in a record the consumer can
+            # surface
+            return {
+                "reachable_units": sum(u for _, u in unfiltered_langs),
+                "original_units": sum(u for _, u in unfiltered_langs),
+                "reduction_percentage": 0,
+                "warning": "; ".join(
+                    f"{lang}: its reachability record is malformed (no "
+                    "integer reachable_units) — treated as unfiltered, its "
+                    "units counted as fully reachable on both sides."
+                    for lang in malformed),
+                "warnings": [
+                    f"{lang}: its reachability record is malformed (no "
+                    "integer reachable_units) — treated as unfiltered, its "
+                    "units counted as fully reachable on both sides."
+                    for lang in malformed],
+                "per_language": {l: u for l, u in unfiltered_langs},
+            }
+        return rf
+    reachable_total = 0
+    original_total = 0
+    warnings: list[str] = []
+    kept_by_lang: dict[str, int] = {}
+    numeric_keys = ("pruned_orphan_count", "pruned_in_dead_cluster_count",
+                    "pruned_forward_called_by_reachable_count",
+                    "structural_reachable_units", "units_newly_reachable",
+                    "reachability_baseline_languages")
+    numeric_sums = {k: 0 for k in numeric_keys}
+    numeric_present: set[str] = set()
+    pruned_by_file: dict = {}
+    strings: dict[str, str] = {}
+    for lang, rec in records.items():
+        kept = rec.get("reachable_units")
+        if isinstance(kept, int) and not isinstance(kept, bool):
+            reachable_total += kept
+            kept_by_lang[lang] = kept
+        orig = rec.get("original_units")
+        if isinstance(orig, int) and not isinstance(orig, bool):
+            original_total += orig
+        w = rec.get("warning")
+        if isinstance(w, str) and w:
+            warnings.append(w)
+        for k in numeric_keys:
+            v = rec.get(k)
+            if isinstance(v, int) and not isinstance(v, bool):
+                numeric_sums[k] += v
+                numeric_present.add(k)
+        pbf = rec.get("pruned_by_file")
+        if isinstance(pbf, dict):
+            for fname, cnt in pbf.items():
+                if isinstance(cnt, int):
+                    pruned_by_file[fname] = pruned_by_file.get(fname, 0) + cnt
+        for sk in ("blackout_advisory", "level_fallback_warning",
+                   "reachability_baseline", "orphan_advisory"):
+            sv = rec.get(sk)
+            if isinstance(sv, str) and sv:
+                # JOINED + ATTRIBUTED, never first-wins (the fable-r1 F2
+                # catch: language B's advisory silently dropped re-opens
+                # the #323/#520 misdiagnosis vector for the other half of
+                # the scan)
+                strings.setdefault(sk, []).append(f"{lang}: {sv}")
+    for lang, units in unfiltered_langs:
+        # an unfiltered language's units are all reachable: both sides
+        reachable_total += units
+        original_total += units
+        kept_by_lang[lang] = units
+    if unfiltered_langs:
+        # N5 (the fable-r2 catch): a MALFORMED language is not "unfiltered" —
+        # exclude it from the mixed-scan line (its own named warning follows)
+        plain = [(l, u) for l, u in unfiltered_langs if l not in malformed]
+        if plain:
+            warnings.append(
+                "Mixed scan: " + ", ".join(
+                    f"{lang} ({units} units)" for lang, units in plain
+                ) + " ran UNFILTERED (no reachability-filter record) — their "
+                "units are counted as fully reachable on both sides of the "
+                "scan-wide figures.")
+    agg: dict = {
+        "reachable_units": reachable_total,
+        "original_units": original_total,
+        "reduction_percentage": (
+            round(100 * (1 - reachable_total / original_total), 1)
+            if original_total else 0
+        ),
+        # the consumer reads the singular `warning` (one append) — the
+        # joined forward keeps every language's warning visible through it
+        "warning": "; ".join(dict.fromkeys(warnings)) if warnings else "",
+        "warnings": list(dict.fromkeys(warnings)),
+        "per_language": kept_by_lang,
+    }
+    for lang in malformed:
+        agg["warnings"].append(
+            f"{lang}: its reachability record is malformed (no integer "
+            "reachable_units) — treated as unfiltered, its units counted "
+            "as fully reachable on both sides.")
+        if agg["warning"]:
+            agg["warning"] += "; "
+        agg["warning"] += agg["warnings"][-1]
+    # F1 (the fable-r1 catch): PER-KEY present-only — a key is emitted only
+    # when at least one language's record CARRIED it. Emitting all five
+    # whenever any was seen fabricated structural_reachable_units: 0 /
+    # units_newly_reachable: 0 for records that never had them — the exact
+    # fabricated-zero class the #602 contract (20 lines below) forbids.
+    for k in numeric_keys:
+        if k in numeric_present:
+            agg[k] = numeric_sums[k]
+    if pruned_by_file:
+        # N4 (the fable-r2 catch): the scanner's own aggregate caps this at
+        # the top 20 files (scanner.py:205) — match it so the merge path
+        # cannot bloat the artifact past the single-scan shape
+        agg["pruned_by_file"] = dict(
+            sorted(pruned_by_file.items(),
+                   key=lambda kv: -kv[1])[:20])
+    # the advisory joins (N2, the fable-r2 catch: the consumer already
+    # forwards each advisory key standalone into reachability_warnings —
+    # folding them into `warning` too double-appended; the join stays on
+    # the advisory keys, the warnings channel carries them once)
+    for sk, vals in strings.items():
+        agg[sk] = "; ".join(dict.fromkeys(vals))
+    # F3 (the fable-r1 catch): the effective level claimed scan-wide only
+    # when every record AGREES — a mixed-level scan claims nothing (the
+    # scanner's own refilter-aggregate precedent), never one language's
+    # level for the whole scan
+    levels = {rec.get("effective_processing_level")
+              for rec in records.values()
+              if isinstance(rec.get("effective_processing_level"), str)
+              and rec.get("effective_processing_level")}
+    if len(levels) == 1:
+        agg["effective_processing_level"] = next(iter(levels))
+    elif len(levels) > 1:
+        agg["warnings"].append(
+            "Mixed effective processing levels across languages: "
+            + ", ".join(sorted(levels))
+            + " — no single scan-wide level claimed.")
+        agg["warning"] = (agg["warning"] + "; " + agg["warnings"][-1]
+                          if agg["warning"] else agg["warnings"][-1])
+    return agg
 
 
 def _severity_fields(finding: dict) -> dict:
@@ -883,11 +1081,20 @@ def build_pipeline_output(
         _fb_warning = _reach.get("level_fallback_warning")
         if isinstance(_fb_warning, str) and _fb_warning:
             reachability_warnings.append(_fb_warning)
-        # The level that actually ran, when the record says one (the Python
-        # path always writes it; per-language records don't, and stay as-is).
+        # The level that actually ran, when the record says one (#707: on a
+        # multi-language scan the aggregate claims it only when every
+        # language's record AGREES — a mixed-level scan warns instead).
         _eff = _reach.get("effective_processing_level")
         if isinstance(_eff, str) and _eff:
             _reach_telemetry["effective_processing_level"] = _eff
+        # #707: the per-language kept decomposition — the scan-wide figures
+        # above are the sums; this additive map names each language's own
+        # kept count (an unfiltered language's whole unit count) so the
+        # artifact's reachability figures ARE per-language, the falsifier's
+        # first disjunct.
+        _pl = _reach.get("per_language")
+        if isinstance(_pl, dict):
+            _reach_telemetry["reachability_per_language"] = _pl
         # #301: the prune classification (orphan = missing-edge ROOT
         # candidate; dead_cluster = downstream shadow) previously reached no
         # consumer — forward it present-only so pipeline_output carries the
