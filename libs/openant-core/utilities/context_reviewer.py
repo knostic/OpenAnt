@@ -33,23 +33,34 @@ def get_context_review_prompt(code: str, route: str, handler: str, files_include
     Generate a prompt for the LLM to review the assembled context
     and identify what additional files might be needed.
     """
-    files_list = "\n".join(f"- {f}" for f in files_included)
-    from prompts._fence import safe_code_fence
-    _cf = safe_code_fence(code[:50000])
+    from prompts._fence import Untrusted, collapse_inline, fence_block
+    # #709 (the fable-r2 N1 catch): the scanned paths are collapsed
+    # PER ITEM (the list structure preserved) — never flattened to one line
+    files_list = "\n".join(f"- {collapse_inline(Untrusted(f))}"
+                           for f in files_included)
+    # #709: the complete block from the single home — the untrusted code is
+    # never interpolated raw here (the truncation note still computed on
+    # the full length)
+    code_block = fence_block(Untrusted(code[:50000]), language='javascript')
 
+    # #709 (the fable-r1 F3 catch + the r2 N1 fix): route/handler are
+    # scanned identifiers (the same class the analysis prompt collapses) —
+    # raw label lines at base; the files list is collapsed PER ITEM (the
+    # list structure preserved, the scanned paths inert per line)
+    route_label = collapse_inline(Untrusted(route))
+    handler_label = collapse_inline(Untrusted(handler))
+    files_label = files_list  # per-item collapsed above — the structure kept
     return f"""You are reviewing code context assembled for a security analysis.
 
 ## Target Endpoint
-**Route:** `{route}`
-**Handler:** `{handler}`
+**Route:** `{route_label}`
+**Handler:** `{handler_label}`
 
 ## Files Currently Included
-{files_list}
+{files_label}
 
 ## Assembled Code
-{_cf}javascript
-{code[:50000]}
-{_cf}
+{code_block}
 {f"[... truncated, {len(code)} total chars ...]" if len(code) > 50000 else ""}
 
 ## Your Task
@@ -111,20 +122,25 @@ def get_targeted_search_prompt(missing_item: dict, files_content: str) -> str:
     """
     Generate a prompt to search for a specific missing item.
     """
-    from prompts._fence import safe_code_fence
-    _ff = safe_code_fence(files_content)
+    from prompts._fence import Untrusted, collapse_inline, fence_block
+    # #709: the complete block from the single home
+    files_block = fence_block(Untrusted(files_content))
+    # #709 (F3): the missing_item fields are prior-stage LLM output —
+    # collapsed label lines (0 callers at HEAD: defense-in-depth)
+    type_label = collapse_inline(Untrusted(missing_item.get('type', 'unknown')))
+    desc_label = collapse_inline(Untrusted(missing_item.get('description', '')))
+    why_label = collapse_inline(Untrusted(missing_item.get('why_needed', '')))
+    hints_label = collapse_inline(Untrusted(missing_item.get('hints', 'none')))
     return f"""You are searching for a specific file needed for security analysis.
 
 ## What We Need
-**Type:** {missing_item.get('type', 'unknown')}
-**Description:** {missing_item.get('description', '')}
-**Why Needed:** {missing_item.get('why_needed', '')}
-**Hints:** {missing_item.get('hints', 'none')}
+**Type:** {type_label}
+**Description:** {desc_label}
+**Why Needed:** {why_label}
+**Hints:** {hints_label}
 
 ## Available Files
-{_ff}
-{files_content}
-{_ff}
+{files_block}
 
 ## Your Task
 Find the file(s) that match what we're looking for.

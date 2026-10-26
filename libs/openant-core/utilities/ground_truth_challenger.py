@@ -48,6 +48,9 @@ class ChallengeResult:
     recommendation: str  # What should the ground truth be?
 
 
+from prompts._fence import Untrusted, collapse_inline, fence_block  # noqa: E402  # #709
+
+
 def get_fp_challenge_prompt(route_key: str, code: str, model_reasoning: str, model_vulnerabilities: list) -> str:
     """
     Generate a prompt to challenge a potential false positive.
@@ -55,24 +58,44 @@ def get_fp_challenge_prompt(route_key: str, code: str, model_reasoning: str, mod
     The model said VULNERABLE, but ground truth says SAFE.
     We need to determine who is right.
     """
+    # #709 (the fable-r2 B1/N2 catch): the entries are DICTS — the base
+    # loop formatted them per-field; the r1 remediation's str.join over the
+    # dicts CRASHED (TypeError: expected str, dict found) on the realistic
+    # FP shape. The loop restored, each attacker/model-authored field
+    # collapsed to its inert single line.
     vuln_details = ""
     if model_vulnerabilities:
         vuln_details = "\n\nVulnerabilities claimed by the model:\n"
         for i, v in enumerate(model_vulnerabilities, 1):
+            # the base loop's per-field defaults restored verbatim
+            # (Unknown for type/severity, N/A for the rest — the r3-N2
+            # silent-drift catch: my first restore used N/A everywhere)
+            _defaults = {"type": "Unknown", "severity": "Unknown",
+                         "source": "N/A", "sink": "N/A", "flow": "N/A",
+                         "evidence": "N/A", "why_vulnerable": "N/A"}
+            fields = {k: collapse_inline(Untrusted(v.get(k, _defaults[k])))
+                      for k in _defaults}
             vuln_details += f"""
-{i}. Type: {v.get('type', 'Unknown')}
-   Severity: {v.get('severity', 'Unknown')}
-   Source: {v.get('source', 'N/A')}
-   Sink: {v.get('sink', 'N/A')}
-   Flow: {v.get('flow', 'N/A')}
-   Evidence: {v.get('evidence', 'N/A')}
-   Why Vulnerable: {v.get('why_vulnerable', 'N/A')}
+{i}. Type: {fields['type']}
+   Severity: {fields['severity']}
+   Source: {fields['source']}
+   Sink: {fields['sink']}
+   Flow: {fields['flow']}
+   Evidence: {fields['evidence']}
+   Why Vulnerable: {fields['why_vulnerable']}
 """
 
+    # #709 (the fable-r1 F2 catch — a pre-#248 survivor): the code sat in a
+    # BARE ``` fence (escapable) and model_reasoning/vuln_details were raw
+    # label lines; the complete block + the collapsed labels now
+    code_block = fence_block(Untrusted(code))
+    route_key_label = collapse_inline(Untrusted(route_key))
+    reasoning_label = collapse_inline(Untrusted(model_reasoning))
+    details_label = vuln_details
     return f"""You are a senior security researcher arbitrating a disagreement between a vulnerability scanner and a ground truth dataset.
 
 ## Situation
-- **Endpoint**: {route_key}
+- **Endpoint**: {route_key_label}
 - **Scanner verdict**: VULNERABLE
 - **Ground truth**: SAFE (not vulnerable)
 
@@ -80,13 +103,11 @@ The scanner claims this endpoint is vulnerable, but the ground truth dataset say
 Your job is to determine who is correct.
 
 ## Code Being Analyzed
-```
-{code}
-```
+{code_block}
 
 ## Scanner's Reasoning
-{model_reasoning}
-{vuln_details}
+{reasoning_label}
+{details_label}
 
 ## Your Task
 Carefully analyze the code and determine:
@@ -125,32 +146,37 @@ def get_fn_challenge_prompt(route_key: str, code: str, ground_truth_vuln_type: s
     The model said SAFE, but ground truth says VULNERABLE.
     We need to determine who is right.
     """
-    gt_details = f" - specifically: {ground_truth_description}" if ground_truth_description else ""
+    # #709: the FN twin — the bare fence retired, the scanned/repo-authored
+    # labels collapsed (gt_details too — the description is ground-truth
+    # DATASET content, attacker-poisonable in the same class)
+    gt_details = (f" - specifically: {collapse_inline(Untrusted(ground_truth_description))}"
+                  if ground_truth_description else "")
 
+    code_block = fence_block(Untrusted(code))
+    route_key_label = collapse_inline(Untrusted(route_key))
+    vuln_type_label = collapse_inline(Untrusted(ground_truth_vuln_type))
     return f"""You are a senior security researcher arbitrating a disagreement about a SPECIFIC vulnerability.
 
 ## The Dispute
-- **Endpoint**: {route_key}
+- **Endpoint**: {route_key_label}
 - **Scanner verdict**: SAFE (no vulnerabilities found)
-- **Ground truth claim**: This endpoint has a **{ground_truth_vuln_type}** vulnerability{gt_details}
+- **Ground truth claim**: This endpoint has a **{vuln_type_label}** vulnerability{gt_details}
 
 ## Your Task
-Determine whether the **specific claimed vulnerability ({ground_truth_vuln_type})** exists in this endpoint.
+Determine whether the **specific claimed vulnerability ({vuln_type_label})** exists in this endpoint.
 
 IMPORTANT:
-- Focus ONLY on whether {ground_truth_vuln_type} exists in THIS endpoint ({route_key})
+- Focus ONLY on whether {vuln_type_label} exists in THIS endpoint ({route_key_label})
 - Do NOT discuss vulnerabilities in other endpoints or other vulnerability types
 - Trace the data flow for THIS specific endpoint from input to output
 
 ## Code
-```
-{code}
-```
+{code_block}
 
 ## Analysis Steps
-1. Find the handler for {route_key}
+1. Find the handler for {route_key_label}
 2. Trace user input through that specific handler
-3. Determine if the data flow creates a {ground_truth_vuln_type} vulnerability
+3. Determine if the data flow creates a {vuln_type_label} vulnerability
 4. Consider: even if storage is "safe", is the data later displayed without encoding?
 
 CRITICAL: Respond with ONLY valid JSON.
@@ -158,9 +184,9 @@ CRITICAL: Respond with ONLY valid JSON.
 {{
     "arbitration_verdict": "MODEL_CORRECT" | "GROUND_TRUTH_CORRECT" | "UNCERTAIN",
     "confidence": 0.0-1.0,
-    "reasoning": "Your analysis of whether {ground_truth_vuln_type} exists in {route_key} specifically",
+    "reasoning": "Your analysis of whether {vuln_type_label} exists in {route_key_label} specifically",
     "vulnerability_found": {{
-        "type": "{ground_truth_vuln_type}",
+        "type": "{vuln_type_label}",
         "source": "where tainted data enters",
         "sink": "where it causes harm",
         "flow": "the data flow in THIS endpoint",

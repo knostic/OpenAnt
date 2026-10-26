@@ -8,7 +8,7 @@ vulnerabilities from internal-only vulnerabilities.
 
 from typing import List, Optional
 
-from prompts._fence import safe_code_fence, collapse_inline
+from prompts._fence import Untrusted, collapse_inline, fence_block
 
 
 # Input budget for the inlined unit code.
@@ -133,9 +133,9 @@ def get_user_prompt(
     # class as route_key). Collapse newlines for one-line inertness/consistency
     # (defense-in-depth; an identifier with a newline is unlikely but not asserted
     # impossible). unit_id is collapsed at its interpolation below.
-    deps_str = collapse_inline(", ".join(static_deps[:10])) if static_deps else "None identified"
-    callers_str = collapse_inline(", ".join(static_callers[:10])) if static_callers else "None identified"
-    unit_id = collapse_inline(unit_id)
+    deps_str = collapse_inline(Untrusted(", ".join(static_deps[:10]))) if static_deps else "None identified"
+    callers_str = collapse_inline(Untrusted(", ".join(static_callers[:10]))) if static_callers else "None identified"
+    unit_id = collapse_inline(Untrusted(unit_id))
 
     # Cap the inlined code so a large unit cannot overflow the model context.
     primary_code = _cap_primary_code(primary_code)
@@ -155,8 +155,13 @@ def get_user_prompt(
             path_items = entry_point_path[:6]  # Limit display length
             if len(entry_point_path) > 6:
                 path_items.append("...")
-            path_display = f"\n**Call Path:** {' -> '.join(path_items)}"
-        entry_display = f"\n**Entry Point:** `{reaching_entry_point}`" if reaching_entry_point else ""
+            # #709 (the fable-r1 N4 catch): the path items and the entry
+            # point are scanned identifiers — collapsed like deps/callers
+            path_display = (f"\n**Call Path:** "
+                            f"{collapse_inline(Untrusted(' -> '.join(path_items)))}")
+        entry_display = (f"\n**Entry Point:** "
+                         f"`{collapse_inline(Untrusted(reaching_entry_point))}`"
+                         if reaching_entry_point else "")
         reachability_section = f"""
 ### Reachability Analysis
 **Reachable from User Input:** YES (static analysis confirmed){entry_display}{path_display}
@@ -171,16 +176,16 @@ def get_user_prompt(
 """
     # else: reachable_from_entry is None, no reachability info available
 
-    code_fence = safe_code_fence(primary_code)
+    # #709: the complete block from the single home — the untrusted unit code
+    # is never interpolated raw here
+    code_block = fence_block(Untrusted(primary_code))
     return f"""## Code Unit to Analyze
 
 **ID:** `{unit_id}`
 **Type:** {unit_type}
 {reachability_section}
 ### Code (with static dependencies already included)
-{code_fence}
-{primary_code}
-{code_fence}
+{code_block}
 
 ### Static Analysis Results
 **Functions this code calls:** {deps_str}

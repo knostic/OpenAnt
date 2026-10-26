@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import re
 
-from prompts.verification_prompts import _fence_for, get_verification_prompt
+from prompts._fence import safe_code_fence as _fence_for
+from prompts.verification_prompts import get_verification_prompt
 
 
 # A malicious analyzed source file. Line 2 is a bare ``` that (in the buggy
@@ -135,7 +136,12 @@ def test_opening_fence_exceeds_longest_backtick_run_in_content():
 
 
 def test_fence_for_helper_minimum_and_growth():
-    """_fence_for returns >= 3 backticks and always exceeds the longest run."""
+    """_fence_for returns >= 3 backticks and always exceeds the longest run.
+
+    #709: the module-level alias was RETIRED (every block assembly now goes
+    through fence_block, the complete block from the single home); this test
+    pins the RUN semantics directly against prompts._fence.safe_code_fence.
+    """
     # No backticks at all -> minimum fence of 3.
     assert _fence_for("plain text\nno ticks") == "```"
     # A single internal triple-backtick run -> grow to 4.

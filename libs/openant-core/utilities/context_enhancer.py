@@ -323,34 +323,41 @@ def get_context_enhancement_prompt(
         static_callers: Callers identified by static analysis
         context_functions: Other functions in the same file
     """
-    from prompts._fence import safe_code_fence
-    deps_list = "\n".join(f"- {d}" for d in static_deps) if static_deps else "- None identified"
-    callers_list = "\n".join(f"- {c}" for c in static_callers) if static_callers else "- None identified"
+    from prompts._fence import Untrusted, collapse_inline, fence_block
+    # #709 (the fable-r7 F2 catch): the header/label fields are scanned
+    # identifiers (the same producer field as the ctx-fn name — the same
+    # class the branch collapses in agentic_enhancer/context_reviewer)
+    fid_label = collapse_inline(Untrusted(function_id))
+    fname_label = collapse_inline(Untrusted(function_name))
+    class_label = collapse_inline(Untrusted(class_name)) if class_name else ""
+    deps_list = "\n".join(f"- {collapse_inline(Untrusted(d))}" for d in static_deps) if static_deps else "- None identified"
+    callers_list = "\n".join(f"- {collapse_inline(Untrusted(c))}" for c in static_callers) if static_callers else "- None identified"
 
     context_section = ""
     if context_functions:
         context_section = "## Other Functions in Same File\n"
         for f in context_functions[:5]:  # Limit to 5 to avoid token overflow
-            context_section += f"### {f.get('name', 'unknown')} ({f.get('unit_type', 'function')})\n"
+            # #709 (the C4-green pin's own catch): the ctx-fn NAME is a
+            # scanned identifier — collapsed (a raw label at base)
+            context_section += (f"### {collapse_inline(Untrusted(f.get('name', 'unknown')))} "
+                                f"({f.get('unit_type', 'function')})\n")
             code_preview = f.get('code', '')[:200]
             if len(f.get('code', '')) > 200:
                 code_preview += '...'
-            _pf = safe_code_fence(code_preview)
-            context_section += f"{_pf}javascript\n{code_preview}\n{_pf}\n\n"
+            # #709: the complete block from the single home
+            context_section += f"{fence_block(Untrusted(code_preview), language='javascript')}\n\n"
     else:
         context_section = "## Other Functions in Same File\nNo other functions in file.\n"
 
     return f"""You are analyzing a JavaScript/TypeScript function to identify all relevant context needed for security analysis.
 
 ## Target Function
-**ID:** `{function_id}`
-**Name:** `{function_name}`
+**ID:** `{fid_label}`
+**Name:** `{fname_label}`
 **Type:** {unit_type}
-{f'**Class:** {class_name}' if class_name else ''}
+{f'**Class:** {class_label}' if class_name else ''}
 
-{safe_code_fence(function_code)}javascript
-{function_code}
-{safe_code_fence(function_code)}
+{fence_block(Untrusted(function_code), language='javascript')}
 
 ## Static Analysis Results
 **Already identified dependencies (functions called):**

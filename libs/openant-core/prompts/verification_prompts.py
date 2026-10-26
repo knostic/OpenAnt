@@ -10,7 +10,7 @@ Supports optional application context to reduce false positives.
 from typing import TYPE_CHECKING
 
 from core.file_boundary import boundary_in_code, split_on_boundary
-from prompts._fence import safe_code_fence, collapse_inline
+from prompts._fence import Untrusted, collapse_inline, fence_block
 
 if TYPE_CHECKING:
     from context.application_context import ApplicationContext
@@ -225,7 +225,7 @@ def _untrusted_supply_list(app_context: "ApplicationContext") -> str:
     cannot forge a directive line in the verifier prompt.
     """
     return ", ".join(
-        collapse_inline(source) or "unnamed source"
+        collapse_inline(Untrusted(source)) or "unnamed source"
         for source in app_context.untrusted_boundaries()
     )
 
@@ -280,10 +280,9 @@ def attacker_model_descriptor(app_context: "ApplicationContext") -> dict:
     }
 
 
-# Backward-compatible thin alias. The canonical implementation now lives in
-# ``prompts._fence.safe_code_fence`` so the Stage-1 analysis prompt and this
-# Stage-2 verification prompt share one un-escapable-fence implementation.
-_fence_for = safe_code_fence
+# #709: the alias retired — every block assembly in this module now goes
+# through ``prompts._fence.fence_block`` (the COMPLETE block, built in the
+# single home) so no untrusted content is interpolated by this builder.
 
 
 def get_verification_system_prompt(app_context: "ApplicationContext" = None) -> str:
@@ -341,15 +340,15 @@ def _format_builtin_app_context_for_verification(app_context: "ApplicationContex
     lines = [
         "## Application Context",
         "",
-        f"**Application Type:** {collapse_inline(app_context.application_type)}",
-        f"**Purpose:** {collapse_inline(app_context.purpose)}",
+        f"**Application Type:** {collapse_inline(Untrusted(app_context.application_type))}",
+        f"**Purpose:** {collapse_inline(Untrusted(app_context.purpose))}",
         "",
     ]
 
     if app_context.intended_behaviors:
         lines.append("**Intended Behaviors (these are FEATURES, not vulnerabilities):**")
         for behavior in app_context.intended_behaviors[:5]:  # Limit for verification prompt
-            lines.append(f"- {collapse_inline(behavior)}")
+            lines.append(f"- {collapse_inline(Untrusted(behavior))}")
         lines.append("")
 
     if app_context.trust_boundaries:
@@ -361,13 +360,13 @@ def _format_builtin_app_context_for_verification(app_context: "ApplicationContex
         # and values are LLM-generated or attacker-authored — collapse both.
         lines.append("**Trust Boundaries:**")
         for source, level in app_context.trust_boundaries.items():
-            lines.append(f"- {collapse_inline(source)}: {collapse_inline(level)}")
+            lines.append(f"- {collapse_inline(Untrusted(source))}: {collapse_inline(Untrusted(level))}")
         lines.append("")
 
     if app_context.not_a_vulnerability:
         lines.append("**Do NOT flag as vulnerable:**")
         for item in app_context.not_a_vulnerability[:5]:  # Limit for verification prompt
-            lines.append(f"- {collapse_inline(item)}")
+            lines.append(f"- {collapse_inline(Untrusted(item))}")
         lines.append("")
 
     if app_context.suppress_local_only():
@@ -419,7 +418,7 @@ def get_verification_prompt(
     # Mark the target function clearly.
     #
     # The code below is UNTRUSTED analyzed source. It is wrapped in a code
-    # fence whose length is computed by ``_fence_for`` to strictly exceed the
+    # fence whose length is computed by ``fence_block`` to strictly exceed the
     # longest backtick run in the content, so the source cannot break out of
     # the fence and inject prompt-level instructions (prompt injection).
     untrusted_note = (
@@ -428,35 +427,31 @@ def get_verification_prompt(
     )
     # See prompts/vulnerability_analysis.py — the marker's comment prefix
     # varies by language, so match on the invariant text.
+    # #709: the complete blocks from the single home (fence_block); the
+    # untrusted code is wrapped AT the boundary and never interpolated here.
     code_parts = split_on_boundary(code)
     if len(code_parts) > 1:
         primary_code = code_parts[0].strip()
         context_code = boundary_in_code(code).join(
             part.strip() for part in code_parts[1:]
         )
-        # One fence long enough to safely enclose either block.
-        fence = _fence_for(primary_code + "\n" + context_code)
+        primary_block = fence_block(Untrusted(primary_code))
+        context_block = fence_block(Untrusted(context_code))
         code_section = f"""
 {untrusted_note}
 
 >>> TARGET FUNCTION <<<
-{fence}
-{primary_code}
-{fence}
+{primary_block}
 
 Context:
-{fence}
-{context_code}
-{fence}"""
+{context_block}"""
     else:
-        fence = _fence_for(code)
+        code_block = fence_block(Untrusted(code))
         code_section = f"""
 {untrusted_note}
 
 >>> TARGET FUNCTION <<<
-{fence}
-{code}
-{fence}"""
+{code_block}"""
 
     # Adjust attacker description based on app context.
     # A threat model declares its own attacker profiles, which REPLACE the
@@ -518,17 +513,15 @@ Context:
     # right beside the fenced code_section, so it could inject prompt-level
     # instructions steering the verifier's verdict. Give it its own
     # length-adaptive fence so it stays inert data.
-    _rf = _fence_for(str(reasoning))
+    reasoning_block = fence_block(Untrusted(str(reasoning)))
     # `finding` is also model-derived (analysis_core maps a non-enum finding
     # through .upper(), so a newline survives). Collapse before .upper() so it
     # can't forge an instruction line on this label line.
-    finding_label = collapse_inline(finding)
+    finding_label = collapse_inline(Untrusted(finding))
     return f"""{app_context_section}Stage 1 claims this function is **{finding_label.upper()}**.
 
 Their reasoning:
-{_rf}
-{reasoning}
-{_rf}
+{reasoning_block}
 
 {code_section}
 
@@ -558,21 +551,21 @@ def get_consistency_check_prompt(
     findings_text = ""
     for i, f in enumerate(findings, 1):
         code_snippet = code_samples.get(f.get("route_key", ""), "")[:500]
-        code_fence = _fence_for(code_snippet)
+        # #709: the complete block from the single home — the untrusted
+        # snippet never interpolated by this builder
+        code_block = fence_block(Untrusted(code_snippet))
         # route_key (scanned file:function) is an inline header label; collapse
         # control chars so an embedded newline can't forge a `### Finding` /
         # instruction line beside the (already fenced) code pattern.
-        rk_label = collapse_inline(f.get("route_key", "unknown")) or "unknown"
+        rk_label = collapse_inline(Untrusted(f.get("route_key", "unknown"))) or "unknown"
         # `finding` is a model-derived verdict; collapse newlines so it can't forge
         # a `### Finding`/instruction line beside the (fenced) code pattern.
-        verdict_label = collapse_inline(f.get("finding", "unknown")) or "unknown"
+        verdict_label = collapse_inline(Untrusted(f.get("finding", "unknown"))) or "unknown"
         findings_text += f"""
 ### Finding {i}: {rk_label}
 - Current verdict: {verdict_label}
 - Code pattern:
-{code_fence}
-{code_snippet}...
-{code_fence}
+{code_block}
 """
 
     return f"""These findings have similar code patterns. Should they have the same verdict?

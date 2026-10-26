@@ -78,18 +78,23 @@ def _canonical_skip_dirs() -> set[str]:
     return skip
 
 
+from prompts._fence import Untrusted, collapse_inline, fence_block  # noqa: E402  # #709
+
+
 def get_missing_context_prompt(reasoning: str) -> str:
     """
     Generate a prompt to extract what context is missing from INSUFFICIENT_CONTEXT reasoning.
 
     Returns a simple description of what's needed, without keyword guessing.
     """
+    # #709 (the fable-r1 F2 catch — a pre-#248 survivor): reasoning is
+    # PRIOR-STAGE LLM OUTPUT, interpolated raw between --- delimiters at
+    # base (a newline forged prompt lines); fenced now
+    reasoning_block = fence_block(Untrusted(reasoning))
     return f"""You are analyzing a security analysis response that returned INSUFFICIENT_CONTEXT.
 
 The analyzer's reasoning for why context was insufficient:
----
-{reasoning}
----
+{reasoning_block}
 
 Your task: Identify what specific code or configuration is missing that would be needed to complete the security analysis.
 
@@ -106,15 +111,18 @@ def get_file_search_prompt(missing_context: str, files_content: str, batch_info:
     """
     Generate a prompt to search through files for the missing context.
     """
+    # #709 (the F2 catch): missing_context is prior-stage LLM output (a
+    # raw label line at base); files_content is scanned-repo content in a
+    # BARE ``` fence at base (escapable — the exact #248 class)
+    missing_label = collapse_inline(Untrusted(missing_context))
+    files_block = fence_block(Untrusted(files_content))
     return f"""You are searching through source code files to find specific functionality.
 
 ## What We're Looking For
-{missing_context}
+{missing_label}
 
 ## Source Files to Search{batch_info}
-```
-{files_content}
-```
+{files_block}
 
 ## Your Task
 Examine these files and identify which ones contain the functionality described above.

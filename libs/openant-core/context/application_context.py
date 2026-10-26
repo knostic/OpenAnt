@@ -34,6 +34,7 @@ from typing import Any
 from dotenv import load_dotenv
 from utilities.file_io import open_utf8, read_json, read_repo_file, write_json
 from utilities.llm import PhaseBinding, simple_completion
+from prompts._fence import Untrusted
 
 load_dotenv()
 
@@ -844,11 +845,12 @@ def generate_application_context(
     # the remainder would be read as prompt-level instructions, steering the
     # generated app-context (which then seeds every Stage-1 analysis prompt).
     # Use a length-adaptive fence per source so the content stays inert data.
-    from prompts._fence import safe_code_fence
+    from prompts._fence import Untrusted, fence_block
     sources_text = ""
     for name, content in sources.items():
-        _sf = safe_code_fence(content)
-        sources_text += f"\n### {name}\n{_sf}\n{content}\n{_sf}\n"
+        # #709: the complete block from the single home — the scanned-repo
+        # source content is never interpolated raw here
+        sources_text += f"\n### {name}\n{fence_block(Untrusted(content))}\n"
 
     # Call LLM via the adapter — provider+model are dictated by the
     # llm-config's ``app_context`` phase, not hardcoded here.
@@ -1009,32 +1011,32 @@ def format_context_for_prompt(context: ApplicationContext) -> str:
     lines = [
         "## Application Context",
         "",
-        f"**Application Type:** {collapse_inline(context.application_type)}",
+        f"**Application Type:** {collapse_inline(Untrusted(context.application_type))}",
     ]
 
     if type_info:
         lines.append(f"**Type Description:** {type_info.get('description', '')}")
         lines.append(f"**Attack Model:** {type_info.get('attack_model', '')}")
 
-    lines.append(f"**Purpose:** {collapse_inline(context.purpose)}")
+    lines.append(f"**Purpose:** {collapse_inline(Untrusted(context.purpose))}")
     lines.append("")
 
     if context.intended_behaviors:
         lines.append("**Intended Behaviors (these are FEATURES, not vulnerabilities):**")
         for behavior in context.intended_behaviors:
-            lines.append(f"- {collapse_inline(behavior)}")
+            lines.append(f"- {collapse_inline(Untrusted(behavior))}")
         lines.append("")
 
     if context.trust_boundaries:
         lines.append("**Trust Boundaries:**")
         for source, level in context.trust_boundaries.items():
-            lines.append(f"- {collapse_inline(source)}: {collapse_inline(level)}")
+            lines.append(f"- {collapse_inline(Untrusted(source))}: {collapse_inline(Untrusted(level))}")
         lines.append("")
 
     if context.not_a_vulnerability:
         lines.append("**Do NOT flag as vulnerable:**")
         for item in context.not_a_vulnerability:
-            lines.append(f"- {collapse_inline(item)}")
+            lines.append(f"- {collapse_inline(Untrusted(item))}")
         lines.append("")
 
     if context.suppress_local_only():
@@ -1043,7 +1045,7 @@ def format_context_for_prompt(context: ApplicationContext) -> str:
         lines.append("")
 
     if context.security_model:
-        lines.append(f"**Security Model:** {collapse_inline(context.security_model)}")
+        lines.append(f"**Security Model:** {collapse_inline(Untrusted(context.security_model))}")
         lines.append("")
 
     return "\n".join(lines)
