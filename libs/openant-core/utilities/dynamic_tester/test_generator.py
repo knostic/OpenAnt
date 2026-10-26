@@ -170,22 +170,22 @@ def _build_finding_prompt(finding: dict, repo_info: dict) -> str:
     # output is EXECUTED (docker build/run), so injection here is the worst case.
     # Collapse control chars so each stays one inert line. (Multi-line body fields —
     # vulnerable_code/description/impact/steps — are length-adaptively FENCED below.)
-    from prompts._fence import collapse_inline
+    from prompts._fence import Untrusted, collapse_inline
 
     parts = [
         f"Generate a dynamic exploit test for the following vulnerability.",
         "",
-        f"Repository: {collapse_inline(repo_info.get('name', 'unknown'))}",
-        f"Language: {collapse_inline(language)}",
-        f"Application Type: {collapse_inline(repo_info.get('application_type', 'unknown'))}",
+        f"Repository: {collapse_inline(Untrusted(repo_info.get('name', 'unknown')))}",
+        f"Language: {collapse_inline(Untrusted(language))}",
+        f"Application Type: {collapse_inline(Untrusted(repo_info.get('application_type', 'unknown')))}",
         "",
         "FINDING:",
-        f"  ID: {collapse_inline(finding.get('id', 'unknown'))}",
-        f"  Name: {collapse_inline(finding.get('name', 'unknown'))}",
-        f"  CWE: {finding.get('cwe_id', 0)} - {collapse_inline(finding.get('cwe_name', 'Unknown'))}",
+        f"  ID: {collapse_inline(Untrusted(finding.get('id', 'unknown')))}",
+        f"  Name: {collapse_inline(Untrusted(finding.get('name', 'unknown')))}",
+        f"  CWE: {finding.get('cwe_id', 0)} - {collapse_inline(Untrusted(finding.get('cwe_name', 'Unknown')))}",
         f"  Location: {json.dumps(loc, indent=4)}",
-        f"  Stage 1 Verdict: {collapse_inline(finding.get('stage1_verdict', 'unknown'))}",
-        f"  Stage 2 Verdict: {collapse_inline(finding.get('stage2_verdict', 'unknown'))}",
+        f"  Stage 1 Verdict: {collapse_inline(Untrusted(finding.get('stage1_verdict', 'unknown')))}",
+        f"  Stage 2 Verdict: {collapse_inline(Untrusted(finding.get('stage2_verdict', 'unknown')))}",
     ]
 
     if source_basename:
@@ -216,12 +216,13 @@ def _build_finding_prompt(finding: dict, repo_info: dict) -> str:
     # EXECUTED (docker build/run). Length-adaptive fences keep them inert here;
     # the structural mitigation (docker build --network=none / --internal test
     # net) is tracked separately (fencing alone is partial for executed output).
-    from prompts._fence import safe_code_fence
+    from prompts._fence import Untrusted, fence_block
 
     def _fenced(label: str, value) -> list:
+        # #709: the complete block from the single home — the untrusted
+        # finding field is never interpolated raw here
         body = value if isinstance(value, str) else str(value)
-        sf = safe_code_fence(body)
-        return ["", f"  {label}:", f"{sf}", body, f"{sf}"]
+        return ["", f"  {label}:", fence_block(Untrusted(body))]
 
     if finding.get("description"):
         parts.extend(_fenced("Description", finding["description"]))
@@ -385,22 +386,29 @@ def regenerate_test(
     # gets its OWN length-aware fence so a ``` line inside one cannot break out and
     # inject prompt-level instructions into the regeneration call. Per-embed, not one
     # global fence, since a single fence sized from one body fails to escape the others.
-    from prompts._fence import safe_code_fence
+    from prompts._fence import Untrusted, collapse_inline, fence_block
+    # #709 (the fable-r1 F1 catch): the previous generation's fields are
+    # PRIOR-STAGE LLM OUTPUT (docker_executor.py documents test_filename as
+    # "LLM output influenced by the scanned repo") — the four hand-rolled
+    # assemblies are retired (the complete blocks from the single home) and
+    # test_filename is collapsed (a raw label interpolation FORGED prompt
+    # lines at base)
     dockerfile_txt = previous_generation.get('dockerfile', '')
     requirements_txt = previous_generation.get('requirements', '')
     error_txt = error_message[:1500]
-    df_fence = safe_code_fence(dockerfile_txt)
-    req_fence = safe_code_fence(requirements_txt)
-    ts_fence = safe_code_fence(test_script)
-    err_fence = safe_code_fence(error_txt)
+    df_block = fence_block(Untrusted(dockerfile_txt))
+    req_block = fence_block(Untrusted(requirements_txt))
+    ts_block = fence_block(Untrusted(test_script))
+    err_block = fence_block(Untrusted(error_txt))
+    filename_label = collapse_inline(Untrusted(test_filename))
 
     retry_prompt = (
         f"{original_prompt}\n\n"
         f"IMPORTANT: A previous attempt to generate this test FAILED.\n\n"
-        f"Previous Dockerfile:\n{df_fence}\n{dockerfile_txt}\n{df_fence}\n\n"
-        f"Previous requirements:\n{req_fence}\n{requirements_txt}\n{req_fence}\n\n"
-        f"Previous test script ({test_filename}):\n{ts_fence}\n{test_script}\n{ts_fence}\n\n"
-        f"Error message:\n{err_fence}\n{error_txt}\n{err_fence}\n\n"
+        f"Previous Dockerfile:\n{df_block}\n\n"
+        f"Previous requirements:\n{req_block}\n\n"
+        f"Previous test script ({filename_label}):\n{ts_block}\n\n"
+        f"Error message:\n{err_block}\n\n"
         f"Fix the issue and regenerate. Common fixes:\n"
         f"- Missing directories: use `mkdir -p` before writing files\n"
         f"- Dependency conflicts: don't pin exact versions, use >= or no pin\n"

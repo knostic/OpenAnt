@@ -58,11 +58,10 @@ class Stage1ConsistencyResult:
 def get_stage1_consistency_prompt(findings: list, code_samples: dict) -> str:
     """Generate prompt for Stage 1 consistency check."""
     findings_text = ""
-    from prompts._fence import safe_code_fence, collapse_inline
+    from prompts._fence import Untrusted, collapse_inline, fence_block
     for i, f in enumerate(findings, 1):
         route_key = f.get("route_key", "unknown")
         code_snippet = code_samples.get(route_key, "")[:800]
-        code_fence = safe_code_fence(code_snippet)
         # route_key (scanned file:function) is an inline header label; a newline in
         # it would forge a `### Finding`/instruction line. Collapse control chars so
         # it stays one inert line. reasoning is prior-stage LLM output (untrusted) and
@@ -70,21 +69,20 @@ def get_stage1_consistency_prompt(findings: list, code_samples: dict) -> str:
         # length-adaptive fence so it can't inject prompt directives. verdict is
         # model-derived (a raw verdict string still passes through analysis_core's
         # normalization, so a newline survives) — collapse it too.
-        rk_label = collapse_inline(route_key) or "unknown"
-        verdict_label = collapse_inline(f.get('verdict', 'unknown')) or "unknown"
+        rk_label = collapse_inline(Untrusted(route_key)) or "unknown"
+        verdict_label = collapse_inline(Untrusted(f.get('verdict', 'unknown'))) or "unknown"
         reasoning = str(f.get("reasoning", "N/A"))[:300]
-        rf = safe_code_fence(reasoning)
+        # #709: the complete blocks from the single home — the untrusted
+        # snippet and reasoning are never interpolated raw here
+        reasoning_block = fence_block(Untrusted(reasoning))
+        code_block = fence_block(Untrusted(code_snippet))
         findings_text += f"""
 ### Finding {i}: {rk_label}
 - Current verdict: {verdict_label}
 - Reasoning:
-{rf}
-{reasoning}
-{rf}
+{reasoning_block}
 - Code:
-{code_fence}
-{code_snippet}
-{code_fence}
+{code_block}
 """
 
     return f"""You are checking Stage 1 detection consistency across similar code patterns.

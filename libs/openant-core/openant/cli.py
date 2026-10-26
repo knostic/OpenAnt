@@ -1547,28 +1547,27 @@ def cmd_report_data(args):
                 # remediation_html sink is also an XSS vector — HTML-escaping at
                 # the sink is a separate, deferred hardening; this closes the
                 # prompt-injection half.)
-                from prompts._fence import safe_code_fence, collapse_inline
+                from prompts._fence import (Untrusted, collapse_inline,
+                                             fence_block)
                 findings_text = ""
                 for f in actionable:
+                    # #709: the complete blocks from the single home — the
+                    # untrusted fields are never interpolated raw here
                     _av = f['attack_vector'] or 'Not specified'
                     _an = f['analysis'][:500]
-                    _avf = safe_code_fence(_av)
-                    _anf = safe_code_fence(_an)
+                    _av_block = fence_block(Untrusted(_av))
+                    _an_block = fence_block(Untrusted(_an))
                     # file/function derive from the (poisonable) route_key; collapse
                     # newlines so they can't forge a `### Finding` header line.
-                    _file = collapse_inline(f['file'])
-                    _func = collapse_inline(f['function'])
+                    _file = collapse_inline(Untrusted(f['file']))
+                    _func = collapse_inline(Untrusted(f['function']))
                     findings_text += f"""
 ### Finding #{f['number']}: {_file}:{_func}
 - **Verdict**: {f['verdict']}
 - **Attack Vector**:
-{_avf}
-{_av}
-{_avf}
+{_av_block}
 - **Analysis**:
-{_anf}
-{_an}
-{_anf}
+{_an_block}
 """
                 prompt = f"""Analyze these security findings and provide:
 
