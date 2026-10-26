@@ -209,9 +209,10 @@ def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
     from datetime import datetime
     date_str = datetime.fromtimestamp(dynamic_path.stat().st_mtime).strftime("%B %Y")
 
-    # #314: the merge verifies the IDENTITY, not just the positional ID.
-    # VULN-NNN is assigned by list position — drop or add one finding
-    # anywhere but the end and every later ID shifts, so a stale
+    # #314: the merge verifies the IDENTITY, not just the id alone.
+    # (#706: the id is now DERIVED from that identity, so the two agree
+    # by construction — but the verification stays: a stale results file
+    # still carries an old id, and a stale
     # results file left in the scan directory merges one finding's
     # result into a DIFFERENT finding, stamped with the stale file's
     # mtime and nothing marking it. Three rules, each surfaced (never

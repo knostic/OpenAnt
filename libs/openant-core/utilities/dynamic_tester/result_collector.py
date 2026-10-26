@@ -33,8 +33,9 @@ def collect_result(
     """
     finding_id = finding.get("id", "unknown")
     # #314: the run-stable identity (threaded from the pipeline finding)
-    # so the report merge can verify the join — the positional VULN-NNN
-    # is not a durable key across artifacts.
+    # so the report merge can verify the join. (#706: the finding_id is
+    # now derived from this identity, so the ID the result carries is the
+    # stable one by construction.)
     identity_key = finding.get("identity_key", "")
 
     # Generation failed
