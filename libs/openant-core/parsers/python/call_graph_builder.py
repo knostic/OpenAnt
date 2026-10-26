@@ -245,6 +245,22 @@ class CallGraphBuilder:
                 resolved = self._resolve_call_node(node, caller_file, caller_class, local_types, aliases, self_aliases, bound_names, defined_classes)
                 if resolved:
                     calls.add(resolved)
+                # #705 (the #441 deferred refinement): the try/except-
+                # ImportError shim — a receiver name carrying BOTH a
+                # same-file class record AND an import record resolves
+                # differently on the two paths (the typed receiver binds
+                # the fallback; the class-name form binds the import). At
+                # parse time the branch that runs is unknowable, so BOTH
+                # edges are emitted. The hook fires EVEN WHEN THE PRIMARY
+                # ABSTAINED (the fable-r1 F1 catch: the dominant real-world
+                # shim has an EXTERNAL optional dependency — the import
+                # branch resolves nothing in-repo, and gating on
+                # ``if resolved:`` left the fallback's edge unasked, the
+                # false-negative direction the repo rule calls worst).
+                for extra in self._resolve_shim_dual_branches(
+                        node, caller_file, local_types, bound_names,
+                        defined_classes, resolved):
+                    calls.add(extra)
                 # Higher-order-function callbacks: a function reference passed as an
                 # argument (map(func, xs), sorted(xs, key=func)) is a real reachability
                 # edge but lives in node.args / node.keywords, not node.func, so the
@@ -1106,6 +1122,108 @@ class CallGraphBuilder:
         if len(matches) == 1:
             return matches[0]
         return None
+
+    def _resolve_shim_dual_branches(
+        self, node: "ast.Call", caller_file: str, local_types: dict,
+        bound_names: Optional[Set[str]],
+        defined_classes: Optional[Set[str]], primary: Optional[str],
+    ) -> List[str]:
+        """#705 (the #441 deferred refinement): for an ``obj.method(...)`` call
+        whose receiver name carries BOTH a same-file class record AND an
+        import record in the caller's file (the try/except-ImportError shim
+        shape), the two resolution paths pick DIFFERENT targets — the typed
+        receiver path binds the local fallback class, the class-name path
+        binds the import. The running branch is unknowable at parse time, so
+        BOTH edges are emitted; the BOTH-records condition is the guard (a
+        name with one record NEVER fans out — the negative control).
+
+        Returns the OTHER branch's target(s) minus the primary — never a
+        duplicate, never a fabricated edge (each branch resolves through its
+        own existing machinery and abstains when it finds nothing)."""
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            return []
+        recv = func.value
+        if not isinstance(recv, ast.Name):
+            return []
+        name = recv.id
+        # the M1 typed-receiver shape: the receiver is a local var whose
+        # inferred type is the shim name
+        if name in (local_types or {}):
+            name = local_types[name]
+        # the fable-r1 F5 catch: a receiver the caller's own scope BINDS
+        # (a parameter or assignment shadowing the dual name) is a variable,
+        # not a class-name reference — the #318 r5 rule, mirrored here (the
+        # defining-caller exception kept: a class the caller itself defines
+        # binds locally IN THIS CALLER)
+        if name in (bound_names or set()) and \
+                name not in (defined_classes or set()):
+            return []
+        method_name = func.attr
+        file_imports = self.imports.get(caller_file, {})
+        class_key = f"{caller_file}:{name}"
+        # the fable-r1 F2 catch: the function_local exclusion every other
+        # class-branch gate has (#318's family) — a FUNCTION-LOCAL class is
+        # not an alternate binding of the module name, and without the gate
+        # a plain import + a function-local namesake (no shim at all)
+        # fanned out
+        has_local = ((class_key in self.classes
+                      or class_key in self.methods_by_class)
+                     and (name in (defined_classes or set())
+                          or not self.classes.get(class_key, {}).get(
+                              'function_local')))
+        has_import = name in file_imports
+        if not (has_local and has_import):
+            return []
+        extras: List[str] = []
+        # branch A: the local fallback class — its OWN method, else its
+        # same-file base chain (the #441 machinery). DELIBERATELY NOT the
+        # full _resolve_class_method: its step-3 cross-file unique-match
+        # would fabricate an edge to an UNRELATED same-named class elsewhere
+        # when the fallback lacks the method (the fable-r2 F7 catch — the
+        # external-import shape, exactly one same-named class elsewhere, so
+        # the "dual-guarded" argument failed); the local branch of a shim
+        # must only ever answer with the LOCAL class's own or inherited
+        # method, or abstain.
+        local_hit = None
+        for func_id in self.methods_by_class.get(class_key, []):
+            if self.functions.get(func_id, {}).get('name') == method_name:
+                local_hit = func_id
+                break
+        if local_hit is None:
+            defined_here = name in (defined_classes or set())
+            if defined_here or not self.classes.get(class_key, {}).get(
+                    'function_local'):
+                try:
+                    local_hit = self._same_file_base_walk(
+                        name, method_name, caller_file)
+                except RecursionError:
+                    # this file's OWN idiom (the `_module_containers`
+                    # catch): never let one pathological input abort the
+                    # whole build_call_graph() — degrade THIS branch to no
+                    # answer (over-seed floor, not a crash). A base chain
+                    # thousands deep is the walker's only live raise
+                    # (`_base_chain` carries a `_stack` cycle guard), and
+                    # on that input master itself survives with no edge:
+                    # propagating here would lose the WHOLE repo's graph.
+                    # NARROW on purpose — every other exception propagates,
+                    # matching this file's five unguarded calls of these
+                    # same two helpers.
+                    local_hit = None
+        if local_hit:
+            extras.append(local_hit)
+        # branch B: the import (the M2 primary's own machinery)
+        try:
+            import_hit = self._resolve_import(
+                file_imports[name], method_name, caller_file)
+        except RecursionError:
+            # the branch-A rule, same reason: `_resolve_import` guards
+            # cycles with `seen`, so recursion depth is its only live
+            # raise; degrade this branch, never the build.
+            import_hit = None
+        if import_hit:
+            extras.append(import_hit)
+        return [e for e in extras if e != primary]
 
     def _resolve_module_call(self, obj_name: str, method_name: str, caller_file: str,
                              receiver_is_local_var: bool = False,
