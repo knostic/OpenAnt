@@ -1197,7 +1197,18 @@ class CallGraphBuilder:
                 try:
                     local_hit = self._same_file_base_walk(
                         name, method_name, caller_file)
-                except Exception:
+                except RecursionError:
+                    # this file's OWN idiom (the `_module_containers`
+                    # catch): never let one pathological input abort the
+                    # whole build_call_graph() — degrade THIS branch to no
+                    # answer (over-seed floor, not a crash). A base chain
+                    # thousands deep is the walker's only live raise
+                    # (`_base_chain` carries a `_stack` cycle guard), and
+                    # on that input master itself survives with no edge:
+                    # propagating here would lose the WHOLE repo's graph.
+                    # NARROW on purpose — every other exception propagates,
+                    # matching this file's five unguarded calls of these
+                    # same two helpers.
                     local_hit = None
         if local_hit:
             extras.append(local_hit)
@@ -1205,7 +1216,10 @@ class CallGraphBuilder:
         try:
             import_hit = self._resolve_import(
                 file_imports[name], method_name, caller_file)
-        except Exception:
+        except RecursionError:
+            # the branch-A rule, same reason: `_resolve_import` guards
+            # cycles with `seen`, so recursion depth is its only live
+            # raise; degrade this branch, never the build.
             import_hit = None
         if import_hit:
             extras.append(import_hit)
