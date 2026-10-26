@@ -101,7 +101,7 @@ What it deliberately does NOT do:
 Usage:
     # Finding-mode (same shape as `openant patch pipeline_output.json --finding-id ...`)
     python3 utilities/autopatcher/tools/run_traced.py pipeline_output.json \\
-        --finding-id VULN-001 --repo-root /path/to/repo --output /tmp/traced-run
+        --finding-id VULN-9c8af5 --repo-root /path/to/repo --output /tmp/traced-run
 
     # CVE-mode, fully traced, with the budget-window policy forwarded:
     python3 utilities/autopatcher/tools/run_traced.py --cve CVE-2021-1234 \\

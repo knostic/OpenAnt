@@ -210,13 +210,13 @@ def finding_identity_key(file_path: str, function: str, cwe_id: int) -> str:
     """#314: a run-stable identity for a finding — a short hash over the
     stable triple (location file, function, CWE).
 
-    VULN-NNN is assigned by list position: drop or add one finding
-    anywhere but the end and every later ID shifts, so the positional ID
-    is not a durable join key across artifacts (a stale
-    dynamic_test_results.json merges one finding's result into a
-    DIFFERENT finding). The identity key is derived from the finding's
-    identity, not its position. Short + hex so it stays human-auditable
-    alongside the display ID."""
+    The finding's DISPLAY ID (#706) is derived FROM this key
+    (``_finding_display_id``): the old positional VULN-NNN was assigned by
+    list position — drop or add one finding anywhere but the end and every
+    later ID shifted, so it was not a durable identifier across runs (a
+    triage spreadsheet or suppression list silently retargeted). The
+    identity key is derived from the finding's identity, not its position;
+    short + hex so it stays human-auditable alongside the join."""
     import hashlib
     try:
         cwe_val = int(cwe_id or 0)
@@ -224,6 +224,120 @@ def finding_identity_key(file_path: str, function: str, cwe_id: int) -> str:
         cwe_val = 0
     payload = f"{file_path}|{function}|{cwe_val}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _finding_cwe(finding: dict, full_result: dict) -> int:
+    """#706: the ONE shared CWE extraction for a confirmed finding — the
+    pre-pass (the identity list) and the emission loop MUST derive the same
+    triple, or the display ID names a different identity than the emitted
+    identity_key (the fable-r2 F-A/F-C catch: the pre-pass's copy had
+    drifted — a non-dict vulnerabilities element crashed it, and its cwe
+    fallback chain missed the full_result source). Mirrors the loop's own
+    read exactly, including the non-dict-element guard."""
+    vulns = finding.get("vulnerabilities", [])
+    # the non-dict-element guard (the loop's own comment: a model can
+    # return vulnerabilities=["str"])
+    vuln = vulns[0] if vulns and isinstance(vulns[0], dict) else {}
+    try:
+        return int(vuln.get("cwe_id") or finding.get("cwe_id")
+                   or full_result.get("cwe_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _finding_display_id(
+        identity_key: str,
+        all_identities: "list[str] | tuple[str, ...]",
+        seen: "set[str] | frozenset[str]") -> str:
+    """#706: the operator-visible finding ID — identity-derived, not
+    positional.
+
+    #416 deferred this half of #314's third suggestion as "a schema-design
+    change"; with the identity key derived one line above the positional
+    assignment, the deferred work is a RENAME. A positional VULN-NNN is not
+    stable across runs (any insertion renumbers everything after it), and
+    consumers that carry an ID across runs — a triage spreadsheet, a
+    suppression list, a cross-reference in a disclosure body — silently
+    retarget. The display ID is now the VULN- prefix + the identity key's
+    leading hex, naming the identity it came from (human-orderable it is
+    not — the issue accepts that).
+
+    TWO-PASS, ORDER-INDEPENDENT (the fable-r1 F1 catch: the first draft's
+    seen-set ladder made a 6-hex prefix collision resolve by LIST ORDER —
+    an inserted finding sharing a prefix took the short form and SILENTLY
+    RETARGETED it, the exact defect this fix exists to remove). Each
+    identity takes the shortest width in (6, 8, 10, 12) whose prefix is
+    unique against every OTHER identity in the set — so when two
+    identities share a 6-hex prefix, BOTH extend to 8: the short form
+    names nobody, and no id ever names a different finding.
+
+    The DISCLOSED RESIDUAL: an ID may LENGTHEN when a colliding finding
+    joins the set (the 6-char form becomes the 8-char form) — a visible
+    diff, never a silent retarget; the ids are a function of the set, not
+    the list order. An exact duplicate identity (the same
+    file/function/CWE twice in one list — the same finding) matches every
+    width against its twin and falls to the positional ``#n`` last resort,
+    deterministic within the run.
+    """
+    prefix = "VULN-"
+    for width in (6, 8, 10, 12):
+        cand = prefix + identity_key[:width]
+        others = {prefix + k[:width] for k in all_identities
+                  if k != identity_key}
+        if cand not in others:
+            if cand not in seen:
+                return cand
+            # an exact duplicate already holds this width's form (the twin
+            # shares the identity, so it is invisible to the k != filter
+            # above) — fall to the positional ladder
+            break
+    n = 2
+    while f"{prefix}{identity_key}#{n}" in seen:
+        n += 1
+    return f"{prefix}{identity_key}#{n}"
+
+
+# #707 FOLLOW-UP — THE DENOMINATOR HALF OF THE MALFORMED-RECORD GATE.
+#
+# The per-language aggregate below derives `reduction_percentage` from BOTH
+# counts, so the gate that admits a record into the sum must validate BOTH.
+# It validated only `reachable_units`, and the summing loop adds each side
+# INDEPENDENTLY — so a record carrying a valid kept count beside a missing or
+# non-integer `original_units` was admitted, then contributed to the NUMERATOR
+# and not to the DENOMINATOR. The scan-wide figures could ship more reachable
+# units than total units with a NEGATIVE reduction. Executed on the
+# two-language fixture python{units 20, rf 10/20} + go{units 500, kept 50, no
+# `original_units`}: reachable_units=60, original_units=20,
+# reduction_percentage=-200.0 — the exact invariant #707 exists to establish,
+# failing on a narrower input than its own falsifier was written against, and
+# identically for `original_units` given as the string "500" or as a bool.
+#
+# WHY THE PREDICATE IS A NAMED HELPER AND NOT AN INLINE `or`: the fields the
+# reduction reads are a SET, and the defect was that the gate knew only one
+# member of it. A list the gate iterates cannot fall out of step with the
+# arithmetic the way two hand-written isinstance pairs did; a future count
+# entering the reduction is added HERE, once.
+_REDUCTION_COUNT_FIELDS = ("reachable_units", "original_units")
+
+
+def _unusable_reduction_counts(rec: dict) -> list[str]:
+    """The reduction-bearing fields this record cannot supply as a unit count.
+
+    `bool` is excluded EXPLICITLY because it is an `int` subclass: without that
+    clause `True` passes as a count and sums as 1, which is how the numerator
+    guard was already written and why the mirror needs the same tooth."""
+    return [k for k in _REDUCTION_COUNT_FIELDS
+            if not isinstance(rec.get(k), int) or isinstance(rec.get(k), bool)]
+
+
+def _malformed_record_warning(lang: str, reason: str) -> str:
+    """The ONE malformed-record sentence, built in one place so the three
+    emitting sites cannot drift. With `reason` == "no integer reachable_units"
+    this reproduces the pre-repair text BYTE-FOR-BYTE — the numerator case's
+    wording is unchanged; only the newly-caught denominator case says so."""
+    return (f"{lang}: its reachability record is malformed ({reason}) — "
+            "treated as unfiltered, its units counted as fully reachable on "
+            "both sides.")
 
 
 def _load_reachability_metadata(scan_dir: str) -> dict | None:
@@ -235,10 +349,13 @@ def _load_reachability_metadata(scan_dir: str) -> dict | None:
     ``pipeline_stats.reachable_units`` reflects reality instead of assuming
     every analyzed unit is reachable. Returns ``None`` when the dataset or the
     record is absent/unreadable (an unfiltered scan, or a parser that recorded
-    none). NOTE: on a multi-language scan the merged ``dataset.json`` currently
-    carries only the first-parsed language's record (see ``dataset_merge`` /
-    BUG-2b); this reader surfaces that record and warns — full per-language
-    accounting is deferred to a follow-up.
+    none). #707 closed the multi-language half of #251's deferral: the merge
+    now carries each language's record under ``metadata.per_language``, and
+    this reader SUMS across languages when any record is present (an
+    unfiltered language contributing its whole unit count to both sides, so
+    the numerator's scope always matches the denominator's) — falling back to
+    the top-level single record (the pre-#707 shape) for datasets without
+    per-language records.
     """
     dataset_path = os.path.join(scan_dir, "dataset.json")
     if not os.path.exists(dataset_path):
@@ -253,7 +370,200 @@ def _load_reachability_metadata(scan_dir: str) -> dict | None:
     if not isinstance(metadata, dict):
         return None
     rf = metadata.get("reachability_filter")
-    return rf if isinstance(rf, dict) else None
+    if not isinstance(rf, dict):
+        rf = None
+    # #707: the per-language accounting. The merge (dataset_merge) carries
+    # each language's own reachability_filter record under
+    # metadata.per_language[lang]; when ANY language's record is present,
+    # the scan-wide figures are the SUM across languages — an UNFILTERED
+    # language (no record) contributes its whole unit count to BOTH sides
+    # (its units are all reachable), so the numerator's language scope
+    # always matches the denominator's. Falls back to the top-level
+    # single record (the pre-#707 shape, still written for the first
+    # language) when no per-language records exist.
+    # F6 (the fable-r1 latent-precedence catch): a top-level record that
+    # already carries its own per_language block IS the scanner's newer
+    # scan-wide aggregate (the post-LLM refilter path) — it outranks the
+    # merge's parse-time per-language records. N1 (the fable-r2 catch):
+    # the scanner's per_language values are FULL RECORDS, not ints — the
+    # artifact's reachability_per_language contract is {lang: kept-int},
+    # so project the kept count here (never the raw record dicts).
+    if isinstance(rf, dict) and isinstance(rf.get("per_language"), dict):
+        pl = rf["per_language"]
+        if all(isinstance(v, dict) for v in pl.values()):
+            projected = {}
+            for lang, rec in pl.items():
+                kept = rec.get("reachable_units") if isinstance(rec, dict) else None
+                if isinstance(kept, int) and not isinstance(kept, bool):
+                    projected[lang] = kept
+            if projected:
+                rf = dict(rf)
+                rf["per_language"] = projected
+        return rf
+    per_lang = metadata.get("per_language")
+    if not isinstance(per_lang, dict):
+        return rf
+    records = {}
+    unfiltered_langs = []
+    malformed = []
+    malformed_reason: dict[str, str] = {}
+    for lang, block in per_lang.items():
+        if not isinstance(block, dict):
+            continue
+        rec = block.get("reachability_filter")
+        units = block.get("units")
+        if isinstance(rec, dict):
+            bad = _unusable_reduction_counts(rec)
+            if bad:
+                # a malformed record: a count the reduction READS is unknown.
+                # Counting its units on the denominator only would fabricate
+                # pruning (the fable-r1 F4 catch) — and counting them on the
+                # numerator only fabricates NEGATIVE pruning, which is the
+                # same defect mirrored. Name it and treat the language as
+                # unfiltered (its units all reachable, both sides).
+                malformed.append(lang)
+                malformed_reason[lang] = "no integer " + " or ".join(bad)
+                if isinstance(units, int) and not isinstance(units, bool):
+                    unfiltered_langs.append((lang, units))
+                continue
+            records[lang] = rec
+        elif isinstance(units, int) and not isinstance(units, bool):
+            unfiltered_langs.append((lang, units))
+    if not records:
+        if malformed and rf is None:
+            # N6 (the fable-r2 catch): every record malformed — no
+            # aggregate is possible, but the silent discard is worse than
+            # the truth: name the languages in a record the consumer can
+            # surface
+            return {
+                "reachable_units": sum(u for _, u in unfiltered_langs),
+                "original_units": sum(u for _, u in unfiltered_langs),
+                "reduction_percentage": 0,
+                "warning": "; ".join(
+                    _malformed_record_warning(lang, malformed_reason[lang])
+                    for lang in malformed),
+                "warnings": [
+                    _malformed_record_warning(lang, malformed_reason[lang])
+                    for lang in malformed],
+                "per_language": {l: u for l, u in unfiltered_langs},
+            }
+        return rf
+    reachable_total = 0
+    original_total = 0
+    warnings: list[str] = []
+    kept_by_lang: dict[str, int] = {}
+    numeric_keys = ("pruned_orphan_count", "pruned_in_dead_cluster_count",
+                    "pruned_forward_called_by_reachable_count",
+                    "structural_reachable_units", "units_newly_reachable",
+                    "reachability_baseline_languages")
+    numeric_sums = {k: 0 for k in numeric_keys}
+    numeric_present: set[str] = set()
+    pruned_by_file: dict = {}
+    strings: dict[str, str] = {}
+    for lang, rec in records.items():
+        kept = rec.get("reachable_units")
+        if isinstance(kept, int) and not isinstance(kept, bool):
+            reachable_total += kept
+            kept_by_lang[lang] = kept
+        orig = rec.get("original_units")
+        if isinstance(orig, int) and not isinstance(orig, bool):
+            original_total += orig
+        w = rec.get("warning")
+        if isinstance(w, str) and w:
+            warnings.append(w)
+        for k in numeric_keys:
+            v = rec.get(k)
+            if isinstance(v, int) and not isinstance(v, bool):
+                numeric_sums[k] += v
+                numeric_present.add(k)
+        pbf = rec.get("pruned_by_file")
+        if isinstance(pbf, dict):
+            for fname, cnt in pbf.items():
+                if isinstance(cnt, int):
+                    pruned_by_file[fname] = pruned_by_file.get(fname, 0) + cnt
+        for sk in ("blackout_advisory", "level_fallback_warning",
+                   "reachability_baseline", "orphan_advisory"):
+            sv = rec.get(sk)
+            if isinstance(sv, str) and sv:
+                # JOINED + ATTRIBUTED, never first-wins (the fable-r1 F2
+                # catch: language B's advisory silently dropped re-opens
+                # the #323/#520 misdiagnosis vector for the other half of
+                # the scan)
+                strings.setdefault(sk, []).append(f"{lang}: {sv}")
+    for lang, units in unfiltered_langs:
+        # an unfiltered language's units are all reachable: both sides
+        reachable_total += units
+        original_total += units
+        kept_by_lang[lang] = units
+    if unfiltered_langs:
+        # N5 (the fable-r2 catch): a MALFORMED language is not "unfiltered" —
+        # exclude it from the mixed-scan line (its own named warning follows)
+        plain = [(l, u) for l, u in unfiltered_langs if l not in malformed]
+        if plain:
+            warnings.append(
+                "Mixed scan: " + ", ".join(
+                    f"{lang} ({units} units)" for lang, units in plain
+                ) + " ran UNFILTERED (no reachability-filter record) — their "
+                "units are counted as fully reachable on both sides of the "
+                "scan-wide figures.")
+    agg: dict = {
+        "reachable_units": reachable_total,
+        "original_units": original_total,
+        "reduction_percentage": (
+            round(100 * (1 - reachable_total / original_total), 1)
+            if original_total else 0
+        ),
+        # the consumer reads the singular `warning` (one append) — the
+        # joined forward keeps every language's warning visible through it
+        "warning": "; ".join(dict.fromkeys(warnings)) if warnings else "",
+        "warnings": list(dict.fromkeys(warnings)),
+        "per_language": kept_by_lang,
+    }
+    for lang in malformed:
+        agg["warnings"].append(
+            _malformed_record_warning(lang, malformed_reason[lang]))
+        if agg["warning"]:
+            agg["warning"] += "; "
+        agg["warning"] += agg["warnings"][-1]
+    # F1 (the fable-r1 catch): PER-KEY present-only — a key is emitted only
+    # when at least one language's record CARRIED it. Emitting all five
+    # whenever any was seen fabricated structural_reachable_units: 0 /
+    # units_newly_reachable: 0 for records that never had them — the exact
+    # fabricated-zero class the #602 contract (20 lines below) forbids.
+    for k in numeric_keys:
+        if k in numeric_present:
+            agg[k] = numeric_sums[k]
+    if pruned_by_file:
+        # N4 (the fable-r2 catch): the scanner's own aggregate caps this at
+        # the top 20 files (scanner.py:205) — match it so the merge path
+        # cannot bloat the artifact past the single-scan shape
+        agg["pruned_by_file"] = dict(
+            sorted(pruned_by_file.items(),
+                   key=lambda kv: -kv[1])[:20])
+    # the advisory joins (N2, the fable-r2 catch: the consumer already
+    # forwards each advisory key standalone into reachability_warnings —
+    # folding them into `warning` too double-appended; the join stays on
+    # the advisory keys, the warnings channel carries them once)
+    for sk, vals in strings.items():
+        agg[sk] = "; ".join(dict.fromkeys(vals))
+    # F3 (the fable-r1 catch): the effective level claimed scan-wide only
+    # when every record AGREES — a mixed-level scan claims nothing (the
+    # scanner's own refilter-aggregate precedent), never one language's
+    # level for the whole scan
+    levels = {rec.get("effective_processing_level")
+              for rec in records.values()
+              if isinstance(rec.get("effective_processing_level"), str)
+              and rec.get("effective_processing_level")}
+    if len(levels) == 1:
+        agg["effective_processing_level"] = next(iter(levels))
+    elif len(levels) > 1:
+        agg["warnings"].append(
+            "Mixed effective processing levels across languages: "
+            + ", ".join(sorted(levels))
+            + " — no single scan-wide level claimed.")
+        agg["warning"] = (agg["warning"] + "; " + agg["warnings"][-1]
+                          if agg["warning"] else agg["warnings"][-1])
+    return agg
 
 
 def _severity_fields(finding: dict) -> dict:
@@ -467,8 +777,31 @@ def build_pipeline_output(
         and isinstance(c.get("verification"), dict)
         and c["verification"].get("incomplete"))
 
+    # #706 (the fable-r1 F1 fix — the two-pass derivation): precompute the
+    # identity of every confirmed finding ONCE, in list order, so each
+    # display ID can be derived against the WHOLE set (order-independent:
+    # a shared 6-hex prefix makes BOTH findings extend, never one silently
+    # taking the other's short form). The CWE extraction is the ONE shared
+    # helper (_finding_cwe) — the loop's own read, verbatim, so the
+    # pre-pass identity and the emitted identity_key agree by construction.
+    _confirmed_identities: list[str] = []
+    for finding in confirmed:
+        route_key = finding.get("route_key") or finding.get("unit_id", "unknown")
+        _file = route_key.split(":")[0] if ":" in route_key else "unknown"
+        _func = route_key.split(":", 1)[1] if ":" in route_key else route_key
+        _cwe = _finding_cwe(finding, next(
+            (r for r in all_results
+             if (r.get("route_key") or r.get("unit_id")) == route_key),
+            finding))
+        _confirmed_identities.append(finding_identity_key(_file, _func, _cwe))
+
     # Build findings in PipelineOutput schema
     findings_data = []
+    # #706: the ids already assigned in THIS run — the exact-duplicate
+    # ladder only (a DIFFERENT identity sharing a prefix extends via the
+    # two-pass above; a SAME-identity duplicate falls here, deterministic
+    # by list order within the run)
+    _seen_display_ids: set[str] = set()
     for i, finding in enumerate(confirmed):
         route_key = finding.get("route_key") or finding.get("unit_id", "unknown")
 
@@ -586,12 +919,19 @@ def build_pipeline_output(
 
         _file = route_key.split(":")[0] if ":" in route_key else "unknown"
         _func = route_key.split(":", 1)[1] if ":" in route_key else route_key
-        _cwe = vuln.get("cwe_id") or finding.get("cwe_id") or full_result.get("cwe_id", 0)
+        _identity = _confirmed_identities[i]
         findings_data.append({
-            "id": f"VULN-{i+1:03d}",
-            # #314: the run-stable join key (see finding_identity_key);
-            # VULN-NNN stays as the display ID.
-            "identity_key": finding_identity_key(_file, _func, _cwe),
+            # #706: the display ID is IDENTITY-DERIVED (VULN- + the leading
+            # hex of the identity key below) — a positional VULN-NNN was not
+            # stable across runs (any insertion renumbered everything after
+            # it). #314's suggestion 3, the half #416 deferred — now a
+            # rename, not a redesign. See _finding_display_id.
+            "id": _finding_display_id(_identity, _confirmed_identities,
+                                      _seen_display_ids),
+            # #314: the run-stable join key (see finding_identity_key) —
+            # also the display ID's derivation source (#706).
+            "identity_key": _identity,
+            # (the seen-set update happens after the dict closes)
             "name": vuln.get("name", finding.get("finding", "Unknown Vulnerability")),
             "short_name": vuln.get("short_name", finding.get("verdict", "vuln")),
             "location": {
@@ -656,6 +996,7 @@ def build_pipeline_output(
             "suggested_fix": vuln.get("suggested_fix"),
             "steps_to_reproduce": steps_to_reproduce,
         })
+        _seen_display_ids.add(findings_data[-1]["id"])
 
     # Compute costs and durations from step reports
     costs = {}
@@ -781,11 +1122,20 @@ def build_pipeline_output(
         _fb_warning = _reach.get("level_fallback_warning")
         if isinstance(_fb_warning, str) and _fb_warning:
             reachability_warnings.append(_fb_warning)
-        # The level that actually ran, when the record says one (the Python
-        # path always writes it; per-language records don't, and stay as-is).
+        # The level that actually ran, when the record says one (#707: on a
+        # multi-language scan the aggregate claims it only when every
+        # language's record AGREES — a mixed-level scan warns instead).
         _eff = _reach.get("effective_processing_level")
         if isinstance(_eff, str) and _eff:
             _reach_telemetry["effective_processing_level"] = _eff
+        # #707: the per-language kept decomposition — the scan-wide figures
+        # above are the sums; this additive map names each language's own
+        # kept count (an unfiltered language's whole unit count) so the
+        # artifact's reachability figures ARE per-language, the falsifier's
+        # first disjunct.
+        _pl = _reach.get("per_language")
+        if isinstance(_pl, dict):
+            _reach_telemetry["reachability_per_language"] = _pl
         # #301: the prune classification (orphan = missing-edge ROOT
         # candidate; dead_cluster = downstream shadow) previously reached no
         # consumer — forward it present-only so pipeline_output carries the

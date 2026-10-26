@@ -387,7 +387,7 @@ jq -r '.findings[] | "\(.id)\t\(.stage2_verdict // .stage1_verdict)"' pipeline_o
 ```
 
 ```bash
-openant patch --finding-id VULN-001
+openant patch --finding-id VULN-9c8af5  # #706: the identity-derived display ID
 ```
 
 With no path argument, the active project's `pipeline_output.json` is used, and `--repo-root` and `--output` default to the active project's repository and scan directory.
