@@ -8,7 +8,10 @@ compose could keep external egress via a plain network, `network_mode: host`, or
 omitted `networks:` (implicit default). These tests lock the structural hardening.
 
 This is sandbox HARDENING (opt-in --dynamic-test, already sandboxed), not a vuln fix;
-build-time RUN egress remains an accepted, documented residual (not tested here).
+build-time RUN egress is the #710 RECORDED RULING (accepted by design — the
+executed evidence that killed the host-proxy alternative is named at the
+single-build site in docker_executor.py; the drift pins live in
+test_issue710_build_egress_ruling.py).
 """
 import yaml
 
@@ -144,7 +147,8 @@ def test_scrubbed_env_removes_provider_secrets_keeps_docker_essentials():
 
     A compose `build.args` value like `${ANTHROPIC_API_KEY}` is interpolated by
     docker compose from the host env at BUILD time and can be exfiltrated by the
-    LLM-authored Dockerfile's `RUN` over the still-open build-time network. The
+    LLM-authored Dockerfile's `RUN` over the build-time network (the #710 recorded
+ruling: accepted by design — which is exactly why the env scrub matters). The
     build/run subprocess never needs any provider secret, so it runs with a
     scrubbed env — closing the exfil by construction regardless of build.args.
     """
