@@ -349,3 +349,57 @@ def test_the_reporter_loop_emits_the_identity_form(tmp_path):
     # the positional form is detectably gone: two findings, ids NOT 001/002
     assert "VULN-001" not in ids and "VULN-002" not in ids, (
         f"the positional form survived: {ids}")
+
+
+def test_the_prepass_reads_the_full_result_cwe_source(tmp_path):
+    """The pre-pass's THIRD cwe fallback — ``full_result`` — is REACHABLE.
+
+    ``_finding_cwe``'s own docstring names this gap as the fable-r2 F-A/F-C
+    catch ("its cwe fallback chain missed the full_result source") and claims
+    to mirror the loop's read "exactly". The loop resolves ``full_result`` by
+    looking the route_key up in ``all_results``; the pre-pass must resolve it
+    the SAME way, or the third fallback is a duplicate of the second and the
+    emitted ``identity_key`` — a SHIPPED field and the #314/#416 cross-artifact
+    join key — silently changes value.
+
+    THE COVERAGE HOLE THIS CLOSES: every other fixture in this file omits the
+    ``results`` key, so ``all_results == []`` and ``full_result`` ALWAYS falls
+    back to ``finding`` — the one argument that makes the two readings agree by
+    accident. Here ``results[]`` carries the CWE and ``confirmed_findings[]``
+    does NOT, so only a real lookup can see it.
+    """
+    import json
+    from utilities.file_io import write_json
+    from core.reporter import build_pipeline_output
+    results = {
+        "dataset": "test",
+        "code_by_route": {"a.py:fa": "def fa(): pass"},
+        "metrics": {},
+        # the CWE lives ONLY here — the full_result source
+        "results": [
+            {"route_key": "a.py:fa", "unit_id": "a.py:fa", "cwe_id": 89,
+             "reasoning": "r"},
+        ],
+        # ... and NOT here, and not on a vulnerabilities[0] either
+        "confirmed_findings": [
+            {"route_key": "a.py:fa", "unit_id": "a.py:fa",
+             "verdict": "VULNERABLE", "finding": "vulnerable",
+             "vulnerabilities": [{"name": "N", "short_name": "sn",
+                                  "description": "d"}]},
+        ],
+    }
+    rp = tmp_path / "results.json"
+    write_json(rp, results)
+    op = tmp_path / "pipeline_output.json"
+    build_pipeline_output(str(rp), str(op), language="python", repo_name="t/r")
+    out = json.loads(op.read_text())
+    f = out["findings"][0]
+    expected = finding_identity_key("a.py", "fa", 89)
+    missed = finding_identity_key("a.py", "fa", 0)
+    assert f["identity_key"] == expected, (
+        f"the pre-pass dropped the full_result CWE source: identity_key is "
+        f"{f['identity_key']!r}, expected {expected!r} (CWE 89); "
+        f"{missed!r} is the CWE-0 reading")
+    # and the artifact does not contradict itself: the rendered cwe agrees
+    assert f["id"] == f"VULN-{expected[:6]}", (
+        f"the display id {f['id']!r} is not derived from {expected!r}")

@@ -550,7 +550,10 @@ def build_pipeline_output(
         route_key = finding.get("route_key") or finding.get("unit_id", "unknown")
         _file = route_key.split(":")[0] if ":" in route_key else "unknown"
         _func = route_key.split(":", 1)[1] if ":" in route_key else route_key
-        _cwe = _finding_cwe(finding, finding)
+        _cwe = _finding_cwe(finding, next(
+            (r for r in all_results
+             if (r.get("route_key") or r.get("unit_id")) == route_key),
+            finding))
         _confirmed_identities.append(finding_identity_key(_file, _func, _cwe))
 
     # Build findings in PipelineOutput schema
