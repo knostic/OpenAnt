@@ -624,25 +624,252 @@ class CallGraphBuilder:
             return inner_leaf, leaf
         return None, leaf
 
+    def _token_tree_call_sites(self, token_tree: Node, source: bytes,
+                               sites: List[dict]) -> None:
+        """#708: the tree-sitter token-tree NODE walk — the structural
+        replacement for the regex macro-body scan.
+
+        tree-sitter already lexes a macro's ``token_tree`` into structured
+        nodes (``identifier`` / ``string_literal`` / nested ``token_tree`` /
+        the punctuation tokens), so the walk gets literals for free (a
+        ``string_literal`` node is skipped WHOLE — call-looking diagnostic
+        text inside it can never phantom-edge, retiring the literal-stripper
+        half of the regex pair) and needs NO byte budget (a linear node
+        stream, retiring the 8KB truncation class: a call past any budget
+        still produces its edge).
+
+        The call shapes are the same four the regex matched, read from the
+        node stream instead of the text:
+
+        - ``bare(``        -> identifier, then a token_tree starting with ``(``
+        - ``recv.name(``   -> identifier ``.`` identifier, then the ``(``-tree
+        - ``A::B::c(``     -> identifiers joined by ``::``, then the ``(``-tree
+        - ``Type::m::<T>(`` -> the ``::``-chain, then the optional turbofish
+          (``::`` ``<`` ... ``>``), then the ``(``-tree
+
+        The regex path (_blank_rust_literals + _MACRO_CALL_RE) is RETAINED
+        in this module as the DIFFERENTIAL ORACLE: the test suite asserts
+        this walk's call set is a SUPERSET of the budgetless regex path's
+        on the fixtures + the real-code corpus, the recovered calls
+        enumerated (the #708 wording).
+        """
+        # the flat node stream, literals excluded, iterative so a
+        # pathologically nested token tree cannot blow the Python stack.
+        # ORDER: the parent's loop appends every KEPT child to the stream
+        # (a nested token_tree as a single node) and pushes the nested
+        # trees onto a stack as it reaches them; the stack pops
+        # LAST-PUSHED-FIRST, so a nested tree's children are emitted
+        # only after ALL the parent's own children are in the stream,
+        # and nested children of SIBLING trees land in REVERSE sibling
+        # order
+        stream: list = []
+        stack: list = [token_tree]
+        while stack:
+            n = stack.pop()
+            for child in n.children:
+                ct = child.type
+                if ct in ("string_literal", "char_literal",
+                          "raw_string_literal", "byte_string_literal",
+                          "line_comment", "block_comment"):
+                    continue
+                stream.append(child)
+                if ct == "token_tree":
+                    stack.append(child)
+        i = 0
+        n_stream = len(stream)
+
+        def _is_call_open(idx: int) -> bool:
+            """stream[idx] is a token_tree starting with '(' — checked on
+            the FIRST CHILD's type, never by decoding the whole subtree
+            (the fable-r1 F7 catch: _text() on a deep tree made even the
+            call-open probe quadratic)."""
+            if idx >= n_stream:
+                return False
+            nd = stream[idx]
+            if nd.type != "token_tree":
+                return False
+            kids = nd.children
+            return bool(kids) and kids[0].type == "("
+
+        # the call-name leaf tokens: any IDENTIFIER-SHAPED token — the node
+        # type varies (identifier, primitive_type for `str`, the keyword
+        # tokens for `match`/`if`...), so the test is the TEXT shape plus
+        # the type exclusions (the corpus differential catches: `str(` lexes
+        # as primitive_type, `x.match(` as the match keyword — in real rust
+        # neither is a call, but the walk's contract is the call-SHAPED
+        # token stream the differential oracle reads)
+        _NON_NAME = ("string_literal", "char_literal", "line_comment",
+                     "block_comment", "token_tree")
+        _name_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+        def _is_name(nd) -> bool:
+            if nd.type in _NON_NAME:
+                return False
+            return bool(_name_re.match(self._text(nd, source)))
+
+        # the angle-bracket match map, precomputed ONCE per token tree
+        # (O(n) build, O(1) lookups): a `<` at stream index i matches the
+        # `>` / `>>` that closes it, or nothing (unclosed). The per-name
+        # turbofish skip is then constant-time, so the unclosed-turbofish
+        # flood cannot re-scan the tail from every following name (the
+        # quadratic reopening), and an UNCLOSED turbofish degrades to the
+        # plain-`::` reading — the astra-blocker probe: inside ONE token
+        # tree an unclosed `::<` followed by a sibling real call
+        # (`println!("{}", x::<, real_tail())`) must NOT consume the rest
+        # of the stream; the < / > tokens become ordinary non-name tokens
+        # and the scan continues past them.
+        #
+        # MECHANISM (the local, code-derivable facts only — the
+        # bound-case enumerations live in the #708 review rounds r5-r9
+        # and are never restated here): the pairing is THIS map's LIFO
+        # stack — a `>` closes the MOST RECENT open; a `>>` closes the
+        # TWO MOST RECENT opens when two exist (the SECOND-most-recent
+        # is the one RECORDED as matched to the `>>`, the most recent is
+        # closed but NOT recorded), else the SINGLE most recent (the
+        # one-open fallback records it); a `::<` left unmapped degrades
+        # to the plain-`::` reading. The stream itself is the LIFO
+        # flatten of the token tree (see the stream-build note above).
+        # Which shapes this captures vs the pre-#708 depth counter — the
+        # divergences run BOTH directions — is enumerated with executed
+        # probes in the review rounds; this comment claims nothing about
+        # it.
+        _angle_match: dict = {}
+        _open_stack: list = []
+        for _ai, _an in enumerate(stream):
+            _at = _an.type
+            if _at == "<":
+                _open_stack.append(_ai)
+            elif _at == ">" and _open_stack:
+                _angle_match[_open_stack.pop()] = _ai
+            elif _at == ">>":
+                # the r5-F1 catch: a `>>` node closes the TWO MOST
+                # RECENT opens AT the `>>` itself — the recorded close
+                # index is _ai (the `>>` node), so the caller's close+1
+                # lands on the node after it (the depth-counter
+                # semantics). The RECORDED match is the
+                # SECOND-MOST-RECENT open (_first, popped second); the
+                # most recent open (popped first) is closed but NOT
+                # recorded — a `::<` that is the most recent open WITH
+                # ANOTHER OPEN BENEATH IT stays unmapped and degrades
+                # to the plain-`::` reading; with NO other open
+                # beneath it, the one-open fallback below RECORDS it
+                # (see the map's MECHANISM note; the bound-case
+                # enumerations live in the review rounds
+                # r5-r9). The pre-r5 bug recorded the WRONG index (the
+                # inner open's), stopping _skip_turbofish INSIDE the
+                # generics — the turbofish call lost its edge
+                # (Thing::turbo::<Vec<u8>>(1) -> no site).
+                if len(_open_stack) >= 2:
+                    _open_stack.pop()
+                    _first = _open_stack.pop()
+                    _angle_match[_first] = _ai
+                elif _open_stack:
+                    _angle_match[_open_stack.pop()] = _ai
+
+        def _skip_turbofish(pos: int) -> int:
+            if (pos + 1 < n_stream and stream[pos].type == "::"
+                    and stream[pos + 1].type == "<"):
+                close = _angle_match.get(pos + 1)
+                if close is not None:
+                    return close + 1
+                # unclosed: the plain-`::` reading (see the map's
+                # docstring) — the caller's linear advance moves past the
+                # chain end; the < / > tokens walk as non-names
+                return pos
+            return pos
+
+        while i < n_stream:
+            nd = stream[i]
+            if not _is_name(nd):
+                i += 1
+                continue
+            # 1. the scoped shape: ident (:: ident)*  [::<...>]?  (tree
+            segments = [self._text(nd, source)]
+            j = i + 1
+            while (j + 1 < n_stream and stream[j].type == "::"
+                   and _is_name(stream[j + 1])):
+                segments.append(self._text(stream[j + 1], source))
+                j += 2
+            # the optional turbofish: :: < ... > — the shared lookahead
+            # (both the scoped AND the dotted branches take it: the fable-r1
+            # F2 catch — `recv.name::<T>()` fell to the bare branch and the
+            # method edge was LOST; the >> token (tree-sitter lexes the
+            # closing double-angle as ONE node) closes TWO depth levels)
+            k = _skip_turbofish(j)
+            if _is_call_open(k):
+                call_name = "::".join(segments)
+                if len(segments) > 1:
+                    qualifier, leaf = call_name.rsplit("::", 1)
+                    immediate = qualifier.rsplit("::", 1)[-1]
+                    sites.append({
+                        "kind": "scoped", "qualifier": immediate,
+                        "leaf": leaf, "bare_filter_name": None,
+                    })
+                else:
+                    sites.append({
+                        "kind": "bare", "name": segments[0],
+                        "bare_filter_name": segments[0],
+                    })
+                i = k
+                continue
+            # 2. the dotted shape: ident (. ident)*  [::<...>]?  (tree
+            dsegs = [self._text(nd, source)]
+            dj = i + 1
+            while (dj + 1 < n_stream and stream[dj].type == "."
+                   and _is_name(stream[dj + 1])):
+                dsegs.append(self._text(stream[dj + 1], source))
+                dj += 2
+            dk = _skip_turbofish(dj)
+            if len(dsegs) > 1 and _is_call_open(dk):
+                receiver_name, method = ".".join(dsegs).rsplit(".", 1)
+                if receiver_name == "self":
+                    sites.append({
+                        "kind": "field", "receiver": "self",
+                        "method": method, "bare_filter_name": method,
+                        "receiver_is_self": True,
+                    })
+                else:
+                    sites.append({
+                        "kind": "field", "receiver": receiver_name,
+                        "method": method, "bare_filter_name": method,
+                        "receiver_is_self": False,
+                    })
+                i = dk
+                continue
+            # 3. the bare shape: ident (tree
+            if _is_call_open(j):
+                sites.append({
+                    "kind": "bare", "name": segments[0],
+                    "bare_filter_name": segments[0],
+                })
+                i = j + 1
+                continue
+            # LINEARITY (the fable-r1 F1 catch + the r2 reopening): a
+            # name whose chains found no call must not be rescanned at
+            # every following offset — advance past the WHOLE scanned
+            # region: the ::-chain's end j, the dotted chain's end dj,
+            # and the turbofish skip (an unclosed ::< scans to n_stream —
+            # advancing past the CHAIN only would rescan that flood from
+            # every following name, the r2 catch: 256KB scoped/::< floods
+            # measured 460s), so every flood shape stays O(n)
+            i = max(dj, dk, j, k, i + 1)
+
     def _scan_macro_body(self, node: Node, source: bytes, sites: List[dict]) -> None:
-        """Best-effort recovery of calls inside a macro's opaque token tree.
+        """Recover calls inside a macro's token tree (#708: the node walk).
 
         tree-sitter-rust does not parse macro arguments as expressions, so a
         call like `self.greet()` inside `format!("{}", self.greet())` is
         invisible to the AST walk above. For a small set of well-known
         macros whose arguments are ordinary expressions (format/print/assert/
-        vec/...), regex-recover call-shaped identifiers from the raw token
-        text. It recovers bare, dotted, and scoped (`Type::method`) call names
-        -- it cannot see argument structure -- so results feed the same
-        bare/field/scoped resolution paths as the AST walk, with a conservative
-        shape.
-
-        NOTE (2026-08-15): "opaque token tree" describes only how THIS scanner
-        treats the body, not the grammar. tree-sitter DOES lex the `token_tree`
-        into structured nodes (string_literal / identifier / nested token_tree),
-        so a node-walk could recover these calls without any regex or scan
-        budget. That rewrite is deferred (see issue #288 R1/T); the
-        regex path is retained for now with a linear literal-stripper in front.
+        vec/...), the token_tree NODE walk (`_token_tree_call_sites`) reads
+        the call shapes — bare, dotted (`recv.name`), scoped (`Type::method`),
+        and the turbofish forms (`Type::m::<T>()`, `recv.name::<T>()`) — from
+        the structured node stream, feeding the same bare/field/scoped
+        resolution paths as the AST walk. Literals and comments are skipped
+        whole (never a phantom edge) and there is NO byte budget (the #246
+        truncation class is retired). The regex pair
+        (`_blank_rust_literals` + `_MACRO_CALL_RE`) is retained in this
+        module as the DIFFERENTIAL ORACLE for the test suite.
         """
         macro_name = None
         token_tree = None
@@ -653,50 +880,16 @@ class CallGraphBuilder:
                 token_tree = child
         if macro_name not in _SCANNABLE_MACROS or token_tree is None:
             return
-        text = self._text(token_tree, source)
-        # Blank literals FIRST, via the linear _blank_rust_literals (byte-identical to
-        # _RUST_STR_LITERAL_RE.sub but O(n), so it cannot ReDoS the way the regex did on an
-        # unterminated-raw-string flood). Stripping before the budget also collapses a large
-        # string literal to one space, so a real trailing call is no longer pushed past the
-        # cap -- fixing the recall regression the earlier bound-first ordering introduced.
-        text = _blank_rust_literals(text)
-        # THEN bound the stripped text for _MACRO_CALL_RE, which is still O(n^2) on an
-        # adversarial dotted/scoped chain with no trailing '('. This residual (a call after
-        # >8KB of non-literal token soup can be truncated) is tracked in issue #288.
-        from utilities.scan_budget import bound_macro_scan_text
-        text, _truncated = bound_macro_scan_text(text, context=f"rust macro {macro_name}")
-        if _truncated:
-            self.scan_truncated.append(f"rust macro {macro_name}")
-        for match in _MACRO_CALL_RE.finditer(text):
-            call_name = match.group(1)
-            if "::" in call_name:
-                # Scoped `A::B::c` -> a `scoped` site with the IMMEDIATE
-                # qualifier (segment just before the leaf), matching the shape
-                # `_split_scoped` produces for an AST scoped_identifier so it
-                # routes through the same `_resolve_scoped` path (associated-fn
-                # via class_name, module via mod-file). Add-only vs the prior
-                # bare capture: a `Type::method(` token that previously yielded
-                # bare `method` (same-file-only) now yields the qualified call.
-                qualifier, leaf = call_name.rsplit("::", 1)
-                immediate = qualifier.rsplit("::", 1)[-1]
-                sites.append({
-                    "kind": "scoped", "qualifier": immediate, "leaf": leaf,
-                    "bare_filter_name": None,
-                })
-            elif "." in call_name:
-                receiver_name, method = call_name.rsplit(".", 1)
-                if receiver_name == "self":
-                    sites.append({
-                        "kind": "field", "receiver": "self", "method": method,
-                        "bare_filter_name": method, "receiver_is_self": True,
-                    })
-                else:
-                    sites.append({
-                        "kind": "field", "receiver": receiver_name, "method": method,
-                        "bare_filter_name": method, "receiver_is_self": False,
-                    })
-            else:
-                sites.append({"kind": "bare", "name": call_name, "bare_filter_name": call_name})
+        # #708: the tree-sitter token-tree NODE walk replaces the
+        # strip-then-budget-then-regex path: literals come free (the
+        # string_literal node is skipped whole — never a phantom edge, so
+        # _blank_rust_literals is no longer needed on the production path)
+        # and there is NO byte budget (a linear node stream — the 8KB
+        # truncation class is retired: a call past any budget still produces
+        # its edge). The regexes stay in this module as the differential
+        # oracle for the test suite (the walk's call set must be a superset
+        # of the budgetless regex path's — see the #708 tests).
+        self._token_tree_call_sites(token_tree, source, sites)
 
     def _same_file_function_names(self, caller_file: str) -> Set[str]:
         if not caller_file:
