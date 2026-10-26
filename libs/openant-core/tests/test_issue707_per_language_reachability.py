@@ -451,3 +451,113 @@ def test_the_applied_flag_means_any_language_filtered(tmp_path):
     assert rf is not None
     assert any("unfiltered" in str(w).lower() for w in (rf.get("warnings") or [])), (
         f"the mixed-scan nuance missing: {rf}")
+
+
+# --- the denominator half of the malformed-record gate ---
+#
+# WHY THESE TESTS NEEDED A SECOND HELPER. Every fixture above builds its record
+# with `_rf(kept, original)`, whose two counts are REQUIRED positional
+# arguments — so the suite literally could not express a record that carries a
+# kept count and no original. That inexpressiveness is what hid the defect
+# these pins close: the gate validated `reachable_units` alone, the summing
+# loop adds each side independently, and such a record therefore reached the
+# NUMERATOR and not the DENOMINATOR, shipping more reachable units than total
+# units with a NEGATIVE reduction. `_partial_rf` exists to make the bad shape
+# constructible, and the invariant test below is the PR's own falsifier
+# asserted as a predicate rather than as a sentence.
+
+def _partial_rf(**fields) -> dict:
+    """A reachability record with EXACTLY the fields named — the deliberate
+    counterpart to `_rf`, which cannot omit a count. Used to build the
+    malformed shapes a non-canonical dataset.json can carry."""
+    return dict(fields)
+
+
+def test_a_record_without_original_units_is_rejected_by_the_gate(tmp_path):
+    """THE DENOMINATOR MIRROR of
+    test_a_malformed_record_is_named_not_silently_miscounted: a record with a
+    valid integer reachable_units and NO original_units is malformed too, and
+    is rejected by the gate instead of being fed to the numerator alone.
+
+    Pre-repair this produced reachable_units=60 against original_units=20 and
+    reduction_percentage=-200.0 — executed, not hypothesised."""
+    merged = _merge(tmp_path, [
+        ("python", 20, _rf(10, 20)),
+        ("go", 500, _partial_rf(reachable_units=50)),  # no original_units
+    ])
+    rf = _prod_reporter._load_reachability_metadata(_scan_dir(tmp_path, merged))
+    assert rf is not None
+    # go is treated as UNFILTERED: its 500 units on BOTH sides, never as a
+    # numerator-only 50.
+    assert rf["reachable_units"] == 10 + 500, (
+        f"go's kept count reached the numerator alone: {rf}")
+    assert rf["original_units"] == 20 + 500, (
+        f"go's units never reached the denominator: {rf}")
+    assert rf["reduction_percentage"] == 1.9, rf
+    assert any("malformed" in str(w) and "original_units" in str(w)
+               for w in (rf.get("warnings") or [])), (
+        f"the denominator's absence is not named in a warning: {rf}")
+
+
+def test_a_non_integer_original_units_is_rejected_by_the_gate(tmp_path):
+    """The same gate, the non-integer shapes: a STRING original_units and a
+    BOOL original_units are both unusable as a count. bool is named
+    explicitly because it is an int subclass — without that tooth `True`
+    passes isinstance and sums as 1."""
+    for bad in ("500", True, 12.5, None, [500]):
+        merged = _merge(tmp_path, [
+            ("python", 20, _rf(10, 20)),
+            ("go", 500, _partial_rf(reachable_units=50, original_units=bad)),
+        ])
+        rf = _prod_reporter._load_reachability_metadata(
+            _scan_dir(tmp_path, merged))
+        assert rf is not None, bad
+        assert rf["reachable_units"] == 510, (
+            f"original_units={bad!r} let the numerator run alone: {rf}")
+        assert rf["original_units"] == 520, (
+            f"original_units={bad!r} was admitted to the denominator: {rf}")
+
+
+def test_the_scan_wide_figures_never_invert(tmp_path):
+    """#707'S OWN FALSIFIER, AS A PREDICATE: across every malformed shape the
+    gate can see, the scan-wide numerator never exceeds its denominator and
+    the reduction is never negative. This is the assertion whose absence let
+    the denominator defect through nineteen passing tests."""
+    shapes = [
+        _partial_rf(reachable_units=50),
+        _partial_rf(reachable_units=50, original_units="500"),
+        _partial_rf(reachable_units=50, original_units=True),
+        _partial_rf(original_units=500),
+        _partial_rf(reachable_units=True, original_units=500),
+        _partial_rf(),
+    ]
+    for shape in shapes:
+        merged = _merge(tmp_path, [
+            ("python", 20, _rf(10, 20)),
+            ("go", 500, shape),
+        ])
+        rf = _prod_reporter._load_reachability_metadata(
+            _scan_dir(tmp_path, merged))
+        assert rf is not None, shape
+        assert rf["reachable_units"] <= rf["original_units"], (
+            f"numerator outran denominator on {shape}: {rf}")
+        assert rf["reduction_percentage"] >= 0, (
+            f"negative reduction shipped on {shape}: {rf}")
+
+
+def test_a_malformed_record_keeps_its_numerator_wording(tmp_path):
+    """The numerator case's warning text is UNCHANGED by the denominator
+    repair — the reason clause is built in one place and reproduces the
+    pre-repair sentence byte-for-byte when only reachable_units is missing."""
+    merged = _merge(tmp_path, [
+        ("python", 10, _partial_rf(original_units=10)),  # no reachable_units
+        ("javascript", 6, _rf(3, 6)),
+    ])
+    rf = _prod_reporter._load_reachability_metadata(_scan_dir(tmp_path, merged))
+    assert rf["reachable_units"] == 13 and rf["original_units"] == 16, rf
+    assert any(
+        w == ("python: its reachability record is malformed (no integer "
+              "reachable_units) — treated as unfiltered, its units counted "
+              "as fully reachable on both sides.")
+        for w in (rf.get("warnings") or [])), (
+        f"the numerator warning's wording drifted: {rf.get('warnings')}")

@@ -297,6 +297,49 @@ def _finding_display_id(
     return f"{prefix}{identity_key}#{n}"
 
 
+# #707 FOLLOW-UP — THE DENOMINATOR HALF OF THE MALFORMED-RECORD GATE.
+#
+# The per-language aggregate below derives `reduction_percentage` from BOTH
+# counts, so the gate that admits a record into the sum must validate BOTH.
+# It validated only `reachable_units`, and the summing loop adds each side
+# INDEPENDENTLY — so a record carrying a valid kept count beside a missing or
+# non-integer `original_units` was admitted, then contributed to the NUMERATOR
+# and not to the DENOMINATOR. The scan-wide figures could ship more reachable
+# units than total units with a NEGATIVE reduction. Executed on the
+# two-language fixture python{units 20, rf 10/20} + go{units 500, kept 50, no
+# `original_units`}: reachable_units=60, original_units=20,
+# reduction_percentage=-200.0 — the exact invariant #707 exists to establish,
+# failing on a narrower input than its own falsifier was written against, and
+# identically for `original_units` given as the string "500" or as a bool.
+#
+# WHY THE PREDICATE IS A NAMED HELPER AND NOT AN INLINE `or`: the fields the
+# reduction reads are a SET, and the defect was that the gate knew only one
+# member of it. A list the gate iterates cannot fall out of step with the
+# arithmetic the way two hand-written isinstance pairs did; a future count
+# entering the reduction is added HERE, once.
+_REDUCTION_COUNT_FIELDS = ("reachable_units", "original_units")
+
+
+def _unusable_reduction_counts(rec: dict) -> list[str]:
+    """The reduction-bearing fields this record cannot supply as a unit count.
+
+    `bool` is excluded EXPLICITLY because it is an `int` subclass: without that
+    clause `True` passes as a count and sums as 1, which is how the numerator
+    guard was already written and why the mirror needs the same tooth."""
+    return [k for k in _REDUCTION_COUNT_FIELDS
+            if not isinstance(rec.get(k), int) or isinstance(rec.get(k), bool)]
+
+
+def _malformed_record_warning(lang: str, reason: str) -> str:
+    """The ONE malformed-record sentence, built in one place so the three
+    emitting sites cannot drift. With `reason` == "no integer reachable_units"
+    this reproduces the pre-repair text BYTE-FOR-BYTE — the numerator case's
+    wording is unchanged; only the newly-caught denominator case says so."""
+    return (f"{lang}: its reachability record is malformed ({reason}) — "
+            "treated as unfiltered, its units counted as fully reachable on "
+            "both sides.")
+
+
 def _load_reachability_metadata(scan_dir: str) -> dict | None:
     """Return the reachability-filter record for this scan, if one exists.
 
@@ -363,19 +406,23 @@ def _load_reachability_metadata(scan_dir: str) -> dict | None:
     records = {}
     unfiltered_langs = []
     malformed = []
+    malformed_reason: dict[str, str] = {}
     for lang, block in per_lang.items():
         if not isinstance(block, dict):
             continue
         rec = block.get("reachability_filter")
         units = block.get("units")
         if isinstance(rec, dict):
-            if not isinstance(rec.get("reachable_units"), int) or \
-                    isinstance(rec.get("reachable_units"), bool):
-                # a malformed record: its kept count is unknown — counting
-                # its units on the denominator only would fabricate pruning
-                # (the fable-r1 F4 catch); name it and treat the language
-                # as unfiltered (its units all reachable, both sides)
+            bad = _unusable_reduction_counts(rec)
+            if bad:
+                # a malformed record: a count the reduction READS is unknown.
+                # Counting its units on the denominator only would fabricate
+                # pruning (the fable-r1 F4 catch) — and counting them on the
+                # numerator only fabricates NEGATIVE pruning, which is the
+                # same defect mirrored. Name it and treat the language as
+                # unfiltered (its units all reachable, both sides).
                 malformed.append(lang)
+                malformed_reason[lang] = "no integer " + " or ".join(bad)
                 if isinstance(units, int) and not isinstance(units, bool):
                     unfiltered_langs.append((lang, units))
                 continue
@@ -393,14 +440,10 @@ def _load_reachability_metadata(scan_dir: str) -> dict | None:
                 "original_units": sum(u for _, u in unfiltered_langs),
                 "reduction_percentage": 0,
                 "warning": "; ".join(
-                    f"{lang}: its reachability record is malformed (no "
-                    "integer reachable_units) — treated as unfiltered, its "
-                    "units counted as fully reachable on both sides."
+                    _malformed_record_warning(lang, malformed_reason[lang])
                     for lang in malformed),
                 "warnings": [
-                    f"{lang}: its reachability record is malformed (no "
-                    "integer reachable_units) — treated as unfiltered, its "
-                    "units counted as fully reachable on both sides."
+                    _malformed_record_warning(lang, malformed_reason[lang])
                     for lang in malformed],
                 "per_language": {l: u for l, u in unfiltered_langs},
             }
@@ -478,9 +521,7 @@ def _load_reachability_metadata(scan_dir: str) -> dict | None:
     }
     for lang in malformed:
         agg["warnings"].append(
-            f"{lang}: its reachability record is malformed (no integer "
-            "reachable_units) — treated as unfiltered, its units counted "
-            "as fully reachable on both sides.")
+            _malformed_record_warning(lang, malformed_reason[lang]))
         if agg["warning"]:
             agg["warning"] += "; "
         agg["warning"] += agg["warnings"][-1]
