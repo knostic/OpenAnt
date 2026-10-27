@@ -192,11 +192,12 @@ def _sanitize_compose(content: str) -> str:
     Fails CLOSED (returns a refusing comment-only compose) on unparseable YAML, a build
     context that escapes the work dir, or a service with neither a safe build nor an image.
 
-    RESIDUAL (documented, NOT closed here): build-time `RUN` egress — `docker build`
-    still runs the generated Dockerfile's RUN steps with network (an egress-allowlisting
-    build proxy is deferred, an accepted residual). This change is RUNTIME sandbox
-    hardening that makes the code enforce its stated "no host volume mounts or privileged
-    mode" contract.
+    #710: the build-time `RUN` egress residual formerly documented here is
+    now the RECORDED RULING (accepted by design — the executed evidence that
+    killed the host-proxy alternative is named at the single-container build
+    site; the drift pins hold the accepted state). This change is RUNTIME
+    sandbox hardening that makes the code enforce its stated "no host volume
+    mounts or privileged mode" contract.
     """
     try:
         import yaml
@@ -466,7 +467,36 @@ def _run_single(
     """
     result = DockerExecutionResult()
 
-    # Build
+    # #710 — THE RECORDED RULING (the falsifier's second disjunct): build
+    # egress is ACCEPTED BY DESIGN. The host-proxy alternative was tried and
+    # killed by TWO EXECUTED findings (the review round's probes) plus ONE
+    # DESIGN JUDGMENT:
+    #   (1) EXECUTED: a host-side proxy pointed at via Docker's predefined
+    #       proxy build-args is UNREACHABLE from the RUN steps — the
+    #       build-args reach the RUN env, but 127.0.0.1 there is the BUILD
+    #       CONTAINER's own loopback, not the host's — measured: every
+    #       dependency build fails with ConnectionRefused. The routing that
+    #       would reach a host-side proxy (--network host on the build)
+    #       puts the RUN steps in the HOST's netns — the build-time
+    #       posture this module exists to prevent — and binding the proxy
+    #       on a non-loopback interface to make it bridge-reachable exposes
+    #       it to every container on the host's bridge networks;
+    #   (2) EXECUTED: even with routing, the proxy-env control is
+    #       ADVISORY, not structural — the Dockerfile is LLM-authored from
+    #       untrusted findings, and `ENV http_proxy=` (one line) or a raw
+    #       socket egresses freely (both executed) — a cooperating-client
+    #       control cannot close a channel the content author controls;
+    #   (3) DESIGN JUDGMENT (not executed): the real structural control (a
+    #       build network-namespace with a proxy sidecar, or --network none
+    #       with vendored deps) either breaks every dependency build
+    #       (--network none) or is a disproportionate re-architecture for
+    #       an opt-in, defense-in-depth surface.
+    # The accepted posture (unchanged from #247): the RUNTIME sandbox is
+    # the hard boundary (--network none below), the env allowlist caps what
+    # the build subprocess SEES (no host secret can be interpolated into
+    # the build context), and the build context is minimal (generated files
+    # + one pre-staged source). The drift pins in the test suite hold this
+    # exact state so it cannot drift silently.
     stdout, stderr, code, timed_out = _run_command(
         ["docker", "build", "-t", image_tag, "."],
         timeout=build_timeout,
@@ -483,8 +513,9 @@ def _run_single(
     # stronger and simpler than an --internal network: an executing test derived from
     # untrusted findings cannot exfiltrate at runtime, and in-container client->server
     # tests still work over loopback. (No `docker network create` needed for this path.)
-    # RESIDUAL: build-time RUN egress is still open — see _sanitize_compose. Hardening,
-    # not a vuln fix. The multi-service path uses an internal compose network instead.
+    # #710: build-time RUN egress is the RECORDED RULING above (accepted
+    # by design, the executed evidence named). Hardening, not a vuln fix.
+    # The multi-service path uses an internal compose network instead.
     #
     # #732: the container is NAMED. subprocess's timeout (inside _run_command)
     # kills the `docker run` CLIENT only, and `--rm` is daemon-side (it fires
@@ -563,7 +594,8 @@ def _run_compose(
 
     compose_base = ["docker", "compose", "-p", project_name]
 
-    # Build all services
+    # Build all services — #710: the compose twin of the recorded ruling
+    # above (build egress accepted by design; the drift pins hold it)
     stdout, stderr, code, timed_out = _run_command(
         compose_base + ["build"],
         timeout=build_timeout,
