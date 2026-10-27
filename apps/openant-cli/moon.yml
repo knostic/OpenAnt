@@ -5,6 +5,15 @@ type: "application"
 language: "go"
 tags: ["cli", "go"]
 
+# #712 — the recorded decision (the issue's option (b) considered and
+# declined): these descriptors are NOT deleted because they describe the
+# build this repo actually runs (go build/test, pytest) and completing
+# their inputs is the prerequisite for any future moon adoption (a .moon/
+# workspace root, absent today, would be the next step); deleting
+# intended-future tooling is the bigger judgment call. The inputs below are
+# now complete: every go:embed target is a build+test input and the
+# test-time reads (the tailwind recipe, the golden testdata) are test
+# inputs.
 tasks:
   build:
     command: "go build -o bin/openant ./main.go"
@@ -12,6 +21,14 @@ tasks:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
+      # #712: the go:embed targets are build inputs — report.go embeds the
+      # templates and the vendored report assets; ui/embed.go embeds the UI
+      # pages and their vendored JS. Editing any of them without a cache
+      # miss would serve a stale binary.
+      - "internal/report/templates/**"
+      - "internal/report/vendor/**"
+      - "ui/**/*.html"
+      - "ui/vendor/**"
     outputs:
       - "bin/openant"
 
@@ -21,6 +38,18 @@ tasks:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
+      # #712: the embedded assets are TEST inputs too — the class-coverage
+      # and golden-render suites in internal/report/ exercise the templates
+      # and the vendored CSS; a stale cache would pass them on old assets.
+      # The test-time NON-embedded reads: the tailwind recipe (the palette,
+      # the config, the input CSS — read by the CSS-freshness suites) and
+      # the golden-render testdata (the browser-smoke oracle).
+      - "internal/report/templates/**"
+      - "internal/report/vendor/**"
+      - "internal/report/tailwind/**"
+      - "internal/server/testdata/**"
+      - "ui/**/*.html"
+      - "ui/vendor/**"
 
   lint:
     command: "go vet ./..."
