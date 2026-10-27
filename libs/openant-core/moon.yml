@@ -16,23 +16,73 @@ tasks:
   analyze:
     command: "python -m openant analyze"
     inputs:
+      # #712: the source tree the tasks actually import (previously only
+      # openant/**/* was listed — seven of eight source dirs were outside
+      # the input set, so any edit outside openant/ was a cache hit)
       - "openant/**/*"
+      - "core/**/*"
+      - "utilities/**/*"
+      - "parsers/**/*"
+      - "context/**/*"
+      - "prompts/**/*"
+      - "report/**/*"
+      - "github_scanner/**/*"
 
   # Parse a repository
   parse:
     command: "python -m openant parse"
     inputs:
+      # #712: the source tree the tasks actually import (previously only
+      # openant/**/* was listed — seven of eight source dirs were outside
+      # the input set, so any edit outside openant/ was a cache hit)
       - "openant/**/*"
+      - "core/**/*"
+      - "utilities/**/*"
+      - "parsers/**/*"
+      - "context/**/*"
+      - "prompts/**/*"
+      - "report/**/*"
+      - "github_scanner/**/*"
 
   # Generate report
   report:
     command: "python -m openant report"
     inputs:
+      # #712: the source tree the tasks actually import (previously only
+      # openant/**/* was listed — seven of eight source dirs were outside
+      # the input set, so any edit outside openant/ was a cache hit)
       - "openant/**/*"
+      - "core/**/*"
+      - "utilities/**/*"
+      - "parsers/**/*"
+      - "context/**/*"
+      - "prompts/**/*"
+      - "report/**/*"
+      - "github_scanner/**/*"
 
   # Run tests
   test:
     command: "pytest"
     inputs:
+      # #712: the source tree the tasks actually import (previously only
+      # openant/**/* was listed — seven of eight source dirs AND the root
+      # modules were outside the input set, so any edit outside openant/
+      # was a cache hit)
       - "openant/**/*"
+      - "core/**/*"
+      - "utilities/**/*"
+      - "parsers/**/*"
+      - "context/**/*"
+      - "prompts/**/*"
+      - "report/**/*"
+      - "github_scanner/**/*"
+      # the root modules the tests import (experiment.py,
+      # validate_dataset_schema.py) + the run-shaping files
+      # (conftest.py, pytest.ini) + the package definition
+      - "*.py"
+      - "conftest.py"
+      - "pytest.ini"
+      - "pyproject.toml"
+      - "requirements.txt"
+      - "moon.yml"
       - "tests/**/*"
