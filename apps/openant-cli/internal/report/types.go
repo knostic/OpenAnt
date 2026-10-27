@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/microcosm-cc/bluemonday"
+	"regexp"
 )
 
 // ReportData holds all pre-computed data needed to render the HTML overview report.
@@ -100,8 +101,40 @@ var remediationPolicy = func() *bluemonday.Policy {
 		"h1", "h2", "h3", "h4", "h5", "h6",
 		"table", "thead", "tbody", "tr", "th", "td",
 	)
-	p.AllowAttrs("href").OnElements("a")
+	// #711: the finding cross-reference contract — the Python CLI
+	// linkifies the model's #N finding references into
+	// <a href="#finding-N" class="finding-ref">#N</a> (cli.py) and both
+	// templates render the matching id="finding-N" anchors on the finding
+	// <details>, but this policy allowed neither the class attribute nor
+	// any fragment href, so bluemonday dropped the WHOLE anchor and the
+	// .finding-ref rules styled nothing (PR #579's noted dead channel).
+	// The agreed producer/consumer contract, allowed now — as narrowly as
+	// the old surface: the class attribute on <a> accepts EXACTLY the
+	// finding-ref value (any other class dies), and the href pattern
+	// accepts the finding fragments ONLY as the new non-absolute surface.
+	// The http(s) HALF of the pattern is deliberately prefix-shaped and
+	// case-insensitive so bluemonday's own validURL — UNCHANGED from the
+	// pre-#711 policy — keeps owning the http(s) value as before: its
+	// TrimSpace + url.Parse (which lowercases the scheme) + the
+	// entity-escaping serializer tolerated uppercase schemes,
+	// whitespace-padded values, and apostrophe/quote-bearing URLs, and an
+	// earlier fully-anchored pattern here silently demoted exactly those
+	// legitimate links to plain text (the r1-B1 executed regression).
+	// The whitespace class matches validURL's TrimSpace (strings.TrimSpace
+	// strips every unicode.IsSpace rune — the r2-F1 residual: the earlier
+	// ASCII-only `\s` class demoted NBSP/\v/U+0085/U+2028/U+3000-led
+	// hrefs the old policy accepted). The FRAGMENT half is strictly
+	// anchored (#finding-N, digits only, end-of-value) — the narrowing
+	// that keeps AllowRelativeURLs from admitting any other non-absolute URL:
+	// page2.html, ../x, //evil.com, #top, and every off-shaped fragment
+	// fail the pattern and die, and javascript: and every other scheme
+	// still die at validURL's scheme allowlist.
+	p.AllowAttrs("class").Matching(regexp.MustCompile(
+		"^finding-ref$")).OnElements("a")
+	p.AllowAttrs("href").Matching(regexp.MustCompile(
+		`^(?i:[\s\v\x{85}\p{Z}]*https?:)|^#finding-[0-9]+$`)).OnElements("a")
 	p.AllowURLSchemes("http", "https")
+	p.AllowRelativeURLs(true)
 	p.RequireNoReferrerOnLinks(true)
 	p.AddTargetBlankToFullyQualifiedLinks(true)
 	return p
