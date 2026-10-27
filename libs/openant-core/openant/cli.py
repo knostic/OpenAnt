@@ -285,6 +285,34 @@ def _step_report_rows(step_reports: list[dict],
     return rows
 
 
+def _linkify_finding_refs(remediation_html: str) -> str:
+    """#711: linkify the model's #N finding references into the
+    same-document anchors the Go render boundary now accepts.
+
+    The contract (cli.py here is the PRODUCER; the Go remediationPolicy in
+    apps/openant-cli/internal/report/types.go is the CONSUMER): the href is
+    EXACTLY ``#finding-<N>`` and the class is EXACTLY ``finding-ref`` —
+    the sanitizer's allowlist admits only those two shapes (a foreign class
+    or any non-finding href dies there), and both templates render the
+    matching ``id="finding-N"`` anchors on the finding <details>. Until
+    #711 the consumer dropped the whole anchor and these links rendered as
+    plain text.
+    """
+    import re as _re
+
+    def _linkify_finding(m):
+        num = m.group(1)
+        return f'<a href="#finding-{num}" class="finding-ref">#{num}</a>'
+
+    # #711 (the fable-r1 D1 catch): the negative lookbehind — a numeric
+    # character reference (&#39;, &#8217; …) is NOT a finding reference;
+    # pre-lookbehind, its digits linkified into a misdirecting LIVE link
+    # once the render boundary started keeping the anchors (Python's own
+    # html.escape emits &#39;, so this is the common shape in model-emitted
+    # remediation HTML).
+    return _re.sub(r'(?<!&)#(\d+)', _linkify_finding, remediation_html)
+
+
 def _load_step_reports(directory: str) -> list[dict]:
     """Load all {step}.report.json files from a directory.
 
@@ -1606,11 +1634,7 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
                 )
 
                 # Post-process: linkify finding references like #4, #12-#14
-                import re
-                def _linkify_finding(m):
-                    num = m.group(1)
-                    return f'<a href="#finding-{num}" class="finding-ref">#{num}</a>'
-                remediation_html = re.sub(r'#(\d+)', _linkify_finding, remediation_html)
+                remediation_html = _linkify_finding_refs(remediation_html)
 
             # --- Step reports ---
             # #305: the projection previously copied five display fields and
