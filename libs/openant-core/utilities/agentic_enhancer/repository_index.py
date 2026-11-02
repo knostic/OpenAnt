@@ -18,8 +18,10 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from utilities.file_io import read_json
-
+from utilities.file_io import read_json, UnsafeRepoFile
+import os
+import stat
+import logging
 
 class RepositoryIndex:
     """
@@ -235,24 +237,102 @@ class RepositoryIndex:
         # arg). Resolve and confine to the repo root so a ``..`` or absolute
         # path can't read arbitrary host files; resolve() also collapses
         # symlink escapes.
+        #repo_root = self.repo_path.resolve()
+        #full_path = (self.repo_path / file_path).resolve()
+        
+        #if not full_path.exists():
+            #return None
+        
+        if(type(start_line) is not int or type(end_line) is not int or start_line < 1 or end_line < 1):
+            raise ValueError("Line numbers must be positive integers")
+
+        if start_line > end_line:
+            return ""
         repo_root = self.repo_path.resolve()
-        full_path = (self.repo_path / file_path).resolve()
+        requested_path=Path(file_path)
+
+        if requested_path.is_absolute():
+            return None
+        if ".." in requested_path.parts:
+            return None
+
+        full_path=(repo_root/requested_path).resolve()
+
         if not full_path.is_relative_to(repo_root):
             return None
-        if not full_path.exists():
+            
+
+        max_scan_bytes= 16* 1024 * 1024
+        max_line_bytes=1024 * 1024
+        max_output_bytes=max_scan_bytes
+
+        #Open files without blocking
+        try:
+            current=repo_root
+            for part in requested_path.parts:
+                current=current/part
+            
+                if current.is_symlink():
+                    raise UnsafeRepoFile(f"Symlink in repository path: {current}")
+            flags=os.O_RDONLY 
+            flags |= getattr(os, "O_NONBLOCK", 0)
+            flags |=getattr(os, "O_NOFOLLOW", 0)
+
+            fd=os.open(full_path, flags)
+
+            #read in binary mode b/c of byte limits
+            with os.fdopen(fd, "rb") as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                    raise UnsafeRepoFile(f"{file_path} is not a regular file")
+
+                #helps it to read incrementally
+                result=[]
+                total_scanned=0
+                total_output=0
+
+                for line_number in range(1, end_line +1):
+                    line=f.readline(max_line_bytes + 1)
+
+                    if not line:
+                        break
+
+                    total_scanned += len(line)
+                    if total_scanned > max_scan_bytes:
+                        raise UnsafeRepoFile(f"{file_path}: scan limit exceeded")
+                    if len(line) > max_line_bytes:
+                        raise UnsafeRepoFile(f"{file_path}: line size limit exceeded")
+                    if line_number <start_line:
+                        continue
+                    total_output += len(line)
+                    if total_output > max_output_bytes:
+                        raise UnsafeRepoFile(f"{file_path}: output limit exceeded")
+
+                    result.append(line.decode("utf-8"))
+
+                return "".join(result)
+            
+        except FileNotFoundError:
             return None
 
-        try:
-            with open(full_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+        except UnsafeRepoFile as exc:
+            logging.getLogger(__name__).warning("read_file_section rejected %s: %s", file_path, exc)
+            return None
+
+        except(OSError, UnicodeError) as exc:
+            logging.getLogger(__name__).warning("read_file_section could not read %s: %s", file_path, exc)
+            return None
+        
+        #try:
+            #with open(full_path, 'r', encoding='utf-8') as f:
+                #lines = f.readlines()
 
             # Convert to 0-indexed
-            start_idx = max(0, start_line - 1)
-            end_idx = min(len(lines), end_line)
+            #start_idx = max(0, start_line - 1)
+           # end_idx = min(len(lines), end_line)
 
-            return ''.join(lines[start_idx:end_idx])
-        except Exception:
-            return None
+            #return ''.join(lines[start_idx:end_idx])
+       # except Exception:
+         #   return None
 
     def resolve_dependencies(self, dep_names: list[str]) -> list[dict]:
         """
