@@ -196,6 +196,20 @@ def _raise_on_error_finish(response: Any) -> None:
         )
 
 
+# #646: the validate() probe's per-request timeout (SECONDS) — a cheap
+# 1-token liveness check, not a full request: with the 600 s adapter
+# default and max_retries=5 a black-holed probe fails after ~61
+# minutes worst case; 15 s anchors the Go wizard's probe
+# (llm_probe_google.go: http.Client{Timeout: 15 * time.Second}), so
+# the probe fails in ~104 s worst case (the client's max_retries=5
+# inherited: 6 jittered attempts under a 15 s deadline — the
+# opus-r1 wire measurement), down from the ~61 minutes of the
+# unbounded 600 s shape; the Go wizard's ONE-attempt probe is
+# tighter still. The request path's 600 s default and its
+# max_retries are UNTOUCHED.
+PROBE_TIMEOUT_SECONDS = 15
+
+
 class OpenRouterAdapter:
     """:class:`LLMAdapter` implementation backed by OpenRouter's
     OpenAI-compatible endpoint via ``openai.OpenAI``."""
@@ -303,6 +317,7 @@ class OpenRouterAdapter:
                 "model": model,
                 _token_param(model): 1,
                 "messages": [{"role": "user", "content": "hi"}],
+                "timeout": PROBE_TIMEOUT_SECONDS,  # #646: the probe's tight deadline
             })
         except openai.APIError as exc:
             raise _classify_error(exc, report_429=False) from redacted_cause_from(exc)

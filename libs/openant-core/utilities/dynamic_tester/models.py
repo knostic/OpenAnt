@@ -46,7 +46,9 @@ class DynamicTestResult:
     unpriced_cache_models: list = field(default_factory=list)
     retry_count: int = 0
     # #314: the run-stable identity from the pipeline finding — the join
-    # key the report merge verifies (VULN-NNN is positional, not stable).
+    # key the report merge verifies. (#706: the pipeline's display ID is
+    # now DERIVED from this key, so the ID and the join key agree by
+    # construction.)
     identity_key: str = ""
 
     def to_dict(self) -> dict:

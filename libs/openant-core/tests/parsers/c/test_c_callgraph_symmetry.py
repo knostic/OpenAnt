@@ -27,27 +27,17 @@ if str(CORE) not in sys.path:
 
 pytest.importorskip("tree_sitter_c")
 
+# #702: the donor now CONSUMES the shared module it was extracted from —
+# one definition of "symmetric" across all six consumers (the five new
+# suites + this one); python/rust/swift keep their pre-existing inline
+# forms (the follow-up migration, recorded in the PR body).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _symmetry_shared import (  # noqa: E402
+    assert_callgraph_symmetry as _assert_symmetric,
+)
+
 from parsers.c.call_graph_builder import CallGraphBuilder  # noqa: E402
 from parsers.c.function_extractor import FunctionExtractor  # noqa: E402
-
-
-def _assert_symmetric(fids, fwd, rev):
-    """The three call-graph invariants reachability depends on."""
-    for k, callees in fwd.items():
-        assert k in fids, f"call_graph key {k} is not a function id"
-        assert len(callees) == len(set(callees)), f"duplicate forward edge from {k}"
-        for c in callees:
-            assert c in fids, f"callee {c} is not a function id"
-            assert c != k, f"self-edge {k} -> {k}"
-    for k, callers in rev.items():
-        assert k in fids, f"reverse_call_graph key {k} is not a function id"
-        assert len(callers) == len(set(callers)), f"duplicate reverse edge into {k}"
-        for c in callers:
-            assert c in fids
-    fwd_edges = {(a, b) for a, bs in fwd.items() for b in bs}
-    rev_edges = {(a, b) for b, as_ in rev.items() for a in as_}
-    assert fwd_edges == rev_edges, (
-        f"only-forward={fwd_edges - rev_edges}, only-reverse={rev_edges - fwd_edges}")
 
 
 def _graph():

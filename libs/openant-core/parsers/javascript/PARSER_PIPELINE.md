@@ -378,7 +378,7 @@ Options:
 
 **Purpose**: Enhance static analysis with LLM-identified context using Claude Sonnet.
 
-**Model**: `claude-sonnet-4-20250514`
+**Model**: `claude-sonnet-4-6`
 
 ### Two Enhancement Modes
 

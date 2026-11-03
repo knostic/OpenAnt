@@ -181,6 +181,18 @@ def _extract_usage_details(usage: Any) -> Optional[dict]:
     return details or None
 
 
+# #646: the validate() probe's per-request timeout (SECONDS) — a cheap
+# 1-token liveness check, not a full request: with the 600 s adapter
+# default a black-holed probe rides it indefinitely; 15 s anchors
+# the Go wizard's probe (llm_probe_google.go:
+# http.Client{Timeout: 15 * time.Second}). The probe fails in ~124 s
+# worst case (the client's 6-attempt retry, the opus-r1 wire
+# measurement — the SDK retries httpx.TimeoutException too), down
+# from the unbounded 600 s shape. The request path's 600 s default
+# is UNTOUCHED.
+PROBE_TIMEOUT_SECONDS = 15
+
+
 class GoogleAdapter:
     """:class:`LLMAdapter` implementation backed by ``google.genai.Client``."""
 
@@ -392,7 +404,16 @@ class GoogleAdapter:
                     role="user",
                     parts=[genai_types.Part.from_text(text="hi")],
                 )],
-                config=genai_types.GenerateContentConfig(max_output_tokens=1),
+                # #646: the probe's tight per-request deadline (the Go
+                # wizard's 15 s anchor) — per-request http_options MERGE with
+                # the client's (the SDK's field-wise is-not-None merge — verified end-to-end by the opus-r1 wire probe: PROBE 15.0 s vs REQUEST 600.0 s),
+                # so the 600 s client default stays for the request path.
+                config=genai_types.GenerateContentConfig(
+                    max_output_tokens=1,
+                    http_options=genai_types.HttpOptions(
+                        timeout=PROBE_TIMEOUT_SECONDS * 1000,
+                    ),
+                ),
             )
         except genai_errors.ClientError as exc:
             code = _http_code_from(exc)

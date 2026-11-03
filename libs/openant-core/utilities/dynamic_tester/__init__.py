@@ -20,6 +20,7 @@ from utilities.dynamic_tester.docker_executor import run_single_container
 from utilities.dynamic_tester.result_collector import collect_result
 from utilities.dynamic_tester.reporter import generate_report
 from utilities.llm_client import (get_global_tracker,
+                                  incomplete_markers,
                                   unpriced_kinds_from)
 from utilities.llm import (
     PhaseRegistry,
@@ -323,18 +324,23 @@ def run_dynamic_tests(
                 "cost_usd": round(t.get("total_cost_usd", 0.0)
                                   - _summary_baseline.get("total_cost_usd", 0.0), 6),
             }
-            # #216: the incomplete-cost markers survive; #605: the counter.
-            # (Run-cumulative — the accepted trade in step_report.py:147-163,
-            # the same parenthetical the llr sibling carries.)
-            if t.get("cost_incomplete"):
-                u["cost_incomplete"] = True
-                u["unpriced_models"] = t.get("unpriced_models") or []
-                # #626/PR#661 hunt F4: the cache kind, present-only (the
-                # llr sibling carries the identical pair).
-                if t.get("unpriced_cache_models"):
-                    u["unpriced_cache_models"] = t["unpriced_cache_models"]
-            if t.get("accounting_errors"):
-                u["accounting_errors"] = t.get("accounting_errors")
+            # #216/#626/#605 → #699: the markers survive the publication
+            # through the ONE builder, counter included — the counter
+            # implies the flag (the #644 shape; both markers, never one
+            # without the other). Run-cumulative (the accepted trade in
+            # step_report.py:147-163, the same parenthetical the llr
+            # sibling carries).
+            u.update(incomplete_markers(
+                t.get("unpriced_models"), t.get("unpriced_cache_models"),
+                t.get("accounting_errors")))
+            # the pre-#626 shape contract this block ships: the #216 list
+            # is unconditional WHEN the tracker's own flag is up (the llr
+            # sibling's identical pair — the condition reads the SOURCE
+            # totals; content-identical shapes, key order differs in the
+            # cache-only case; a counter-only flag takes the present-only
+            # pair).
+            if t.get("cost_incomplete") and not t.get("unpriced_models"):
+                u["unpriced_models"] = []
             return u
         except Exception:  # noqa: BLE001 — a usage read must never kill the stage
             return None

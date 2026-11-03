@@ -58,6 +58,13 @@ def _load_rust_language() -> Language:
 # form ending in "::test" (`#[tokio::test]`, `#[async_std::test]`). Does not
 # attempt to match custom test-harness attribute names beyond this.
 _TEST_ATTR_RE = re.compile(r"^(?:[\w:]+::)?test$")
+# #704: the harness tokens searched inside a macro_rules! definition body (the
+# expansion-shape check — textual containment, word-boundary anchored so
+# `my_fuzz_target!` / `not_fuzz!` do not ride a substring). The AFL bare form
+# is gated on the FILE's own afl macro scope at the call site, exactly as the
+# direct path gates it.
+_FUZZ_TARGET_TOKEN_RE = re.compile(r"\bfuzz_target!")
+_BARE_FUZZ_TOKEN_RE = re.compile(r"\bfuzz!")
 
 # `#[cfg(test)]` (and the common `#[cfg(any(test, ...))]` shape) marking an
 # entire module as test-only. Word-bounded so `cfg(feature = "testing")`
@@ -206,6 +213,13 @@ class FunctionExtractor:
         # builder to over-approximate calls made from a trait's default-method
         # body (which cannot know its concrete Self statically).
         self._trait_impl_pairs: List[Tuple[str, str]] = []
+        # #704 (the fable-r7 F1 catch): the macro names currently being
+        # lifted — the RECURSION GUARD. A self-/mutually-recursive wrapper
+        # (or an AFL-style tt-muncher whose body re-invokes itself) must
+        # seed ONE harness per invocation site, never an interpreter-bounded
+        # explosion (330 harnesses from a 12-line file before the guard).
+        # The guard makes "seeds once" DESIGNED, not RecursionError-luck.
+        self._lift_stack: Set[str] = set()
 
     def extract(self) -> Dict[str, Any]:
         """Extract all functions/classes/imports from scanned files.
@@ -230,6 +244,18 @@ class FunctionExtractor:
 
                 tree = self.parser.parse(source)
                 file_imports: List[dict] = []
+                # #704: this file's local macro_rules! definitions — name ->
+                # [(rule body text, rule body start line), ...]. The FULL-TREE
+                # PRE-SCAN runs BEFORE the walk, so a definition nested in a
+                # mod/fn body is in the map before any sibling invocation is
+                # processed (the worklist is LIFO — the in-walk collection
+                # alone misses the `#[macro_use] mod m { macro_rules! .. }`
+                # then top-level-invocation order, the fable-r1 F6 catch);
+                # the walk's own branch still collects for the SYNTH trees
+                # (the lifted bodies), which this scan cannot see.
+                macro_rules_local: Dict[str, List[Tuple[str, int]]] = {}
+                self._collect_macro_rules(tree.root_node, source,
+                                          macro_rules_local)
                 ctx = {
                     "qual_prefix": "",
                     "class_name": None,
@@ -238,7 +264,7 @@ class FunctionExtractor:
                 }
                 self._walk(
                     tree.root_node, source, file_path, functions, classes,
-                    file_imports, ctx,
+                    file_imports, ctx, macro_rules_local,
                 )
                 imports[file_path] = file_imports
                 files_processed += 1
@@ -246,6 +272,14 @@ class FunctionExtractor:
             except Exception as e:
                 print(f"Error processing {file_path}: {e}")
                 files_with_errors += 1
+
+        # #704 (the fable-r3 F4 catch): the file-absolute marker is PRIVATE
+        # merge-control metadata — no reader outside this module — strip it
+        # from the public tables (wrapped_macro_alias stays: informative).
+        for _info in functions.values():
+            _info.pop("_wrapped_lift_file_absolute", None)
+        for _cinfo in classes.values():
+            _cinfo.pop("_wrapped_lift_file_absolute", None)
 
         trait_impls: Dict[str, List[str]] = {}
         for trait_name, type_name in self._trait_impl_pairs:
@@ -268,6 +302,32 @@ class FunctionExtractor:
             },
         }
 
+    def _collect_macro_rules(
+        self, root: Node, source: bytes,
+        macro_rules_local: Dict[str, List[Tuple[str, int]]],
+    ) -> None:
+        """#704: the FULL-TREE macro-definition pre-scan — every
+        `macro_definition` node at any depth, name -> [(rule body text,
+        start line), ...]. The walk's own branch re-collects (duplicates are
+        harmless: _wrapped_macro_body takes the first harness-bearing body)
+        and additionally covers the synth trees the pre-scan cannot see."""
+        stack: List[Node] = [root]
+        while stack:
+            node = stack.pop()
+            if node.type == "macro_definition":
+                mname = next((_text(c, source) for c in node.children
+                              if c.type == "identifier"), None)
+                if mname:
+                    for rule in node.children:
+                        if rule.type != "macro_rule":
+                            continue
+                        tt = next((c for c in rule.children
+                                   if c.type == "token_tree"), None)
+                        if tt is not None:
+                            macro_rules_local.setdefault(mname, []).append(
+                                (_text(tt, source), tt.start_point[0]))
+            stack.extend(node.children)
+
     # -- structural walk -----------------------------------------------------
 
     def _walk(
@@ -279,6 +339,7 @@ class FunctionExtractor:
         classes: Dict[str, Any],
         imports_local: List[dict],
         ctx: dict,
+        macro_rules_local: Optional[Dict[str, List[Tuple[str, int]]]] = None,
     ) -> None:
         """Iteratively scan sibling lists, threading module/impl/fn context.
 
@@ -304,6 +365,28 @@ class FunctionExtractor:
 
                 if t == "use_declaration":
                     self._collect_use(child, source, imports_local)
+                    pending_attrs = []
+                    continue
+
+                if t == "macro_definition":
+                    # #704: macro-definition scanning — collect this file's
+                    # local `macro_rules!` bodies (name + each rule's token
+                    # tree + its start line). The bodies stay opaque token
+                    # trees (we do NOT expand); the harness-shape check is
+                    # the textual containment in _macro_body_has_harness and
+                    # the lift re-parses one rule body (see
+                    # _lift_wrapped_harness).
+                    mname = next((_text(c, source) for c in child.children
+                                  if c.type == "identifier"), None)
+                    if mname and macro_rules_local is not None:
+                        for rule in child.children:
+                            if rule.type != "macro_rule":
+                                continue
+                            tt = next((c for c in rule.children
+                                       if c.type == "token_tree"), None)
+                            if tt is not None:
+                                macro_rules_local.setdefault(mname, []).append(
+                                    (_text(tt, source), tt.start_point[0]))
                     pending_attrs = []
                     continue
 
@@ -368,10 +451,10 @@ class FunctionExtractor:
                 # macro token_tree, so no function_item is emitted and its calls
                 # (e.g. `Frame::decode`) never reach the call graph. Emit a
                 # synthetic entry-point unit carrying the body as ordinary Rust.
-                if t == "macro_invocation" and self._is_fuzz_target_macro(child, source, imports_local):
+                if t == "macro_invocation" and self._is_fuzz_target_macro(child, source, imports_local, macro_rules_local):
                     self._handle_fuzz_target(
                         child, source, file_path, functions, classes,
-                        imports_local, cur_ctx, pending_attrs,
+                        imports_local, cur_ctx, pending_attrs, macro_rules_local,
                     )
                     pending_attrs = []
                     continue
@@ -687,20 +770,25 @@ class FunctionExtractor:
         return None, name
 
     def _is_fuzz_target_macro(self, node: Node, source: bytes,
-                              imports_local: List[dict]) -> bool:
+                              imports_local: List[dict],
+                              macro_rules_local: Optional[Dict[str, List[Tuple[str, int]]]] = None,
+                              ) -> bool:
         """True if `node` is a fuzz-harness macro invocation.
 
         Recognizes libFuzzer `fuzz_target!` (bare, path-qualified, or
-        import-aliased `use libfuzzer_sys::fuzz_target as ft; ft!(..)`) and AFL's
-        `fuzz!` (path-qualified `afl::fuzz!` or `use afl::fuzz; fuzz!(..)`). A
-        bare name is resolved THROUGH the file's `use` imports to its origin
-        crate + real macro name, so an alias to an unrelated macro
-        (`use evil::thing as fuzz_target`) and a bare `fuzz!` with no afl import
-        are NOT matched (path-resolution is the over-match guard). `fuzz_target`
-        is accepted from any crate (a distinctive libFuzzer name); the generic
-        `fuzz` is accepted only from the `afl` crate. macro_rules!-wrapped
-        harnesses are out of scope (a deliberate deferral: recognizing them
-        needs macro-definition scanning + expansion-shape handling)."""
+        import-aliased `use libfuzzer_sys::fuzz_target as ft; ft!(..)`), AFL's
+        `fuzz!` (path-qualified `afl::fuzz!` or `use afl::fuzz; fuzz!(..)`),
+        and — #704 — a locally-defined `macro_rules!` wrapper whose definition
+        body contains one of those harness forms. A bare name is resolved
+        THROUGH the file's `use` imports to its origin crate + real macro
+        name, so an alias to an unrelated macro (`use evil::thing as
+        fuzz_target`) and a bare `fuzz!` with no afl import are NOT matched
+        (path-resolution is the over-match guard). `fuzz_target` is accepted
+        from any crate (a distinctive libFuzzer name); the generic `fuzz` is
+        accepted only from the `afl` crate. The #704 form accepts ONLY a
+        locally-defined macro whose body carries a harness shape (the
+        local-map lookup is its own over-match guard: a name that imports
+        resolved through the import path above and never reaches the map)."""
         ref = next((c for c in node.children
                     if c.type in ("identifier", "scoped_identifier")), None)
         if ref is None:
@@ -722,6 +810,78 @@ class FunctionExtractor:
         if (crate is None and macro_name == "fuzz"
                 and self._afl_in_macro_scope(imports_local)):
             return True
+        # #704: the macro_rules!-wrapped form — a bare name with a LOCAL
+        # definition (this file's own macro_rules!) whose rule body contains a
+        # harness form. The over-seed direction is the reachability-safe one
+        # (a recognized harness adds an entry point); the local-map lookup is
+        # the control that keeps a hostile alias from mis-lifting a real unit.
+        if crate is None and macro_rules_local:
+            if self._wrapped_macro_body(macro_name, imports_local,
+                                        macro_rules_local) is not None:
+                return True
+        return False
+
+    def _wrapped_macro_body(
+        self, macro_name: str, imports_local: List[dict],
+        macro_rules_local: Dict[str, List[Tuple[str, int]]],
+    ) -> Optional[Tuple[str, int]]:
+        """#704's expansion-shape handling: the FIRST harness-bearing rule
+        body of the locally-defined macro `macro_name`, as
+        ``(body_text, body_start_line)``, or None when the name has no local
+        definition or no rule body carries a harness form. The DISCLOSED
+        transitive-chain edge: a wrapper whose rule body carries NO harness
+        token of its own and only NAMES another local wrapper
+        (`outer => { leaf_w!(); }`) is not recognized — the invocation inside
+        a LIFTED body IS followed (the map threads through the synth walks),
+        but the name-only chain never starts a lift (under-seed, pinned in
+        the #704 suite)."""
+        if macro_name in self._lift_stack:
+            # The recursion guard: this name is already being lifted higher
+            # in the chain — the recursive invocation is not re-lifted (the
+            # outer lift already carries its closure text; re-lifting is
+            # the explosion).
+            return None
+        for body_text, start_line in macro_rules_local.get(macro_name, ()):
+            if self._macro_body_has_harness(body_text, imports_local):
+                return body_text, start_line
+        return None
+
+    def _macro_body_has_harness(self, body_text: str,
+                                imports_local: List[dict]) -> bool:
+        """True if a macro_rules! rule body CONTAINS a harness form — the
+        conservative textual containment (the token tree is opaque to
+        tree-sitter and we do not expand it). The distinctive libFuzzer token
+        is accepted from anywhere (exactly as the direct path accepts the
+        name from any crate); the AFL forms are gated exactly as the direct
+        path gates them — path-qualified `afl::fuzz!`, or a bare `fuzz!`
+        under the FILE's own afl macro scope (the macro lives in this file,
+        so the file's provenance is the gate). Word-boundary anchored so a
+        longer token (`my_fuzz_target!`) does not ride a substring."""
+        if _FUZZ_TARGET_TOKEN_RE.search(body_text):
+            return True
+        if "afl::fuzz!" in body_text:
+            return True
+        if _BARE_FUZZ_TOKEN_RE.search(body_text) and (
+                self._afl_in_macro_scope(imports_local)
+                or self._afl_fuzz_imported(imports_local)):
+            return True
+        return False
+
+    def _afl_fuzz_imported(self, imports_local: List[dict]) -> bool:
+        """True if the file binds AFL's `fuzz` macro by an UNALIASED
+        `use afl::fuzz;` — the documented afl.rs form the direct path
+        accepts (the fable-r1 F2 catch: the body gate checked only the
+        macro_use/glob scopes, silently diverging from the direct path).
+        An aliased import (`use afl::fuzz as f;`) does NOT bind the bare
+        name `fuzz` in this file, so a body calling `fuzz!` under an alias
+        is correctly NOT afl's `fuzz!`."""
+        for imp in imports_local:
+            if imp.get("kind") != "use":
+                continue
+            if (imp.get("leaf") == "fuzz"
+                    and not imp.get("alias")
+                    and (imp.get("path") or "").split("::")[0] == "afl"):
+                return True
         return False
 
     def _afl_in_macro_scope(self, imports_local: List[dict]) -> bool:
@@ -739,6 +899,7 @@ class FunctionExtractor:
         self, node: Node, source: bytes, file_path: str,
         functions: Dict[str, Any], classes: Dict[str, Any],
         imports_local: List[dict], ctx: dict, attrs: List[str],
+        macro_rules_local: Optional[Dict[str, List[Tuple[str, int]]]] = None,
     ) -> None:
         """Synthesize an entry-point unit from a `fuzz_target!(|d| { .. })` body.
 
@@ -755,11 +916,48 @@ class FunctionExtractor:
         forced to ``unit_type="main"`` so it seeds reachability, and tagged
         ``synthetic_harness`` so downstream stages can special-case it.
         """
-        # Test-gated harness (`#[cfg(test)] fuzz_target!` or inside a test scope)
-        # is skipped like a normal test function when tests are excluded.
+        # Test-gated harness (inside a test scope — `in_test_scope` from an
+        # enclosing `#[test]` fn, or a `#[cfg(test)]`/test attr reaching this
+        # node through pending_attrs) is skipped like a normal test function
+        # when tests are excluded. DISCLOSED PRE-EXISTING LIMIT (#704's
+        # side-finding, both forms leak it): an attr on the invocation's own
+        # STATEMENT (`#[cfg(test)]\nfuzz_target!(..);`) is dropped at the
+        # statement boundary (the walk pushes the expression_statement with
+        # pending_attrs cleared) and never reaches this gate — the harness
+        # seeds anyway. The leak is the over-seed direction (a test-gated
+        # harness treated as an entry point — the reachability-SAFE false
+        # positive); the strict-xfail pin in the #704 suite retires loudly if
+        # the attr threading is ever fixed.
         is_test_attr = any(_TEST_ATTR_RE.match(a) for a in attrs)
         if (is_test_attr or ctx.get("in_test_scope")) and self.skip_tests:
             return
+
+        # #704: the macro_rules!-wrapped form — this invocation's own token
+        # tree carries no closure (`fuzz_entry!()` expands elsewhere); the
+        # closure lives in the macro DEFINITION's rule body. Dispatch to the
+        # wrapper lift; the direct path below is untouched.
+        ref = next((c for c in node.children
+                    if c.type in ("identifier", "scoped_identifier")), None)
+        if ref is not None:
+            rtext = _text(ref, source)
+            if "::" not in rtext and macro_rules_local:
+                crate_w, name_w = self._resolve_macro_origin(rtext, imports_local)
+                if crate_w is None:
+                    wrapped = self._wrapped_macro_body(
+                        name_w, imports_local, macro_rules_local)
+                    if wrapped is not None:
+                        lifted = self._lift_wrapped_harness(
+                            wrapped[0], wrapped[1], file_path, functions,
+                            classes, imports_local, ctx, macro_rules_local,
+                            name_w)
+                        if lifted:
+                            return
+                        # The lift merged NOTHING (the fable-r1 F3 catch:
+                        # a PASS-THROUGH wrapper — `($c:expr) => {
+                        # fuzz_target!($c) }` — whose rule body carries no
+                        # closure of its own; the closure lives at the
+                        # INVOCATION site). Fall through to the direct path
+                        # so the invocation's own token_tree is lifted.
 
         # Locate the closure body via tree-sitter token_tree nodes (string/comment
         # -safe, unlike a raw brace scan). Macro args are `( |params| BODY )`.
@@ -828,6 +1026,7 @@ class FunctionExtractor:
             self._walk(
                 self.parser.parse(synth).root_node, synth, file_path,
                 synth_funcs, synth_classes, imports_local, walk_ctx,
+                macro_rules_local,
             )
         except Exception:
             return
@@ -842,8 +1041,17 @@ class FunctionExtractor:
                     info[k] = info[k] + base_line
 
         for fid, info in synth_funcs.items():
-            # Offset the synthetic line numbers back onto the real harness body.
-            _offset(info)
+            # Offset the synthetic line numbers back onto the real harness
+            # body — EXCEPT units an inner WRAPPER lift already made
+            # file-absolute (the #704 fable-r2 R2-2 double-offset class: a
+            # wrapper lift invoked inside this body converts with the MAP's
+            # file-relative line, so its output is file-absolute and this
+            # merge must not offset it again; the marker passes through).
+            _file_abs = info.pop("_wrapped_lift_file_absolute", False)
+            if not _file_abs:
+                _offset(info)
+            if _file_abs:
+                info["_wrapped_lift_file_absolute"] = True
             if fid == harness_id:
                 # The walk classified the lifted `fn` as a plain function; retype
                 # it to a structural entry point and tag it synthetic.
@@ -852,14 +1060,160 @@ class FunctionExtractor:
                 info["synthetic_harness"] = True
             if fid not in functions:
                 functions[fid] = info
+            elif _file_abs and info.get("synthetic_harness"):
+                # A wrapper-lifted harness colliding with a real unit in the
+                # table (the fable-r3 F3 catch: the silent drop was the
+                # UNDER-SEED direction and order-dependent). Mirror the
+                # wrapper merge's rename instead of dropping.
+                _n = 2
+                while f"{fid}__wrapped{_n}" in functions:
+                    _n += 1
+                info = dict(info)
+                info["wrapped_macro_alias"] = fid
+                functions[f"{fid}__wrapped{_n}"] = info
 
         # Nested harness-local types: record with offset lines, but never clobber
-        # a real same-named crate type (a real definition always wins).
+        # a real same-named crate type (a real definition always wins). The
+        # marker skip mirrors the functions loop: an inner WRAPPER lift's
+        # classes are already file-absolute (the fable-r3 F2 catch — the
+        # functions were protected, the classes double-offset).
         for cid, cinfo in synth_classes.items():
             if cid in classes:
                 continue
-            _offset(cinfo)
+            _cls_abs = cinfo.pop("_wrapped_lift_file_absolute", False)
+            if not _cls_abs:
+                _offset(cinfo)
+            if _cls_abs:
+                # pass the marker through (the fable-r4 F5 catch: the class
+                # loop popped but never re-set, so a wrapper-lifted class
+                # passing through a direct merge inside an enclosing wrapper
+                # merge double-offsetted)
+                cinfo["_wrapped_lift_file_absolute"] = True
             classes[cid] = cinfo
+
+    def _lift_wrapped_harness(
+        self, macro_body_text: str, body_start_line: int, file_path: str,
+        functions: Dict[str, Any], classes: Dict[str, Any],
+        imports_local: List[dict], ctx: dict,
+        macro_rules_local: Optional[Dict[str, List[Tuple[str, int]]]] = None,
+        macro_name: str = "",
+    ) -> bool:
+        """Lift a macro_rules!-wrapped harness (#704): re-parse the
+        harness-bearing rule body as a wrapper fn and run the ORDINARY walk
+        over it, so the inner harness invocation inside the body parses as a
+        real `macro_invocation` node and the DIRECT machinery above
+        (_handle_fuzz_target) lifts the actual closure — typed `main` +
+        `synthetic_harness` by its own merge, exactly as a direct harness.
+        The wrapper fn is a VEHICLE, never a unit.
+
+        Line offsets: the rule body is embedded verbatim starting at synth
+        line 0, so a lifted unit's real line = its synth line + the rule
+        body's own start line in the real file (the inner merge already made
+        its lines absolute within THIS synth source). Disclosed edges: a
+        body whose closure references `$`-metavariables may not parse and is
+        silently skipped (the same failure mode as the direct path's
+        unparseable bodies); two invocations of one wrapper expand to
+        identical closure text and dedup to ONE unit (identical reachable
+        set)."""
+        # the recursion guard's bookkeeping: the name is on the stack for
+        # the whole inner walk (a nested invocation of the SAME macro inside
+        # the lifted body re-enters _wrapped_macro_body and stops there)
+        self._lift_stack.add(macro_name)
+        try:
+            return self._lift_wrapped_harness_inner(
+                macro_body_text, body_start_line, file_path, functions,
+                classes, imports_local, ctx, macro_rules_local)
+        finally:
+            self._lift_stack.discard(macro_name)
+
+    def _lift_wrapped_harness_inner(
+        self, macro_body_text: str, body_start_line: int, file_path: str,
+        functions: Dict[str, Any], classes: Dict[str, Any],
+        imports_local: List[dict], ctx: dict,
+        macro_rules_local: Optional[Dict[str, List[Tuple[str, int]]]] = None,
+    ) -> bool:
+        name = "__wrapped_macro_harness__"
+        synth = f"fn {name}() {macro_body_text}".encode("utf-8")
+        synth_funcs: Dict[str, Any] = {}
+        synth_classes: Dict[str, Any] = {}
+        walk_ctx = {
+            "qual_prefix": "",
+            "class_name": None,
+            "module_path": ctx.get("module_path", ()),
+            "in_test_scope": ctx.get("in_test_scope", False),
+        }
+        try:
+            self._walk(
+                self.parser.parse(synth).root_node, synth, file_path,
+                synth_funcs, synth_classes, imports_local, walk_ctx,
+                macro_rules_local,
+            )
+        except Exception:
+            return False
+
+        vehicle_id = f"{file_path}:{name}"
+        merged = 0
+
+        def _offset(info):
+            for k in ("start_line", "end_line"):
+                if isinstance(info.get(k), int):
+                    info[k] = info[k] + body_start_line
+
+        for fid, info in synth_funcs.items():
+            if fid == vehicle_id:
+                continue
+            _file_abs = info.pop("_wrapped_lift_file_absolute", False)
+            if not _file_abs:
+                _offset(info)
+            # This merge's output is FILE-absolute (the offset above used the
+            # map's file-relative body_start_line): mark every unit it writes
+            # so an enclosing merge (a wrapper lift around THIS one) never
+            # offsets it again — the fable-r2 R2-2 fix, correct at every
+            # nesting level.
+            info["_wrapped_lift_file_absolute"] = True
+            target_fid = fid
+            if fid in functions:
+                existing = functions[fid]
+                same_unit = (
+                    existing.get("code") == info.get("code")
+                    and existing.get("synthetic_harness")
+                    and info.get("synthetic_harness")
+                )
+                if same_unit:
+                    # identical expansion text (two invocations of ONE
+                    # wrapper): the first unit stands, the dedup holds. The
+                    # dedup IS a successful lift — count it (the fable-r2 S4
+                    # catch: leaving merged=0 fell through to the direct
+                    # path, order-dependently lifting the invocation's own
+                    # args as a second harness).
+                    merged += 1
+                    continue
+                if not info.get("synthetic_harness"):
+                    continue  # never clobber a real unit with a lift artifact
+                # A DIFFERENT harness body occupies the id (two different
+                # wrappers in one file, or a direct harness + a wrapped one):
+                # rename with a suffixed id instead of silently dropping the
+                # second — the drop was the UNDER-SEED direction (the fable-r1
+                # F1 catch: `a`'s closure edges were lost while `b` survived).
+                n = 2
+                while f"{fid}__wrapped{n}" in functions:
+                    n += 1
+                target_fid = f"{fid}__wrapped{n}"
+                info = dict(info)
+                info["wrapped_macro_alias"] = fid
+            functions[target_fid] = info
+            merged += 1
+        for cid, cinfo in synth_classes.items():
+            if cid in classes:
+                continue
+            _cls_abs = cinfo.pop("_wrapped_lift_file_absolute", False)
+            if not _cls_abs:
+                _offset(cinfo)
+            # this merge's class output is file-absolute: mark it for any
+            # enclosing merge (the fable-r3 F2 fix)
+            cinfo["_wrapped_lift_file_absolute"] = True
+            classes[cid] = cinfo
+        return merged > 0
 
     def _classify(
         self, name: str, class_name: Optional[str], has_self: bool,

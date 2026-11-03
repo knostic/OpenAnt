@@ -38,6 +38,7 @@ import anthropic
 from ._ratelimit import report_rate_limit, wait_for_rate_limit
 from .._pricing import LazyProviderPricing
 from .._redact import redact_secrets, redacted_cause_from
+from .. import LLMConfigError
 from ..adapter import (
     CompletionResult,
     ContentBlock,
@@ -108,6 +109,20 @@ def reset_warnings() -> None:
         _warned_stop_reasons.clear()
     with _warned_block_kinds_lock:
         _warned_block_kinds.clear()
+
+
+# #646: the validate() probe's per-request timeout (SECONDS) — a cheap
+# 1-token liveness check, not a full request: with the 600 s adapter
+# default and max_retries=5 a black-holed probe fails after ~61
+# minutes worst case; 15 s anchors the Go wizard's probe
+# (llm_probe_google.go: http.Client{Timeout: 15 * time.Second}), so
+# the probe fails in ~104 s worst case (the client's max_retries=5
+# inherited: 6 jittered attempts under a 15 s deadline — the
+# opus-r1 wire measurement), down from the ~61 minutes of the
+# unbounded 600 s shape; the Go wizard's ONE-attempt probe is
+# tighter still. The request path's 600 s default and its
+# max_retries are UNTOUCHED.
+PROBE_TIMEOUT_SECONDS = 15
 
 
 class AnthropicAdapter:
@@ -203,6 +218,22 @@ class AnthropicAdapter:
         if self.thinking is not None:
             request["thinking"] = self.thinking
 
+        # #696 trigger 3: the thinking budget must leave room for the
+        # response — a budget >= max_tokens reaches messages.create with no
+        # check and the provider rejects it AFTER iteration 1 is billed.
+        # Refuse it up front as a config error (it recurs on every unit —
+        # the designed-abort class the analyze stage re-raises).
+        if (self.thinking is not None
+                and self.thinking.get("type") not in (None, "disabled")):
+            budget = self.thinking.get("budget_tokens")
+            if isinstance(budget, int) and budget >= max_tokens:
+                raise LLMConfigError(
+                    f"thinking budget_tokens ({budget}) must be less than "
+                    f"max_tokens ({max_tokens}) — the budget is carved out "
+                    "of the response allowance and leaves no room for the "
+                    "response itself; lower budget_tokens or raise max_tokens"
+                )
+
         # #625 T1 guard (2026-09-21, the retro bug-hunt finding): a
         # thinking-enabled request WITH tools requires the thinking blocks
         # preserved on the echoed assistant turn (Anthropic's documented
@@ -212,7 +243,7 @@ class AnthropicAdapter:
         # failure; the full preserved-blocks handling is a separate change.
         if (tools and self.thinking is not None
                 and self.thinking.get("type") not in (None, "disabled")):
-            raise LLMResponseError(
+            raise LLMConfigError(
                 f"AnthropicAdapter refuses thinking+tools: thinking blocks must be "
                 "preserved on the echoed assistant turn for multi-turn tool "
                 "loops, and this adapter's loop echo does not carry them "
@@ -278,6 +309,7 @@ class AnthropicAdapter:
         # below so the caller sees a typed error.
         try:
             self._client.messages.create(
+                timeout=PROBE_TIMEOUT_SECONDS,  # #646: the probe's tight deadline
                 model=model,
                 max_tokens=1,
                 messages=[{"role": "user", "content": "hi"}],

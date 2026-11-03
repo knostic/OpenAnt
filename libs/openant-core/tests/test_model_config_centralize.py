@@ -182,10 +182,40 @@ _EXPECTED_ANTHROPIC_CURRENT = {
     "claude-mythos-5": {"input": 10.00, "output": 50.00},
     "claude-mythos-5-1": {"input": 10.00, "output": 50.00},
     "claude-opus-4-7": {"input": 5.00, "output": 25.00},
+    # #648: the 4.5-generation census + the opus-4-6 status flip — every
+    # rate independently sourced (Anthropic's live pricing page + the live
+    # OpenRouter catalogue, both fetched 2026-10-20, both agreeing).
+    "claude-opus-4-5": {"input": 5.00, "output": 25.00},
+    "claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
+    # #648: the dated snapshot spellings (their own records; the #434
+    # alias machinery also resolves them)
+    "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00},
+    "claude-sonnet-4-5-20250929": {"input": 3.00, "output": 15.00},
+    # #648: the liveness dispute RESOLVED (the page's priced row + the
+    # SDK literal + the OpenRouter listing)
+    "claude-opus-4-6": {"input": 5.00, "output": 25.00},
+    # #648 (the opus-r1 catch): the bare haiku-4-5 spelling — an SDK
+    # literal the census was missing; same rate as the dated form
+    "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
+    # #648 (the S6 witness's remainder): the 5.5 generation. The SDK's
+    # model-literal union carries claude-opus-5-5, claude-sonnet-5-5 and
+    # claude-haiku-5-5, and NO record priced them — the S6 census row
+    # failed on the first of them. Every rate independently sourced
+    # (Anthropic's live pricing page + the live OpenRouter catalogue, both
+    # fetched 2026-10-21, both agreeing to the cent). Note that Opus 5.5
+    # is the first Opus to price BELOW its predecessor ($4/$20 against
+    # Opus 5's $5/$25), so this snapshot's value is NOT the family rate.
+    "claude-opus-5-5": {"input": 4.00, "output": 20.00},
+    "claude-sonnet-5-5": {"input": 2.00, "output": 10.00},
+    # Haiku 5.5's BASE (prompts up to 100k) row — the page prices this one
+    # model by prompt length and the record models the base tier only; the
+    # record's own source field names the untracked over-100k tier.
+    "claude-haiku-5-5": {"input": 0.10, "output": 0.50},
 }
 _RETIRED_OR_UNKNOWN_ANTHROPIC = {
     "claude-opus-4-20250514",
-    "claude-opus-4-6",
+    # #648: claude-opus-4-6 moved to _EXPECTED_ANTHROPIC_CURRENT (the
+    # liveness dispute resolved — the page prices it, the SDK carries it)
     "claude-sonnet-4-20250514",
     # #610: SDK-listed with NO published price row on Anthropic's page —
     # deliberately unpriced (the registry's unknown/null form); pinned
@@ -227,9 +257,6 @@ _EXPECTED_PHASE_MODELS = {
     "llm_reach": "claude-opus-4-8",
     "app_context": "claude-sonnet-4-6",
 }
-_EXPECTED_LEGACY_ENHANCE = "claude-sonnet-4-20250514"
-
-
 def test_c_pricing_maps_match_pre_refactor_snapshot():
     # Values are now sourced from config/models.json via core.model_registry.
     # Behavior-preserving for CURRENT models; retired/unknown ids are omitted.
@@ -271,7 +298,6 @@ def test_c_consumers_resolve_to_pre_refactor_values():
     from utilities.llm.providers.google import GoogleAdapter
     from utilities.llm.providers.openai import OpenAIAdapter
     from utilities.llm.builtins import OPENANT_DEFAULT
-    from utilities.context_enhancer import CONTEXT_ENHANCEMENT_MODEL_LEGACY
 
     # #434: subset semantics — the maps gained alias spellings; the exact
     # keys keep their exact values. #626: pair-compare (cache multipliers
@@ -283,8 +309,6 @@ def test_c_consumers_resolve_to_pre_refactor_values():
         assert (OpenAIAdapter.pricing[k]["input"], OpenAIAdapter.pricing[k]["output"]) == (v["input"], v["output"]), k
     for k, v in _EXPECTED_GOOGLE.items():
         assert (GoogleAdapter.pricing[k]["input"], GoogleAdapter.pricing[k]["output"]) == (v["input"], v["output"]), k
-    assert CONTEXT_ENHANCEMENT_MODEL_LEGACY == _EXPECTED_LEGACY_ENHANCE
-
     resolved = {p: OPENANT_DEFAULT.phases[p].model for p in _EXPECTED_PHASE_MODELS}
     assert resolved == _EXPECTED_PHASE_MODELS
 

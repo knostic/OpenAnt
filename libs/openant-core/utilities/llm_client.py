@@ -112,7 +112,7 @@ CACHE_READ_FIELDS_EXCLUSIVE = ("cache_read_input_tokens",)      # anthropic / be
 CACHE_READ_FIELDS_INCLUSIVE = ("cached_tokens",                 # openai / openrouter
                                "cached_content_token_count")    # google
 CACHE_WRITE_FIELDS_EXCLUSIVE = ("cache_creation_input_tokens",)  # anthropic / bedrock
-CACHE_WRITE_FIELDS_INCLUSIVE = ("cache_write_tokens",)           # openrouter (inside prompt_tokens)
+CACHE_WRITE_FIELDS_INCLUSIVE = ("cache_write_tokens",)           # openrouter (inside prompt_tokens — the OpenAI-normalized usage shape: OpenRouter's usage-object docs (openrouter.ai/docs/features/prompt-caching, fetched 2026-10-20) show cache_write_tokens in prompt_tokens_details, the same inclusive shape as OpenAI's cached_tokens)
 # the union (the captured-verbatim normalization, unchanged)
 CACHE_READ_FIELDS = CACHE_READ_FIELDS_EXCLUSIVE + CACHE_READ_FIELDS_INCLUSIVE
 CACHE_WRITE_FIELDS = CACHE_WRITE_FIELDS_EXCLUSIVE + CACHE_WRITE_FIELDS_INCLUSIVE
@@ -150,7 +150,8 @@ class PricedUsage(NamedTuple):
     #: the run is incomplete. The DIRECTION the figure errs in depends on the
     #: provider's field shape and is OPPOSITE for the two (PR#661 hunt F1 —
     #: the round-1 label asserted "an UPPER bound" for both, which was false
-    #: for 11 of the 11 shipped bedrock records):
+    #: for the ENTIRE shipped bedrock census at the #661 pin — pre-#690
+    #: the bedrock family carried no cache rates; #690 rated all 11):
     #:
     #:   EXCLUSIVE shapes (anthropic/bedrock ``cache_read_input_tokens`` /
     #:     ``cache_creation_input_tokens``) are DISJOINT from ``input_tokens``,
@@ -306,7 +307,7 @@ def price_usage(
     # input_tokens — subtract it from the billed input (it prices at its
     # own multiplier below, never twice). T1 round-2 (F-A): subtract ONLY
     # the portion that actually prices at a multiplier — an unpriced
-    # inclusive cache (the shipped census: no openai/google cache rates)
+    # inclusive cache (the #661-era census had no openai/google rates; the post-#690 unrated class: the ollama records, the unpublished-cache google 2.0/1.5 models, the divergent-price z-ai routes)
     # must degrade to the FULL-RATE upper bound (master's direction,
     # over-estimate + cost_incomplete), never to a $0 under-report of the
     # cached tokens.
@@ -316,11 +317,21 @@ def price_usage(
     if counts.write_incl and "cache_write" in pricing:
         _incl_priced += counts.write_incl
     _billed_input = input_tokens - _incl_priced
+    unpriced_side = False
     if _billed_input < 0:
         _billed_input = 0
+        # the fable-r1 overlap catch (the OpenRouter->Google explicit-cache
+        # shape reports the SAME tokens as both cached_tokens AND
+        # cache_write_tokens, live-verified: prompt=5137, cached=5132,
+        # write=5132 — the subtraction clamps away the whole uncached
+        # remainder, silently under-reporting min(uncached, overlap) x
+        # the input rate with cost_incomplete=False). Unreachable from
+        # OpenAnt today (no explicit-cache breakpoints are ever sent),
+        # but priced-complete since #690 — mark the run INCOMPLETE so the
+        # shape is loud, never silently under-reported.
+        unpriced_side = True
     total_cost = ((_billed_input / 1_000_000) * pricing["input"]
                   + (output_tokens / 1_000_000) * pricing["output"])
-    unpriced_side = False
     if counts.any:
         # #626: the cache portion, priced at its own multipliers of the
         # base input rate. T8 fix (2026-09-21, the retro probe): each side
@@ -371,25 +382,44 @@ def price_usage(
 # ---------------------------------------------------------------------------
 
 
-def incomplete_markers(unpriced=None, unpriced_cache=None) -> dict:
+def incomplete_markers(unpriced=None, unpriced_cache=None,
+                       accounting_errors=0) -> dict:
     """The incompleteness marker keys for a usage/summary dict.
 
-    Returns ``{}`` when neither kind is present (never a fabricated
+    Returns ``{}`` when no kind is present (never a fabricated
     ``cost_incomplete: False`` — absent means "nothing to disclose", and the
     byte-identity contract for a clean run depends on the absence).
 
     Accepts any iterables (sets, lists, None); emits SORTED, de-duplicated
     lists so two restore sites that merged the same ids agree byte-for-byte.
+
+    #699: the #605 accounting-error COUNTER is the third incompleteness
+    kind, and it carries the #633 pairing invariant the five _summary.json
+    writers each implemented differently (llr/dt published the counter
+    without the flag; analyze/verify published neither; enhance alone
+    forced the flag — the #644 shape): an accounting error implies
+    cost_incomplete — "both markers, never one without the other" (the
+    step report's step_report.py:219-222 wording). The pairing now lives
+    HERE, once, for every writer. A non-int / non-positive counter is
+    SKIPPED, never coerced into a fabricated pair (the #697 F3 guard
+    class; bool excluded — True is a flag, not a count).
     """
     _u = sorted(set(unpriced or ()))
     _c = sorted(set(unpriced_cache or ()))
+    _errs = (accounting_errors
+             if isinstance(accounting_errors, int)
+             and not isinstance(accounting_errors, bool)
+             and accounting_errors > 0
+             else 0)
     out: dict = {}
-    if _u or _c:
+    if _u or _c or _errs:
         out["cost_incomplete"] = True
     if _u:
         out["unpriced_models"] = _u
     if _c:
         out["unpriced_cache_models"] = _c
+    if _errs:
+        out["accounting_errors"] = _errs
     return out
 
 
@@ -574,6 +604,10 @@ class TokenTracker:
             # the billing-reconciliation totals).
             self.total_cache_read_tokens = 0
             self.total_cache_write_tokens = 0
+            # #697: the dropped-block per-kind counts (#625/#660's
+            # diagnostic — computed per call on the CompletionResult,
+            # accumulated here so the run's artifacts can carry it).
+            self._dropped_block_kinds: dict[str, int] = {}
 
     @property
     def total_tokens(self) -> int:
@@ -590,6 +624,7 @@ class TokenTracker:
         usage_details: dict | list | None = None,
         turns: int | None = None,
         provider_cost_usd: float | None = None,
+        dropped_block_kinds: dict[str, int] | None = None,
     ) -> dict:
         """
         Record a single LLM call.
@@ -759,6 +794,19 @@ class TokenTracker:
                 self.total_cache_read_tokens += cache_read + cache_read_incl
             if cache_write or cache_write_incl:
                 self.total_cache_write_tokens += cache_write + cache_write_incl
+            # #697: the per-call dropped-block counts accumulate per kind
+            # (present-only — a call that dropped nothing adds nothing).
+            if dropped_block_kinds:
+                for _kind, _n in dropped_block_kinds.items():
+                    # fable-F3: a non-numeric count is SKIPPED, never
+                    # coerced to a 0-valued key (a present-only dict must
+                    # not grow a zero entry from garbage); bool counts as
+                    # numeric-by-heritage but a bool here is a caller's
+                    # mistake — skip it too.
+                    if isinstance(_n, bool) or not isinstance(_n, (int, float)):
+                        continue
+                    self._dropped_block_kinds[_kind] = (
+                        self._dropped_block_kinds.get(_kind, 0) + int(_n))
 
         # Accumulate to thread-local unit tracking if active
         tl = self._thread_local
@@ -906,6 +954,10 @@ class TokenTracker:
                 out["total_cache_write_tokens"] = self.total_cache_write_tokens
             if self._unpriced_cache_models:
                 out["unpriced_cache_models"] = sorted(self._unpriced_cache_models)
+            # #697: the dropped-block per-kind counts, present-only (a
+            # clean run's totals shape is byte-identical to pre-#697).
+            if self._dropped_block_kinds:
+                out["dropped_block_kinds"] = dict(self._dropped_block_kinds)
             return out
 
     def get_totals(self) -> dict:
@@ -936,6 +988,10 @@ class TokenTracker:
                 out["total_cache_write_tokens"] = self.total_cache_write_tokens
             if self._unpriced_cache_models:
                 out["unpriced_cache_models"] = sorted(self._unpriced_cache_models)
+            # #697: the dropped-block per-kind counts, present-only (a
+            # clean run's totals shape is byte-identical to pre-#697).
+            if self._dropped_block_kinds:
+                out["dropped_block_kinds"] = dict(self._dropped_block_kinds)
             # #605: present-only — a healthy run's totals serialize
             # byte-identical to pre-#605.
             _errs = _accounting_error_count()

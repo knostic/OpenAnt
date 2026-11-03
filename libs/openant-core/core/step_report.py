@@ -123,7 +123,24 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
             _summary = report.summary if isinstance(report.summary, dict) else {}
             _counted = _summary.get("error_count")
             _error_count = _counted if isinstance(_counted, int) and _counted > 0 else 0
-            if report.errors or _error_count:
+            # #742: an incomplete unit degrades the step exactly as an
+            # errored one does — the symmetric rule to ``error_count``
+            # (``incomplete_count`` is the enhancer's well-typed int counter
+            # for units that hit the iteration limit and discarded their
+            # gathered context, the #730 class; the campaign measured 2-of-3
+            # runs reporting ``success`` with ``incomplete_count: 1`` as a
+            # summary counter only, and an ALL-incomplete enhancement —
+            # every unit discarded — reading the same green). No fraction
+            # threshold: ``error_count`` has none either, and one
+            # incomplete unit is one unit the step did not deliver.
+            # Deliberately still ``partial``, never ``error`` (the
+            # propagating-exception reserve, #285): the step ran and
+            # recorded what it could not finish.
+            _incomplete = _summary.get("incomplete_count")
+            _incomplete_count = (_incomplete
+                                 if isinstance(_incomplete, int) and _incomplete > 0
+                                 else 0)
+            if report.errors or _error_count or _incomplete_count:
                 report.status = "partial"
 
         report.duration_seconds = round(time.monotonic() - start, 2)
@@ -165,6 +182,12 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
                 if end_snapshot.get("unpriced_cache_models"):
                     report.token_usage["unpriced_cache_models"] = \
                         end_snapshot["unpriced_cache_models"]
+                # #697: the dropped-block per-kind counts survive the
+                # sentinel too (run-cumulative, the #216 disclosure trade)
+                # — present-only.
+                if end_snapshot.get("dropped_block_kinds"):
+                    report.token_usage["dropped_block_kinds"] = dict(
+                        end_snapshot["dropped_block_kinds"])
         else:
             report.cost_usd = round(end_cost - start_cost, 6)
             report.token_usage = {
@@ -179,6 +202,20 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
                               - start_tokens.get(_ck, 0))
                     if _delta:
                         report.token_usage[_ck] = _delta
+            # #697: the step's dropped-block per-kind DELTA (present-only —
+            # a step that dropped nothing keeps its token_usage shape
+            # byte-identical to pre-#697). Per-kind subtraction, never a
+            # whole-dict replace: a resumed step inherits the run-cumulative
+            # counts at start and credits exactly its own drops.
+            _dk_end = end_snapshot.get("dropped_block_kinds") or {}
+            _dk_start = start_tokens.get("dropped_block_kinds") or {}
+            _dk_delta: dict[str, int] = {}
+            for _kind in set(_dk_end) | set(_dk_start):
+                _d = int(_dk_end.get(_kind, 0)) - int(_dk_start.get(_kind, 0))
+                if _d:
+                    _dk_delta[_kind] = _d
+            if _dk_delta:
+                report.token_usage["dropped_block_kinds"] = _dk_delta
             # #216: a step whose cost is incomplete (any call on an unpriced
             # model) must say so IN the artifact — OR the end snapshot's marker
             # (run-cumulative, so a step after unpriced spend also flags).
@@ -236,12 +273,35 @@ def _snapshot_usage() -> tuple[float | None, dict | None]:
             snap["cache_write"] = usage.total_cache_write_tokens
         if usage.unpriced_cache_models:
             snap["unpriced_cache_models"] = usage.unpriced_cache_models
+        # #697: the dropped-block per-kind counts — read from the tracker
+        # totals directly (NEVER from UsageInfo: that dataclass's asdict
+        # reaches result envelopes, so a field there would add a key to
+        # every envelope; the diagnostic stays in the token_usage
+        # channel). Present-only, run-cumulative (the same accepted trade
+        # as #216's cost_incomplete: the snapshot is a point-in-time
+        # totals read; the step report computes the per-kind DELTA from
+        # the start/end snapshot pair).
+        try:
+            from utilities.llm_client import get_global_tracker
+            _dk = get_global_tracker().get_totals().get("dropped_block_kinds")
+            if _dk:
+                snap["dropped_block_kinds"] = dict(_dk)
+        except Exception:
+            pass
         return usage.total_cost_usd, snap
     except Exception as exc:
         # #605: a failed snapshot is a SENTINEL, never a complete-looking
         # zero — the caller must skip the subtraction (a fabricated baseline
         # produces negative deltas or charges another step's spend) and
-        # mark the step's accounting incomplete.
-        print(f"[step-report] accounting snapshot failed ({type(exc).__name__}): "
-              f"{exc}", file=sys.stderr)
+        # mark the step's accounting incomplete. The print is itself
+        # guarded (#701, the #644 pattern at agent.py:431-453, the fable
+        # r1 F1 twin): a closed/encoding-broken stderr raising HERE would
+        # escape the sentinel path and kill the step the sentinel exists
+        # to protect — the diagnostic may never become the failure.
+        try:
+            print(f"[step-report] accounting snapshot failed "
+                  f"({type(exc).__name__}): {exc}", file=sys.stderr)
+        except Exception:
+            pass  # stderr unavailable — the (None, None) sentinel is the
+                  # durable signal; the step still completes
         return None, None

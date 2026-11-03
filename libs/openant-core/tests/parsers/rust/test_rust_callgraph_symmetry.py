@@ -3,7 +3,10 @@
 Asserts exact BIDIRECTIONAL consistency — B in call_graph[A] iff A in
 reverse_call_graph[B] — plus every graph key is a real function id. A parser that
 populates one direction but not the other silently corrupts reachability (which
-BFS-walks the reverse graph). Mirrors the swift/zig symmetry tests.
+BFS-walks the reverse graph). Mirrors the c/swift symmetry tests (the zig
+suite joined with #702; this docstring's earlier "swift/zig" reference
+predates it and named a sibling that did not exist — #702's stale
+cross-reference, fixed).
 """
 
 import pathlib

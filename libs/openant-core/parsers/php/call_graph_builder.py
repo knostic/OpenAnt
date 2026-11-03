@@ -191,6 +191,20 @@ class CallGraphBuilder:
         """Check if name is a PHP builtin or common function."""
         return name.lower() in PHP_BUILTINS  # PHP function names are case-insensitive
 
+    def _user_free_function_shadows(self, name: str) -> bool:
+        """#835: True when a user-declared FREE function (never a class
+        method — functions_by_name indexes both) carries this exact name.
+        The #835 user-first gate's own predicate, hoisted so all three
+        sites share it: a bare membership check fired for a method named
+        like a builtin (Countable::count — a PHP-mandated interface
+        method name inside PHP_BUILTINS) and the resolver's import path
+        lacks the class_name filter, fabricating an edge from a genuine
+        builtin call to the method. A method never shadows a global
+        function in PHP."""
+        return any(
+            not self.functions.get(func_id, {}).get('class_name')
+            for func_id in self.functions_by_name.get(name, []))
+
     def _extract_calls_from_code(self, code: str, caller_id: str) -> Set[str]:
         """Extract function call references from code using tree-sitter."""
         calls = set()
@@ -243,9 +257,9 @@ class CallGraphBuilder:
                             calls.add(rid)
                     stack.extend(reversed(node.children))
                     continue
-                resolved = self._resolve_call_node(node, code_bytes, caller_file,
-                                                   caller_class, caller_namespace, root)
-                if resolved:
+                for resolved in self._resolve_call_node(node, code_bytes, caller_file,
+                                                        caller_class, caller_namespace,
+                                                        root):
                     calls.add(resolved)
                     if node.type == 'function_call_expression':
                         # A bare call that resolved to a same-file global may be one
@@ -263,25 +277,38 @@ class CallGraphBuilder:
     def _resolve_call_node(self, node, source: bytes, caller_file: str,
                            caller_class: Optional[str],
                            caller_namespace: Optional[str] = None,
-                           root=None) -> Optional[str]:
-        """Resolve a tree-sitter call node to a function ID."""
+                           root=None) -> List[str]:
+        """Resolve a tree-sitter call node to its call-edge targets.
+
+        One call node can own MORE than one edge: an in-scope user shadow
+        of a higher-order builtin keeps BOTH its own edge and base's
+        callback-argument edge (#835, the astra-r1 conservative-retention
+        catch). Every other shape resolves to exactly zero or one target."""
         if node.type == 'function_call_expression':
             return self._resolve_function_call(node, source, caller_file, caller_class,
                                                caller_namespace, root)
-        elif node.type == 'member_call_expression':
-            return self._resolve_member_call(node, source, caller_file, caller_class, root)
+        if node.type == 'member_call_expression':
+            rid = self._resolve_member_call(node, source, caller_file, caller_class, root)
         elif node.type == 'scoped_call_expression':
-            return self._resolve_scoped_call(node, source, caller_file, caller_class)
+            rid = self._resolve_scoped_call(node, source, caller_file, caller_class)
         elif node.type == 'object_creation_expression':
-            return self._resolve_new(node, source, caller_file, caller_class)
-        return None
+            rid = self._resolve_new(node, source, caller_file, caller_class)
+        else:
+            return []
+        return [rid] if rid else []
 
     def _resolve_function_call(self, node, source: bytes, caller_file: str,
                                 caller_class: Optional[str],
                                 caller_namespace: Optional[str] = None,
-                                root=None) -> Optional[str]:
-        """Resolve a simple function call like func()."""
+                                root=None) -> List[str]:
+        """Resolve a simple function call like func() to its edge targets."""
         func_name = None
+        # #835 (the opus F3 catch): the leading-\ escape (\hash) names
+        # the GLOBAL function explicitly — PHP never binds it to a
+        # namespaced user function, so the user-first rescue must NOT
+        # fire for this shape (the single-backslash form; \App\hash
+        # keeps its normal namespaced resolution).
+        _global_escape = False
 
         for child in node.children:
             if child.type in ('name', 'identifier'):
@@ -289,6 +316,11 @@ class CallGraphBuilder:
                 break
             elif child.type == 'qualified_name':
                 func_name = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
+                # #835 (the opus F3 catch): record the explicit-global
+                # escape BEFORE the reduction strips it — `\hash` (one
+                # backslash) names the GLOBAL function; a namespaced user
+                # function never shadows it.
+                _global_escape = func_name.startswith('\\') and func_name.count('\\') == 1
                 # Use just the last segment for resolution
                 if '\\' in func_name:
                     func_name = func_name.rsplit('\\', 1)[-1]
@@ -301,15 +333,68 @@ class CallGraphBuilder:
                 break
 
         if not func_name:
-            return None
+            return []
 
+        # #835: a USER-DEFINED FREE FUNCTION of this name outranks the
+        # built-in veto — a user function named like a built-in (namespace
+        # App; function hash(...) called as hash($x)) is the real call
+        # target (PHP's own shadowing rule), and the veto dropped its
+        # inbound edge BEFORE the lookup, orphaning the function and its
+        # whole subtree (the seven-family precedent: C, Go, Python, Swift,
+        # Ruby, Zig, Rust each resolve the user function first with scope
+        # guards; the file's own framework rule below names the exact
+        # shape — "NOT shadowed by a user-defined function of the same
+        # name"). The opus-seat catches shape the gate:
+        #   * FREE-FUNCTION-ONLY (the F1 catch): functions_by_name
+        #     indexes METHODS too, so a bare membership check fired for a
+        #     class method named like a builtin (Countable::count — a
+        #     PHP-mandated interface method name inside PHP_BUILTINS) and
+        #     _resolve_simple_call's step-2 import path lacked the
+        #     class_name filter (the fable-r1 F1 sink closed it), emitting a FABRICATED edge from a
+        #     genuine count() call to Order::count. A method never
+        #     shadows a global function in PHP.
+        #   * FALL-THROUGH (the F2 catch): resolve WITHOUT returning
+        #     when the name is unresolvable in scope — an out-of-scope
+        #     user-named CALLBACK_BUILTINS (array_map declared in an
+        #     unrelated namespace) must still take the callback dispatch
+        #     below; an unconditional return skipped it and LOST an edge
+        #     base produced (an outright false negative, the exact class
+        #     this PR exists to close).
+        #   * CONSERVATIVE CALLBACK RETENTION (the astra-r1 catch): an
+        #     in-scope shadow of a HIGHER-ORDER builtin (array_map)
+        #     keeps base's callback-argument edge TOO. The shadow is the
+        #     real callee, but its dispatch semantics are user code and
+        #     unknowable statically; base seeded the argument edge under
+        #     builtin-assumed semantics, and dropping it traded a
+        #     guaranteed edge for a variable-invocation false negative
+        #     (the over-seed rule: a reachability-safe FP beats an FN).
+        #     Only the CALLBACK_BUILTINS dispatch is retained — the
+        #     framework-dispatch path below never had an arg edge at
+        #     base for this shape (its own shadow guard skipped it), so
+        #     it is left exactly as before.
+        #   * The scope is _resolve_simple_call's own (same file /
+        #     use-imports / namespace-compatible), so a GENUINE builtin
+        #     call with no in-scope user function is never rescued to an
+        #     unrelated function (Ruby's guard — the S6 pin).
+        if self._user_free_function_shadows(func_name) and not _global_escape:
+            _resolved = self._resolve_simple_call(func_name, caller_file,
+                                                   None, caller_namespace)
+            if _resolved:
+                _cb_idx = CALLBACK_BUILTINS.get(func_name.lower())
+                if _cb_idx is not None:
+                    _cb = self._resolve_callback_arg(node, source, caller_file,
+                                                      caller_class, _cb_idx)
+                    if _cb and _cb != _resolved:
+                        return [_resolved, _cb]
+                return [_resolved]
         if self._is_builtin(func_name):
             # Higher-order builtins (call_user_func, array_map, ...) drop the OUTER call, but the
             # callback they dispatch to is a real edge -- resolve it instead of returning None.
             cb_idx = CALLBACK_BUILTINS.get(func_name.lower())
             if cb_idx is not None:
-                return self._resolve_callback_arg(node, source, caller_file, caller_class, cb_idx)
-            return None
+                _cb = self._resolve_callback_arg(node, source, caller_file, caller_class, cb_idx)
+                return [_cb] if _cb else []
+            return []
 
         # Framework registration dispatchers (add_action, register_shutdown_function,
         # ...) route to a callback argument. They are not PHP builtins, so treat them as
@@ -317,7 +402,8 @@ class CallGraphBuilder:
         # (which would be the real call target).
         fw_idx = FRAMEWORK_CALLBACKS.get(func_name.lower())
         if fw_idx is not None and func_name not in self.functions_by_name:
-            return self._resolve_callback_arg(node, source, caller_file, caller_class, fw_idx)
+            _cb = self._resolve_callback_arg(node, source, caller_file, caller_class, fw_idx)
+            return [_cb] if _cb else []
 
         # A bare function call -- `foo()`, incl. a framework-callback dispatcher that is
         # shadowed by a same-named user function and so lands here -- is resolved by PHP in
@@ -325,7 +411,8 @@ class CallGraphBuilder:
         # class. Pass caller_class=None so _resolve_simple_call's implicit-$this step does
         # not poison the edge with a coincidentally same-named enclosing method (mirrors the
         # string-callback fix in _resolve_callback_name). Namespace resolution is preserved.
-        return self._resolve_simple_call(func_name, caller_file, None, caller_namespace)
+        _resolved = self._resolve_simple_call(func_name, caller_file, None, caller_namespace)
+        return [_resolved] if _resolved else []
 
     def _resolve_callback_arg(self, node, source: bytes, caller_file: str,
                               caller_class: Optional[str], idx: int) -> Optional[str]:
@@ -372,7 +459,14 @@ class CallGraphBuilder:
             # class indexed by its bare name; reduce the qualified class to its last segment
             # so it resolves like a plain callback instead of leaving an unmatched prefix.
             return self._resolve_class_call(self._strip_namespace(cls), method, caller_file)
-        if self._is_builtin(name):
+        # #835: the same user-first shadow rule as _resolve_function_call
+        # — a string callback naming a user-shadowed builtin
+        # (call_user_func('hash') with a user hash) resolves the USER
+        # function (the shadow is the real target); only an unshadowed
+        # builtin name drops. The FREE-FUNCTION-ONLY predicate (the
+        # opus-seat F1 catch: a method named call_user_func never
+        # shadows).
+        if self._is_builtin(name) and not self._user_free_function_shadows(name):
             return None
         # A bare string callable ('name') is resolved by PHP as a GLOBAL function, never a
         # method of the class the registration sits in. Pass caller_class=None so the implicit
@@ -594,7 +688,20 @@ class CallGraphBuilder:
                         file_funcs = self.functions_by_file[file_path]
                         for func_id in file_funcs:
                             func_data = self.functions.get(func_id, {})
-                            if func_data.get('name') == func_name:
+                            # #835 (the fable-r1 F1 catch): the same
+                            # free-function-only filter the gate uses —
+                            # the predicate is REPO-WIDE (any free function
+                            # of the name opens the gate) but this sink is
+                            # PER-IMPORT, and an imported CLASS METHOD of
+                            # the name (Hasher::hash under
+                            # use App\Security\Hasher) leaked here and
+                            # FABRICATED an edge from a genuine builtin call
+                            # to the method (the gate's own contract: a
+                            # genuine builtin is never rescued to an
+                            # unrelated function; the opus F1 shape, one
+                            # sink deeper).
+                            if (func_data.get('name') == func_name
+                                    and not func_data.get('class_name')):
                                 return func_id
 
         # 3. Unqualified call resolution across files. PHP resolves an unqualified
@@ -904,7 +1011,15 @@ class CallGraphBuilder:
             # Skip PHP keywords
             if func_name in PHP_KEYWORDS:
                 continue
-            if not self._is_builtin(func_name):
+            # #835: the same user-first shadow rule here — a
+            # user-shadowed builtin name resolves to the user function;
+            # only an UNSHADOWED builtin skips. The precedence now
+            # matches the tree-walk path; the SCOPE deliberately does
+            # not (this fallback predates the fix and passes no
+            # caller_namespace — a pre-existing divergence, not
+            # introduced here; the opus-seat F5 note).
+            if (self._user_free_function_shadows(func_name)
+                    or not self._is_builtin(func_name)):
                 resolved = self._resolve_simple_call(func_name, caller_file, None)
                 if resolved:
                     calls.add(resolved)

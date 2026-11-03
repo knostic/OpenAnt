@@ -25,6 +25,127 @@ from utilities.llm import (
 )
 
 
+# #739: the --limit selection order. The raw head-slice took
+# ``dataset.units[:N]`` in FILE-WALK order — a limited run silently measured
+# whichever files the parser visited first (the campaign's --limit 3 on
+# OpenBao selected three api/auth/approle CLIENT-SDK files while the 90
+# http_handler units — the server attack surface — began at index 18). The
+# priority available BEFORE enhancement is the structural one: the seeded
+# entry points (``is_entry_point``, stamped by the reachability filter /
+# the LLM-reachability promotions) and the call-graph edges
+# (``metadata.direct_calls``) — so the selection is a multi-source BFS
+# from the entry points (depth 0 = the seeds, depth 1 = their direct
+# callees, ...) with the ORIGINAL file-walk order as the per-depth
+# tiebreak (deterministic: the same dataset + limit always selects the
+# same units — the reproducibility contract a head-slice gave for free
+# and a priority sort must not lose).
+LIMIT_MODE_ENTRY_PATH = "entry-path-bfs"
+LIMIT_MODE_FILE_ORDER = "file-order-head-slice"
+# #739 fix round: a ``--limit N`` with N >= len(units) selects NOTHING --
+# ``select_units_for_limit`` early-returns the units unreordered and unsliced. The
+# first cut still stamped ``entry-path-bfs`` there, so the artifact claimed a
+# priority selection that never ran: verbatim the failure this change exists to
+# remove ("the mode is printed so a limited run never reads as a priority-based
+# sample when it is not"). A third value names that state, rather than reusing the
+# empty string -- empty already MEANS "no limit ran", and a non-binding limit DID
+# run, so collapsing the two would lose the distinction an operator needs.
+LIMIT_MODE_NOT_BINDING = "no-selection-all-units-under-limit"
+
+
+def limit_selection_mode(units) -> str:
+    """#739: the selection mode a --limit run used — the reportable label
+    for the issue's shape-2 ask. ``entry-path-bfs`` when the dataset
+    carries at least one seeded entry point (the BFS has a source);
+    ``file-order-head-slice`` when it does not (the order is UNCHANGED
+    file-walk order and the output must say so, never read as a
+    priority-based sample)."""
+    for u in units:
+        if (isinstance(u, dict) and u.get("is_entry_point")
+                and isinstance(u.get("id"), str) and u.get("id")):
+            return LIMIT_MODE_ENTRY_PATH
+    return LIMIT_MODE_FILE_ORDER
+
+
+def limit_mode_for(units, limit) -> str:
+    """#739 fix round: THE ONE DERIVATION of the REPORTED selection mode.
+
+    ``limit_selection_mode`` answers a different question -- "does this dataset
+    carry a BFS source?" -- and is still the predicate ``select_units_for_limit``
+    branches on. What the REPORT needs is "what did the selection actually do",
+    and those diverge in exactly one place: a limit that does not bind. Deriving
+    the label here, from the same (units, limit) pair the selection sees, is what
+    stops the stamp and the selection from disagreeing again."""
+    if not limit:
+        return ""
+    if len(units) <= limit:
+        return LIMIT_MODE_NOT_BINDING
+    return limit_selection_mode(units)
+
+
+def select_units_for_limit(units, limit):
+    """#739: the priority-ordered selection — entry-path BFS depth first,
+    original file order within a depth, then the slice.
+
+    Units NOT reachable from any entry point sort after every reachable
+    unit (they keep their relative file order). Non-dict rows (the fa15
+    trust-boundary class) and rows without ids pass through in place,
+    never crash the sort. A falsy ``limit`` or an empty seed set returns
+    the units UNREORDERED (the #213 diff-selected population contract is
+    the caller's; this function only orders)."""
+    if not limit or len(units) <= limit:
+        return units
+    if limit_selection_mode(units) == LIMIT_MODE_FILE_ORDER:
+        # no seeded entry points: nothing to BFS from — the file order
+        # stands (still sliced: the limit binds), and the caller's label
+        # (limit_selection_mode) says so.
+        return units[:limit]
+
+    # The depth map: multi-source BFS from every is_entry_point unit over
+    # the callee edges (metadata.direct_calls). Malformed rows/edges are
+    # skipped, never raised (the fa15 shape; the selection degrades to
+    # file order for the row, not for the run). The id index is built
+    # ONCE — the OpenBao-scale corpus (13,944 units) must not re-scan the
+    # list per frontier node.
+    by_id: dict = {}
+    for u in units:
+        if (isinstance(u, dict) and isinstance(u.get("id"), str)
+                and u.get("id")):
+            by_id.setdefault(u["id"], u)
+    depth: dict = {}
+    frontier = [u.get("id") for u in units
+                if (isinstance(u, dict) and u.get("is_entry_point")
+                    and isinstance(u.get("id"), str) and u.get("id"))]
+    for _id in frontier:
+        depth[_id] = 0
+    while frontier:
+        next_frontier = []
+        for _id in frontier:
+            meta = by_id.get(_id, {}).get("metadata")
+            calls = meta.get("direct_calls") if isinstance(meta, dict) else None
+            if not isinstance(calls, list):
+                continue
+            for callee in calls:
+                if (isinstance(callee, str) and callee in by_id
+                        and callee not in depth):
+                    depth[callee] = depth[_id] + 1
+                    next_frontier.append(callee)
+        frontier = next_frontier
+
+    # unreachable units sort last, keeping their relative order among
+    # themselves; the enumerate index is the per-depth tiebreak.
+    order = sorted(
+        enumerate(units),
+        key=lambda pair: (
+            depth.get(pair[1].get("id")) if isinstance(pair[1], dict)
+            and isinstance(pair[1].get("id"), str)
+            and pair[1].get("id") in depth else float("inf"),
+            pair[0],
+        ),
+    )
+    selected = [u for _, u in order][:limit]
+    return selected
+
+
 def enhance_dataset(
     dataset_path: str,
     output_path: str,
@@ -113,9 +234,22 @@ def enhance_dataset(
     # unrelated units (sonnet confirm-round catch).
     if any("diff_selected" in u for u in units if isinstance(u, dict)):
         units = [u for u in units if isinstance(u, dict) and u.get("diff_selected")]
+    # #739: the selection mode a --limit run used, stamped over the
+    # population the slice ACTUALLY selected from (the #213 diff-selected
+    # subset when diff-mode annotated the dataset — the label must never
+    # describe the unfiltered corpus; the T1-r1 F1 catch). Threaded to the
+    # EnhanceResult below.
+    _limit_mode = ""
     if limit:
-        units = units[:limit]
+        # the selection is the entry-path BFS priority first, the
+        # file-order head-slice only when no entry point is seeded — and
+        # the mode is printed so a limited run never reads as a
+        # priority-based sample when it is not.
+        _limit_mode = limit_mode_for(units, limit)
+        units = select_units_for_limit(units, limit)
         dataset["units"] = units  # so the agentic/single-shot paths enhance only these
+        print(f"[Enhance] Limit {limit}: selection mode {_limit_mode}",
+              file=sys.stderr)
     print(f"[Enhance] Units to enhance: {len(units)}", file=sys.stderr)
 
     # Set up progress reporter
@@ -231,5 +365,7 @@ def enhance_dataset(
         # stale-restored intersections (present-only; None on a fresh run
         # or when nothing dropped).
         resume_delta=getattr(enhancer, "_resume_delta", None),
+        # #739: the stamped selection mode (empty = no limit ran)
+        limit_mode=_limit_mode,
         usage=usage,
     )

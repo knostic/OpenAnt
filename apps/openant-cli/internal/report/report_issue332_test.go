@@ -47,7 +47,7 @@ func TestRenderedReportHasNoCDNScripts(t *testing.T) {
 		// markers come from the pinned files themselves (version banners),
 		// which the templates' own inline config blocks cannot provide.
 		// #540: the tailwind marker is the CSS build banner ("tailwindcss v3.4.19").
-		for _, marker := range []string{"tailwindcss v3.4.19", "Chart.js v4.5.1", "chartjs-plugin-datalabels"} {
+		for _, marker := range []string{"tailwindcss v3.4.19", "Chart.js v4.6.1", "chartjs-plugin-datalabels"} {
 			if !strings.Contains(out, marker) {
 				t.Fatalf("%s: missing vendored-asset marker %q (an empty inline would strip styling/charts silently)",
 					name, marker)
@@ -84,7 +84,7 @@ func TestReportCSSSelfContained(t *testing.T) {
 func TestVendoredReportScriptsEmbedded(t *testing.T) {
 	for _, name := range []string{
 		"report.css",
-		"chart-4.5.1.umd.min.js",
+		"chart-4.6.1.umd.min.js",
 		"chartjs-plugin-datalabels-2.2.0.min.js",
 	} {
 		data, err := vendorFS.ReadFile("vendor/" + name)

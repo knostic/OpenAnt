@@ -45,7 +45,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import anthropic  # noqa: E402
 
-from utilities.llm import LLMResponseError, ToolDef  # noqa: E402
+from utilities.llm import ToolDef  # noqa: E402
 from utilities.llm.config import parse_config, ProviderConfig  # noqa: E402
 from utilities.llm.providers.anthropic import (  # noqa: E402
     AnthropicAdapter,
@@ -117,28 +117,28 @@ def test_config_thinking_absent_is_none():
 def test_anthropic_configured_thinking_lands_in_request():
     adapter, client = _stub_anthropic(thinking=_THINKING)
     adapter.complete(model="claude-test", system=None,
-                     messages=[], max_tokens=10)
+                     messages=[], max_tokens=4096)
     assert client.messages.create.call_args.kwargs["thinking"] == _THINKING
 
 
 def test_anthropic_default_request_has_no_thinking_key():
     adapter, client = _stub_anthropic()
     adapter.complete(model="claude-test", system=None,
-                     messages=[], max_tokens=10)
+                     messages=[], max_tokens=4096)
     assert "thinking" not in client.messages.create.call_args.kwargs
 
 
 def test_bedrock_configured_thinking_lands_in_request():
     adapter, client = _stub_bedrock(thinking=_THINKING)
     adapter.complete(model="claude-test", system=None,
-                     messages=[], max_tokens=10)
+                     messages=[], max_tokens=4096)
     assert client.messages.create.call_args.kwargs["thinking"] == _THINKING
 
 
 def test_bedrock_default_request_has_no_thinking_key():
     adapter, client = _stub_bedrock()
     adapter.complete(model="claude-test", system=None,
-                     messages=[], max_tokens=10)
+                     messages=[], max_tokens=4096)
     assert "thinking" not in client.messages.create.call_args.kwargs
 
 
@@ -246,9 +246,10 @@ _GUARD_ADAPTERS = [_stub_anthropic, _stub_bedrock]
 @pytest.mark.parametrize("_stub", _GUARD_ADAPTERS, ids=["anthropic", "bedrock"])
 def test_thinking_with_tools_refuses_loudly_before_the_paid_call(_stub):
     adapter, client = _stub(thinking=_THINKING)
-    with pytest.raises(LLMResponseError, match="thinking\\+tools"):
+    from utilities.llm import LLMConfigError  # deferred: the class is new at head; the module must collect at base
+    with pytest.raises(LLMConfigError, match="thinking\\+tools"):
         adapter.complete(model="claude-test", system=None, messages=[],
-                         max_tokens=10, tools=[ToolDef(
+                         max_tokens=4096, tools=[ToolDef(
                              name="t", description="d", input_schema={})])
     client.messages.create.assert_not_called()
 
@@ -257,7 +258,7 @@ def test_thinking_with_tools_refuses_loudly_before_the_paid_call(_stub):
 def test_disabled_thinking_with_tools_is_allowed(_stub):
     adapter, client = _stub(thinking={"type": "disabled"})
     adapter.complete(model="claude-test", system=None, messages=[],
-                     max_tokens=10, tools=[ToolDef(
+                     max_tokens=4096, tools=[ToolDef(
                          name="t", description="d", input_schema={})])
     assert "thinking" in client.messages.create.call_args.kwargs
 
@@ -266,5 +267,5 @@ def test_disabled_thinking_with_tools_is_allowed(_stub):
 def test_thinking_without_tools_is_allowed(_stub):
     adapter, client = _stub(thinking=_THINKING)
     adapter.complete(model="claude-test", system=None, messages=[],
-                     max_tokens=10)
+                     max_tokens=4096)
     assert client.messages.create.call_args.kwargs["thinking"] == _THINKING

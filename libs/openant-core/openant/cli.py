@@ -197,6 +197,18 @@ def _step_report_rows(step_reports: list[dict],
     themselves (capped — a pathological step must not balloon the report
     payload), and each step's disambiguated skip reason from the scan
     aggregate's ``steps_skipped_reasons``.
+
+    #700: the diagnostic channel rides alongside — the #216/#605
+    incompleteness markers (``cost_incomplete`` + the unpriced-model
+    attribution) from the step report's ``token_usage``, and the
+    discovery/skip counters from the summary: the #600 discovery block's
+    per-language excluded-dirs counts (``excluded_directories`` — never a
+    cross-language total; the flat count measures prune observations), the
+    #602/#798 ``signals_skipped_unknown_unit`` and
+    ``units_newly_reachable``. Every key is PRESENT-ONLY — a clean step's
+    row keeps exactly the pre-#700 eight keys (byte-identical clean
+    artifacts), and a hostile summary never fabricates a counter (a bool
+    is not a count; a non-int never lands).
     """
     skip_reasons = skip_reasons or {}
     rows = []
@@ -211,7 +223,7 @@ def _step_report_rows(step_reports: list[dict],
         if not isinstance(error_count, int) or isinstance(error_count, bool):
             error_count = len(sr.get("errors") or [])
         step = sr.get("step", "unknown")
-        rows.append({
+        row = {
             "step": step,
             "duration": dur_str,
             "cost": cost_str,
@@ -221,7 +233,55 @@ def _step_report_rows(step_reports: list[dict],
             "error_count": error_count,
             "errors": errors,
             "skipped_reason": str(skip_reasons.get(step, "")),
-        })
+        }
+        # #700: the diagnostic channel, present-only
+        tu = sr.get("token_usage")
+        if isinstance(tu, dict):
+            if tu.get("cost_incomplete") is True:
+                row["cost_incomplete"] = True
+            _unpriced = tu.get("unpriced_models")
+            if isinstance(_unpriced, list) and _unpriced:
+                row["unpriced_models"] = [str(m) for m in _unpriced]
+            # F1 (the fable r1 catch): BOTH unpriced kinds ride — a
+            # cache-only incompleteness names its model in the artifact
+            # (unpriced_cache_models), and the #605 sentinel marks the
+            # accounting error — neither may render as the false
+            # "unattributable" shape at the HTML boundary
+            _unpriced_cache = tu.get("unpriced_cache_models")
+            if isinstance(_unpriced_cache, list) and _unpriced_cache:
+                row["unpriced_cache_models"] = [str(m) for m in _unpriced_cache]
+            if tu.get("accounting_error") is True:
+                row["accounting_error"] = True
+        _skipped = summary.get("signals_skipped_unknown_unit")
+        if isinstance(_skipped, int) and not isinstance(_skipped, bool) \
+                and _skipped > 0:
+            row["signals_skipped_unknown_unit"] = _skipped
+        _newly = summary.get("units_newly_reachable")
+        if isinstance(_newly, int) and not isinstance(_newly, bool) \
+                and _newly > 0:
+            row["units_newly_reachable"] = _newly
+        discovery = summary.get("discovery")
+        if isinstance(discovery, dict):
+            _excluded: list[str] = []
+            for lang, stats in (discovery.get("per_language") or {}).items():
+                if not isinstance(stats, dict):
+                    continue
+                n = stats.get("directories_excluded")
+                # F2 (the fable r1 catch): > 0, consistent with the sibling
+                # counters — the real scanner writes 0 on a clean repo and
+                # a carried zero would break the clean-row contract in
+                # production (the fixture-only control missed it)
+                if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                    _excluded.append(f"{lang} {n}")
+            if _excluded:
+                # the #600 contract: per-language segments only — the
+                # cross-language "total" measures prune observations, not
+                # unique excluded directories, and is never fabricated.
+                # DISPLAY-READY and SORTED here (the row's own convention:
+                # step/duration/cost pre-format too) — the Go consumer
+                # joins in order, sorts nothing, imports nothing.
+                row["excluded_directories"] = sorted(_excluded)
+        rows.append(row)
     return rows
 
 

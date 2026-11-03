@@ -70,7 +70,7 @@ After running, two files are written to the output directory (defaults to the sa
   "total_cost_usd": 0.1234,
   "results": [
     {
-      "finding_id": "VULN-001",
+      "finding_id": "VULN-1d89f8",
       "status": "CONFIRMED",
       "details": "Successfully read /etc/passwd via path traversal",
       "evidence": [
@@ -85,6 +85,10 @@ After running, two files are written to the output directory (defaults to the sa
   ]
 }
 ```
+#706: the finding IDs are identity-derived (VULN- + the identity_key's
+leading hex) — stable across runs of the same finding set, unlike the
+old positional VULN-NNN.
+
 
 ## Architecture
 

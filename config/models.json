@@ -1,5 +1,5 @@
 {
-  "_comment": "Provider-model registry: the single source of truth for model IDs and pricing, read by BOTH the Python engine (core/model_registry.py) and the Go CLI (internal/models). status is OpenAnt's shipped claim; source+retrieved are its provenance. price is null for any model that must not be auto-dispatched (retired/unknown) so it never resolves to a silent $0 in cost accounting. Prices are OpenAnt's shipped rates and are NOT verified against live provider pricing in the build environment — see each record's source. Recency of `retrieved` is an operational/CI concern, not asserted in the unit tests. INVARIANT (test_models_price_cross_check.py): records for the same model family across providers must agree on price unless the diverging record carries an explicit `price_diverges` reason string (#344).",
+  "_comment": "Provider-model registry: the single source of truth for model IDs and pricing, read by BOTH the Python engine (core/model_registry.py) and the Go CLI (internal/models). status is OpenAnt's shipped claim; source+retrieved are its provenance. price is null for any model that must not be auto-dispatched (retired/unknown) so it never resolves to a silent $0 in cost accounting. Prices are OpenAnt's shipped rates and are NOT verified against live provider pricing in the build environment — see each record's source. Recency of `retrieved` is an operational/CI concern, not asserted in the unit tests. INVARIANT (test_models_price_cross_check.py): records for the same model family across providers must agree on price unless the diverging record carries an explicit `price_diverges` reason string (#344); the same rule holds for the cache multipliers (#690), with `cache_diverges` the analogous annotation (a non-empty reason string on the diverging record, e.g. the OpenRouter google routes listing cache writes at their own prices while Google's own page publishes none). `cache` carries {read, write?, source} — the multipliers of the base input rate with a per-record vendor receipt (#690); an UNRATED cache with a known reason carries `cache_unrated_reason` (e.g. the z-ai routes' shipped base prices diverging from the listing — the loud cost_incomplete path, never a pasted rate against a stale base). The Go registry reader (internal/models) drops unknown keys by design.",
   "schema_version": 1,
   "models": [
     {
@@ -48,6 +48,54 @@
         "read": 0.1,
         "write": 1.25,
         "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
+    },
+    {
+      "id": "claude-opus-5-5",
+      "provider": "anthropic",
+      "status": "current",
+      "price": {
+        "input": 4.0,
+        "output": 20.0
+      },
+      "source": "verified against live Anthropic pricing (Claude Opus 5.5 = $4/$20 per MTok, platform.claude.com/docs/en/about-claude/pricing, fetched 2026-10-21 — the model-pricing table's own row; the models overview lists it as the current default recommendation with retirement not sooner than 2027-09-22, so the record is current) and the live OpenRouter catalogue (anthropic/claude-opus-5.5 = $4.00/$20.00 per 1M, openrouter.ai/api/v1/models, fetched 2026-10-21) — both live sources agree; the $8/$40 fast-mode rate is the fast-mode SKU, not the catalogue rate",
+      "retrieved": "2026-10-21",
+      "cache": {
+        "read": 0.05,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-10-21): 5-minute cache write 1.25x ($5/MTok on the $4 base); cache read 0.05x — the DOCUMENTED Opus 5.5 / Sonnet 5.5 exception, stated by the page's own footnote ('Cache hits and refreshes on Claude Opus 5.5 and Claude Sonnet 5.5 are priced at 0.05x the base input price') and by its $0.20/MTok cache-hit row; the live OpenRouter catalogue confirms both (input_cache_read $0.20 per 1M, input_cache_write $5.00 per 1M, fetched 2026-10-21)"
+      }
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "provider": "anthropic",
+      "status": "current",
+      "price": {
+        "input": 2.0,
+        "output": 10.0
+      },
+      "source": "verified against live Anthropic pricing (Claude Sonnet 5.5 = $2/$10 per MTok, platform.claude.com/docs/en/about-claude/pricing, fetched 2026-10-21) and the live OpenRouter catalogue (anthropic/claude-sonnet-5.5 = $2.00/$10.00 per 1M, openrouter.ai/api/v1/models, fetched 2026-10-21) — both live sources agree; the models overview names it the current Sonnet line with retirement not sooner than 2027-09-28, and Anthropic's deprecations table names it the replacement for the deprecated claude-sonnet-4-5-20250929",
+      "retrieved": "2026-10-21",
+      "cache": {
+        "read": 0.05,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-10-21): 5-minute cache write 1.25x ($2.50/MTok on the $2 base); cache read 0.05x — the DOCUMENTED Opus 5.5 / Sonnet 5.5 exception, stated by the page's own footnote and by its $0.10/MTok cache-hit row; the live OpenRouter catalogue confirms both (input_cache_read $0.10 per 1M, input_cache_write $2.50 per 1M, fetched 2026-10-21)"
+      }
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "provider": "anthropic",
+      "status": "current",
+      "price": {
+        "input": 0.1,
+        "output": 0.5
+      },
+      "source": "verified against live Anthropic pricing (Claude Haiku 5.5 = $0.10/$0.50 per MTok, platform.claude.com/docs/en/about-claude/pricing, fetched 2026-10-21) and the live OpenRouter catalogue (anthropic/claude-haiku-5.5 = $0.10/$0.50 per 1M, openrouter.ai/api/v1/models, fetched 2026-10-21) — both live sources agree. THE TIER THIS RECORD DOES NOT MODEL, named rather than hidden: Haiku 5.5 is the one model priced BY PROMPT LENGTH — the page carries two rows, 'for prompts up to 100,000 tokens' at $0.10/$0.50 and 'for prompts over 100,000 tokens' at $0.50/$2.50, and the registry's price schema is a single per-MTok pair. The BASE row is recorded (the models overview states 'From $0.10 / input MTok, From $0.50 / output MTok', and the OpenRouter catalogue serves the model at exactly that rate), so a long-prompt request is UNDER-billed by 5x rather than mis-attributed; the over-100k tier needs a per-prompt-length schema this registry does not have (#216's fail-visible path covers an absent record, not a second tier of a present one)",
+      "retrieved": "2026-10-21",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-10-21): 5-minute cache write 1.25x ($0.125/MTok on the $0.10 base); cache read 0.1x — the STANDARD multiplier, which the page's footnote confirms by exclusion ('All other models use the standard 0.1x multiplier'; the 0.05x exception names Opus 5.5 and Sonnet 5.5 only) and by its $0.01/MTok cache-hit row on the base tier; the live OpenRouter catalogue confirms both (input_cache_read $0.01 per 1M, input_cache_write $0.125 per 1M, fetched 2026-10-21)"
       }
     },
     {
@@ -189,10 +237,18 @@
     {
       "id": "claude-opus-4-6",
       "provider": "anthropic",
-      "status": "unknown",
-      "price": null,
-      "source": "liveness contested and not verifiable in build env; asserted neither alive nor dead",
-      "retrieved": "2026-07-23"
+      "status": "current",
+      "price": {
+        "input": 5.0,
+        "output": 25.0
+      },
+      "source": "verified against live Anthropic pricing (Claude Opus 4.6 = $5/$25 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-10-20 — no retired marker, resolving the earlier 'liveness contested' dispute: the page lists the model at a priced row and the SDK carries the literal); the live OpenRouter catalogue serves it at the same rate (anthropic/claude-opus-4.6 = $5.00/$25.00 per 1M, openrouter.ai/api/v1/models, 2026-10-20) — both live sources agree",
+      "retrieved": "2026-10-20",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
     },
     {
       "id": "us.anthropic.claude-opus-4-8",
@@ -204,7 +260,12 @@
       },
       "source": "regional Bedrock inference profile; liveness via list-inference-profiles (us-east-1, status ACTIVE) on 2026-07-31; price = the direct Anthropic rate x1.1 (the regional-endpoint premium Anthropic's pricing page documents for Claude 4.5+ models), re-derived 2026-09-01",
       "retrieved": "2026-07-31",
-      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models — this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate."
+      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models — this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate.",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "AWS Bedrock prompt-caching docs (docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html, fetched 2026-10-20): 'Tokens written to cache are billed at 1.25x the uncached input token rate. Cache reads are billed at the model-specific cache-read rate.' — the Claude models' model-specific rate is Anthropic's own published multiplier (platform.claude.com/docs/en/about-claude/pricing, the receipt the direct anthropic records carry): cache read 0.1x, write 1.25x; the multipliers are RELATIVE to the base input so the x1.1 regional uplift cancels; corroborated by OpenRouter's listings (every Claude model's input_cache_read at exactly 0.1x of the route's prompt price)"
+      }
     },
     {
       "id": "global.anthropic.claude-opus-4-8",
@@ -215,7 +276,12 @@
         "output": 25.0
       },
       "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-opus-4-8 record, corrected to $5/$25 per #344's live re-verification (Bedrock Claude token rates match the direct Anthropic API); the mirrored direct rate re-verified 2026-09-01 via Anthropic's pricing page (global endpoints: standard pricing)",
-      "retrieved": "2026-07-31"
+      "retrieved": "2026-07-31",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "AWS Bedrock prompt-caching docs (docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html, fetched 2026-10-20): 'Tokens written to cache are billed at 1.25x the uncached input token rate. Cache reads are billed at the model-specific cache-read rate.' — the Claude models' model-specific rate is Anthropic's own published multiplier (platform.claude.com/docs/en/about-claude/pricing, the receipt the direct anthropic records carry): cache read 0.1x, write 1.25x; the multipliers are RELATIVE to the base input so the x1.1 regional uplift cancels; corroborated by OpenRouter's listings (every Claude model's input_cache_read at exactly 0.1x of the route's prompt price)"
+      }
     },
     {
       "id": "us.anthropic.claude-sonnet-4-6",
@@ -227,7 +293,12 @@
       },
       "source": "regional Bedrock inference profile; liveness via list-inference-profiles (us-east-1, status ACTIVE) on 2026-07-31; price = the direct Anthropic rate x1.1 (the regional-endpoint premium Anthropic's pricing page documents for Claude 4.5+ models), re-derived 2026-09-01",
       "retrieved": "2026-07-31",
-      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models — this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate."
+      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models — this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate.",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "AWS Bedrock prompt-caching docs (docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html, fetched 2026-10-20): 'Tokens written to cache are billed at 1.25x the uncached input token rate. Cache reads are billed at the model-specific cache-read rate.' — the Claude models' model-specific rate is Anthropic's own published multiplier (platform.claude.com/docs/en/about-claude/pricing, the receipt the direct anthropic records carry): cache read 0.1x, write 1.25x; the multipliers are RELATIVE to the base input so the x1.1 regional uplift cancels; corroborated by OpenRouter's listings (every Claude model's input_cache_read at exactly 0.1x of the route's prompt price)"
+      }
     },
     {
       "id": "global.anthropic.claude-sonnet-4-6",
@@ -238,7 +309,12 @@
         "output": 15.0
       },
       "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-sonnet-4-6 record (Bedrock Claude token rates match the direct Anthropic API); the mirrored direct rate re-verified 2026-09-01 via Anthropic's pricing page (global endpoints: standard pricing)",
-      "retrieved": "2026-07-31"
+      "retrieved": "2026-07-31",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "AWS Bedrock prompt-caching docs (docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html, fetched 2026-10-20): 'Tokens written to cache are billed at 1.25x the uncached input token rate. Cache reads are billed at the model-specific cache-read rate.' — the Claude models' model-specific rate is Anthropic's own published multiplier (platform.claude.com/docs/en/about-claude/pricing, the receipt the direct anthropic records carry): cache read 0.1x, write 1.25x; the multipliers are RELATIVE to the base input so the x1.1 regional uplift cancels; corroborated by OpenRouter's listings (every Claude model's input_cache_read at exactly 0.1x of the route's prompt price)"
+      }
     },
     {
       "id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -250,7 +326,12 @@
       },
       "source": "regional Bedrock inference profile; liveness via list-inference-profiles (us-east-1, status ACTIVE) on 2026-07-31; price = the direct Anthropic rate x1.1 (the regional-endpoint premium Anthropic's pricing page documents for Claude 4.5+ models), re-derived 2026-09-01",
       "retrieved": "2026-07-31",
-      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models — this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate."
+      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models — this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate.",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "AWS Bedrock prompt-caching docs (docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html, fetched 2026-10-20): 'Tokens written to cache are billed at 1.25x the uncached input token rate. Cache reads are billed at the model-specific cache-read rate.' — the Claude models' model-specific rate is Anthropic's own published multiplier (platform.claude.com/docs/en/about-claude/pricing, the receipt the direct anthropic records carry): cache read 0.1x, write 1.25x; the multipliers are RELATIVE to the base input so the x1.1 regional uplift cancels; corroborated by OpenRouter's listings (every Claude model's input_cache_read at exactly 0.1x of the route's prompt price)"
+      }
     },
     {
       "id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -261,7 +342,12 @@
         "output": 5.0
       },
       "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-haiku-4-5-20251001 record (Bedrock Claude token rates match the direct Anthropic API); the mirrored direct rate re-verified 2026-09-01 via Anthropic's pricing page (global endpoints: standard pricing)",
-      "retrieved": "2026-07-31"
+      "retrieved": "2026-07-31",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "AWS Bedrock prompt-caching docs (docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html, fetched 2026-10-20): 'Tokens written to cache are billed at 1.25x the uncached input token rate. Cache reads are billed at the model-specific cache-read rate.' — the Claude models' model-specific rate is Anthropic's own published multiplier (platform.claude.com/docs/en/about-claude/pricing, the receipt the direct anthropic records carry): cache read 0.1x, write 1.25x; the multipliers are RELATIVE to the base input so the x1.1 regional uplift cancels; corroborated by OpenRouter's listings (every Claude model's input_cache_read at exactly 0.1x of the route's prompt price)"
+      }
     },
     {
       "id": "anthropic.claude-sonnet-5",
@@ -272,7 +358,12 @@
         "output": 10.0
       },
       "source": "current-generation Bedrock serving: plain anthropic.* model id, NO us./global. inference-profile twins — Anthropic's legacy Bedrock guide omits these models from its model table because \"they do not have ARN-versioned model IDs\" (platform.claude.com/docs/en/build-with-claude/claude-on-amazon-bedrock-legacy, fetched 2026-09-21); id from the Supported models table of the Claude in Amazon Bedrock integration doc (platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock, fetched 2026-09-21); price = the direct Anthropic rate re-verified 2026-09-21 (platform.claude.com/docs/en/about-claude/pricing: Sonnet 5 $2/$10, the page's note that this launch price is now the STANDARD price) — Bedrock GLOBAL-endpoint pricing carries no premium (the 10% regional premium is an endpoint choice, not a model-id variant, so id-level pricing carries the global rate); no live-account list-inference-profiles verification performed (no AWS credentials in the authoring environment) — the id is vendor-documented, not account-verified",
-      "retrieved": "2026-09-21"
+      "retrieved": "2026-09-21",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "AWS Bedrock prompt-caching docs (docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html, fetched 2026-10-20): 'Tokens written to cache are billed at 1.25x the uncached input token rate. Cache reads are billed at the model-specific cache-read rate.' — the Claude models' model-specific rate is Anthropic's own published multiplier (platform.claude.com/docs/en/about-claude/pricing, the receipt the direct anthropic records carry): cache read 0.1x, write 1.25x; the multipliers are RELATIVE to the base input so the x1.1 regional uplift cancels; corroborated by OpenRouter's listings (every Claude model's input_cache_read at exactly 0.1x of the route's prompt price)"
+      }
     },
     {
       "id": "anthropic.claude-opus-5",
@@ -283,7 +374,12 @@
         "output": 25.0
       },
       "source": "current-generation Bedrock serving: plain anthropic.* model id, NO us./global. inference-profile twins — Anthropic's legacy Bedrock guide omits these models from its model table because \"they do not have ARN-versioned model IDs\" (platform.claude.com/docs/en/build-with-claude/claude-on-amazon-bedrock-legacy, fetched 2026-09-21); id from the Supported models table of the Claude in Amazon Bedrock integration doc (platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock, fetched 2026-09-21); price = the direct Anthropic rate re-verified 2026-09-21 (platform.claude.com/docs/en/about-claude/pricing: Opus 5 $5/$25) — Bedrock GLOBAL-endpoint pricing carries no premium (the 10% regional premium is an endpoint choice, not a model-id variant, so id-level pricing carries the global rate); no live-account list-inference-profiles verification performed (no AWS credentials in the authoring environment) — the id is vendor-documented, not account-verified",
-      "retrieved": "2026-09-21"
+      "retrieved": "2026-09-21",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "AWS Bedrock prompt-caching docs (docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html, fetched 2026-10-20): 'Tokens written to cache are billed at 1.25x the uncached input token rate. Cache reads are billed at the model-specific cache-read rate.' — the Claude models' model-specific rate is Anthropic's own published multiplier (platform.claude.com/docs/en/about-claude/pricing, the receipt the direct anthropic records carry): cache read 0.1x, write 1.25x; the multipliers are RELATIVE to the base input so the x1.1 regional uplift cancels; corroborated by OpenRouter's listings (every Claude model's input_cache_read at exactly 0.1x of the route's prompt price)"
+      }
     },
     {
       "id": "anthropic.claude-fable-5",
@@ -294,7 +390,12 @@
         "output": 50.0
       },
       "source": "current-generation Bedrock serving: plain anthropic.* model id, NO us./global. inference-profile twins — Anthropic's legacy Bedrock guide omits these models from its model table because \"they do not have ARN-versioned model IDs\" (platform.claude.com/docs/en/build-with-claude/claude-on-amazon-bedrock-legacy, fetched 2026-09-21); id from the Supported models table of the Claude in Amazon Bedrock integration doc (platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock, fetched 2026-09-21); price = the direct Anthropic rate re-verified 2026-09-21 (platform.claude.com/docs/en/about-claude/pricing: Fable 5 $10/$50) — Bedrock GLOBAL-endpoint pricing carries no premium (the 10% regional premium is an endpoint choice, not a model-id variant, so id-level pricing carries the global rate); no live-account list-inference-profiles verification performed (no AWS credentials in the authoring environment) — the id is vendor-documented, not account-verified",
-      "retrieved": "2026-09-21"
+      "retrieved": "2026-09-21",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "AWS Bedrock prompt-caching docs (docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html, fetched 2026-10-20): 'Tokens written to cache are billed at 1.25x the uncached input token rate. Cache reads are billed at the model-specific cache-read rate.' — the Claude models' model-specific rate is Anthropic's own published multiplier (platform.claude.com/docs/en/about-claude/pricing, the receipt the direct anthropic records carry): cache read 0.1x, write 1.25x; the multipliers are RELATIVE to the base input so the x1.1 regional uplift cancels; corroborated by OpenRouter's listings (every Claude model's input_cache_read at exactly 0.1x of the route's prompt price)"
+      }
     },
     {
       "id": "anthropic.claude-fable-5-1",
@@ -305,7 +406,12 @@
         "output": 50.0
       },
       "source": "sibling sweep (the #607 gap class): same Supported models table as the -5 trio — Claude Fable 5.1 | anthropic.claude-fable-5-1 | Open (platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock, fetched 2026-09-21), and per the legacy guide it too has no ARN-versioned ids; price = the direct Anthropic rate re-verified 2026-09-21 (platform.claude.com/docs/en/about-claude/pricing: Fable 5.1 $10/$50) — Bedrock GLOBAL-endpoint pricing carries no premium (id-level pricing carries the global rate); no live-account verification performed — the id is vendor-documented, not account-verified",
-      "retrieved": "2026-09-21"
+      "retrieved": "2026-09-21",
+      "cache": {
+        "read": 0.025,
+        "write": 1.25,
+        "source": "AWS Bedrock prompt-caching docs (docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html, fetched 2026-10-20): 'Tokens written to cache are billed at 1.25x the uncached input token rate. Cache reads are billed at the model-specific cache-read rate.' — the model-specific rate for this model is Anthropic's own DOCUMENTED EXCEPTION (platform.claude.com/docs/en/about-claude/pricing, the receipt the direct anthropic record carries): the Fable 5.1/Mythos 5.1 pair reads at 0.025x, write 1.25x (the #661 census's exception pair, mirrored on Bedrock); corroborated by OpenRouter's listing (anthropic/claude-fable-5.1 input_cache_read at exactly 0.025x of the route's prompt price)"
+      }
     },
     {
       "id": "anthropic.claude-opus-4-7",
@@ -316,7 +422,12 @@
         "output": 25.0
       },
       "source": "sibling sweep (the #607 gap class): same Supported models table — Claude Opus 4.7 | anthropic.claude-opus-4-7 | Open (platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock, fetched 2026-09-21), and per the legacy guide it too has no ARN-versioned ids; price = the direct Anthropic rate re-verified 2026-09-21 (platform.claude.com/docs/en/about-claude/pricing: Opus 4.7 $5/$25) — Bedrock GLOBAL-endpoint pricing carries no premium (id-level pricing carries the global rate); no live-account verification performed — the id is vendor-documented, not account-verified",
-      "retrieved": "2026-09-21"
+      "retrieved": "2026-09-21",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "AWS Bedrock prompt-caching docs (docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html, fetched 2026-10-20): 'Tokens written to cache are billed at 1.25x the uncached input token rate. Cache reads are billed at the model-specific cache-read rate.' — the Claude models' model-specific rate is Anthropic's own published multiplier (platform.claude.com/docs/en/about-claude/pricing, the receipt the direct anthropic records carry): cache read 0.1x, write 1.25x; the multipliers are RELATIVE to the base input so the x1.1 regional uplift cancels; corroborated by OpenRouter's listings (every Claude model's input_cache_read at exactly 0.1x of the route's prompt price)"
+      }
     },
     {
       "id": "gpt-4o",
@@ -327,7 +438,12 @@
         "output": 10.0
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "cache": {
+        "read": 0.5,
+        "source": "OpenAI's pricing page (platform.openai.com/docs/pricing, fetched 2026-10-20): the Standard table's per-model Cached input column vs Input — gpt-4o $1.25 cached vs $2.50 input (0.5x) — no cache-write column — the write is KNOWN, not unknown: OpenAI charges NO write premium on these pre-GPT-5.6 models (OpenRouter's prompt-caching docs, openrouter.ai/docs/features/prompt-caching, fetched 2026-10-20: 'Cache writes: no cost on models before the GPT-5.6 family'), so the inclusive write tokens bill at exactly the base input rate — encoded as write: 1.0 (never the one-sided 'absent' shape, which would falsely mark a write-reporting run cost_incomplete)",
+        "write": 1.0
+      }
     },
     {
       "id": "gpt-4o-mini",
@@ -338,7 +454,12 @@
         "output": 0.6
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "cache": {
+        "read": 0.5,
+        "source": "OpenAI's pricing page (platform.openai.com/docs/pricing, fetched 2026-10-20): the Standard table's per-model Cached input column vs Input — gpt-4o-mini $0.075 vs $0.15 (0.5x) — no cache-write column — the write is KNOWN, not unknown: OpenAI charges NO write premium on these pre-GPT-5.6 models (OpenRouter's prompt-caching docs, openrouter.ai/docs/features/prompt-caching, fetched 2026-10-20: 'Cache writes: no cost on models before the GPT-5.6 family'), so the inclusive write tokens bill at exactly the base input rate — encoded as write: 1.0 (never the one-sided 'absent' shape, which would falsely mark a write-reporting run cost_incomplete)",
+        "write": 1.0
+      }
     },
     {
       "id": "gpt-4.1",
@@ -350,7 +471,12 @@
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
       "retrieved": "2026-07-23",
-      "max_output_tokens": 32768
+      "max_output_tokens": 32768,
+      "cache": {
+        "read": 0.25,
+        "source": "OpenAI's pricing page (platform.openai.com/docs/pricing, fetched 2026-10-20): the Standard table's per-model Cached input column vs Input — gpt-4.1 $0.50 vs $2.00 (0.25x) — no cache-write column — the write is KNOWN, not unknown: OpenAI charges NO write premium on these pre-GPT-5.6 models (OpenRouter's prompt-caching docs, openrouter.ai/docs/features/prompt-caching, fetched 2026-10-20: 'Cache writes: no cost on models before the GPT-5.6 family'), so the inclusive write tokens bill at exactly the base input rate — encoded as write: 1.0 (never the one-sided 'absent' shape, which would falsely mark a write-reporting run cost_incomplete)",
+        "write": 1.0
+      }
     },
     {
       "id": "gpt-4.1-mini",
@@ -362,7 +488,12 @@
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
       "retrieved": "2026-07-23",
-      "max_output_tokens": 32768
+      "max_output_tokens": 32768,
+      "cache": {
+        "read": 0.25,
+        "source": "OpenAI's pricing page (platform.openai.com/docs/pricing, fetched 2026-10-20): the Standard table's per-model Cached input column vs Input — gpt-4.1-mini $0.10 vs $0.40 (0.25x) — no cache-write column — the write is KNOWN, not unknown: OpenAI charges NO write premium on these pre-GPT-5.6 models (OpenRouter's prompt-caching docs, openrouter.ai/docs/features/prompt-caching, fetched 2026-10-20: 'Cache writes: no cost on models before the GPT-5.6 family'), so the inclusive write tokens bill at exactly the base input rate — encoded as write: 1.0 (never the one-sided 'absent' shape, which would falsely mark a write-reporting run cost_incomplete)",
+        "write": 1.0
+      }
     },
     {
       "id": "gpt-4.1-nano",
@@ -374,7 +505,12 @@
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
       "retrieved": "2026-07-23",
-      "max_output_tokens": 32768
+      "max_output_tokens": 32768,
+      "cache": {
+        "read": 0.25,
+        "source": "OpenAI's pricing page (platform.openai.com/docs/pricing, fetched 2026-10-20): the Standard table's per-model Cached input column vs Input — gpt-4.1-nano $0.025 vs $0.10 (0.25x) — no cache-write column — the write is KNOWN, not unknown: OpenAI charges NO write premium on these pre-GPT-5.6 models (OpenRouter's prompt-caching docs, openrouter.ai/docs/features/prompt-caching, fetched 2026-10-20: 'Cache writes: no cost on models before the GPT-5.6 family'), so the inclusive write tokens bill at exactly the base input rate — encoded as write: 1.0 (never the one-sided 'absent' shape, which would falsely mark a write-reporting run cost_incomplete)",
+        "write": 1.0
+      }
     },
     {
       "id": "o1",
@@ -386,7 +522,12 @@
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
       "retrieved": "2026-07-23",
-      "max_output_tokens": 100000
+      "max_output_tokens": 100000,
+      "cache": {
+        "read": 0.5,
+        "source": "OpenAI's pricing page (platform.openai.com/docs/pricing, fetched 2026-10-20): the Standard table's per-model Cached input column vs Input — o1 $7.50 vs $15.00 (0.5x) — no cache-write column — the write is KNOWN, not unknown: OpenAI charges NO write premium on these pre-GPT-5.6 models (OpenRouter's prompt-caching docs, openrouter.ai/docs/features/prompt-caching, fetched 2026-10-20: 'Cache writes: no cost on models before the GPT-5.6 family'), so the inclusive write tokens bill at exactly the base input rate — encoded as write: 1.0 (never the one-sided 'absent' shape, which would falsely mark a write-reporting run cost_incomplete)",
+        "write": 1.0
+      }
     },
     {
       "id": "o3",
@@ -398,7 +539,12 @@
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
       "retrieved": "2026-07-23",
-      "max_output_tokens": 100000
+      "max_output_tokens": 100000,
+      "cache": {
+        "read": 0.25,
+        "source": "OpenAI's pricing page (platform.openai.com/docs/pricing, fetched 2026-10-20): the Standard table's per-model Cached input column vs Input — o3 $0.50 vs $2.00 (0.25x) — no cache-write column — the write is KNOWN, not unknown: OpenAI charges NO write premium on these pre-GPT-5.6 models (OpenRouter's prompt-caching docs, openrouter.ai/docs/features/prompt-caching, fetched 2026-10-20: 'Cache writes: no cost on models before the GPT-5.6 family'), so the inclusive write tokens bill at exactly the base input rate — encoded as write: 1.0 (never the one-sided 'absent' shape, which would falsely mark a write-reporting run cost_incomplete)",
+        "write": 1.0
+      }
     },
     {
       "id": "o3-mini",
@@ -410,7 +556,12 @@
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
       "retrieved": "2026-07-23",
-      "max_output_tokens": 100000
+      "max_output_tokens": 100000,
+      "cache": {
+        "read": 0.5,
+        "source": "OpenAI's pricing page (platform.openai.com/docs/pricing, fetched 2026-10-20): the Standard table's per-model Cached input column vs Input — o3-mini $0.55 vs $1.10 (0.5x) — no cache-write column — the write is KNOWN, not unknown: OpenAI charges NO write premium on these pre-GPT-5.6 models (OpenRouter's prompt-caching docs, openrouter.ai/docs/features/prompt-caching, fetched 2026-10-20: 'Cache writes: no cost on models before the GPT-5.6 family'), so the inclusive write tokens bill at exactly the base input rate — encoded as write: 1.0 (never the one-sided 'absent' shape, which would falsely mark a write-reporting run cost_incomplete)",
+        "write": 1.0
+      }
     },
     {
       "id": "o4-mini",
@@ -422,7 +573,12 @@
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
       "retrieved": "2026-07-23",
-      "max_output_tokens": 100000
+      "max_output_tokens": 100000,
+      "cache": {
+        "read": 0.25,
+        "source": "OpenAI's pricing page (platform.openai.com/docs/pricing, fetched 2026-10-20): the Standard table's per-model Cached input column vs Input — o4-mini $0.275 vs $1.10 (0.25x) — no cache-write column — the write is KNOWN, not unknown: OpenAI charges NO write premium on these pre-GPT-5.6 models (OpenRouter's prompt-caching docs, openrouter.ai/docs/features/prompt-caching, fetched 2026-10-20: 'Cache writes: no cost on models before the GPT-5.6 family'), so the inclusive write tokens bill at exactly the base input rate — encoded as write: 1.0 (never the one-sided 'absent' shape, which would falsely mark a write-reporting run cost_incomplete)",
+        "write": 1.0
+      }
     },
     {
       "id": "gemini-2.5-pro",
@@ -434,7 +590,11 @@
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
       "retrieved": "2026-07-23",
-      "max_output_tokens": 65536
+      "max_output_tokens": 65536,
+      "cache": {
+        "read": 0.1,
+        "source": "Google's Vertex AI generative-ai pricing page (cloud.google.com/vertex-ai/generative-ai/pricing, fetched 2026-10-20): the Gemini 2.5/3 Standard tables' 'cached input tokens' columns — 2.5-pro $0.125 cached vs $1.25 input (0.1x) — NO cache-write price published for any Gemini (the explicit-caching storage is per-token-hour, not representable as a base-input multiplier — documented; the cache-read multiplier prices only the cached reads)"
+      }
     },
     {
       "id": "gemini-2.5-flash",
@@ -446,7 +606,11 @@
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
       "retrieved": "2026-07-23",
-      "max_output_tokens": 65536
+      "max_output_tokens": 65536,
+      "cache": {
+        "read": 0.1,
+        "source": "Google's Vertex AI generative-ai pricing page (cloud.google.com/vertex-ai/generative-ai/pricing, fetched 2026-10-20): the Gemini 2.5/3 Standard tables' 'cached input tokens' columns — 2.5-flash $0.03 vs $0.30 (0.1x) — NO cache-write price published for any Gemini (the explicit-caching storage is per-token-hour, not representable as a base-input multiplier — documented; the cache-read multiplier prices only the cached reads)"
+      }
     },
     {
       "id": "gemini-2.5-flash-lite",
@@ -458,7 +622,11 @@
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
       "retrieved": "2026-07-23",
-      "max_output_tokens": 65536
+      "max_output_tokens": 65536,
+      "cache": {
+        "read": 0.1,
+        "source": "Google's Vertex AI generative-ai pricing page (cloud.google.com/vertex-ai/generative-ai/pricing, fetched 2026-10-20): the Gemini 2.5/3 Standard tables' 'cached input tokens' columns — 2.5-flash-lite $0.01 vs $0.10 (0.1x) — NO cache-write price published for any Gemini (the explicit-caching storage is per-token-hour, not representable as a base-input multiplier — documented; the cache-read multiplier prices only the cached reads)"
+      }
     },
     {
       "id": "gemini-2.0-flash",
@@ -513,7 +681,12 @@
         "output": 25.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "cache": {
+        "read": 0.1,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.50/M vs $5.00 prompt (0.1x), write $6.25/M (1.25x)",
+        "write": 1.25
+      }
     },
     {
       "id": "anthropic/claude-sonnet-4.6",
@@ -524,7 +697,12 @@
         "output": 15.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "cache": {
+        "read": 0.1,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.30/M vs $3.00 (0.1x), write $3.75/M (1.25x)",
+        "write": 1.25
+      }
     },
     {
       "id": "anthropic/claude-haiku-4.5",
@@ -535,7 +713,12 @@
         "output": 5.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "cache": {
+        "read": 0.1,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.10/M vs $1.00 (0.1x), write $1.25/M (1.25x)",
+        "write": 1.25
+      }
     },
     {
       "id": "openai/gpt-4o",
@@ -546,7 +729,12 @@
         "output": 10.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "cache": {
+        "read": 0.5,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $1.25/M vs $2.50 (0.5x); matches OpenAI's own page (the #344 cross-check); the write is KNOWN at 1.0 — the route charges no write premium on these pre-GPT-5.6 models (OpenRouter's prompt-caching docs, fetched 2026-10-20)",
+        "write": 1.0
+      }
     },
     {
       "id": "openai/gpt-4o-mini",
@@ -557,7 +745,12 @@
         "output": 0.6
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "cache": {
+        "read": 0.5,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.075/M vs $0.15 (0.5x); matches OpenAI's own page",
+        "write": 1.0
+      }
     },
     {
       "id": "openai/gpt-4.1",
@@ -569,7 +762,12 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
       "retrieved": "2026-08-01",
-      "max_output_tokens": 32768
+      "max_output_tokens": 32768,
+      "cache": {
+        "read": 0.25,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.50/M vs $2.00 (0.25x); matches OpenAI's own page",
+        "write": 1.0
+      }
     },
     {
       "id": "openai/gpt-4.1-mini",
@@ -581,7 +779,12 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
       "retrieved": "2026-08-01",
-      "max_output_tokens": 32768
+      "max_output_tokens": 32768,
+      "cache": {
+        "read": 0.25,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.10/M vs $0.40 (0.25x); matches OpenAI's own page",
+        "write": 1.0
+      }
     },
     {
       "id": "openai/gpt-4.1-nano",
@@ -593,7 +796,12 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
       "retrieved": "2026-08-01",
-      "max_output_tokens": 32768
+      "max_output_tokens": 32768,
+      "cache": {
+        "read": 0.25,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.025/M vs $0.10 (0.25x); matches OpenAI's own page",
+        "write": 1.0
+      }
     },
     {
       "id": "openai/o1",
@@ -605,7 +813,12 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
       "retrieved": "2026-08-01",
-      "max_output_tokens": 100000
+      "max_output_tokens": 100000,
+      "cache": {
+        "read": 0.5,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $7.50/M vs $15.00 (0.5x); matches OpenAI's own page",
+        "write": 1.0
+      }
     },
     {
       "id": "openai/o3",
@@ -617,7 +830,12 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
       "retrieved": "2026-08-01",
-      "max_output_tokens": 100000
+      "max_output_tokens": 100000,
+      "cache": {
+        "read": 0.25,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.50/M vs $2.00 (0.25x); matches OpenAI's own page",
+        "write": 1.0
+      }
     },
     {
       "id": "openai/o3-mini",
@@ -629,7 +847,12 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
       "retrieved": "2026-08-01",
-      "max_output_tokens": 100000
+      "max_output_tokens": 100000,
+      "cache": {
+        "read": 0.5,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.55/M vs $1.10 (0.5x); matches OpenAI's own page",
+        "write": 1.0
+      }
     },
     {
       "id": "openai/o4-mini",
@@ -641,7 +864,12 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
       "retrieved": "2026-08-01",
-      "max_output_tokens": 100000
+      "max_output_tokens": 100000,
+      "cache": {
+        "read": 0.25,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.275/M vs $1.10 (0.25x); matches OpenAI's own page",
+        "write": 1.0
+      }
     },
     {
       "id": "google/gemini-2.5-pro",
@@ -653,7 +881,13 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
       "retrieved": "2026-08-01",
-      "max_output_tokens": 65536
+      "max_output_tokens": 65536,
+      "cache": {
+        "read": 0.1,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.125/M vs $1.25 (0.1x; matches Google's own page), write $0.375/M (0.3x — OpenRouter's route listing; Google's own page publishes no write)",
+        "write": 0.3
+      },
+      "cache_diverges": "the OpenRouter ROUTE lists a cache-write price for this model ($0.375/M, 0.3x of the route's prompt) while Google's own pricing page publishes NO cache-write price for any Gemini — different routes charging differently, both recorded as published (the reads agree at 0.1x)"
     },
     {
       "id": "google/gemini-2.5-flash",
@@ -665,7 +899,13 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
       "retrieved": "2026-08-01",
-      "max_output_tokens": 65536
+      "max_output_tokens": 65536,
+      "cache": {
+        "read": 0.1,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.03/M vs $0.30 (0.1x; matches Google's own page), write $0.0833/M (0.2778x — the route listing)",
+        "write": 0.2778
+      },
+      "cache_diverges": "the OpenRouter ROUTE lists a cache-write price for this model ($0.0833/M, 0.2778x of the route's prompt) while Google's own pricing page publishes NO cache-write price for any Gemini — different routes charging differently, both recorded as published (the reads agree at 0.1x)"
     },
     {
       "id": "google/gemini-2.5-flash-lite",
@@ -677,7 +917,13 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
       "retrieved": "2026-08-01",
-      "max_output_tokens": 65536
+      "max_output_tokens": 65536,
+      "cache": {
+        "read": 0.1,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.01/M vs $0.10 (0.1x; matches Google's own page), write $0.0833/M (0.8333x — the route listing)",
+        "write": 0.8333
+      },
+      "cache_diverges": "the OpenRouter ROUTE lists a cache-write price for this model ($0.0833/M, 0.8333x of the route's prompt) while Google's own pricing page publishes NO cache-write price for any Gemini — different routes charging differently, both recorded as published (the reads agree at 0.1x)"
     },
     {
       "id": "anthropic/claude-opus-5",
@@ -688,7 +934,12 @@
         "output": 25.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's — re-verified 2026-09-18 at the same rate, alongside the new direct-anthropic record (#344 cross-check: the family agrees)",
-      "retrieved": "2026-08-27"
+      "retrieved": "2026-08-27",
+      "cache": {
+        "read": 0.1,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.50/M vs $5.00 (0.1x), write $6.25/M (1.25x)",
+        "write": 1.25
+      }
     },
     {
       "id": "anthropic/claude-sonnet-5",
@@ -699,7 +950,12 @@
         "output": 10.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's — re-verified 2026-09-18 at the same rate (the page's introductory-made-standard note makes $2/$10 the standing price; the scheduled 2026-09-01 increase did not occur), alongside the new direct-anthropic record",
-      "retrieved": "2026-08-27"
+      "retrieved": "2026-08-27",
+      "cache": {
+        "read": 0.1,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.20/M vs $2.00 (0.1x), write $2.50/M (1.25x)",
+        "write": 1.25
+      }
     },
     {
       "id": "anthropic/claude-fable-5",
@@ -710,7 +966,12 @@
         "output": 50.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's — re-verified 2026-09-18 at the same rate, alongside the new direct-anthropic record (#344 cross-check: the family agrees)",
-      "retrieved": "2026-08-27"
+      "retrieved": "2026-08-27",
+      "cache": {
+        "read": 0.1,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $1.00/M vs $10.00 (0.1x), write $12.50/M (1.25x)",
+        "write": 1.25
+      }
     },
     {
       "id": "anthropic/claude-fable-5.1",
@@ -721,7 +982,12 @@
         "output": 50.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models, 2026-09-18: anthropic/claude-fable-5.1 = $10.00/$50.00 per 1M), which agrees with the direct-anthropic record added the same day (#601/#610)",
-      "retrieved": "2026-09-18"
+      "retrieved": "2026-09-18",
+      "cache": {
+        "read": 0.025,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.25/M vs $10.00 (0.025x — the listing's own number, recorded as published), write $12.50/M (1.25x)",
+        "write": 1.25
+      }
     },
     {
       "id": "anthropic/claude-opus-4.7",
@@ -732,7 +998,12 @@
         "output": 25.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models, 2026-09-18: anthropic/claude-opus-4.7 = $5.00/$25.00 per 1M), which agrees with the direct-anthropic record added the same day (#601/#610)",
-      "retrieved": "2026-09-18"
+      "retrieved": "2026-09-18",
+      "cache": {
+        "read": 0.1,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.50/M vs $5.00 (0.1x), write $6.25/M (1.25x)",
+        "write": 1.25
+      }
     },
     {
       "id": "gemini-3.7-flash",
@@ -743,7 +1014,11 @@
         "output": 3.75
       },
       "source": "verified against Google's own pricing page (ai.google.dev/gemini-api/docs/pricing: gemini-3.7-flash $0.75/$3.75 per 1M, 2026-09-01 — the page documents a scheduled step to $1.50/$7.50 on 2027-01-01; revisit then) and the live OpenRouter catalogue (google/gemini-3.7-flash $0.75/$3.75) — both live sources agree (#434's stale-family gap)",
-      "retrieved": "2026-09-01"
+      "retrieved": "2026-09-01",
+      "cache": {
+        "read": 0.1,
+        "source": "Google's Vertex AI generative-ai pricing page (cloud.google.com/vertex-ai/generative-ai/pricing, fetched 2026-10-20): the Gemini 2.5/3 Standard tables' 'cached input tokens' columns — 3.7-flash $0.075 vs $0.75, the promotional rate through 2026-12-31 (0.1x) — NO cache-write price published for any Gemini (the explicit-caching storage is per-token-hour, not representable as a base-input multiplier — documented; the cache-read multiplier prices only the cached reads)"
+      }
     },
     {
       "id": "google/gemini-3.7-flash",
@@ -754,7 +1029,13 @@
         "output": 3.75
       },
       "source": "verified against the live OpenRouter catalogue (GET openrouter.ai/api/v1/models, 2026-09-01: google/gemini-3.7-flash $0.75/$3.75 per 1M) and Google's own pricing page, which agrees (#434)",
-      "retrieved": "2026-09-01"
+      "retrieved": "2026-09-01",
+      "cache": {
+        "read": 0.1,
+        "source": "OpenRouter's models API (openrouter.ai/api/v1/models, fetched 2026-10-20): the per-model input_cache_read/input_cache_write token prices, the multipliers derived as cache/prompt — read $0.075/M vs $0.75 (0.1x; matches Google's own page), write $0.0417/M (0.0556x — the route listing)",
+        "write": 0.0556
+      },
+      "cache_diverges": "the OpenRouter ROUTE lists a cache-write price for this model ($0.0417/M, 0.0556x of the route's prompt) while Google's own pricing page publishes NO cache-write price for any Gemini — different routes charging differently, both recorded as published (the reads agree at 0.1x)"
     },
     {
       "id": "qwen3.8:27b",
@@ -798,7 +1079,8 @@
         "output": 4.4
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models, 2026-09-05), per-token rates converted to per-1M",
-      "retrieved": "2026-09-05"
+      "retrieved": "2026-09-05",
+      "cache_unrated_reason": "OpenRouter's listing (fetched 2026-10-20) carries cache reads for this route (glm-5.3 $0.078/M, glm-5.3-flash $0.006/M) but the record's SHIPPED base input price diverges from the listing's prompt price ($1.4 vs $0.079 for glm-5.3; $0.075 vs $0.048 for flash) — a pre-existing price-currency gap; rating the cache against the stale base would misprice the cached reads, so the record stays UNRATED (the loud cost_incomplete path, the over-estimate direction) pending the price refresh"
     },
     {
       "id": "z-ai/glm-5.3-flash",
@@ -809,7 +1091,88 @@
         "output": 0.25
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models, 2026-09-05), per-token rates converted to per-1M",
-      "retrieved": "2026-09-05"
+      "retrieved": "2026-09-05",
+      "cache_unrated_reason": "OpenRouter's listing (fetched 2026-10-20) carries cache reads for this route (glm-5.3 $0.078/M, glm-5.3-flash $0.006/M) but the record's SHIPPED base input price diverges from the listing's prompt price ($1.4 vs $0.079 for glm-5.3; $0.075 vs $0.048 for flash) — a pre-existing price-currency gap; rating the cache against the stale base would misprice the cached reads, so the record stays UNRATED (the loud cost_incomplete path, the over-estimate direction) pending the price refresh"
+    },
+    {
+      "id": "claude-opus-4-5",
+      "provider": "anthropic",
+      "status": "current",
+      "price": {
+        "input": 5.0,
+        "output": 25.0
+      },
+      "source": "verified against live Anthropic pricing (Claude Opus 4.5 = $5/$25 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-10-20 — no retired marker); the live OpenRouter catalogue serves it at the same rate (anthropic/claude-opus-4.5 = $5.00/$25.00 per 1M, openrouter.ai/api/v1/models, 2026-10-20) — both live sources agree",
+      "retrieved": "2026-10-20",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
+    },
+    {
+      "id": "claude-opus-4-5-20251101",
+      "provider": "anthropic",
+      "status": "current",
+      "price": {
+        "input": 5.0,
+        "output": 25.0
+      },
+      "source": "the dated snapshot id of Claude Opus 4.5 (the SDK's model-literal union lists it; Anthropic's page prices the family at $5/$25 per MTok, 2026-10-20); the same rate as the bare spelling",
+      "retrieved": "2026-10-20",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
+    },
+    {
+      "id": "claude-sonnet-4-5",
+      "provider": "anthropic",
+      "status": "current",
+      "price": {
+        "input": 3.0,
+        "output": 15.0
+      },
+      "source": "verified against live Anthropic pricing (Claude Sonnet 4.5 = $3/$15 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-10-20 — STATUS: Anthropic's model-deprecations table (fetched 2026-10-20) marks claude-sonnet-4-5-20250929 as Deprecated with retirement on the Claude API on November 30, 2026 (notified 2026-09-30; the replacement is claude-sonnet-5-5); the model still serves at the priced rate as of the fetch date, and the registry carries it as current with the retirement named in the receipt (the mythos-gated limited-availability idiom)); the live OpenRouter catalogue serves it at the same rate (anthropic/claude-sonnet-4.5 = $3.00/$15.00 per 1M, openrouter.ai/api/v1/models, 2026-10-20) — both live sources agree",
+      "retrieved": "2026-10-20",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
+    },
+    {
+      "id": "claude-sonnet-4-5-20250929",
+      "provider": "anthropic",
+      "status": "current",
+      "price": {
+        "input": 3.0,
+        "output": 15.0
+      },
+      "source": "the dated snapshot id of Claude Sonnet 4.5 (the SDK's model-literal union lists it; Anthropic's page prices the family at $3/$15 per MTok, 2026-10-20); the same rate as the bare spelling",
+      "retrieved": "2026-10-20",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "provider": "anthropic",
+      "status": "current",
+      "price": {
+        "input": 1.0,
+        "output": 5.0
+      },
+      "source": "the bare spelling of Claude Haiku 4.5 (an SDK model-literal the #648 census was missing — the opus-r1 catch; the dated snapshot claude-haiku-4-5-20251001 already carried the same rate): $1/$5 per MTok per Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, 2026-10-20); the live OpenRouter catalogue serves the family at the same rate",
+      "retrieved": "2026-10-20",
+      "cache": {
+        "read": 0.1,
+        "write": 1.25,
+        "source": "Anthropic's pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-21): prompt-caching multipliers relative to the base input rate — 5-minute cache write 1.25x, cache read 0.1x"
+      }
     }
   ]
 }

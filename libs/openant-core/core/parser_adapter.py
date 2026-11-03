@@ -596,6 +596,12 @@ def apply_reachability_filter(
             "filtered_out": 0,
             "reduction_percentage": 0,
             "warning": warning,
+            # #738: WHICH seeding mode this filter ran with — the artifact
+            # must explain a coverage delta between two scans of the same
+            # repo (the classification lottery can flip the derived mode
+            # across runs; the operator diffing datasets needs the mode in
+            # the metadata, not only in a step report).
+            "library_mode": bool(library_mode),
         }
         # #520: the seed-class counts on BOTH branches — the keep-all record
         # must not read as "no signal" when synthetic-only seeding was the cause.
@@ -657,6 +663,8 @@ def apply_reachability_filter(
         "reachable_units": len(filtered_units),
         "filtered_out": original_count - len(filtered_units),
         "reduction_percentage": reduction_pct,
+        # #738: the seeding mode, same as the keep-all branch's record.
+        "library_mode": bool(library_mode),
     }
     # #602: the decomposition — units_newly_reachable is derived from the
     # counterfactual baseline (the DATASET units the combined seeds retain

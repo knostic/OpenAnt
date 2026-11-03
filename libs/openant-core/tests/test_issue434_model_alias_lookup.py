@@ -97,15 +97,33 @@ def test_suffix_versions_get_aliases():
     config (gemini-3-7-flash)."""
     or_map = pricing_map("openrouter")
     or_map.update(pricing_map("google"))
+
+    def _alias_equal(a, b):
+        """#690: an annotated route record (cache_diverges — the OpenRouter
+        google routes list cache writes at their own prices while Google's
+        own page publishes none) may differ from its cross-provider sibling
+        by EXACTLY the cache_write key; the price and cache_read still
+        must agree (a laundered divergence fails here)."""
+        if a == b:
+            return True
+        import json as _json
+        _ga = _json.loads(_json.dumps(a))
+        _gb = _json.loads(_json.dumps(b))
+        _ga.pop("cache_write", None)
+        _gb.pop("cache_write", None)
+        return _ga == _gb and ("cache_write" in a) != ("cache_write" in b)
+
     for slashed, dashed in [
         ("google/gemini-3.7-flash", "gemini-3-7-flash"),
         ("openai/gpt-4.1-mini", "gpt-4-1-mini"),
         ("google/gemini-1.5-pro", "gemini-1-5-pro"),
     ]:
         if slashed in or_map:  # the record must exist for the alias to apply
-            assert or_map.get(dashed) == or_map[slashed], (slashed, dashed)
+            assert or_map.get(dashed) == or_map[slashed] or _alias_equal(
+                or_map.get(dashed) or {}, or_map[slashed]), (slashed, dashed)
             bare = slashed.split("/", 1)[1]
-            assert or_map.get(bare) == or_map[slashed], (slashed, bare)
+            assert or_map.get(bare) == or_map[slashed] or _alias_equal(
+                or_map.get(bare) or {}, or_map[slashed]), (slashed, bare)
 
 
 def test_find_model_prefers_the_same_provider():

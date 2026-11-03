@@ -15,7 +15,7 @@ Output Columns:
     - stage2_justification: Stage 2 explanation
     - stage1_verdict: Initial Stage 1 detection verdict
     - stage1_justification: Stage 1 reasoning
-    - stage1_confidence: Confidence score (0.0-1.0)
+    - stage1_confidence: The Stage-1 evidence-completeness rubric score (0.0-1.0, #736: 0.9+ = the full chain traced in the analyzed code; 0.7-0.89 = one named external assumption; 0.5-0.69 = plausible but partially untraced; 0.3-0.49 = a named suspicion; below 0.3 = a guess) — clamped to the range at parse; a non-numeric model value emits no score
     - agentic_classification: Pre-analysis security classification
 
 Usage:

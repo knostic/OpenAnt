@@ -28,7 +28,7 @@ State machine additions in `autopilot/state.py`:
 | `docker_executor.py` | Container exec | `run_single_container()`, `_sanitize_compose()` |
 | `result_collector.py` | Parse output | `collect_result()` |
 | `reporter.py` | Markdown report | `generate_report()` |
-| `docker_templates/python.Dockerfile` | Base Python image | `python:3.11-slim` |
+| `docker_templates/python.Dockerfile` | Base Python image | `python:3.15-slim` |
 | `docker_templates/node.Dockerfile` | Base Node image | `node:24-slim` |
 | `docker_templates/go.Dockerfile` | Base Go image | `golang:1.27-alpine` |
 | `docker_templates/attacker_server.py` | Capture server | Port 9999, endpoints: `/health`, `/capture`, `/logs`, `/logs/clear` |
@@ -152,7 +152,7 @@ The `_build_pipeline_output()` function was fixed to handle the actual Stage 1 o
 
 ## Key Dependencies
 
-- `utilities/llm_client.py` — `AnthropicClient`, `TokenTracker` (Sonnet model: `claude-sonnet-4-20250514`)
+- `utilities/llm_client.py` — `AnthropicClient`, `TokenTracker` (Sonnet model: `claude-sonnet-4-6`)
 - Docker Engine — must be running for container execution
 - No additional pip packages required (uses stdlib `subprocess` for Docker CLI)
 

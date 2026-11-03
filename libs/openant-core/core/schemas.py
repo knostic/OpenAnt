@@ -363,6 +363,12 @@ class EnhanceResult:
     # #802: the kept-set delta (``build_resume_delta``'s block) — same
     # shape + present-only semantics as AnalyzeResult's.
     resume_delta: dict | None = None
+    # #739: the selection mode a --limit run used, stamped AT THE SLICE
+    # SITE over the population the slice actually selected from (the
+    # #213 diff-selected subset when diff-mode annotated the dataset) —
+    # present-only: an unlimited run serializes byte-identical to the
+    # pre-#739 shape. Empty string = no limit ran.
+    limit_mode: str = ""
 
     def to_dict(self) -> dict:
         result = {
@@ -380,6 +386,8 @@ class EnhanceResult:
             result["incomplete_summary"] = self.incomplete_summary
         if self.resume_delta:
             result["resume_delta"] = self.resume_delta
+        if self.limit_mode:
+            result["limit_mode"] = self.limit_mode
         return result
 
 

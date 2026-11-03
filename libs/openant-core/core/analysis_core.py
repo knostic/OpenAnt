@@ -17,6 +17,7 @@ and they depend only on stdlib and shipped packages (utilities/, prompts/).
 from __future__ import annotations
 
 import json
+import math
 from typing import TYPE_CHECKING
 from datetime import datetime
 
@@ -187,6 +188,62 @@ def _normalize_result(result: dict) -> dict:
         result["cwe_id"] = 0
     if "cwe_name" not in result:
         result["cwe_name"] = None
+
+    # #736: the confidence rubric's READ-SIDE half — the emitted surface
+    # can only ever carry a DEFINED 0.0-1.0 float. The rubric (the five
+    # evidence-completeness bands) lives at the prompt's reply shape; this
+    # is the single normalization chokepoint every verdict dict passes
+    # through, so the bound is enforced HERE: a numeric value is clamped
+    # to the range (1.5 -> 1.0, -0.3 -> 0.0); a NON-NUMERIC value (the
+    # "high"/None/garbage class a free-form field invites) reads as NO
+    # confidence — set to None so the reporter's present-only gate omits
+    # it (an unusable number presented as a triage signal is the exact
+    # #736 finding; the #215 present-only contract treats it as absent,
+    # never a fabricated 0). int 1 (a "1" the model emitted without the
+    # decimal) coerces to the float — the range check runs on the
+    # COERCED value (bool is excluded: True is 1.0's integer twin and
+    # never a confidence).
+    # #736: the bound runs only when the key is PRESENT — absent stays
+    # absent (never fabricated), the #215 present-only contract.
+    if "confidence" in result:
+        _conf = result["confidence"]
+        if isinstance(_conf, bool):
+            result["raw_confidence"] = _conf
+            result["confidence"] = None
+        elif isinstance(_conf, (int, float)):
+            # #736 (the T1-r2 F8 catch): a giant int (>=309 digits — the
+            # bare-digit-string class json.loads yields) raises
+            # OverflowError inside isfinite's float conversion, which the
+            # analyze loop catches as a non-retryable ERROR and the
+            # unit's verdict is LOST (the base kept it); bound the int
+            # BEFORE any float conversion — a value that overflows the
+            # conversion is out of range by definition, so it routes to
+            # the no-confidence branch.
+            try:
+                _bounded = max(0.0, min(1.0, float(_conf)))
+            except (OverflowError, ValueError):
+                _bounded = None
+            if _bounded is None:
+                result["raw_confidence"] = _conf
+                result["confidence"] = None
+            else:
+                # #736 (the T1-r1 F1 catch): NaN/Infinity are NON-FINITE —
+                # Python's comparisons are False against NaN, so
+                # min(1.0, nan) returns 1.0 and the clamp FABRICATED the
+                # MAXIMUM confidence from json.loads' accepted bare-NaN
+                # token (the exact unusable-number-as-signal class, in the
+                # worst direction). Non-finite routes to no-confidence.
+                result["confidence"] = (
+                    _bounded if math.isfinite(_conf) else None)
+                if not math.isfinite(_conf):
+                    result["raw_confidence"] = _conf
+        elif _conf is not None:
+            # a non-numeric OR non-finite present value (the free-form
+            # field's "high"/garbage/NaN class) preserved raw, reads as NO
+            # confidence
+            result["raw_confidence"] = _conf
+            result["confidence"] = None
+        # None stays None (the present-but-null shape: no confidence)
 
     return result
 

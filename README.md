@@ -126,10 +126,10 @@ The wizard writes `~/.config/openant/config.json` for you, but you can edit it d
   "llm_configs": {
     "my-llm": {
       "app_context":  {"provider": "openai",    "model": "gpt-4o-mini"},
-      "llm_reach":    {"provider": "anthropic", "model": "claude-opus-4-6"},
+      "llm_reach":    {"provider": "anthropic", "model": "claude-opus-4-8"},
       "enhance":      {"provider": "openai",    "model": "gpt-4o-mini"},
-      "analyze":      {"provider": "anthropic", "model": "claude-opus-4-6"},
-      "verify":       {"provider": "anthropic", "model": "claude-opus-4-6"},
+      "analyze":      {"provider": "anthropic", "model": "claude-opus-4-8"},
+      "verify":       {"provider": "anthropic", "model": "claude-opus-4-8"},
       "dynamic_test": {"provider": "google",    "model": "gemini-2.0-flash"},
       "report":       {"provider": "google",    "model": "gemini-2.0-flash"}
     }
@@ -387,7 +387,7 @@ jq -r '.findings[] | "\(.id)\t\(.stage2_verdict // .stage1_verdict)"' pipeline_o
 ```
 
 ```bash
-openant patch --finding-id VULN-001
+openant patch --finding-id VULN-9c8af5  # #706: the identity-derived display ID
 ```
 
 With no path argument, the active project's `pipeline_output.json` is used, and `--repo-root` and `--output` default to the active project's repository and scan directory.

@@ -163,6 +163,17 @@ def _is_not_pulled(lowered_message: str) -> bool:
     return all(marker in lowered_message for marker in _NOT_PULLED_MARKERS)
 
 
+# #646: the validate() probe's per-request timeout (SECONDS) — a cheap
+# 1-token liveness check, not a full request: with the 600 s adapter
+# default and the SDK's retries a black-holed probe rides the
+# client default for many minutes (measured: ~30 min at the opus
+# seat's wire probe); 15 s anchors the Go wizard's probe
+# (llm_probe_openai.go: probeClientTimeout = 15 * time.Second — the
+# Go wizard DOES bound the Ollama probe too). The request path's
+# default is UNTOUCHED.
+PROBE_TIMEOUT_SECONDS = 15
+
+
 class OllamaAdapter:
     """:class:`LLMAdapter` implementation backed by a local Ollama server's
     OpenAI-compatible endpoint via ``openai.OpenAI``."""
@@ -265,6 +276,7 @@ class OllamaAdapter:
                 "model": model,
                 _token_param(model): 1,
                 "messages": [{"role": "user", "content": "hi"}],
+                "timeout": PROBE_TIMEOUT_SECONDS,  # #646: the probe's tight deadline
             })
         except openai.APIError as exc:
             raise _classify_error(exc, report_429=False) from redacted_cause_from(exc)

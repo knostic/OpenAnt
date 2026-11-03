@@ -63,6 +63,7 @@ from .anthropic import (
 )
 from .._pricing import LazyProviderPricing
 from .._redact import redact_secrets, redacted_cause_from
+from .. import LLMConfigError
 from ..adapter import (
     CompletionResult,
     LLMAuthError,
@@ -73,6 +74,39 @@ from ..adapter import (
     Message,
     ToolDef,
 )
+
+
+# #852: THE INVOKEMODEL BODY'S API VERSION, PINNED EXPLICITLY.
+#
+# The SDK injects this field itself in ``anthropic/lib/bedrock/_client.py``:
+#     options.json_data.setdefault("anthropic_version", ANTHROPIC_API_VERSION)
+# anthropic 2.0.0 DELETED ``DEFAULT_VERSION = "bedrock-2023-05-31"`` and pointed
+# that setdefault at ``ANTHROPIC_API_VERSION``, which moved 2023-06-01 ->
+# 2026-10-21 (2.1.0 is byte-identical to 2.0.0 in both files). Because the key is
+# a ``setdefault``, a caller-supplied value WINS -- so sending it explicitly keeps
+# the wire exactly where it is today, independent of the installed SDK.
+#
+# WHY IT MUST BE PINNED. Anthropic's Bedrock (Opus 4.6 and earlier) page warns
+# that the ARN-versioned models in its table "don't support 2026-10-21 on
+# Bedrock, and requests to them that send it can return a 400 error", and ends:
+# "The Boto3 example sets anthropic_version in its request body and isn't
+# affected." config/models.json ships FOUR of those models as ``status: current``
+# -- {global,us}.anthropic.claude-haiku-4-5-20251001-v1:0 and
+# {global,us}.anthropic.claude-sonnet-4-6 -- two of which are this module's own
+# docstring examples. Retiring them to let a dep bump land would be a coverage
+# regression; pinning the field keeps all eleven Bedrock records serving.
+#
+# SCOPE, stated so it is not mistaken for a wider claim: this pins the BEDROCK
+# body field only. The direct-API adapter (providers/anthropic.py) still sends
+# whatever ``anthropic-version`` header its SDK defaults to, which is correct --
+# the 2026-10-21 Messages-API changes (temperature/top_p/top_k removed, document
+# blocks in assistant messages, citations on user text blocks) were each checked
+# against this tree and none is reached.
+#
+# The value is DELIBERATELY a literal and not read from the SDK: importing the
+# SDK's constant is what broke, and a pin that tracks the thing it is pinning
+# against is not a pin.
+BEDROCK_BODY_API_VERSION = "bedrock-2023-05-31"
 
 
 _MODEL_ACCESS_HINT = (
@@ -119,6 +153,20 @@ def reset_warnings() -> None:
     global _api_key_warned
     with _api_key_warned_lock:
         _api_key_warned = False
+
+
+# #646: the validate() probe's per-request timeout (SECONDS) — a cheap
+# 1-token liveness check, not a full request: with the 600 s adapter
+# default and max_retries=5 a black-holed probe fails after ~61
+# minutes worst case; 15 s anchors the Go wizard's probe
+# (llm_probe_google.go: http.Client{Timeout: 15 * time.Second}), so
+# the probe fails in ~104 s worst case (the client's max_retries=5
+# inherited: 6 jittered attempts under a 15 s deadline — the
+# opus-r1 wire measurement), down from the ~61 minutes of the
+# unbounded 600 s shape; the Go wizard's ONE-attempt probe is
+# tighter still. The request path's 600 s default and its
+# max_retries are UNTOUCHED.
+PROBE_TIMEOUT_SECONDS = 15
 
 
 class BedrockAdapter:
@@ -209,6 +257,8 @@ class BedrockAdapter:
             "model": model,
             "max_tokens": max_tokens,
             "messages": [_message_to_anthropic(m) for m in messages],
+            # #852: pin the body's API version (see BEDROCK_BODY_API_VERSION).
+            "extra_body": {"anthropic_version": BEDROCK_BODY_API_VERSION},
         }
         if system is not None:
             request["system"] = system
@@ -219,6 +269,21 @@ class BedrockAdapter:
         if self.thinking is not None:
             request["thinking"] = self.thinking
 
+        # #696 trigger 3 (the fable-hunt sibling catch): the thinking
+        # budget must leave room for the response — the same contract as
+        # the anthropic adapter, mirrored here so the issue's trigger-3
+        # shape cannot survive on a sibling provider.
+        if (self.thinking is not None
+                and self.thinking.get("type") not in (None, "disabled")):
+            budget = self.thinking.get("budget_tokens")
+            if isinstance(budget, int) and budget >= max_tokens:
+                raise LLMConfigError(
+                    f"thinking budget_tokens ({budget}) must be less than "
+                    f"max_tokens ({max_tokens}) — the budget is carved out "
+                    "of the response allowance and leaves no room for the "
+                    "response itself; lower budget_tokens or raise max_tokens"
+                )
+
         # #625 T1 guard (2026-09-21, the retro bug-hunt finding): a
         # thinking-enabled request WITH tools requires the thinking blocks
         # preserved on the echoed assistant turn (Anthropic's documented
@@ -228,7 +293,7 @@ class BedrockAdapter:
         # failure; the full preserved-blocks handling is a separate change.
         if (tools and self.thinking is not None
                 and self.thinking.get("type") not in (None, "disabled")):
-            raise LLMResponseError(
+            raise LLMConfigError(
                 f"BedrockAdapter refuses thinking+tools: thinking blocks must be "
                 "preserved on the echoed assistant turn for multi-turn tool "
                 "loops, and this adapter's loop echo does not carry them "
@@ -298,9 +363,15 @@ class BedrockAdapter:
         # backoff — it is a one-shot probe at scan startup.
         try:
             self._client.messages.create(
+                timeout=PROBE_TIMEOUT_SECONDS,  # #646: the probe's tight deadline
                 model=model,
                 max_tokens=1,
                 messages=[{"role": "user", "content": "hi"}],
+                # #852: validate() is the FIRST call a scan makes
+                # (registry.validate at startup). Pinning only complete() would
+                # 400 every preflight on the four ARN-versioned current records
+                # while the scan body succeeded.
+                extra_body={"anthropic_version": BEDROCK_BODY_API_VERSION},
             )
         except anthropic.AuthenticationError as exc:
             raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)

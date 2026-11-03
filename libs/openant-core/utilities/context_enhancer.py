@@ -23,7 +23,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
-from .model_config import CLAUDE_SONNET_4_20250514
 from .llm_client import (TokenTracker, get_global_tracker,
                          incomplete_markers, turn_has_spend,
                          unpriced_kinds_from)
@@ -60,10 +59,6 @@ def _get_step_checkpoint():
 _null_logger = logging.getLogger("null")
 _null_logger.addHandler(logging.NullHandler())
 
-
-# The enhance phase's model is supplied by the binding now; this
-# constant is retained only for legacy log lines that reference it.
-CONTEXT_ENHANCEMENT_MODEL_LEGACY = CLAUDE_SONNET_4_20250514
 
 # Max bounded rounds of the post-loop transient-error retry. Each round
 # re-attempts units still carrying a retryable error; rounds stop early once
@@ -1004,13 +999,13 @@ class ContextEnhancer:
                      "cost_usd": round(_summary_cost_usd, 6)}
             # #626/PR#661 hunt F4: both kinds, one rule
             # (utilities.llm_client.incomplete_markers), present-only.
-            usage.update(incomplete_markers(_summary_unpriced,
-                                            _summary_unpriced_cache))
+            # #699: the counter's pairing (the #644 shape this writer alone
+            # shipped by hand) moves INTO the builder — one rule for all
+            # five _summary.json writers now.
             from utilities.llm_client import _accounting_error_count
-            _errs = _accounting_error_count()
-            if _errs:
-                usage["accounting_errors"] = _errs
-                usage["cost_incomplete"] = True
+            usage.update(incomplete_markers(_summary_unpriced,
+                                            _summary_unpriced_cache,
+                                            _accounting_error_count()))
             return usage
 
         if checkpoint_dir:

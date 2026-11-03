@@ -26,7 +26,7 @@ _VENDOR = _REPO_ROOT / "apps" / "openant-cli" / "internal" / "report" / "vendor"
 
 _PINNED = [
     # (url fragment, vendored filename)
-    ("chart.js@4.5.1/dist/chart.umd.min.js", "chart-4.5.1.umd.min.js"),
+    ("chart.js@4.6.1/dist/chart.umd.min.js", "chart-4.6.1.umd.min.js"),
     ("chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js",
      "chartjs-plugin-datalabels-2.2.0.min.js"),
 ]

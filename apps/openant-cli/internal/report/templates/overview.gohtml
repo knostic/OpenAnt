@@ -6,7 +6,7 @@
     <title>{{.Title}}</title>
     {{/* #540: the prebuilt CSS (the choice-1 migration; the runtime compiler was frozen at the dead Play-CDN channel). Same self-containment: template.CSS embed, no CDN. Cascade: this block comes BEFORE the hand-written <style> below — the hand-written rules win at equal specificity, the same order the runtime-injected stylesheet had (appended at head-end AFTER these blocks) reversed only for utility-vs-handcrafted collisions, none observed (one manual render checked). */}}
     <style>{{ vendorCSS "report.css" }}</style>
-    <script>{{ vendorJS "chart-4.5.1.umd.min.js" }}</script>
+    <script>{{ vendorJS "chart-4.6.1.umd.min.js" }}</script>
     <script>{{ vendorJS "chartjs-plugin-datalabels-2.2.0.min.js" }}</script>
     <style>
         /* Details marker styling */
@@ -201,6 +201,7 @@
                                     <th class="text-left py-3 px-4 text-gray-300 font-medium">Duration</th>
                                     <th class="text-left py-3 px-4 text-gray-300 font-medium">Cost</th>
                                     <th class="text-left py-3 px-4 text-gray-300 font-medium">Status</th>
+                                    <th class="text-left py-3 px-4 text-gray-300 font-medium">Details</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -208,8 +209,9 @@
                                 <tr class="border-b border-gray-800 {{if even $i}} bg-navy-800/50 {{else}} bg-navy-900/30 {{end}}">
                                     <td class="py-3 px-4 font-mono">{{$step.Step}}</td>
                                     <td class="py-3 px-4">{{$step.Duration}}</td>
-                                    <td class="py-3 px-4">{{$step.Cost}}</td>
+                                    <td class="py-3 px-4">{{$step.Cost}}{{if $step.CostIncomplete}} <span class="text-xs text-orange-500" title="{{$step.UnpricedModelsTitle}}">incomplete</span>{{end}}</td>
                                     <td class="py-3 px-4 {{$step.StatusColor}}">{{$step.Status}}</td>
+                                    <td class="py-3 px-4 text-xs text-gray-400">{{$step.DiagnosticDetails}}</td>
                                 </tr>
                                 {{end}}
                             </tbody>
@@ -218,6 +220,7 @@
                                     <td class="py-3 px-4">Total</td>
                                     <td class="py-3 px-4">{{.FormatDuration}}</td>
                                     <td class="py-3 px-4">{{.FormatTotalCost}}</td>
+                                    <td class="py-3 px-4"></td>
                                     <td class="py-3 px-4"></td>
                                 </tr>
                             </tfoot>
@@ -235,12 +238,13 @@
                                 </div>
                                 <div>
                                     <span class="text-gray-400">Cost</span>
-                                    <div class="text-gray-200">{{.Cost}}</div>
+                                    <div class="text-gray-200">{{.Cost}}{{if .CostIncomplete}} <span class="text-xs text-orange-500" title="{{.UnpricedModelsTitle}}">incomplete</span>{{end}}</div>
                                 </div>
                                 <div>
                                     <span class="text-gray-400">Status</span>
                                     <div class="{{.StatusColor}}">{{.Status}}</div>
                                 </div>
+                                {{if .DiagnosticDetails}}<div class="grid grid-cols-2 gap-2 mt-2"><span class="text-gray-400">Details</span><div class="text-xs text-gray-400">{{.DiagnosticDetails}}</div></div>{{end}}
                             </div>
                         </div>
                         {{end}}
