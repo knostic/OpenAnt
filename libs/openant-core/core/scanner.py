@@ -523,8 +523,16 @@ def scan_repository(
         if os.path.exists(_diff_report):
             try:
                 ctx.summary["diff_stats"] = read_json(_diff_report)
-            except (json.JSONDecodeError, OSError):
-                pass
+            except Exception as e:
+                # #714 (#257's pattern, the scanner's own site): read_json
+                # opens strict UTF-8 — a bad-encoding diff_filter.report.json
+                # raised UnicodeDecodeError (a ValueError, outside the old
+                # narrow clause) out of the parse step_context, which
+                # re-raises — the whole SCAN aborted at Step 1, before the
+                # reporter's own degrade for the same file was ever reached.
+                # The summary degrades to "no diff_stats", never crashes.
+                print(f"  WARNING: could not read {_diff_report}: {e}",
+                      file=sys.stderr)
         ctx.outputs = {
             "dataset_path": parse_result.dataset_path,
             "analyzer_output_path": parse_result.analyzer_output_path,
@@ -1543,6 +1551,16 @@ def scan_repository(
     else:
         _dt_will_run = True
 
+    # #714 (the #799 pattern, the report step's twin): the report-step
+    # skip decision is knowable BEFORE the Step-6 build — hoist it so the
+    # skipped set the human summary reads (pipeline_output.json) carries
+    # it. Previously the "not_requested" record was made AFTER the build
+    # (Step 8's else branch), so the file said "No steps were skipped"
+    # while scan.report.json disagreed — the machine artifacts contradicted
+    # each other about the same fact.
+    if not generate_report:
+        _record_skip(result, "report", "not_requested")
+
     # ---------------------------------------------------------------
     # Step 6: Build pipeline_output.json
     # ---------------------------------------------------------------
@@ -1602,12 +1620,12 @@ def scan_repository(
     with step_context("build-output", output_dir, inputs={
         "results_path": active_results_path,
     }) as ctx:
-        # #799: the closure carries the true skipped set — the dynamic-test
-        # decision was made BEFORE this build (see the #799 hoist above), so
-        # every knowable skip class is in the file the summary reads; the
-        # attempted-run `failed` class (Step 7) rebuilds via the same
-        # closure; the REPORT step's own skip remains post-build (#799's
-        # Not-claimed boundary, the issue names it).
+        # #799 + #714: the closure carries the true skipped set — BOTH the
+        # dynamic-test AND the report-step decisions were made BEFORE this
+        # build (see the #799/#714 hoists above), so every knowable skip
+        # class is in the file the summary reads; the attempted-run
+        # `failed` class (Step 7) rebuilds via the same closure. No skip
+        # class is post-build anymore.
         _build_pipeline_output_file()
 
         ctx.outputs = {"pipeline_output_path": pipeline_output_path}
@@ -1748,8 +1766,10 @@ def scan_repository(
 
         collected_step_reports.append(_load_step_report(output_dir, "report"))
     else:
+        # #714: the skip was recorded pre-build (the #799 hoist twin); only
+        # the operator-facing line prints here (the position of the line in
+        # the step sequence is unchanged from the pre-#714 flow)
         print(_step_label("Skipping report generation (--no-report)."), file=sys.stderr)
-        _record_skip(result, "report", "not_requested")
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------

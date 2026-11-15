@@ -43,7 +43,20 @@ def _load_diff_metadata(scan_dir: str) -> dict | None:
         return None
     try:
         manifest = read_json(manifest_path)
-    except (json.JSONDecodeError, OSError):
+    except Exception as e:
+        # #714 (#257's pattern): read_json opens strict UTF-8 — a
+        # bad-encoding manifest raises UnicodeDecodeError (a ValueError),
+        # outside the old (json.JSONDecodeError, OSError) clause, so the
+        # degrade path ABORTED instead of degrading. The degrade contract:
+        # an unreadable optional sidecar means "no diff" — the report
+        # builds without the diff block, never crashes on it.
+        print(f"WARNING: could not read {manifest_path}: {e}", file=sys.stderr)
+        return None
+    # the shape guard (the _load_reachability_metadata site's own
+    # precedent): a valid-JSON but non-dict manifest degrades to "no
+    # diff" too — the manifest is pipeline-produced, so a wrong top-level
+    # type is corruption, and corruption must not abort report building
+    if not isinstance(manifest, dict):
         return None
     out = {
         "mode": "incremental",
@@ -58,12 +71,25 @@ def _load_diff_metadata(scan_dir: str) -> dict | None:
     if os.path.exists(filter_report):
         try:
             stats = read_json(filter_report)
-            out["units_in_diff"] = stats.get("selected")
-            out["units_total_parsed"] = stats.get("total")
-            out["callers_added"] = stats.get("callers_added") or 0
-            out["fallback_file_match"] = stats.get("fallback_file_match") or 0
-        except (json.JSONDecodeError, OSError):
-            pass
+        except Exception as e:
+            # #714 (#257's pattern): same strict-UTF-8 abort class — the
+            # diff block degrades to "no filter stats", never crashes.
+            # The try wraps ONLY the read (D1, the r1 review): a valid-JSON
+            # but non-dict filter report is a shape error, not a read
+            # error — it degrades below via the .get() guards, not through
+            # a "could not read" message that would be false.
+            print(f"WARNING: could not read {filter_report}: {e}",
+                  file=sys.stderr)
+        else:
+            # the shape guard: a valid-JSON but non-dict filter report
+            # degrades to "no filter stats" silently — a read failure
+            # warns, a shape failure just lacks the keys (the warning
+            # text says "could not read", which would be false here)
+            if isinstance(stats, dict):
+                out["units_in_diff"] = stats.get("selected")
+                out["units_total_parsed"] = stats.get("total")
+                out["callers_added"] = stats.get("callers_added") or 0
+                out["fallback_file_match"] = stats.get("fallback_file_match") or 0
     return out
 
 
@@ -158,7 +184,16 @@ def _dedup_caller_callee(
 
     try:
         cg_data = read_json(call_graph_path)
-    except (json.JSONDecodeError, OSError):
+    except Exception as e:
+        # #714 (#257's pattern): a bad-encoding call_graph.json aborted
+        # the confirmation path instead of degrading to the input set
+        print(f"WARNING: could not read {call_graph_path}: {e}",
+              file=sys.stderr)
+        return confirmed
+
+    # the shape guard (B1, the r1 review): same precedent — a valid-JSON
+    # but non-dict call graph degrades to the input confirmed set
+    if not isinstance(cg_data, dict):
         return confirmed
 
     reverse_cg = cg_data.get("reverse_call_graph", {})
@@ -362,7 +397,11 @@ def _load_reachability_metadata(scan_dir: str) -> dict | None:
         return None
     try:
         dataset = read_json(dataset_path)
-    except (json.JSONDecodeError, OSError):
+    except Exception as e:
+        # #714 (#257's pattern): the issue's own executed repro — a
+        # bad-encoding dataset.json raised UnicodeDecodeError out of this
+        # helper and aborted report building entirely
+        print(f"WARNING: could not read {dataset_path}: {e}", file=sys.stderr)
         return None
     if not isinstance(dataset, dict):
         return None

@@ -25,6 +25,7 @@ Example:
 
 import argparse
 import json
+import sys
 import html
 import os
 from datetime import datetime
@@ -98,7 +99,12 @@ def _load_pipeline_metadata(experiment_path: str) -> tuple[dict | None, dict | N
         return None, None
     try:
         data = read_json(candidate)
-    except (json.JSONDecodeError, OSError):
+    except Exception as e:
+        # #714 (#257's pattern, the csv twin's sibling): same optional
+        # pipeline_output.json read — degrade to (None, None), never die
+        print(f"WARNING: could not read {candidate}: {e}", file=sys.stderr)
+        return None, None
+    if not isinstance(data, dict):
         return None, None
     return data.get("repository"), data.get("diff")
 

@@ -295,9 +295,22 @@ def _load_step_reports(directory: str) -> list[dict]:
     reports = []
     for path in glob.glob(os.path.join(directory, "*.report.json")):
         try:
-            reports.append(read_json(path))
-        except (json.JSONDecodeError, OSError):
+            data = read_json(path)
+        except Exception as e:
+            # #714 (#257's pattern, the report-data loader): the glob
+            # catches diff_filter.report.json — the very file the scanner,
+            # the parse CLI and the reporter degrade elsewhere — and a
+            # bad-encoding step report raised UnicodeDecodeError (a
+            # ValueError, outside the old narrow clause) out of
+            # build-output / report / report-data, killing the deliverable
+            # on an optional cost/duration sidecar. Skip the one file.
+            print(f"WARNING: could not read {path}: {e}", file=sys.stderr)
             continue
+        # the shape filter (single home): every consumer calls .get() on
+        # each element — a non-dict report (B1's class) degrades to
+        # skipped here rather than AttributeError at four call sites
+        if isinstance(data, dict):
+            reports.append(data)
     return reports
 
 
@@ -536,8 +549,18 @@ def cmd_parse(args):
             if os.path.exists(diff_report):
                 try:
                     ctx.summary["diff_stats"] = read_json(diff_report)
-                except (json.JSONDecodeError, OSError):
-                    pass
+                except Exception as e:
+                    # #714 (#257's pattern, the `openant parse` twin of the
+                    # scanner's F3 site): read_json opens strict UTF-8 — a
+                    # bad-encoding diff_filter.report.json raised
+                    # UnicodeDecodeError (a ValueError, outside the old
+                    # narrow clause) out of the parse step_context, which
+                    # re-raises — a SUCCESSFUL parse was reported to the
+                    # operator and the Go CLI as rc=2 (status error) after
+                    # every artifact was already written. The summary
+                    # degrades to no diff_stats, the parse reports success.
+                    print(f"WARNING: could not read {diff_report}: {e}",
+                          file=sys.stderr)
             ctx.outputs = {
                 "dataset_path": result.dataset_path,
                 "analyzer_output_path": result.analyzer_output_path,
@@ -1296,38 +1319,60 @@ def cmd_report_data(args):
             dt_path = os.path.join(results_dir, "dynamic_test_results.json")
             po_path = os.path.join(results_dir, "pipeline_output.json")
             if os.path.exists(dt_path) and os.path.exists(po_path):
-                dt_data = read_json(dt_path)
-                # fa17 TRUST BOUNDARY: dynamic_test_results.json is a separate
-                # model-supplied schema; normalize its `results` to dicts-only so
-                # the `for dr in dt_data.get("results", [])` loop below is safe.
-                normalize_results(dt_data)
-                po_data = read_json(po_path)
-                # fa18 TRUST BOUNDARY: normalize model `findings` from
-                # pipeline_output.json to dicts-only at load (presence-guarded)
-                # so the `finding.get("id")` mapping loop below is safe.
-                if "findings" in po_data:
-                    normalize_results(po_data, "findings")
+                # #714 (#257's pattern): BOTH reads of this optional pair
+                # were bare — a bad-encoding or non-dict file raised past
+                # the outer try and killed report-data (rc=2) on an
+                # OPTIONAL dynamic-test bridge (the HTML deliverable's
+                # live data source). Degrade to no bridge, never die; the
+                # dt enrichment block below simply does not fire.
+                try:
+                    dt_data = read_json(dt_path)
+                    if not isinstance(dt_data, dict):
+                        dt_data = None
+                    else:
+                        # fa17 TRUST BOUNDARY: dynamic_test_results.json is a
+                        # separate model-supplied schema; normalize its
+                        # `results` to dicts-only so the loop below is safe.
+                        normalize_results(dt_data)
+                except Exception as e:
+                    print(f"WARNING: could not read {dt_path}: {e}",
+                          file=sys.stderr)
+                    dt_data = None
+                try:
+                    po_data = read_json(po_path)
+                    if not isinstance(po_data, dict):
+                        po_data = None
+                    elif "findings" in po_data:
+                        # fa18 TRUST BOUNDARY: normalize model `findings`
+                        # from pipeline_output.json to dicts-only at load
+                        # (presence-guarded) so the `finding.get("id")`
+                        # mapping loop below is safe.
+                        normalize_results(po_data, "findings")
+                except Exception as e:
+                    print(f"WARNING: could not read {po_path}: {e}",
+                          file=sys.stderr)
+                    po_data = None
+                if dt_data and po_data:
+                    # Map VULN-ID → route_key from pipeline_output
+                    vuln_id_to_route = {}
+                    for finding in po_data.get("findings", []):
+                        fid = finding.get("id")
+                        loc = finding.get("location", {})
+                        route = (
+                            f"{loc.get('file', '')}:{loc.get('function', '')}"
+                            if loc.get("file") else loc.get("function", "")
+                        )
+                        if fid and route:
+                            vuln_id_to_route[fid] = route
 
-                # Map VULN-ID → route_key from pipeline_output
-                vuln_id_to_route = {}
-                for finding in po_data.get("findings", []):
-                    fid = finding.get("id")
-                    loc = finding.get("location", {})
-                    route = (
-                        f"{loc.get('file', '')}:{loc.get('function', '')}"
-                        if loc.get("file") else loc.get("function", "")
-                    )
-                    if fid and route:
-                        vuln_id_to_route[fid] = route
+                    # Map route_key → dynamic test result
+                    for dr in dt_data.get("results", []):
+                        fid = dr.get("finding_id")
+                        route = vuln_id_to_route.get(fid)
+                        if route:
+                            dt_by_route_key[route] = dr
 
-                # Map route_key → dynamic test result
-                for dr in dt_data.get("results", []):
-                    fid = dr.get("finding_id")
-                    route = vuln_id_to_route.get(fid)
-                    if route:
-                        dt_by_route_key[route] = dr
-
-                print(f"[Report] Loaded {len(dt_by_route_key)} dynamic test results", file=sys.stderr)
+                    print(f"[Report] Loaded {len(dt_by_route_key)} dynamic test results", file=sys.stderr)
 
             # --- Prepare findings ---
             units_by_id = {u["id"]: u for u in dataset.get("units", [])}
@@ -1651,6 +1696,17 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
             if os.path.exists(po_path):
                 try:
                     po = read_json(po_path)
+                except Exception as e:
+                    # #714 (#257's pattern): a bad-encoding
+                    # pipeline_output.json killed report-data (the HTML
+                    # deliverable's live data source) on an optional
+                    # repo-info block — degrade to the empty defaults
+                    print(f"WARNING: could not read {po_path}: {e}",
+                          file=sys.stderr)
+                    po = None
+                # the shape guard (B1's class): a non-dict po degrades to
+                # the empty defaults too, never an AttributeError
+                if isinstance(po, dict):
                     repo_info = po.get("repository", {})
                     repo_name = repo_info.get("name", "")
                     commit_sha = repo_info.get("commit_sha", "")
@@ -1671,8 +1727,6 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
                             "changed_files": raw_diff.get("changed_files", 0) or 0,
                             "pr_number": raw_diff.get("pr_number") or 0,
                         }
-                except (json.JSONDecodeError, OSError):
-                    pass
 
             # --- Totals from step reports ---
             total_duration_seconds = 0.0
