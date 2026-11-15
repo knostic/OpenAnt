@@ -43,7 +43,14 @@ def _load_diff_metadata(scan_dir: str) -> dict | None:
         return None
     try:
         manifest = read_json(manifest_path)
-    except (json.JSONDecodeError, OSError):
+    except Exception as e:
+        # #714 (#257's pattern): read_json opens strict UTF-8 — a
+        # bad-encoding manifest raises UnicodeDecodeError (a ValueError),
+        # outside the old (json.JSONDecodeError, OSError) clause, so the
+        # degrade path ABORTED instead of degrading. The degrade contract:
+        # an unreadable optional sidecar means "no diff" — the report
+        # builds without the diff block, never crashes on it.
+        print(f"WARNING: could not read {manifest_path}: {e}", file=sys.stderr)
         return None
     out = {
         "mode": "incremental",
@@ -62,8 +69,11 @@ def _load_diff_metadata(scan_dir: str) -> dict | None:
             out["units_total_parsed"] = stats.get("total")
             out["callers_added"] = stats.get("callers_added") or 0
             out["fallback_file_match"] = stats.get("fallback_file_match") or 0
-        except (json.JSONDecodeError, OSError):
-            pass
+        except Exception as e:
+            # #714 (#257's pattern): same strict-UTF-8 abort class — the
+            # diff block degrades to "no filter stats", never crashes
+            print(f"WARNING: could not read {filter_report}: {e}",
+                  file=sys.stderr)
     return out
 
 
@@ -158,7 +168,11 @@ def _dedup_caller_callee(
 
     try:
         cg_data = read_json(call_graph_path)
-    except (json.JSONDecodeError, OSError):
+    except Exception as e:
+        # #714 (#257's pattern): a bad-encoding call_graph.json aborted
+        # the confirmation path instead of degrading to the input set
+        print(f"WARNING: could not read {call_graph_path}: {e}",
+              file=sys.stderr)
         return confirmed
 
     reverse_cg = cg_data.get("reverse_call_graph", {})
@@ -362,7 +376,11 @@ def _load_reachability_metadata(scan_dir: str) -> dict | None:
         return None
     try:
         dataset = read_json(dataset_path)
-    except (json.JSONDecodeError, OSError):
+    except Exception as e:
+        # #714 (#257's pattern): the issue's own executed repro — a
+        # bad-encoding dataset.json raised UnicodeDecodeError out of this
+        # helper and aborted report building entirely
+        print(f"WARNING: could not read {dataset_path}: {e}", file=sys.stderr)
         return None
     if not isinstance(dataset, dict):
         return None
