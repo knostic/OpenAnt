@@ -164,6 +164,82 @@ def test_a_bad_encoding_filter_report_does_not_abort_the_scan(
     assert os.path.exists(po), "the scan aborted before the Step-6 build"
 
 
+# --- the r2 sites: the parse CLI twin + the report-package reads ---
+
+def test_the_parse_cli_degrades_a_bad_encoding_filter_report(
+        tmp_path, monkeypatch, capsys):
+    """F1 (r2): `openant parse` — the public entry the Go CLI dispatches
+    — had F3's exact twin clause on the same file, inside its own
+    step_context. A bad-encoding diff_filter.report.json made a
+    SUCCESSFUL parse exit rc=2 (status error) after every artifact was
+    already written. The parse must complete and report success."""
+    import subprocess
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    with open(os.path.join(repo, "a.py"), "w") as fh:
+        fh.write("def f(): pass\n")
+    out = str(tmp_path / "out")
+    os.makedirs(out)
+    with open(os.path.join(out, "diff_filter.report.json"), "wb") as fh:
+        fh.write(b'{"selected": 1, "\xff\xfe"}')
+    proc = subprocess.run(
+        [sys.executable, "-m", "openant.cli", "parse", repo, "--output", out],
+        capture_output=True, text=True, timeout=180,
+        cwd=str(_CORE_ROOT),
+    )
+    assert proc.returncode == 0, (
+        f"the parse aborted on the optional sidecar: {proc.stderr[-400:]}")
+    assert "WARNING: could not read" in proc.stderr, (
+        "the degrade must warn (the #257 per-site pattern)")
+
+
+def test_the_csv_export_degrades_a_bad_encoding_pipeline_output(
+        tmp_path, capsys):
+    """F2a (r2): the CSV export's optional pipeline_output.json read — a
+    bad-encoding file killed the WHOLE export via the child exit (the
+    banner block is optional; the CSV is the deliverable). Degrade to no
+    diff block."""
+    from report.csv_export import _load_diff_block
+    exp = os.path.join(str(tmp_path), "results.json")
+    with open(exp, "w") as fh:
+        fh.write("[]")
+    with open(os.path.join(str(tmp_path), "pipeline_output.json"), "wb") as fh:
+        fh.write(b'{"diff": {"mode": "incremental"}, "\xff\xfe"}')
+    assert _load_diff_block(exp) is None
+    assert "could not read" in capsys.readouterr().err
+
+
+def test_the_html_report_degrades_a_bad_encoding_pipeline_output(
+        tmp_path, capsys):
+    """F2b (r2): the HTML report's read of the same optional file — the
+    csv twin's sibling. Degrade to (None, None)."""
+    from report.html_report import _load_pipeline_metadata
+    exp = os.path.join(str(tmp_path), "results.json")
+    with open(exp, "w") as fh:
+        fh.write("[]")
+    with open(os.path.join(str(tmp_path), "pipeline_output.json"), "wb") as fh:
+        fh.write(b'{"repository": {"name": "x"}, "\xff\xfe"}')
+    assert _load_pipeline_metadata(exp) == (None, None)
+    assert "could not read" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("shape", ["[]", "null"])
+def test_the_report_package_reads_degrade_a_non_dict_pipeline_output(
+        tmp_path, shape):
+    """The shape class on the two report-package sites (B1's twin):
+    a valid-JSON non-dict pipeline_output.json degrades, never an
+    AttributeError out of the .get()."""
+    from report.csv_export import _load_diff_block
+    from report.html_report import _load_pipeline_metadata
+    exp = os.path.join(str(tmp_path), "results.json")
+    with open(exp, "w") as fh:
+        fh.write("[]")
+    with open(os.path.join(str(tmp_path), "pipeline_output.json"), "w") as fh:
+        fh.write(shape)
+    assert _load_diff_block(exp) is None
+    assert _load_pipeline_metadata(exp) == (None, None)
+
+
 # --- the report-step skip hoist ---
 
 def test_the_report_step_skip_is_hoisted_pre_build():

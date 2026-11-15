@@ -536,8 +536,18 @@ def cmd_parse(args):
             if os.path.exists(diff_report):
                 try:
                     ctx.summary["diff_stats"] = read_json(diff_report)
-                except (json.JSONDecodeError, OSError):
-                    pass
+                except Exception as e:
+                    # #714 (#257's pattern, the `openant parse` twin of the
+                    # scanner's F3 site): read_json opens strict UTF-8 — a
+                    # bad-encoding diff_filter.report.json raised
+                    # UnicodeDecodeError (a ValueError, outside the old
+                    # narrow clause) out of the parse step_context, which
+                    # re-raises — a SUCCESSFUL parse was reported to the
+                    # operator and the Go CLI as rc=2 (status error) after
+                    # every artifact was already written. The summary
+                    # degrades to no diff_stats, the parse reports success.
+                    print(f"WARNING: could not read {diff_report}: {e}",
+                          file=sys.stderr)
             ctx.outputs = {
                 "dataset_path": result.dataset_path,
                 "analyzer_output_path": result.analyzer_output_path,

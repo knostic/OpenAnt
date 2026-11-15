@@ -27,7 +27,7 @@ Example:
 
 import argparse
 import csv
-import json
+import sys
 import os
 from utilities.file_io import normalize_results, read_json
 
@@ -91,7 +91,14 @@ def _load_diff_block(experiment_path: str) -> dict | None:
         return None
     try:
         data = read_json(candidate)
-    except (json.JSONDecodeError, OSError):
+    except Exception as e:
+        # #714 (#257's pattern, the report package's twin): a bad-encoding
+        # or unreadable pipeline_output.json killed the WHOLE CSV export
+        # (an optional banner block) via the child-process exit — the
+        # export degrades to no diff block, never dies on it
+        print(f"WARNING: could not read {candidate}: {e}", file=sys.stderr)
+        return None
+    if not isinstance(data, dict):
         return None
     diff = data.get("diff")
     if isinstance(diff, dict) and diff.get("mode") == "incremental":
