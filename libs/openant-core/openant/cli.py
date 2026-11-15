@@ -1319,38 +1319,60 @@ def cmd_report_data(args):
             dt_path = os.path.join(results_dir, "dynamic_test_results.json")
             po_path = os.path.join(results_dir, "pipeline_output.json")
             if os.path.exists(dt_path) and os.path.exists(po_path):
-                dt_data = read_json(dt_path)
-                # fa17 TRUST BOUNDARY: dynamic_test_results.json is a separate
-                # model-supplied schema; normalize its `results` to dicts-only so
-                # the `for dr in dt_data.get("results", [])` loop below is safe.
-                normalize_results(dt_data)
-                po_data = read_json(po_path)
-                # fa18 TRUST BOUNDARY: normalize model `findings` from
-                # pipeline_output.json to dicts-only at load (presence-guarded)
-                # so the `finding.get("id")` mapping loop below is safe.
-                if "findings" in po_data:
-                    normalize_results(po_data, "findings")
+                # #714 (#257's pattern): BOTH reads of this optional pair
+                # were bare — a bad-encoding or non-dict file raised past
+                # the outer try and killed report-data (rc=2) on an
+                # OPTIONAL dynamic-test bridge (the HTML deliverable's
+                # live data source). Degrade to no bridge, never die; the
+                # dt enrichment block below simply does not fire.
+                try:
+                    dt_data = read_json(dt_path)
+                    if not isinstance(dt_data, dict):
+                        dt_data = None
+                    else:
+                        # fa17 TRUST BOUNDARY: dynamic_test_results.json is a
+                        # separate model-supplied schema; normalize its
+                        # `results` to dicts-only so the loop below is safe.
+                        normalize_results(dt_data)
+                except Exception as e:
+                    print(f"WARNING: could not read {dt_path}: {e}",
+                          file=sys.stderr)
+                    dt_data = None
+                try:
+                    po_data = read_json(po_path)
+                    if not isinstance(po_data, dict):
+                        po_data = None
+                    elif "findings" in po_data:
+                        # fa18 TRUST BOUNDARY: normalize model `findings`
+                        # from pipeline_output.json to dicts-only at load
+                        # (presence-guarded) so the `finding.get("id")`
+                        # mapping loop below is safe.
+                        normalize_results(po_data, "findings")
+                except Exception as e:
+                    print(f"WARNING: could not read {po_path}: {e}",
+                          file=sys.stderr)
+                    po_data = None
+                if dt_data and po_data:
+                    # Map VULN-ID → route_key from pipeline_output
+                    vuln_id_to_route = {}
+                    for finding in po_data.get("findings", []):
+                        fid = finding.get("id")
+                        loc = finding.get("location", {})
+                        route = (
+                            f"{loc.get('file', '')}:{loc.get('function', '')}"
+                            if loc.get("file") else loc.get("function", "")
+                        )
+                        if fid and route:
+                            vuln_id_to_route[fid] = route
 
-                # Map VULN-ID → route_key from pipeline_output
-                vuln_id_to_route = {}
-                for finding in po_data.get("findings", []):
-                    fid = finding.get("id")
-                    loc = finding.get("location", {})
-                    route = (
-                        f"{loc.get('file', '')}:{loc.get('function', '')}"
-                        if loc.get("file") else loc.get("function", "")
-                    )
-                    if fid and route:
-                        vuln_id_to_route[fid] = route
+                    # Map route_key → dynamic test result
+                    for dr in dt_data.get("results", []):
+                        fid = dr.get("finding_id")
+                        route = vuln_id_to_route.get(fid)
+                        if route:
+                            dt_by_route_key[route] = dr
 
-                # Map route_key → dynamic test result
-                for dr in dt_data.get("results", []):
-                    fid = dr.get("finding_id")
-                    route = vuln_id_to_route.get(fid)
-                    if route:
-                        dt_by_route_key[route] = dr
-
-                print(f"[Report] Loaded {len(dt_by_route_key)} dynamic test results", file=sys.stderr)
+                    print(f"[Report] Loaded {len(dt_by_route_key)} dynamic test results", file=sys.stderr)
 
             # --- Prepare findings ---
             units_by_id = {u["id"]: u for u in dataset.get("units", [])}

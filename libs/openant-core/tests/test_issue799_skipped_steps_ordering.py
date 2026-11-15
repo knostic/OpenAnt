@@ -20,8 +20,10 @@ skipped." — the exact three-artifact divergence.
 The fix: the dynamic-test DECISION is hoisted BEFORE Step 6's build (every
 knowable skip class — not_requested / no_candidates / docker_unavailable —
 recorded at its source), and the attempted-run ``failed`` class REBUILDS the
-output after the attempt. The report step's own skip stays post-build
-(#799's own Not-claimed boundary).
+output after the attempt. (#714 later closed the one remaining boundary:
+the report step's own skip is hoisted pre-build the same way, so no skip
+class is post-build anymore — see this file's S2 pin and
+test_issue714_reporter_sidecar_degrade.py.)
 
 Shapes:
 

@@ -5,7 +5,10 @@ PR #257 broadened two `except (OSError, json.JSONDecodeError)` reads in
 `core/scanner.py` to `except Exception` because `read_json` opens strict
 UTF-8 and raises `UnicodeDecodeError` (a `ValueError`), escaping the narrow
 clause. It named "a parallel narrow-except JSON read in `core/reporter.py`"
-as a follow-up. #714 found FOUR such reads; the issue's own executed repro:
+as a follow-up. #714 found FOUR such reads in reporter.py (the review
+rounds then traced the same class to five more sites along the file's
+consumer paths — the scan, the parse CLI, the report package, and the
+report-data loader); the issue's own executed repro:
 
   a dataset.json with an invalid byte raised UnicodeDecodeError out of
   `_load_reachability_metadata` and ABORTED report building.
@@ -294,6 +297,35 @@ def test_report_data_degrades_a_bad_encoding_pipeline_output(tmp_path):
     assert proc.returncode == 0, (
         f"report-data died on the optional pipeline_output: "
         f"{proc.stderr[-400:]}")
+
+
+def test_report_data_degrades_a_bad_encoding_dt_pair(tmp_path):
+    """F1 (r4): the dt BRIDGE reads — cmd_report_data's FIRST reads of
+    dynamic_test_results.json AND pipeline_output.json were bare; the
+    r3-guarded second read is never reached when the first raises. With a
+    dynamic-test run present (the shape every --dynamic-test scan
+    leaves), a bad-encoding file in the pair killed report-data. Both
+    degrade now: no bridge, the command completes."""
+    import subprocess
+    out = str(tmp_path / "out")
+    os.makedirs(out)
+    with open(os.path.join(out, "results.json"), "w") as fh:
+        fh.write('{"results": []}')
+    with open(os.path.join(out, "dataset.json"), "w") as fh:
+        fh.write('{"units": [], "metadata": {}}')
+    with open(os.path.join(out, "dynamic_test_results.json"), "w") as fh:
+        json.dump({"results": [{"finding_id": "F1", "verdict": "confirmed"}]}, fh)
+    with open(os.path.join(out, "pipeline_output.json"), "wb") as fh:
+        fh.write(b'{"repository": {"name": "x"}, "\xff\xfe"}')
+    proc = subprocess.run(
+        [sys.executable, "-m", "openant.cli", "report-data",
+         os.path.join(out, "results.json"),
+         "--dataset", os.path.join(out, "dataset.json")],
+        capture_output=True, text=True, timeout=180,
+        cwd=str(_CORE_ROOT),
+    )
+    assert proc.returncode == 0, (
+        f"report-data died on the dt-bridge pair: {proc.stderr[-400:]}")
 
 
 @pytest.mark.parametrize("shape", ["[]", "null"])
