@@ -531,7 +531,7 @@ def scan_repository(
                 # re-raises — the whole SCAN aborted at Step 1, before the
                 # reporter's own degrade for the same file was ever reached.
                 # The summary degrades to "no diff_stats", never crashes.
-                print(f"WARNING: could not read {_diff_report}: {e}",
+                print(f"  WARNING: could not read {_diff_report}: {e}",
                       file=sys.stderr)
         ctx.outputs = {
             "dataset_path": parse_result.dataset_path,

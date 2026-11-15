@@ -295,9 +295,22 @@ def _load_step_reports(directory: str) -> list[dict]:
     reports = []
     for path in glob.glob(os.path.join(directory, "*.report.json")):
         try:
-            reports.append(read_json(path))
-        except (json.JSONDecodeError, OSError):
+            data = read_json(path)
+        except Exception as e:
+            # #714 (#257's pattern, the report-data loader): the glob
+            # catches diff_filter.report.json — the very file the scanner,
+            # the parse CLI and the reporter degrade elsewhere — and a
+            # bad-encoding step report raised UnicodeDecodeError (a
+            # ValueError, outside the old narrow clause) out of
+            # build-output / report / report-data, killing the deliverable
+            # on an optional cost/duration sidecar. Skip the one file.
+            print(f"WARNING: could not read {path}: {e}", file=sys.stderr)
             continue
+        # the shape filter (single home): every consumer calls .get() on
+        # each element — a non-dict report (B1's class) degrades to
+        # skipped here rather than AttributeError at four call sites
+        if isinstance(data, dict):
+            reports.append(data)
     return reports
 
 
@@ -1661,6 +1674,17 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
             if os.path.exists(po_path):
                 try:
                     po = read_json(po_path)
+                except Exception as e:
+                    # #714 (#257's pattern): a bad-encoding
+                    # pipeline_output.json killed report-data (the HTML
+                    # deliverable's live data source) on an optional
+                    # repo-info block — degrade to the empty defaults
+                    print(f"WARNING: could not read {po_path}: {e}",
+                          file=sys.stderr)
+                    po = None
+                # the shape guard (B1's class): a non-dict po degrades to
+                # the empty defaults too, never an AttributeError
+                if isinstance(po, dict):
                     repo_info = po.get("repository", {})
                     repo_name = repo_info.get("name", "")
                     commit_sha = repo_info.get("commit_sha", "")
@@ -1681,8 +1705,6 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
                             "changed_files": raw_diff.get("changed_files", 0) or 0,
                             "pr_number": raw_diff.get("pr_number") or 0,
                         }
-                except (json.JSONDecodeError, OSError):
-                    pass
 
             # --- Totals from step reports ---
             total_duration_seconds = 0.0

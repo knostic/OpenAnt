@@ -240,6 +240,77 @@ def test_the_report_package_reads_degrade_a_non_dict_pipeline_output(
     assert _load_pipeline_metadata(exp) == (None, None)
 
 
+# --- the r3 site: the LIVE HTML path (report-data + the step-report loader) ---
+
+def test_report_data_degrades_a_bad_encoding_step_report(tmp_path):
+    """F1 (r3): the report-data command — the HTML deliverable's live
+    data source (the Go CLI's `openant report -f html` dispatches to it)
+    — loaded *.report.json (a glob that CATCHES diff_filter.report.json,
+    the very file three other sites degrade) behind the narrow clause.
+    A bad-encoding file killed the whole command; the loader must skip
+    the ONE file."""
+    import subprocess
+    out = str(tmp_path / "out")
+    os.makedirs(out)
+    with open(os.path.join(out, "results.json"), "w") as fh:
+        fh.write('{"results": []}')
+    with open(os.path.join(out, "dataset.json"), "w") as fh:
+        fh.write('{"units": [], "metadata": {}}')
+    with open(os.path.join(out, "diff_filter.report.json"), "wb") as fh:
+        fh.write(b'{"selected": 1, "\xff\xfe"}')
+    proc = subprocess.run(
+        [sys.executable, "-m", "openant.cli", "report-data",
+         os.path.join(out, "results.json"),
+         "--dataset", os.path.join(out, "dataset.json")],
+        capture_output=True, text=True, timeout=180,
+        cwd=str(_CORE_ROOT),
+    )
+    assert proc.returncode == 0, (
+        f"report-data died on the optional sidecar: {proc.stderr[-400:]}")
+    assert "WARNING: could not read" in proc.stderr
+
+
+def test_report_data_degrades_a_bad_encoding_pipeline_output(tmp_path):
+    """F1's second arm (r3): report-data's own read of
+    pipeline_output.json — the r2 F2 file — behind the same narrow
+    clause. A bad-encoding file killed the command on the optional
+    repo-info block."""
+    import subprocess
+    out = str(tmp_path / "out")
+    os.makedirs(out)
+    with open(os.path.join(out, "results.json"), "w") as fh:
+        fh.write('{"results": []}')
+    with open(os.path.join(out, "dataset.json"), "w") as fh:
+        fh.write('{"units": [], "metadata": {}}')
+    with open(os.path.join(out, "pipeline_output.json"), "wb") as fh:
+        fh.write(b'{"repository": {"name": "x"}, "\xff\xfe"}')
+    proc = subprocess.run(
+        [sys.executable, "-m", "openant.cli", "report-data",
+         os.path.join(out, "results.json"),
+         "--dataset", os.path.join(out, "dataset.json")],
+        capture_output=True, text=True, timeout=180,
+        cwd=str(_CORE_ROOT),
+    )
+    assert proc.returncode == 0, (
+        f"report-data died on the optional pipeline_output: "
+        f"{proc.stderr[-400:]}")
+
+
+@pytest.mark.parametrize("shape", ["[]", "null"])
+def test_the_step_report_loader_drops_a_non_dict_report(tmp_path, shape):
+    """The shape class on the loader (B1's twin): a valid-JSON non-dict
+    step report must be dropped at the loader (the single home), never
+    reach the four .get()-calling consumers."""
+    from openant.cli import _load_step_reports
+    with open(os.path.join(str(tmp_path), "parse.report.json"), "w") as fh:
+        json.dump({"step": "parse", "status": "success"}, fh)
+    with open(os.path.join(str(tmp_path), "bad.report.json"), "w") as fh:
+        fh.write(shape)
+    reports = _load_step_reports(str(tmp_path))
+    assert [r.get("step") for r in reports] == ["parse"], (
+        f"the non-dict report leaked through: {reports!r}")
+
+
 # --- the report-step skip hoist ---
 
 def test_the_report_step_skip_is_hoisted_pre_build():
