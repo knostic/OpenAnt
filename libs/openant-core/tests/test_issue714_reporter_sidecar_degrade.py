@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+
 _CORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_CORE_ROOT))
 
@@ -94,6 +95,73 @@ def test_a_good_sidecar_still_loads(tmp_path):
     md = _load_reachability_metadata(str(tmp_path))
     assert md is not None
     assert md["selected"] == 5
+
+
+# --- the shape class (B1, the r1 review): valid JSON, wrong top level ---
+
+@pytest.mark.parametrize("shape", ["[]", "null", '"s"', "1"])
+def test_a_non_dict_manifest_degrades(tmp_path, shape):
+    """A pipeline-produced sidecar with a corrupted top-level type is
+    still corruption — it degrades to "no diff" (the
+    _load_reachability_metadata site's own isinstance precedent), never
+    an AttributeError abort out of the .get() below the try."""
+    from core.reporter import _load_diff_metadata
+    with open(os.path.join(str(tmp_path), "diff_manifest.json"), "w") as fh:
+        fh.write(shape)
+    assert _load_diff_metadata(str(tmp_path)) is None
+
+
+@pytest.mark.parametrize("shape", ["[]", "null", '"s"', "1"])
+def test_a_non_dict_call_graph_degrades(tmp_path, shape):
+    """Same shape class on the call-graph read: degrade to the input
+    confirmed set, never an AttributeError abort."""
+    from core.reporter import _dedup_caller_callee
+    with open(os.path.join(str(tmp_path), "call_graph.json"), "w") as fh:
+        fh.write(shape)
+    confirmed = [{"route_key": "x", "cwe_id": 1}]
+    out = _dedup_caller_callee(confirmed, [],
+                               os.path.join(str(tmp_path), "call_graph.json"))
+    assert out == confirmed
+
+
+def test_a_non_dict_filter_report_degrades_silently(tmp_path, capsys):
+    """D1's true-message contract: a READ failure warns ("could not
+    read"); a SHAPE failure (valid JSON, non-dict) degrades to no filter
+    keys SILENTLY — the read succeeded, so the warning would be false."""
+    from core.reporter import _load_diff_metadata
+    with open(os.path.join(str(tmp_path), "diff_manifest.json"), "w") as fh:
+        json.dump({"base_ref": "main"}, fh)
+    with open(os.path.join(str(tmp_path), "diff_filter.report.json"), "w") as fh:
+        fh.write("[]")
+    block = _load_diff_metadata(str(tmp_path))
+    assert block is not None and "units_in_diff" not in block
+    assert capsys.readouterr().err == "", (
+        "a shape failure must not print a read failure's warning")
+
+
+# --- the scanner's own site (F3, the r1 review): the same file, Step 1 ---
+
+def test_a_bad_encoding_filter_report_does_not_abort_the_scan(
+        tmp_path, monkeypatch):
+    """F3: scanner.py's own read of diff_filter.report.json (the parse
+    step's summary attach) used the SAME narrow clause — and inside
+    step_context, which re-raises, a bad-encoding file ABORTED THE WHOLE
+    SCAN at Step 1, before the reporter's degrade for the same file was
+    ever reached. The scan must complete: the summary degrades to no
+    diff_stats, pipeline_output.json still gets built."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    with open(os.path.join(repo, "a.py"), "w") as fh:
+        fh.write("def f(): pass\n")
+    out = str(tmp_path / "out")
+    os.makedirs(out)
+    # the planted bad-encoding sidecar: the parse step reads it because
+    # it EXISTS in the output dir before the scan
+    with open(os.path.join(out, "diff_filter.report.json"), "wb") as fh:
+        fh.write(b'{"selected": 1, "\xff\xfe"}')
+    _scan_with_stubbed_analysis(repo, out, monkeypatch)
+    po = os.path.join(out, "pipeline_output.json")
+    assert os.path.exists(po), "the scan aborted before the Step-6 build"
 
 
 # --- the report-step skip hoist ---
@@ -189,7 +257,8 @@ def test_pipeline_output_carries_a_report_skip(tmp_path, monkeypatch):
     result = _scan_with_stubbed_analysis(repo, out, monkeypatch)
     po = os.path.join(out, "pipeline_output.json")
     assert os.path.exists(po)
-    data = json.load(open(po))
+    with open(po) as fh:
+        data = json.load(fh)
     # the file nests the skips under pipeline_stats (the human summary's
     # read path)
     steps = data.get("pipeline_stats", {}).get("skipped_steps", [])
@@ -219,7 +288,8 @@ def test_pipeline_output_carries_a_dynamic_test_skip(tmp_path, monkeypatch):
     result = _scan_with_stubbed_analysis(repo, out, monkeypatch)
     po = os.path.join(out, "pipeline_output.json")
     assert os.path.exists(po)
-    data = json.load(open(po))
+    with open(po) as fh:
+        data = json.load(fh)
     steps = data.get("pipeline_stats", {}).get("skipped_steps", [])
     names = [s.get("step") for s in steps]
     assert "dynamic-test" in names, (

@@ -52,6 +52,12 @@ def _load_diff_metadata(scan_dir: str) -> dict | None:
         # builds without the diff block, never crashes on it.
         print(f"WARNING: could not read {manifest_path}: {e}", file=sys.stderr)
         return None
+    # the shape guard (the _load_reachability_metadata site's own
+    # precedent): a valid-JSON but non-dict manifest degrades to "no
+    # diff" too — the manifest is pipeline-produced, so a wrong top-level
+    # type is corruption, and corruption must not abort report building
+    if not isinstance(manifest, dict):
+        return None
     out = {
         "mode": "incremental",
         "base_ref": manifest.get("base_ref"),
@@ -65,15 +71,25 @@ def _load_diff_metadata(scan_dir: str) -> dict | None:
     if os.path.exists(filter_report):
         try:
             stats = read_json(filter_report)
-            out["units_in_diff"] = stats.get("selected")
-            out["units_total_parsed"] = stats.get("total")
-            out["callers_added"] = stats.get("callers_added") or 0
-            out["fallback_file_match"] = stats.get("fallback_file_match") or 0
         except Exception as e:
             # #714 (#257's pattern): same strict-UTF-8 abort class — the
-            # diff block degrades to "no filter stats", never crashes
+            # diff block degrades to "no filter stats", never crashes.
+            # The try wraps ONLY the read (D1, the r1 review): a valid-JSON
+            # but non-dict filter report is a shape error, not a read
+            # error — it degrades below via the .get() guards, not through
+            # a "could not read" message that would be false.
             print(f"WARNING: could not read {filter_report}: {e}",
                   file=sys.stderr)
+        else:
+            # the shape guard: a valid-JSON but non-dict filter report
+            # degrades to "no filter stats" silently — a read failure
+            # warns, a shape failure just lacks the keys (the warning
+            # text says "could not read", which would be false here)
+            if isinstance(stats, dict):
+                out["units_in_diff"] = stats.get("selected")
+                out["units_total_parsed"] = stats.get("total")
+                out["callers_added"] = stats.get("callers_added") or 0
+                out["fallback_file_match"] = stats.get("fallback_file_match") or 0
     return out
 
 
@@ -173,6 +189,11 @@ def _dedup_caller_callee(
         # the confirmation path instead of degrading to the input set
         print(f"WARNING: could not read {call_graph_path}: {e}",
               file=sys.stderr)
+        return confirmed
+
+    # the shape guard (B1, the r1 review): same precedent — a valid-JSON
+    # but non-dict call graph degrades to the input confirmed set
+    if not isinstance(cg_data, dict):
         return confirmed
 
     reverse_cg = cg_data.get("reverse_call_graph", {})

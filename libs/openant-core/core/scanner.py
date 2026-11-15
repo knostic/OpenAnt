@@ -523,8 +523,16 @@ def scan_repository(
         if os.path.exists(_diff_report):
             try:
                 ctx.summary["diff_stats"] = read_json(_diff_report)
-            except (json.JSONDecodeError, OSError):
-                pass
+            except Exception as e:
+                # #714 (#257's pattern, the scanner's own site): read_json
+                # opens strict UTF-8 — a bad-encoding diff_filter.report.json
+                # raised UnicodeDecodeError (a ValueError, outside the old
+                # narrow clause) out of the parse step_context, which
+                # re-raises — the whole SCAN aborted at Step 1, before the
+                # reporter's own degrade for the same file was ever reached.
+                # The summary degrades to "no diff_stats", never crashes.
+                print(f"WARNING: could not read {_diff_report}: {e}",
+                      file=sys.stderr)
         ctx.outputs = {
             "dataset_path": parse_result.dataset_path,
             "analyzer_output_path": parse_result.analyzer_output_path,

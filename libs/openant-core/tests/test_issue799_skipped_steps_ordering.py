@@ -144,8 +144,9 @@ def test_the_two_artifacts_agree_about_skipped_steps(monkeypatch, tmp_path):
     full scan — pipeline_output.json.pipeline_stats.skipped_steps AND
     scan.report.json.summary.steps_skipped — so the human summary (which
     reads the former) cannot state a falsehood the latter contradicts.
-    (The REPORT step's own skip is #799's named Not-claimed boundary — the
-    same argument may apply to it; this test does not pin it.)"""
+    (#714 closed #799's last Not-claimed boundary: the report step's own
+    skip is now hoisted pre-build too, so the subtraction is gone — the
+    artifacts agree on EVERY step.)"""
     _offline_drive(monkeypatch)
     _recording_build(monkeypatch, [])
 
@@ -161,10 +162,10 @@ def test_the_two_artifacts_agree_about_skipped_steps(monkeypatch, tmp_path):
         f"pipeline_output carries only the pre-build skips: {po!r}")
     assert "dynamic-test" in sr, (
         f"scan.report carries it but pipeline_output does not: {po!r} vs {sr!r}")
-    # and the two agree on every step the BUILD could know
-    assert set(po) == set(sr) - {"report"}, (
-        f"beyond the report step's own late skip (the Not-claimed "
-        f"boundary), the artifacts disagree: {po!r} vs {sr!r}")
+    # and the two agree on every step — #714 hoisted the report step's
+    # skip pre-build, so no step is subtracted anymore
+    assert set(po) == set(sr), (
+        f"the artifacts disagree: {po!r} vs {sr!r}")
 
 
 # ---------------------------------------------------------------------------
