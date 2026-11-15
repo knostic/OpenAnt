@@ -6,9 +6,9 @@ PR #257 broadened two `except (OSError, json.JSONDecodeError)` reads in
 UTF-8 and raises `UnicodeDecodeError` (a `ValueError`), escaping the narrow
 clause. It named "a parallel narrow-except JSON read in `core/reporter.py`"
 as a follow-up. #714 found FOUR such reads in reporter.py (the review
-rounds then traced the same class to five more sites along the file's
+rounds then traced the same class to EIGHT more reads along the file's
 consumer paths — the scan, the parse CLI, the report package, and the
-report-data loader); the issue's own executed repro:
+report-data loader's three reads); the issue's own executed repro:
 
   a dataset.json with an invalid byte raised UnicodeDecodeError out of
   `_load_reachability_metadata` and ABORTED report building.
@@ -169,8 +169,7 @@ def test_a_bad_encoding_filter_report_does_not_abort_the_scan(
 
 # --- the r2 sites: the parse CLI twin + the report-package reads ---
 
-def test_the_parse_cli_degrades_a_bad_encoding_filter_report(
-        tmp_path, monkeypatch, capsys):
+def test_the_parse_cli_degrades_a_bad_encoding_filter_report(tmp_path):
     """F1 (r2): `openant parse` — the public entry the Go CLI dispatches
     — had F3's exact twin clause on the same file, inside its own
     step_context. A bad-encoding diff_filter.report.json made a
