@@ -612,6 +612,12 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 		)
 		meta.Base = decision.Base
 		meta.Scope = decision.Scope
+		// #665 cycle 3 (the r2 D1 catch): the running record carries the
+		// PR the same way writeInitScanMeta does — a run that dies between
+		// this stamp and the pipeline end leaves a pending record whose
+		// flagless adoption would otherwise silently drop the PR intent
+		// (a plain diff vs origin/main on the user's tree)
+		meta.PR = decision.PR
 		if err := config.SaveScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, scanLanguage, meta); err != nil {
 			output.PrintWarning(fmt.Sprintf("Failed to write scan meta: %s", err))
 		}

@@ -878,3 +878,40 @@ func TestIssue665NoKeyExitsBeforeFetch(t *testing.T) {
 	}
 	_ = base
 }
+
+// TestIssue665ResolveScanModeBranchStamp pins the branch-stamp block
+// in-process (the r2 D2 catch: the defense-in-depth claim's "cannot be
+// executed" premise was false — resolveScanMode is directly drivable, the
+// same entry the adoption pin uses). The mutant (branchRepo := repoPath)
+// survives the battery; this test kills it.
+func TestIssue665ResolveScanModeBranchStamp(t *testing.T) {
+	repoDir, binDir, base, prHeads := issue665Env(t)
+	issue665Preflight(t, binDir)
+
+	withTempHome(t)
+	// no pending record: the scan --pr flag path writes the running meta
+	// with the branch stamped from the WORKTREE (detached: "")
+	savedLang, savedPR, savedBase, savedFull, savedInc, savedStaged, savedSkip := scanLanguage, scanPR, scanDiffBase, scanFull, scanIncremental, scanStaged, scanSkipDynamicTest
+	scanLanguage, scanPR, scanDiffBase, scanFull, scanIncremental, scanStaged, scanSkipDynamicTest = "go", 7, "", false, false, false, true
+	scanOutput = t.TempDir()
+	t.Cleanup(func() { scanLanguage, scanPR, scanDiffBase, scanFull, scanIncremental, scanStaged, scanSkipDynamicTest = savedLang, savedPR, savedBase, savedFull, savedInc, savedStaged, savedSkip })
+
+	ctx := &projectContext{Project: &config.Project{Name: "p665-branchstamp", CommitSHAShort: config.ShortSHA(prHeads[7]), Language: "go", CommitSHA: prHeads[7]}, RepoPath: repoDir}
+
+	d, err := resolveScanMode(ctx, repoDir)
+	if err != nil {
+		t.Fatalf("resolveScanMode --pr: %v", err)
+	}
+	defer git.CleanupPRWorktree(repoDir, d.PRWorktree, d.PRRef)
+
+	meta, err := config.LoadScanMeta("p665-branchstamp", config.ShortSHA(prHeads[7]), "go")
+	if err != nil {
+		t.Fatalf("load the running meta: %v", err)
+	}
+	if meta.Branch != "" {
+		t.Errorf("the running meta's branch = %q, want \"\" (the WORKTREE's detached HEAD — the detached-PR-head stamp; the user's tree is on main at %s)", meta.Branch, base[:8])
+	}
+	if meta.PR != 7 {
+		t.Errorf("the running meta's PR = %d, want 7 (the r2 D1 catch: the running record carries the PR)", meta.PR)
+	}
+}

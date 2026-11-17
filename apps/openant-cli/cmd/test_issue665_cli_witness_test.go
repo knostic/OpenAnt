@@ -271,16 +271,17 @@ func TestIssue665ParsePRCLIWitness(t *testing.T) {
 		{name: "engine-crash", env: "engine-crash", want: 2},
 	} {
 		t.Run(shape.name, func(t *testing.T) {
-			repoDir, binDir, base, prHeads := issue665Env(t)
+			repoDir, binDir, base, _ := issue665Env(t)
 			issue665Preflight(t, binDir)
 			out := t.TempDir()
 			t.Setenv(issue665ShapeEnv, shape.env)
 			rec, rc := issue665RunCLI(t, repoDir,
 				"parse", repoDir, "--pr", "7", "-o", out)
 			issue665AssertCommon(t, repoDir, base, rec)
-			if rec.CommitSHA != "" && rec.CommitSHA != prHeads[7] {
-				t.Errorf("the run threaded --commit-sha %s, want the PR head %s (the m10 class: the detection stamped the USER's tree)", rec.CommitSHA, prHeads[7])
-			}
+			// NOTE (the r2 F1 catch): NO --commit-sha pin here — the parse
+			// verb never threads a commit stamp (buildParsePyArgs emits no
+			// --commit-sha), so a CommitSHA assertion would be vacuous.
+			// The m10 pin is the SCAN arm's alone.
 			if rec.Verb != "parse" {
 				t.Errorf("the engine verb = %q, want parse", rec.Verb)
 			}
