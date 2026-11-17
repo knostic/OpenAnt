@@ -46,6 +46,11 @@ type issue665EngineRecord struct {
 	RepoPath        string `json:"repo_path"`
 	RepoIsUserClone bool   `json:"repo_is_user_clone"`
 	PRFilePresent   bool   `json:"pr_file_present"`
+	// #665 cycle 3 (the m10 catch): the --commit-sha the run threaded —
+	// the detection stamps must name the SCANNED tree (the PR head), and
+	// this field pins the threading end-to-end (detectedSHA from scanPath
+	// -> resolveRepoMetadataFull -> pyArgs)
+	CommitSHA string `json:"commit_sha"`
 }
 
 func init() {
@@ -70,11 +75,18 @@ func issue665FakePython(args []string) int {
 		userClone := os.Getenv("OPENANT_TEST_665_USERCLONE")
 		prFile := "b.txt" // the PR-7 head's committed file (issue665Env)
 		_, statErr := os.Stat(filepath.Join(repoPath, prFile))
+		commitSHA := ""
+		for i, a := range args {
+			if a == "--commit-sha" && i+1 < len(args) {
+				commitSHA = args[i+1]
+			}
+		}
 		rec := issue665EngineRecord{
 			Verb:            verb,
 			RepoPath:        repoPath,
 			RepoIsUserClone: repoPath == userClone,
 			PRFilePresent:   statErr == nil,
+			CommitSHA:       commitSHA,
 		}
 		data, err := json.Marshal(rec)
 		if err == nil {
@@ -226,13 +238,16 @@ func TestIssue665ScanPRCLIWitness(t *testing.T) {
 		{name: "interrupted", env: "interrupted", want: 130},
 	} {
 		t.Run(shape.name, func(t *testing.T) {
-			repoDir, binDir, base, _ := issue665Env(t)
+			repoDir, binDir, base, prHeads := issue665Env(t)
 			issue665Preflight(t, binDir)
 			out := t.TempDir()
 			t.Setenv(issue665ShapeEnv, shape.env)
 			rec, rc := issue665RunCLI(t, repoDir,
 				"scan", repoDir, "--pr", "7", "--skip-dynamic-test", "-o", out, "--no-report")
 			issue665AssertCommon(t, repoDir, base, rec)
+			if rec.CommitSHA != "" && rec.CommitSHA != prHeads[7] {
+				t.Errorf("the run threaded --commit-sha %s, want the PR head %s (the m10 class: the detection stamped the USER's tree)", rec.CommitSHA, prHeads[7])
+			}
 			if rec.Verb != "scan" {
 				t.Errorf("the engine verb = %q, want scan", rec.Verb)
 			}
@@ -256,13 +271,16 @@ func TestIssue665ParsePRCLIWitness(t *testing.T) {
 		{name: "engine-crash", env: "engine-crash", want: 2},
 	} {
 		t.Run(shape.name, func(t *testing.T) {
-			repoDir, binDir, base, _ := issue665Env(t)
+			repoDir, binDir, base, prHeads := issue665Env(t)
 			issue665Preflight(t, binDir)
 			out := t.TempDir()
 			t.Setenv(issue665ShapeEnv, shape.env)
 			rec, rc := issue665RunCLI(t, repoDir,
 				"parse", repoDir, "--pr", "7", "-o", out)
 			issue665AssertCommon(t, repoDir, base, rec)
+			if rec.CommitSHA != "" && rec.CommitSHA != prHeads[7] {
+				t.Errorf("the run threaded --commit-sha %s, want the PR head %s (the m10 class: the detection stamped the USER's tree)", rec.CommitSHA, prHeads[7])
+			}
 			if rec.Verb != "parse" {
 				t.Errorf("the engine verb = %q, want parse", rec.Verb)
 			}
