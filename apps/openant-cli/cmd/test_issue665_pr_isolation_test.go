@@ -746,3 +746,118 @@ func issue665PRRefs(t *testing.T, dir string) []string {
 	}
 	return refs
 }
+
+// TestIssue665AdoptionRefetchesPRHead pins the F1 catch (the cycle-3 r1
+// round): a pending `init --pr N` decision adopted by a FLAGLESS scan must
+// RE-FETCH the PR head into the scan's own isolated worktree. The
+// pre-isolation era left the head checked out in the user's tree, so a
+// bare {Kind, Base, Scope} adoption scanned the right tree by that
+// mechanism; with the checkout gone it silently scanned the USER's tree
+// while stamping the PR head's SHA (zero changed files, exit 0 — a
+// false-negative generator). At the pre-cycle-3 head this test fails with
+// PRWorktree="" (no fetch); the record carries no PR either.
+func TestIssue665AdoptionRefetchesPRHead(t *testing.T) {
+	repoDir, binDir, base, prHeads := issue665Env(t)
+	issue665Preflight(t, binDir)
+
+	withTempHome(t)
+	// a pending --pr decision exactly as writeInitScanMeta leaves it
+	meta := &config.ScanMeta{
+		Kind:      config.ScanKindDiff,
+		Commit:    prHeads[7],
+		Base:      "origin/main",
+		Scope:     "callers",
+		StartedAt: "2026-11-16T00:00:00Z",
+		Status:    config.ScanStatusRunning,
+		Language:  "go",
+		PR:        7,
+	}
+	if err := config.SaveScanMeta("p665-adopt", config.ShortSHA(prHeads[7]), "go", meta); err != nil {
+		t.Fatal(err)
+	}
+
+	// the flagless scan state: NO mode flags, the language matching the record
+	savedLang, savedPR, savedBase, savedFull, savedInc, savedStaged := scanLanguage, scanPR, scanDiffBase, scanFull, scanIncremental, scanStaged
+	scanLanguage, scanPR, scanDiffBase, scanFull, scanIncremental, scanStaged = "go", 0, "", false, false, false
+	t.Cleanup(func() { scanLanguage, scanPR, scanDiffBase, scanFull, scanIncremental, scanStaged = savedLang, savedPR, savedBase, savedFull, savedInc, savedStaged })
+
+	ctx := &projectContext{Project: &config.Project{Name: "p665-adopt", CommitSHAShort: config.ShortSHA(prHeads[7]), Language: "go"}, RepoPath: repoDir}
+
+	got, err := resolveScanMode(ctx, repoDir)
+	if err != nil {
+		t.Fatalf("the flagless adoption errored: %v", err)
+	}
+	defer git.CleanupPRWorktree(repoDir, got.PRWorktree, got.PRRef)
+
+	if got.PR != 7 {
+		t.Errorf("the adopted decision lost the PR: got %d, want 7", got.PR)
+	}
+	if got.PRWorktree == "" {
+		t.Fatal("the flagless adoption did NOT re-fetch: PRWorktree empty — the scan would scan the USER's tree with a PR-head stamp (the F1 regression)")
+	}
+	// the worktree holds the PR HEAD, not the user's tree
+	if rev := issue665Rev(t, got.PRWorktree, "HEAD"); rev != prHeads[7] {
+		t.Errorf("the adopted worktree HEAD = %s, want the PR head %s (the user tree is at %s)", rev, prHeads[7], base)
+	}
+	// the user's checkout still never moved
+	if rev := issue665Rev(t, repoDir, "HEAD"); rev != base {
+		t.Errorf("the adoption moved the user's checkout: %s -> %s", base, rev)
+	}
+}
+
+// TestIssue665NoKeyExitsBeforeFetch pins the F2 catch (the cycle-3 r1
+// round): a `scan --pr` with NO API key must exit BEFORE the fetch creates
+// anything. requireAPIKey() os.Exit(2)s, and it was previously evaluated
+// as an ARGUMENT to python.Invoke — after the fetch — so the no-key run
+// stranded a full PR checkout in $TMPDIR plus its ref and worktree entry.
+// The exec-self pattern (the child is this same test binary) pins the
+// ORDER: at the pre-cycle-3 head the child leaves a workspace behind and
+// this test fails on the residue count.
+func TestIssue665NoKeyExitsBeforeFetch(t *testing.T) {
+	if os.Getenv("OPENANT_665_NOKEY_CHILD") == "1" {
+		// the child: runScan with --pr set, no key anywhere
+		scanPR = 7
+		scanSkipDynamicTest = true
+		scanOutput = os.Getenv("OPENANT_665_OUT")
+		_ = captureStderr(t, func() { runScan(nil, []string{os.Getenv("OPENANT_665_REPO")}) })
+		return
+	}
+
+	repoDir, binDir, _, _ := issue665Env(t)
+	issue665Preflight(t, binDir)
+	out := t.TempDir()
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.run", "^TestIssue665NoKeyExitsBeforeFetch$")
+	cmd.Env = append(os.Environ(),
+		"OPENANT_665_NOKEY_CHILD=1",
+		"OPENANT_665_REPO="+repoDir,
+		"OPENANT_665_OUT="+out,
+		"OPENANT_API_KEY=",
+		"HOME="+t.TempDir(),
+	)
+	cmd.Dir = repoDir
+	_ = cmd.Run() // the exit code is os.Exit(2); the residue is the assertion
+
+	if refs := issue665PRRefs(t, repoDir); len(refs) != 0 {
+		t.Errorf("the no-key exit stranded PR refs (the fetch ran before the key check — the F2 arm): %v", refs)
+	}
+	var worktrees []string
+	wout, err := exec.Command("git", "-C", repoDir, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		t.Fatalf("worktree list: %v", err)
+	}
+	for _, line := range strings.Split(string(wout), "\n") {
+		if w, ok := strings.CutPrefix(line, "worktree "); ok {
+			if strings.Contains(filepath.Base(strings.TrimSpace(w)), "openant-pr-") {
+				worktrees = append(worktrees, strings.TrimSpace(w))
+			}
+		}
+	}
+	if len(worktrees) != 0 {
+		t.Errorf("the no-key exit stranded worktrees (the F2 arm): %v", worktrees)
+	}
+}

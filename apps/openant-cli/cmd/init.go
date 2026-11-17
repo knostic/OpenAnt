@@ -407,5 +407,8 @@ func writeInitScanMeta(name string, project *config.Project, decision modeDecisi
 	)
 	meta.Base = decision.Base
 	meta.Scope = decision.Scope
+	// #665 cycle 3: the PR number rides the record so the flagless scan's
+	// adoption can re-fetch into its own isolated worktree (the F1 fix)
+	meta.PR = decision.PR
 	return config.SaveScanMeta(name, project.CommitSHAShort, language, meta)
 }

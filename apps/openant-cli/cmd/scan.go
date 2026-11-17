@@ -262,6 +262,15 @@ func runScan(cmd *cobra.Command, args []string) {
 			os.Exit(2)
 		}
 	}
+	// #665 cycle 3 (the r1 F2 catch): resolve the API key HERE, before the
+	// --pr fetch creates the isolated worktree. requireAPIKey() calls
+	// os.Exit(2) itself, and it was previously evaluated as an ARGUMENT to
+	// python.Invoke — after the fetch, before any cleanupPR() — so a
+	// no-key scan stranded a full PR checkout in $TMPDIR plus its ref and
+	// worktree entry (the exit arm the C4's "every arm cleans" claim
+	// missed). Hoisted, the no-key exit fires before anything is created;
+	// the key is threaded through to Invoke below.
+	apiKey := requireAPIKey()
 
 	repoPath, ctx, err := resolveRepoArg(args)
 	if err != nil {
@@ -460,7 +469,7 @@ func runScan(cmd *cobra.Command, args []string) {
 		pyArgs = append(pyArgs, "--commit-sha", commitSHA)
 	}
 
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey(), nil)
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, apiKey, nil)
 	if err != nil {
 		finalizeScanMetaIfProject(ctx, config.ScanStatusFailed)
 		output.PrintError(err.Error())
@@ -532,6 +541,25 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 		existing, err := config.LoadScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, ctx.Project.Language)
 		if err == nil && existing.Status == config.ScanStatusRunning {
 			if existing.Language == scanLanguage {
+				// #665 cycle 3 (the r1 F1 catch): a pending --pr decision
+				// must RE-FETCH into THIS run's isolated worktree. The
+				// pre-isolation era left the PR head checked out in the
+				// user's tree, so a bare {Kind, Base, Scope} adoption
+				// scanned the right tree by the old mechanism; with the
+				// checkout gone it would silently scan the USER's tree
+				// while stamping the PR head's SHA (the executed
+				// differential: pr_file_present=0, changed_files=0).
+				// Existing records without a PR (pre-cycle-3 inits, the
+				// diff-base/staged kinds) adopt exactly as before.
+				if existing.Kind == config.ScanKindDiff && existing.PR > 0 {
+					baseRef, wt, ref, err := git.FetchPR(repoPath, existing.PR, nil)
+					if err != nil {
+						return modeDecision{}, err
+					}
+					return modeDecision{Kind: existing.Kind, Base: baseRef,
+						Scope: existing.Scope, PR: existing.PR,
+						PRWorktree: wt, PRRef: ref}, nil
+				}
 				return modeDecision{Kind: existing.Kind, Base: existing.Base, Scope: existing.Scope}, nil
 			}
 		}
