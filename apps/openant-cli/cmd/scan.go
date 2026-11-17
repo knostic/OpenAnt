@@ -262,16 +262,6 @@ func runScan(cmd *cobra.Command, args []string) {
 			os.Exit(2)
 		}
 	}
-	// #665 cycle 3 (the r1 F2 catch): resolve the API key HERE, before the
-	// --pr fetch creates the isolated worktree. requireAPIKey() calls
-	// os.Exit(2) itself, and it was previously evaluated as an ARGUMENT to
-	// python.Invoke — after the fetch, before any cleanupPR() — so a
-	// no-key scan stranded a full PR checkout in $TMPDIR plus its ref and
-	// worktree entry (the exit arm the C4's "every arm cleans" claim
-	// missed). Hoisted, the no-key exit fires before anything is created;
-	// the key is threaded through to Invoke below.
-	apiKey := requireAPIKey()
-
 	repoPath, ctx, err := resolveRepoArg(args)
 	if err != nil {
 		output.PrintError(err.Error())
@@ -302,6 +292,18 @@ func runScan(cmd *cobra.Command, args []string) {
 	if scanLanguage == "" {
 		scanLanguage = "auto"
 	}
+
+	// #665 cycle 3 (the r1 F2 catch, repositioned after the r2 full-suite
+	// catch): resolve the API key BEFORE the --pr fetch creates the
+	// isolated worktree — requireAPIKey() os.Exit(2)s, and it was
+	// previously evaluated as an ARGUMENT to python.Invoke (after the
+	// fetch, before any cleanupPR()), stranding a full PR checkout in
+	// $TMPDIR plus its ref and worktree entry. Positioned AFTER the
+	// #667/#691 language guard so a misconfigured-language user still
+	// gets the LANGUAGE rejection (the pre-existing fail-fast order,
+	// pinned by TestOffPinWiringRejectsEndToEnd), and BEFORE
+	// resolveScanMode (the fetch).
+	apiKey := requireAPIKey()
 
 	rt, err := ensurePython()
 	if err != nil {
