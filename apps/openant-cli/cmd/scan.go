@@ -262,7 +262,6 @@ func runScan(cmd *cobra.Command, args []string) {
 			os.Exit(2)
 		}
 	}
-
 	repoPath, ctx, err := resolveRepoArg(args)
 	if err != nil {
 		output.PrintError(err.Error())
@@ -294,6 +293,18 @@ func runScan(cmd *cobra.Command, args []string) {
 		scanLanguage = "auto"
 	}
 
+	// #665 cycle 3 (the r1 F2 catch, repositioned after the r2 full-suite
+	// catch): resolve the API key BEFORE the --pr fetch creates the
+	// isolated worktree — requireAPIKey() os.Exit(2)s, and it was
+	// previously evaluated as an ARGUMENT to python.Invoke (after the
+	// fetch, before any cleanupPR()), stranding a full PR checkout in
+	// $TMPDIR plus its ref and worktree entry. Positioned AFTER the
+	// #667/#691 language guard so a misconfigured-language user still
+	// gets the LANGUAGE rejection (the pre-existing fail-fast order,
+	// pinned by TestOffPinWiringRejectsEndToEnd), and BEFORE
+	// resolveScanMode (the fetch).
+	apiKey := requireAPIKey()
+
 	rt, err := ensurePython()
 	if err != nil {
 		output.PrintError(err.Error())
@@ -309,8 +320,7 @@ func runScan(cmd *cobra.Command, args []string) {
 	}
 
 	// Build the diff manifest from the decision before checkpoint
-	// detection so that any PR-mode checkout happens first and the scan
-	// dir is up-to-date.
+	// detection so that the scan dir is up-to-date.
 	manifestOpts := diffOpts{}
 	// #668: PR is stamp-only (the fetch already happened in selectMode); it does NOT set opts.pr (which means "fetch this")
 	manifestOpts.prNumber = decision.PR
@@ -319,9 +329,28 @@ func runScan(cmd *cobra.Command, args []string) {
 		manifestOpts.scope = decision.Scope
 		manifestOpts.staged = decision.Staged
 	}
-	manifestPath, err := prepareDiffManifest(repoPath, scanOutput, manifestOpts)
+
+	// #665 cycle 2: a --pr run scans the ISOLATED worktree, never the
+	// user's checkout — every tree reader below (the manifest builder,
+	// the Python engine, the metadata stamps) reads the PR head; the
+	// user's tree stays exactly where it was, and a concurrent --pr run
+	// cannot re-point this run's HEAD (each run owns its worktree).
+	scanPath := repoPath
+	if decision.PRWorktree != "" {
+		scanPath = decision.PRWorktree
+	}
+	// os.Exit bypasses defers, so the workspace cleanup is EXPLICIT at
+	// every exit arm from here down (a no-op unless this run fetched a PR).
+	cleanupPR := func() {
+		if decision.PRWorktree != "" {
+			git.CleanupPRWorktree(repoPath, decision.PRWorktree, decision.PRRef)
+		}
+	}
+
+	manifestPath, _, err := prepareDiffManifest(scanPath, scanOutput, manifestOpts)
 	if err != nil {
 		output.PrintError(err.Error())
+		cleanupPR()
 		os.Exit(2)
 	}
 
@@ -346,7 +375,9 @@ func runScan(cmd *cobra.Command, args []string) {
 	}
 
 	// Build Python CLI args
-	pyArgs := []string{"scan", repoPath}
+	// #665 cycle 2: the engine reads the ISOLATED worktree on --pr (the
+	// user's tree is never the scanned tree on that path)
+	pyArgs := []string{"scan", scanPath}
 	if scanOutput != "" {
 		pyArgs = append(pyArgs, "--output", scanOutput)
 	}
@@ -403,15 +434,17 @@ func runScan(cmd *cobra.Command, args []string) {
 	// placeholders. #539: an explicit flag wins; the project context is the
 	// fallback (a bare-path scan has no project context — the flags are the
 	// only way in).
-	// #557: detection runs AFTER resolveScanMode (the --pr path checks
-	// out the PR head in mode.go's FetchPR — scan.go:178) — hoisting this
-	// above would stamp the pre-checkout SHA (the review round's ordering
-	// hazard).
-	detectedSHA := git.HeadSHA(repoPath)
+	// #557: detection runs AFTER resolveScanMode (the --pr path
+	// materializes the PR head in mode.go's FetchPR) — hoisting this
+	// above would stamp the pre-fetch SHA (the review round's ordering
+	// hazard). #665 cycle 2: the stamp reads scanPath — on --pr that is
+	// the isolated worktree whose HEAD is the PR head, so the metadata
+	// still names the scanned tree.
+	detectedSHA := git.HeadSHA(scanPath)
 	// #562: the origin remote, normalized (scp→https, credentials never
 	// persist). The detection is informational — a non-git path or a
 	// remote-less repo yields "" and the tier is skipped.
-	detectedURL := git.NormalizeRemote(git.RemoteURL(repoPath))
+	detectedURL := git.NormalizeRemote(git.RemoteURL(scanPath))
 	repoName, repoURL, commitSHA, metadataWarn := resolveRepoMetadataFull(
 		scanRepoName, scanRepoURL, scanCommitSHA, ctx, detectedSHA,
 		detectedURL)
@@ -438,10 +471,11 @@ func runScan(cmd *cobra.Command, args []string) {
 		pyArgs = append(pyArgs, "--commit-sha", commitSHA)
 	}
 
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey(), nil)
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, apiKey, nil)
 	if err != nil {
 		finalizeScanMetaIfProject(ctx, config.ScanStatusFailed)
 		output.PrintError(err.Error())
+		cleanupPR()
 		os.Exit(2)
 	}
 
@@ -455,6 +489,7 @@ func runScan(cmd *cobra.Command, args []string) {
 	}
 
 	if result.Envelope.Status == "interrupted" {
+		cleanupPR()
 		os.Exit(130)
 	} else if jsonOutput {
 		output.PrintJSON(result.Envelope)
@@ -466,6 +501,7 @@ func runScan(cmd *cobra.Command, args []string) {
 		output.PrintErrors(result.Envelope.Errors)
 	}
 
+	cleanupPR()
 	os.Exit(result.ExitCode)
 }
 
@@ -507,6 +543,25 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 		existing, err := config.LoadScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, ctx.Project.Language)
 		if err == nil && existing.Status == config.ScanStatusRunning {
 			if existing.Language == scanLanguage {
+				// #665 cycle 3 (the r1 F1 catch): a pending --pr decision
+				// must RE-FETCH into THIS run's isolated worktree. The
+				// pre-isolation era left the PR head checked out in the
+				// user's tree, so a bare {Kind, Base, Scope} adoption
+				// scanned the right tree by the old mechanism; with the
+				// checkout gone it would silently scan the USER's tree
+				// while stamping the PR head's SHA (the executed
+				// differential: pr_file_present=0, changed_files=0).
+				// Existing records without a PR (pre-cycle-3 inits, the
+				// diff-base/staged kinds) adopt exactly as before.
+				if existing.Kind == config.ScanKindDiff && existing.PR > 0 {
+					baseRef, wt, ref, err := git.FetchPR(repoPath, existing.PR, nil)
+					if err != nil {
+						return modeDecision{}, err
+					}
+					return modeDecision{Kind: existing.Kind, Base: baseRef,
+						Scope: existing.Scope, PR: existing.PR,
+						PRWorktree: wt, PRRef: ref}, nil
+				}
 				return modeDecision{Kind: existing.Kind, Base: existing.Base, Scope: existing.Scope}, nil
 			}
 		}
@@ -542,14 +597,29 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 	// `scan -l go` lands artifacts under python/ while this record lands
 	// under go/ (issue #667 tracks that alignment).
 	if ctx != nil && ctx.Project != nil {
+		// #665 cycle 2: the branch stamps the SCANNED tree — on --pr that
+		// is the isolated worktree, whose detached HEAD reads "" via
+		// CurrentBranch (the pre-isolation behavior when the checkout
+		// itself was detached). Stamping the user's branch instead would
+		// mislabel a scan of the PR head as a scan of main.
+		branchRepo := repoPath
+		if decision.PRWorktree != "" {
+			branchRepo = decision.PRWorktree
+		}
 		meta := config.NewScanMeta(
 			decision.Kind,
 			ctx.Project.CommitSHA,
-			git.CurrentBranch(repoPath),
+			git.CurrentBranch(branchRepo),
 			scanLanguage,
 		)
 		meta.Base = decision.Base
 		meta.Scope = decision.Scope
+		// #665 cycle 3 (the r2 D1 catch): the running record carries the
+		// PR the same way writeInitScanMeta does — a run that dies between
+		// this stamp and the pipeline end leaves a pending record whose
+		// flagless adoption would otherwise silently drop the PR intent
+		// (a plain diff vs origin/main on the user's tree)
+		meta.PR = decision.PR
 		if err := config.SaveScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, scanLanguage, meta); err != nil {
 			output.PrintWarning(fmt.Sprintf("Failed to write scan meta: %s", err))
 		}

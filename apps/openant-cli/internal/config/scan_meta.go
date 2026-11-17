@@ -55,6 +55,15 @@ type ScanMeta struct {
 	Base            string     `json:"base,omitempty"`  // diff base SHA, only when Kind == ScanKindDiff
 	Scope           string     `json:"scope,omitempty"` // diff scope, only when Kind == ScanKindDiff
 	DiffStats       *DiffStats `json:"diff_stats,omitempty"`
+	// #665 cycle 3 (the r1 F1 catch): the PR number the pending diff
+	// decision came from, present-only. The pre-isolation era left the
+	// PR head CHECKED OUT in the user's tree, so a later flagless scan
+	// adopted init's decision AND scanned the PR head's tree; the
+	// isolated-worktree fix removes the checkout, so the adoption must
+	// RE-FETCH — and could not, because the PR number was nowhere in the
+	// record. The flagless scan silently scanned the USER's tree while
+	// stamping the PR head's SHA (a zero-changed-files "PR scan", exit 0).
+	PR int `json:"pr,omitempty"`
 }
 
 // ScanRunDir returns the per-run directory (without the language subdir).

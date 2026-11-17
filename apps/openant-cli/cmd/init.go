@@ -243,10 +243,12 @@ func runInit(cmd *cobra.Command, args []string) {
 		commitSHA = "nogit"
 	}
 
-	// #669: selectMode runs BEFORE the project save — the PR fetch may
-	// rewrite the working tree (FetchPR checks out pr-head), and the
-	// project identity + scan-dir key + meta.json must all point at the
-	// commit that was actually checked out, not the pre-checkout HEAD.
+	// #669: selectMode runs BEFORE the project save — the project identity
+	// + scan-dir key + meta.json must all point at the commit that was
+	// actually scanned, not the pre-fetch HEAD. #665 cycle 2: FetchPR
+	// materializes the PR head in an ISOLATED worktree (the user's
+	// checkout is never touched), so the stamp below reads the WORKTREE's
+	// HEAD and the run's exit arms own the workspace cleanup.
 	decision, err := selectMode(modeOpts{
 		full:        initFull,
 		incremental: initIncremental,
@@ -261,7 +263,21 @@ func runInit(cmd *cobra.Command, args []string) {
 		os.Exit(2)
 	}
 
-	// #669: if the PR fetch moved the tree, re-resolve the commit SHA
+	// #665 cycle 2: the scanned tree on --pr is the ISOLATED worktree, and
+	// the run that fetched it owns its removal (os.Exit bypasses defers —
+	// the cleanup is explicit at every arm from here down; a no-op unless
+	// this run fetched a PR).
+	stampRepo := repoPath
+	cleanupPR := func() {
+		if decision.PRWorktree != "" {
+			git.CleanupPRWorktree(repoPath, decision.PRWorktree, decision.PRRef)
+		}
+	}
+	if decision.PRWorktree != "" {
+		stampRepo = decision.PRWorktree
+	}
+
+	// #669: if the PR fetch resolved a tree, re-resolve the commit SHA
 	// so the project, the scan dir, and the meta all name the scanned tree.
 	if isGit && initPR > 0 {
 		// The body's promised guard: an explicit --commit is never silently
@@ -269,7 +285,7 @@ func runInit(cmd *cobra.Command, args []string) {
 		if initCommit != "" {
 			output.PrintWarning("--commit ignored: the PR checkout determines the stamped SHA")
 		}
-		sha, warn, err := resolveLocalCommit(repoPath, "")
+		sha, warn, err := resolveLocalCommit(stampRepo, "")
 		if err != nil {
 			output.PrintWarning(fmt.Sprintf(
 				"PR checkout moved the tree but the post-checkout SHA could not be re-resolved: %s — the project identity names the pre-checkout commit", err))
@@ -287,6 +303,7 @@ func runInit(cmd *cobra.Command, args []string) {
 	// Save project.json
 	if err := config.SaveProject(project); err != nil {
 		output.PrintError(err.Error())
+		cleanupPR()
 		os.Exit(1)
 	}
 
@@ -294,15 +311,20 @@ func runInit(cmd *cobra.Command, args []string) {
 	scanDir, err := config.ScanDir(name, project.CommitSHAShort, initLanguage)
 	if err != nil {
 		output.PrintError(err.Error())
+		cleanupPR()
 		os.Exit(1)
 	}
 	if err := os.MkdirAll(scanDir, 0755); err != nil {
 		output.PrintError(fmt.Sprintf("Failed to create scan directory: %s", err))
+		cleanupPR()
 		os.Exit(1)
 	}
 
-	// Write scan-run meta.json reflecting the decision.
-	if err := writeInitScanMeta(name, project, decision, git.CurrentBranch(repoPath)); err != nil {
+	// Write scan-run meta.json reflecting the decision. #665 cycle 2: the
+	// branch names the SCANNED tree — on --pr the worktree's detached HEAD
+	// reads "" via CurrentBranch, exactly as the in-place detached checkout
+	// did before isolation.
+	if err := writeInitScanMeta(name, project, decision, git.CurrentBranch(stampRepo)); err != nil {
 		output.PrintWarning(fmt.Sprintf("Failed to write scan meta: %s", err))
 	}
 
@@ -328,11 +350,14 @@ func runInit(cmd *cobra.Command, args []string) {
 	fmt.Println()
 	output.PrintSuccess("Set as active project")
 	fmt.Println()
+
+	cleanupPR()
 }
 
 // resolveLocalCommit determines the commit SHA to record for a LOCAL git repo.
-// openant references local repos in place and never checks them out (unlike the
-// remote path, which runs `git checkout`), so the recorded commit MUST reflect
+// openant references local repos in place and never checks them out (#665 cycle 2:
+// the --pr head materializes in an isolated worktree, never the user's checkout),
+// so the recorded commit MUST reflect
 // what will actually be scanned: the current working-tree HEAD. A --commit that
 // differs from HEAD, or that cannot be resolved, is warned about and ignored
 // (record HEAD) rather than silently recorded — otherwise the scan would be
@@ -382,5 +407,8 @@ func writeInitScanMeta(name string, project *config.Project, decision modeDecisi
 	)
 	meta.Base = decision.Base
 	meta.Scope = decision.Scope
+	// #665 cycle 3: the PR number rides the record so the flagless scan's
+	// adoption can re-fetch into its own isolated worktree (the F1 fix)
+	meta.PR = decision.PR
 	return config.SaveScanMeta(name, project.CommitSHAShort, language, meta)
 }
