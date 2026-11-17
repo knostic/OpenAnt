@@ -24,7 +24,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 )
 
@@ -103,9 +102,11 @@ func issue665FakePython(args []string) int {
 			// run flows the FINAL cleanup, not the err != nil arm (that
 			// arm fires only on Start/wait failure, which the pre-validated
 			// runtime makes unreachable here). This shape witnesses the
-			// failed-envelope path and its exit 2.
+			// failed-envelope path and its exit 2. The abrupt-death itself
+			// is build-tagged (the CI catch: syscall.Kill is POSIX-only —
+			// the windows vet failed on it).
 			fmt.Fprintln(os.Stderr, "fake python: simulated engine crash")
-			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			crashSelf()
 			return 7 // unreachable
 		case "interrupted":
 			fmt.Println(`{"status":"interrupted","data":{},"errors":[]}`)
