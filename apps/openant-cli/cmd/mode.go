@@ -222,6 +222,18 @@ func resolveStepDiffOpts(ctx *projectContext, flagBase string, flagPR int, flagS
 	if meta.Kind != config.ScanKindDiff {
 		return diffOpts{}, nil
 	}
+	// #665 cycle 3 (the r3 F1 catch, the parse verb's twin of the scan
+	// adoption fix): a pending --pr decision must carry its PR so
+	// prepareDiffManifest re-fetches into this run's isolated worktree —
+	// the pre-isolation era left the head checked out, so a bare
+	// {base, scope} adoption parsed the right tree by that mechanism;
+	// with the checkout gone a flagless `parse` after `init --pr` would
+	// build the manifest on the USER's tree (zero changed files) while
+	// the dataset is stamped with the PR head's SHA (the executed
+	// differential: pr_file_present=false, changed=[]).
+	if meta.PR > 0 {
+		return diffOpts{pr: meta.PR, scope: meta.Scope}, nil
+	}
 	return diffOpts{base: meta.Base, scope: meta.Scope}, nil
 }
 

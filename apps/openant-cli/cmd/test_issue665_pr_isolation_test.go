@@ -893,7 +893,6 @@ func TestIssue665ResolveScanModeBranchStamp(t *testing.T) {
 	// with the branch stamped from the WORKTREE (detached: "")
 	savedLang, savedPR, savedBase, savedFull, savedInc, savedStaged, savedSkip := scanLanguage, scanPR, scanDiffBase, scanFull, scanIncremental, scanStaged, scanSkipDynamicTest
 	scanLanguage, scanPR, scanDiffBase, scanFull, scanIncremental, scanStaged, scanSkipDynamicTest = "go", 7, "", false, false, false, true
-	scanOutput = t.TempDir()
 	t.Cleanup(func() { scanLanguage, scanPR, scanDiffBase, scanFull, scanIncremental, scanStaged, scanSkipDynamicTest = savedLang, savedPR, savedBase, savedFull, savedInc, savedStaged, savedSkip })
 
 	ctx := &projectContext{Project: &config.Project{Name: "p665-branchstamp", CommitSHAShort: config.ShortSHA(prHeads[7]), Language: "go", CommitSHA: prHeads[7]}, RepoPath: repoDir}
@@ -914,4 +913,65 @@ func TestIssue665ResolveScanModeBranchStamp(t *testing.T) {
 	if meta.PR != 7 {
 		t.Errorf("the running meta's PR = %d, want 7 (the r2 D1 catch: the running record carries the PR)", meta.PR)
 	}
+}
+
+// TestIssue665ParseAdoptionCarriesPR pins the r3 F1 catch (the parse
+// verb's twin of the scan adoption fix): a flagless `parse` after
+// `init --pr N` must carry the PR so prepareDiffManifest re-fetches into
+// the run's own isolated worktree. At the pre-cycle-3 head the fallback
+// returned a bare {base, scope} — the manifest was built on the USER's
+// tree (zero changed files) while the dataset was stamped with the PR
+// head's SHA.
+func TestIssue665ParseAdoptionCarriesPR(t *testing.T) {
+	repoDir, binDir, _, prHeads := issue665Env(t)
+	issue665Preflight(t, binDir)
+
+	withTempHome(t)
+	initPRDriveFlags(t, repoDir, "p665-parse-adopt", "", 7)
+	initPRPreflight(t, binDir)
+	_ = captureStderr(t, func() { runInit(nil, []string{repoDir}) })
+	stamped, err := config.LoadScanMeta("p665-parse-adopt", config.ShortSHA(prHeads[7]), "go")
+	if err != nil {
+		t.Fatalf("load init's meta: %v", err)
+	}
+	if stamped.PR != 7 {
+		t.Fatalf("init's meta carries PR=%d, want 7", stamped.PR)
+	}
+
+	// the flagless parse fallback, exactly as runParse resolves it
+	ctx := &projectContext{Project: &config.Project{Name: "p665-parse-adopt", CommitSHAShort: config.ShortSHA(prHeads[7]), Language: "go", CommitSHA: prHeads[7]}, RepoPath: repoDir}
+	opts, err := resolveStepDiffOpts(ctx, "", 0, "")
+	if err != nil {
+		t.Fatalf("the flagless parse fallback errored: %v", err)
+	}
+	if opts.pr != 7 {
+		t.Fatalf("the flagless parse fallback dropped the PR: opts=%+v — the manifest would build on the USER's tree (the r3 F1 class)", opts)
+	}
+
+	// and the manifest built from it fetches into a real isolated worktree
+	out := t.TempDir()
+	manifestPath, prwt, err := prepareDiffManifest(repoDir, out, opts)
+	if err != nil {
+		t.Fatalf("prepareDiffManifest: %v", err)
+	}
+	defer git.CleanupPRWorktree(repoDir, prwt.Worktree, prwt.Ref)
+	if prwt.Worktree == "" {
+		t.Fatal("the flagless parse did NOT fetch: prwt empty — the engine would parse the USER's tree with a PR-stamped dataset")
+	}
+	if rev := issue665Rev(t, prwt.Worktree, "HEAD"); rev != prHeads[7] {
+		t.Errorf("the fetched worktree HEAD = %s, want the PR head %s", rev, prHeads[7])
+	}
+	// the manifest's head names the PR head (read the struct, the parity
+	// test's own accessor)
+	m, err := git.BuildManifest(prwt.Worktree, "origin/main", opts.scope, 7)
+	if err != nil {
+		t.Fatalf("re-derive the manifest: %v", err)
+	}
+	if m.HeadSHA != prHeads[7] {
+		t.Errorf("the manifest head = %s, want the PR head %s", m.HeadSHA, prHeads[7])
+	}
+	if len(m.ChangedFiles) == 0 {
+		t.Error("the manifest carries zero changed files — the PR head's b.txt is missing (the user-tree manifest class)")
+	}
+	_ = manifestPath
 }
