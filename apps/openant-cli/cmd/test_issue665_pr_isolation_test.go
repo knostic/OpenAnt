@@ -761,20 +761,24 @@ func TestIssue665AdoptionRefetchesPRHead(t *testing.T) {
 	issue665Preflight(t, binDir)
 
 	withTempHome(t)
-	// a pending --pr decision exactly as writeInitScanMeta leaves it
-	meta := &config.ScanMeta{
-		Kind:      config.ScanKindDiff,
-		Commit:    prHeads[7],
-		Base:      "origin/main",
-		Scope:     "callers",
-		StartedAt: "2026-11-16T00:00:00Z",
-		Status:    config.ScanStatusRunning,
-		Language:  "go",
-		PR:        7,
+	// the pending --pr decision created by the REAL runInit path (pins the
+	// writeInitScanMeta stamp too — the E1/E2 catch: seeding the meta by
+	// hand left init's stamping unguarded)
+	xdg := initPRDriveFlags(t, repoDir, "p665-adopt", "", 7)
+	initPRPreflight(t, binDir)
+	_ = captureStderr(t, func() { runInit(nil, []string{repoDir}) })
+	persisted := persistedCommitSHA(t, "p665-adopt")
+	if persisted != prHeads[7] {
+		t.Fatalf("init stamped %s, want the PR head %s", persisted, prHeads[7])
 	}
-	if err := config.SaveScanMeta("p665-adopt", config.ShortSHA(prHeads[7]), "go", meta); err != nil {
-		t.Fatal(err)
+	stamped, err := config.LoadScanMeta("p665-adopt", config.ShortSHA(prHeads[7]), "go")
+	if err != nil {
+		t.Fatalf("load init's meta: %v", err)
 	}
+	if stamped.PR != 7 {
+		t.Fatalf("init's meta carries PR=%d, want 7 (the F1 record)", stamped.PR)
+	}
+	_ = xdg
 
 	// the flagless scan state: NO mode flags, the language matching the record
 	savedLang, savedPR, savedBase, savedFull, savedInc, savedStaged := scanLanguage, scanPR, scanDiffBase, scanFull, scanIncremental, scanStaged
