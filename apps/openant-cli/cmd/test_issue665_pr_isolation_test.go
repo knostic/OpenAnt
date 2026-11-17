@@ -810,38 +810,50 @@ func TestIssue665AdoptionRefetchesPRHead(t *testing.T) {
 // anything. requireAPIKey() os.Exit(2)s, and it was previously evaluated
 // as an ARGUMENT to python.Invoke — after the fetch — so the no-key run
 // stranded a full PR checkout in $TMPDIR plus its ref and worktree entry.
-// The exec-self pattern (the child is this same test binary) pins the
-// ORDER: at the pre-cycle-3 head the child leaves a workspace behind and
-// this test fails on the residue count.
+// Driven through the same re-exec harness as the CLI-witness tests (the
+// real rootCmd, the fake engine resolving cleanly so the flow WOULD reach
+// Invoke), with NO --api-key and the env key cleared: at the pre-cycle-3
+// head the fetch has already run when the key check exits, and the
+// workspace strands — this test fails on the residue.
 func TestIssue665NoKeyExitsBeforeFetch(t *testing.T) {
-	if os.Getenv("OPENANT_665_NOKEY_CHILD") == "1" {
-		// the child: runScan with --pr set, no key anywhere
-		scanPR = 7
-		scanSkipDynamicTest = true
-		scanOutput = os.Getenv("OPENANT_665_OUT")
-		_ = captureStderr(t, func() { runScan(nil, []string{os.Getenv("OPENANT_665_REPO")}) })
-		return
-	}
-
-	repoDir, binDir, _, _ := issue665Env(t)
+	repoDir, binDir, base, _ := issue665Env(t)
 	issue665Preflight(t, binDir)
 	out := t.TempDir()
 
 	exe, err := os.Executable()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.Executable: %v", err)
 	}
-	cmd := exec.Command(exe, "-test.run", "^TestIssue665NoKeyExitsBeforeFetch$")
-	cmd.Env = append(os.Environ(),
-		"OPENANT_665_NOKEY_CHILD=1",
-		"OPENANT_665_REPO="+repoDir,
-		"OPENANT_665_OUT="+out,
+	proc := exec.Command(exe,
+		"-test.run=TestIssue665HelperCLI",
+		"--", "scan", repoDir, "--pr", "7", "--skip-dynamic-test", "-o", out, "--no-report")
+	// an ISOLATED home + XDG in the child: otherwise the child reads the
+	// REAL machine's config.json and a key may resolve there (the dev
+	// machine runs OpenAnt) — the no-key arm would never fire
+	childHome := t.TempDir()
+	childXDG := t.TempDir()
+	proc.Env = append(os.Environ(),
+		issue665RoleEnv+"="+issue665RoleCLI,
+		"OPENANT_PYTHON="+exe,
+		"OPENANT_TEST_665_USERCLONE="+repoDir,
 		"OPENANT_API_KEY=",
-		"HOME="+t.TempDir(),
+		"HOME="+childHome,
+		"XDG_CONFIG_HOME="+childXDG,
 	)
-	cmd.Dir = repoDir
-	_ = cmd.Run() // the exit code is os.Exit(2); the residue is the assertion
-
+	outb, err := proc.CombinedOutput()
+	rc := 0
+	if exit, ok := err.(*exec.ExitError); ok {
+		rc = exit.ExitCode()
+	} else if err != nil {
+		t.Fatalf("re-exec the CLI: %v: %s", err, outb)
+	}
+	if rc != 2 {
+		t.Errorf("the no-key exit code = %d, want 2: %s", rc, lastLines(outb))
+	}
+	if !strings.Contains(string(outb), "No API key configured") {
+		t.Errorf("the no-key message missing: %s", lastLines(outb))
+	}
+	// THE F2 assertion: nothing was created before the exit
 	if refs := issue665PRRefs(t, repoDir); len(refs) != 0 {
 		t.Errorf("the no-key exit stranded PR refs (the fetch ran before the key check — the F2 arm): %v", refs)
 	}
@@ -860,4 +872,5 @@ func TestIssue665NoKeyExitsBeforeFetch(t *testing.T) {
 	if len(worktrees) != 0 {
 		t.Errorf("the no-key exit stranded worktrees (the F2 arm): %v", worktrees)
 	}
+	_ = base
 }
